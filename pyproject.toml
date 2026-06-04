@@ -60,6 +60,9 @@ acp = [
 exa = [
     "exa-py>=2.16.0",
 ]
+modal = [
+    "modal>=1.4.3",
+]
 
 [project.urls]
 Homepage = 'https://github.com/pydantic/pydantic-ai-harness'
