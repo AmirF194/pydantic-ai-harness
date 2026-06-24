@@ -108,7 +108,8 @@ def truncate_output(
     body = '\n'.join(result.truncated_lines)
     if not result.truncated:
         return body
-    marker = f'[... output truncated to the last {format_size(max_bytes)} ...]'
+    kept = 'last' if direction == 'tail' else 'first'
+    marker = f'[... output truncated to the {kept} {format_size(max_bytes)} ...]'
     return f'{marker}\n{body}' if direction == 'tail' else f'{body}\n{marker}'
 
 

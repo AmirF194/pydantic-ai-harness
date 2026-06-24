@@ -120,6 +120,7 @@ class FakeSandbox:
         self.exec_calls: list[ExecCall] = []
         self.terminated = False
         self.detached = False
+        self.terminate_error: Exception | None = None
         self.exec = _AioCallable(self._exec)
         self.terminate = _AioCallable(self._terminate)
         self.detach = _AioCallable(self._detach)
@@ -142,6 +143,8 @@ class FakeSandbox:
         return _FakeProcess(stdout, stderr, code)
 
     def _terminate(self) -> None:
+        if self.terminate_error is not None:
+            raise self.terminate_error
         self.terminated = True
 
     def _detach(self) -> None:

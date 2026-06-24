@@ -59,6 +59,13 @@ class TestRunCommand:
             await ts.run_command('echo', timeout_seconds=12.0)
         assert fake_modal.sandboxes[0].exec_calls[-1].timeout == 12
 
+    async def test_fractional_timeout_rounds_up(self, fake_modal: FakeModal) -> None:
+        fake_modal.responder = lambda argv, timeout: (str(timeout), '', 0)
+        async with _toolset() as ts:
+            await ts.run_command('echo', timeout_seconds=0.5)
+        # A sub-second timeout must not floor to 0, which Modal treats as "no timeout".
+        assert fake_modal.sandboxes[0].exec_calls[-1].timeout == 1
+
     async def test_output_truncated(self, fake_modal: FakeModal) -> None:
         fake_modal.responder = lambda argv, timeout: ('x' * 1000, '', 0)
         async with _toolset(max_output_chars=100) as ts:
@@ -202,6 +209,17 @@ class TestCapability:
 
     def test_instructions_can_be_disabled(self) -> None:
         assert ModalSandbox(include_instructions=False).get_instructions() is None
+
+    def test_owned_instructions_say_reset_between_sessions(self) -> None:
+        instructions = ModalSandbox().get_instructions()
+        assert instructions is not None
+        assert 'reset between' in instructions
+
+    def test_attached_instructions_say_persists(self) -> None:
+        instructions = ModalSandbox(sandbox_id='sb-keep').get_instructions()
+        assert instructions is not None
+        assert 'persists across sessions' in instructions
+        assert 'reset between' not in instructions
 
     def test_exported_from_experimental_namespace(self) -> None:
         import pydantic_ai_harness

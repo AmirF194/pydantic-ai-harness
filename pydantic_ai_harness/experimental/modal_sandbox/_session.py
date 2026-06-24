@@ -83,6 +83,9 @@ class ModalSandboxSession:
 
     async def __aenter__(self) -> Self:
         """Create or attach to the sandbox."""
+        # Clear any cwd cached from a prior entry: a reused session must resolve relative
+        # paths against the new sandbox's tree, not the previous one's.
+        self._cwd = None
         try:
             import modal
         except ImportError as e:
@@ -112,16 +115,20 @@ class ModalSandboxSession:
         """Release the sandbox: terminate it when owned, and always detach the client."""
         sandbox = self._sandbox
         self._sandbox = None
+        self._cwd = None
         if sandbox is None:
             return
         owned = self._sandbox_id is None
         # Shield cleanup so a cancellation mid-run still tears the sandbox down. Stop a
-        # sandbox we created; an attached one keeps running. Always detach to release the
-        # local client connection -- Modal's recommended cleanup.
+        # sandbox we created; an attached one keeps running. Detach in `finally` so the
+        # local client connection is always released -- Modal's recommended cleanup --
+        # even if terminating the owned sandbox fails.
         with anyio.CancelScope(shield=True):
-            if owned:
-                await sandbox.terminate.aio()
-            await sandbox.detach.aio()  # pyright: ignore[reportUnknownMemberType]
+            try:
+                if owned:
+                    await sandbox.terminate.aio()
+            finally:
+                await sandbox.detach.aio()  # pyright: ignore[reportUnknownMemberType]
 
     def _require_sandbox(self) -> modal.Sandbox:
         sandbox = self._sandbox

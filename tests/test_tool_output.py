@@ -63,7 +63,13 @@ class TestTruncateOutput:
     def test_head_marker_on_bottom(self) -> None:
         out = truncate_output('a\nb\nc', max_lines=1, direction='head')
         assert out.startswith('a')
+        # Head keeps the first lines, so the marker must say "first", not "last".
+        assert 'truncated to the first' in out
         assert out.rstrip().endswith(']')
+
+    def test_tail_marker_says_last(self) -> None:
+        out = truncate_output('a\nb\nc', max_lines=1, direction='tail')
+        assert 'truncated to the last' in out
 
 
 class TestRenderFileWindow:

@@ -45,6 +45,15 @@ class TestOwnedLifecycle:
     async def test_exit_without_enter_is_safe(self) -> None:
         await ModalSandboxSession().__aexit__(None, None, None)
 
+    async def test_detaches_even_when_terminate_fails(self, fake_modal: FakeModal) -> None:
+        session = ModalSandboxSession()
+        await session.__aenter__()
+        fake_modal.sandboxes[0].terminate_error = RuntimeError('terminate boom')
+        with pytest.raises(RuntimeError, match='terminate boom'):
+            await session.__aexit__(None, None, None)
+        # The client is detached even though terminate raised, so the attachment is not leaked.
+        assert fake_modal.sandboxes[0].detached is True
+
 
 class TestAttachLifecycle:
     async def test_attaches_detaches_but_does_not_terminate(self, fake_modal: FakeModal) -> None:
@@ -175,3 +184,16 @@ class TestPathResolution:
         async with ModalSandboxSession() as session:
             await session.write_bytes('file.txt', b'x')
         assert '/file.txt' in fake_modal.sandboxes[0].files
+
+    async def test_cwd_not_carried_across_reentry(self, fake_modal: FakeModal) -> None:
+        # A reused session must re-query pwd for the new sandbox rather than reuse the
+        # cwd cached during the first entry.
+        responses = iter(['/first\n', '/second\n'])
+        fake_modal.responder = lambda argv, timeout: (next(responses), '', 0)
+        session = ModalSandboxSession()
+        async with session:
+            await session.write_bytes('a.txt', b'x')
+        async with session:
+            await session.write_bytes('b.txt', b'y')
+        assert '/first/a.txt' in fake_modal.sandboxes[0].files
+        assert '/second/b.txt' in fake_modal.sandboxes[1].files

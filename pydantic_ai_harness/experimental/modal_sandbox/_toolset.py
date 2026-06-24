@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from typing import Annotated, Any
 
 from pydantic import Field
@@ -96,7 +97,10 @@ class ModalSandboxToolset(FunctionToolset[AgentDepsT]):
         return self._session
 
     def _command_timeout(self, timeout_seconds: float | None) -> int:
-        return int(timeout_seconds if timeout_seconds is not None else self._default_timeout)
+        # Modal takes whole-second timeouts; round fractional values up so a sub-second
+        # request is not floored to 0 (which Modal treats as "no timeout").
+        timeout = timeout_seconds if timeout_seconds is not None else self._default_timeout
+        return max(1, math.ceil(timeout))
 
     async def run_command(self, command: str, *, timeout_seconds: float | None = None) -> str:
         """Run a shell command in the sandbox and return its output.

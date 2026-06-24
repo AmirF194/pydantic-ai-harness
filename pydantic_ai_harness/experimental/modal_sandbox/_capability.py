@@ -10,11 +10,18 @@ from pydantic_ai.toolsets import AgentToolset
 
 from pydantic_ai_harness.experimental.modal_sandbox._toolset import ModalSandboxToolset
 
-_INSTRUCTIONS = (
+_OWNED_INSTRUCTIONS = (
     'You have a Modal sandbox: an isolated, ephemeral cloud container. Use `run_command` to run '
     'shell commands in it, and `read_file` / `write_file` / `list_directory` to manage files. '
     'Commands run through `sh`, so pipes and redirection work. The sandbox is reset between '
     'sessions, so persist anything important outside it.'
+)
+
+_ATTACHED_INSTRUCTIONS = (
+    'You have a Modal sandbox: an isolated cloud container. Use `run_command` to run shell '
+    'commands in it, and `read_file` / `write_file` / `list_directory` to manage files. '
+    'Commands run through `sh`, so pipes and redirection work. This sandbox persists across '
+    'sessions, so files from earlier runs can still be present.'
 )
 
 
@@ -76,7 +83,7 @@ class ModalSandbox(AbstractCapability[AgentDepsT]):
         """Explain the sandbox to the model, unless disabled."""
         if not self.include_instructions:
             return None
-        return _INSTRUCTIONS
+        return _ATTACHED_INSTRUCTIONS if self.sandbox_id is not None else _OWNED_INSTRUCTIONS
 
     def get_toolset(self) -> AgentToolset[AgentDepsT]:
         """Build and return the Modal sandbox toolset."""
