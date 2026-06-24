@@ -32,6 +32,11 @@ _MISSING_MODAL = (
 )
 
 
+# This is the mechanism layer: every Modal-specific operation (create/attach,
+# exec, file access, path resolution, lifecycle) is contained here, behind a small
+# byte-oriented method surface that the toolset depends on. Keeping it isolated from
+# the presentation in `_toolset.py` is what lets the sandbox internals change without
+# touching the tools or the capability.
 class ModalSandboxSession:
     """Async context manager that owns or attaches to a Modal sandbox.
 

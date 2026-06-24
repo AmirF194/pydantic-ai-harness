@@ -73,7 +73,11 @@ run; attach a long-lived sandbox when you want to avoid it.
 Not shipped yet: keeping an *owned* sandbox warm across runs (outer-scope reuse)
 is not implemented -- use attach mode for reuse for now.
 
-The same lifecycle is available standalone as an async context manager:
+`ModalSandbox` is the supported entry point. The capability is built in two
+layers -- a session that owns the sandbox mechanism (commands, file access,
+lifecycle) and a toolset that presents it to the model -- kept separate so the
+internals can change without affecting the tools. The session is also usable on
+its own as a lower-level async context manager:
 
 ```python
 from pydantic_ai_harness.experimental.modal_sandbox import ModalSandboxSession
