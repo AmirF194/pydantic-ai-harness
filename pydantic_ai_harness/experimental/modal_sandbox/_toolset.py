@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import base64
 from typing import Any
 
 from pydantic_ai import RunContext
@@ -11,11 +10,7 @@ from pydantic_ai.tools import AgentDepsT
 from pydantic_ai.toolsets import AbstractToolset, FunctionToolset
 from typing_extensions import Self
 
-from pydantic_ai_harness.experimental.modal_sandbox._session import ModalSandboxSession
-
-# Write `$2` (base64) to `$1`, creating parent directories. Passing the content as an
-# argument (base64-encoded) avoids stdin handling and keeps it free of shell metacharacters.
-_WRITE_SCRIPT = 'mkdir -p "$(dirname "$1")" && printf %s "$2" | base64 -d > "$1"'
+from pydantic_ai_harness.experimental.modal_sandbox._session import ModalSandboxError, ModalSandboxSession
 
 
 class ModalSandboxToolset(FunctionToolset[AgentDepsT]):
@@ -126,17 +121,15 @@ class ModalSandboxToolset(FunctionToolset[AgentDepsT]):
             Labelled stdout/stderr output, with an exit code on non-zero exit.
         """
         session = self._require_session()
-        stdout, stderr, exit_code = await session.exec(
-            ['sh', '-c', command], timeout=self._command_timeout(timeout_seconds)
-        )
+        result = await session.exec(['sh', '-c', command], timeout=self._command_timeout(timeout_seconds))
         parts: list[str] = []
-        if stdout:
-            parts.append(f'[stdout]\n{stdout}')
-        if stderr:
-            parts.append(f'[stderr]\n{stderr}')
+        if result.stdout:
+            parts.append(f'[stdout]\n{result.stdout}')
+        if result.stderr:
+            parts.append(f'[stderr]\n{result.stderr}')
         output = self._truncate('\n'.join(parts) if parts else '(no output)')
-        if exit_code:
-            return f'{output}\n[exit code: {exit_code}]'
+        if result.returncode:
+            return f'{output}\n[exit code: {result.returncode}]'
         return output
 
     async def read_file(self, path: str) -> str:
@@ -146,10 +139,11 @@ class ModalSandboxToolset(FunctionToolset[AgentDepsT]):
             path: Path to the file inside the sandbox.
         """
         session = self._require_session()
-        stdout, stderr, exit_code = await session.exec(['cat', '--', path], timeout=self._command_timeout(None))
-        if exit_code:
-            raise ModelRetry(f'Could not read {path!r}: {stderr.strip() or f"exit code {exit_code}"}')
-        return self._truncate(stdout)
+        try:
+            content = await session.read_text(path)
+        except ModalSandboxError as e:
+            raise ModelRetry(f'Could not read {path!r}: {e}')
+        return self._truncate(content)
 
     async def write_file(self, path: str, content: str) -> str:
         """Write text to a file in the sandbox, creating parent directories.
@@ -159,12 +153,10 @@ class ModalSandboxToolset(FunctionToolset[AgentDepsT]):
             content: The text to write.
         """
         session = self._require_session()
-        encoded = base64.b64encode(content.encode('utf-8')).decode('ascii')
-        _, stderr, exit_code = await session.exec(
-            ['sh', '-c', _WRITE_SCRIPT, 'sh', path, encoded], timeout=self._command_timeout(None)
-        )
-        if exit_code:
-            raise ModelRetry(f'Could not write {path!r}: {stderr.strip() or f"exit code {exit_code}"}')
+        try:
+            await session.write_text(path, content)
+        except ModalSandboxError as e:
+            raise ModelRetry(f'Could not write {path!r}: {e}')
         return f'Wrote {len(content)} characters to {path!r}.'
 
     async def list_directory(self, path: str = '.') -> str:
@@ -174,7 +166,11 @@ class ModalSandboxToolset(FunctionToolset[AgentDepsT]):
             path: Directory to list (default: the working directory).
         """
         session = self._require_session()
-        stdout, stderr, exit_code = await session.exec(['ls', '-1Ap', '--', path], timeout=self._command_timeout(None))
-        if exit_code:
-            raise ModelRetry(f'Could not list {path!r}: {stderr.strip() or f"exit code {exit_code}"}')
-        return self._truncate(stdout) if stdout else '(empty)'
+        try:
+            entries = await session.list_files(path)
+        except ModalSandboxError as e:
+            raise ModelRetry(f'Could not list {path!r}: {e}')
+        if not entries:
+            return '(empty)'
+        names = sorted(f'{name}/' if is_dir else name for name, is_dir in entries)
+        return self._truncate('\n'.join(names))

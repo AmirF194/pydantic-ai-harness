@@ -9,7 +9,7 @@ import pytest
 
 from pydantic_ai_harness.experimental.modal_sandbox import ModalSandboxError, ModalSandboxSession
 
-from .fake_modal import FakeModal
+from .fake_modal import FakeModal, FileInfo
 
 
 class TestOwnedLifecycle:
@@ -87,7 +87,8 @@ class TestExec:
     async def test_returns_stdout_stderr_nonzero_code(self, fake_modal: FakeModal) -> None:
         fake_modal.responder = lambda argv, timeout: ('out', 'err', 7)
         async with ModalSandboxSession() as session:
-            assert await session.exec(['whatever'], timeout=5) == ('out', 'err', 7)
+            result = await session.exec(['whatever'], timeout=5)
+            assert (result.stdout, result.stderr, result.returncode) == ('out', 'err', 7)
             call = fake_modal.sandboxes[0].exec_calls[-1]
             assert call.argv == ['whatever']
             assert call.timeout == 5
@@ -95,4 +96,49 @@ class TestExec:
     async def test_zero_exit_code(self, fake_modal: FakeModal) -> None:
         fake_modal.responder = lambda argv, timeout: ('done\n', '', 0)
         async with ModalSandboxSession() as session:
-            assert await session.exec(['echo', 'done']) == ('done\n', '', 0)
+            result = await session.exec(['echo', 'done'])
+            assert (result.stdout, result.stderr, result.returncode) == ('done\n', '', 0)
+
+
+class TestFilesystem:
+    async def test_write_then_read_round_trips(self, fake_modal: FakeModal) -> None:
+        async with ModalSandboxSession() as session:
+            await session.write_text('/work/app/main.py', 'print(1)\n')
+            assert await session.read_text('/work/app/main.py') == 'print(1)\n'
+        sandbox = fake_modal.sandboxes[0]
+        # Parent directories are created before the write.
+        assert sandbox.made_dirs == ['/work/app']
+
+    async def test_write_at_root_skips_make_directory(self, fake_modal: FakeModal) -> None:
+        async with ModalSandboxSession() as session:
+            await session.write_text('file.txt', 'data')
+        assert fake_modal.sandboxes[0].made_dirs == []
+
+    async def test_list_files_normalizes_to_name_is_dir(self, fake_modal: FakeModal) -> None:
+        async with ModalSandboxSession() as session:
+            fake_modal.sandboxes[0].listing = [FileInfo('a.py', False), FileInfo('sub', True)]
+            assert await session.list_files('/work') == [('a.py', False), ('sub', True)]
+            assert fake_modal.sandboxes[0].list_paths == ['/work']
+
+    async def test_read_error_wrapped(self, fake_modal: FakeModal) -> None:
+        async with ModalSandboxSession() as session:
+            fake_modal.sandboxes[0].fs_error = fake_modal.filesystem_error_type('No such file: /x')
+            with pytest.raises(ModalSandboxError, match='No such file: /x'):
+                await session.read_text('/x')
+
+    async def test_write_error_wrapped(self, fake_modal: FakeModal) -> None:
+        async with ModalSandboxSession() as session:
+            fake_modal.sandboxes[0].fs_error = fake_modal.filesystem_error_type('Permission denied: /x')
+            with pytest.raises(ModalSandboxError, match='Permission denied: /x'):
+                await session.write_text('/x', 'data')
+
+    async def test_list_error_wrapped(self, fake_modal: FakeModal) -> None:
+        async with ModalSandboxSession() as session:
+            fake_modal.sandboxes[0].fs_error = fake_modal.filesystem_error_type('Not a directory: /x')
+            with pytest.raises(ModalSandboxError, match='Not a directory: /x'):
+                await session.list_files('/x')
+
+    async def test_filesystem_without_session_raises(self) -> None:
+        session = ModalSandboxSession()
+        with pytest.raises(ModalSandboxError, match='sandbox is not running'):
+            await session.read_text('/x')

@@ -76,7 +76,8 @@ The same lifecycle is available standalone as an async context manager:
 from pydantic_ai_harness.experimental.modal_sandbox import ModalSandboxSession
 
 async with ModalSandboxSession(image='python:3.12-slim') as session:
-    stdout, stderr, code = await session.exec(['echo', 'hello'])
+    result = await session.exec(['echo', 'hello'])
+    print(result.stdout, result.returncode)
 ```
 
 ## Configuration
@@ -95,11 +96,12 @@ ModalSandbox(
 )
 ```
 
-Modal's blocking SDK is driven through worker threads, so the capability works
-under both the asyncio and trio backends. `write_file` passes its content
-base64-encoded as a command argument, which avoids shell-quoting issues but caps
-a single write at the platform's argument-length limit — write very large files
-in chunks or with `run_command`.
+Modal's SDK is asyncio-native, so the capability drives its async (`.aio`) API
+directly and requires an asyncio event loop (it does not run under trio).
+`run_command` runs through `sh -c`; `read_file`, `write_file`, and
+`list_directory` use Modal's filesystem API directly (no shell), so writes stream
+the content rather than passing it as a command argument and `write_file` creates
+parent directories.
 
 ## Agent spec (YAML/JSON)
 

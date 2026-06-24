@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
+import posixpath
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 import anyio
-from anyio import to_thread
 from typing_extensions import Self
 
 if TYPE_CHECKING:
@@ -14,6 +15,15 @@ if TYPE_CHECKING:
 
 class ModalSandboxError(RuntimeError):
     """Raised when a Modal sandbox cannot be created, attached to, or used."""
+
+
+@dataclass(frozen=True)
+class ExecResult:
+    """The outcome of running a command in the sandbox."""
+
+    stdout: str
+    stderr: str
+    returncode: int
 
 
 _MISSING_MODAL = (
@@ -30,13 +40,13 @@ class ModalSandboxSession:
     up an existing sandbox and leaves it running on exit, so a sandbox you manage
     elsewhere can be reused across runs.
 
-    Modal's blocking API is driven through worker threads, so the session works
-    under any async backend and authenticates from the standard `MODAL_TOKEN_ID`
-    / `MODAL_TOKEN_SECRET` environment variables.
+    Modal's SDK is asyncio-native, so this session drives its `.aio` coroutine API
+    directly and requires an asyncio event loop. It authenticates from the standard
+    `MODAL_TOKEN_ID` / `MODAL_TOKEN_SECRET` environment variables.
 
     ```python
     async with ModalSandboxSession(image='python:3.12-slim') as session:
-        stdout, stderr, code = await session.exec(['echo', 'hello'])
+        result = await session.exec(['echo', 'hello'])
     ```
     """
 
@@ -72,21 +82,25 @@ class ModalSandboxSession:
         except ImportError as e:
             raise ModalSandboxError(_MISSING_MODAL) from e
         try:
-            self._sandbox = await to_thread.run_sync(self._open_sandbox)
+            self._sandbox = await self._open_sandbox()
         except modal.exception.Error as e:
             raise ModalSandboxError(f'Could not start Modal sandbox: {e}') from e
         return self
 
-    def _open_sandbox(self) -> modal.Sandbox:
-        """Create an owned sandbox or attach to an existing one (runs in a worker thread)."""
+    async def _open_sandbox(self) -> modal.Sandbox:
+        """Create an owned sandbox or attach to an existing one."""
         import modal
 
         if self._sandbox_id is not None:
-            return modal.Sandbox.from_id(self._sandbox_id)
-        app = modal.App.lookup(self._app_name, create_if_missing=self._create_app_if_missing)
-        # modal's `from_registry` is typed with an untyped `**kwargs`, so pyright flags the access.
+            return await modal.Sandbox.from_id.aio(self._sandbox_id)
+        app = await modal.App.lookup.aio(self._app_name, create_if_missing=self._create_app_if_missing)
+        # `from_registry` builds the image spec locally (no network), so it has no `.aio` variant.
+        # Its typing uses an untyped `**kwargs`, so pyright flags the access.
         image = modal.Image.from_registry(self._image)  # pyright: ignore[reportUnknownMemberType]
-        return modal.Sandbox.create(app=app, image=image, timeout=self._sandbox_timeout, workdir=self._workdir)
+        # `create.aio` is typed with a partially-`Any` coroutine return, so pyright flags the call.
+        return await modal.Sandbox.create.aio(  # pyright: ignore[reportUnknownMemberType]
+            app=app, image=image, timeout=self._sandbox_timeout, workdir=self._workdir
+        )
 
     async def __aexit__(self, *args: Any) -> None:
         """Release the sandbox: terminate it when owned, and always detach the client."""
@@ -95,36 +109,85 @@ class ModalSandboxSession:
         if sandbox is None:
             return
         owned = self._sandbox_id is None
-
-        def close() -> None:
-            # Stop a sandbox we created; an attached one keeps running. Always detach to
-            # release the local client connection — Modal's recommended cleanup.
-            if owned:
-                sandbox.terminate()
-            sandbox.detach()
-
+        # Shield cleanup so a cancellation mid-run still tears the sandbox down. Stop a
+        # sandbox we created; an attached one keeps running. Always detach to release the
+        # local client connection -- Modal's recommended cleanup.
         with anyio.CancelScope(shield=True):
-            await to_thread.run_sync(close)
+            if owned:
+                await sandbox.terminate.aio()
+            await sandbox.detach.aio()  # pyright: ignore[reportUnknownMemberType]
 
-    async def exec(self, argv: list[str], *, timeout: int | None = None) -> tuple[str, str, int]:
-        """Run an argument vector in the sandbox and return (stdout, stderr, exit code).
-
-        Args:
-            argv: The command and its arguments (executed without a shell).
-            timeout: Optional per-command timeout in seconds, enforced by Modal.
-        """
+    def _require_sandbox(self) -> modal.Sandbox:
         sandbox = self._sandbox
         if sandbox is None:
             raise ModalSandboxError('The sandbox is not running; use the session as an async context manager.')
+        return sandbox
 
-        def run() -> tuple[str, str, int]:
-            # Modal buffers exec output server-side and streams it over its own connection,
-            # so draining stdout then stderr before waiting cannot deadlock the way OS pipes
-            # would. `text=True` (Modal's default) makes the streams yield str.
-            process = sandbox.exec(*argv, timeout=timeout)
-            stdout = process.stdout.read()
-            stderr = process.stderr.read()
-            process.wait()
-            return stdout, stderr, process.returncode or 0
+    async def exec(self, argv: list[str], *, timeout: int | None = None) -> ExecResult:
+        """Run an argument vector in the sandbox (without a shell) and return its result.
 
-        return await to_thread.run_sync(run)
+        Args:
+            argv: The command and its arguments.
+            timeout: Optional per-command timeout in seconds, enforced by Modal.
+        """
+        sandbox = self._require_sandbox()
+        # Modal buffers exec output server-side and streams it over its own connection,
+        # so draining stdout then stderr before waiting cannot deadlock the way OS pipes
+        # would. `text=True` (Modal's default) makes the streams yield str.
+        process = await sandbox.exec.aio(*argv, timeout=timeout)
+        stdout = await process.stdout.read.aio()
+        stderr = await process.stderr.read.aio()
+        returncode = await process.wait.aio()
+        return ExecResult(stdout=stdout, stderr=stderr, returncode=returncode or 0)
+
+    async def read_text(self, path: str) -> str:
+        """Read a text file from the sandbox via Modal's filesystem API.
+
+        Raises:
+            ModalSandboxError: if the file cannot be read (missing, a directory, ...).
+        """
+        sandbox = self._require_sandbox()
+        import modal
+
+        try:
+            return await sandbox.filesystem.read_text.aio(path)
+        except modal.exception.SandboxFilesystemError as e:
+            raise ModalSandboxError(str(e)) from e
+
+    async def write_text(self, path: str, content: str) -> None:
+        """Write text to a file in the sandbox, creating parent directories.
+
+        Unlike shelling out, Modal's filesystem API streams the content, so the size
+        is not bounded by the argument-length limit of a command.
+
+        Raises:
+            ModalSandboxError: if the file cannot be written (bad path, permissions, ...).
+        """
+        sandbox = self._require_sandbox()
+        import modal
+
+        parent = posixpath.dirname(path)
+        try:
+            if parent:
+                await sandbox.filesystem.make_directory.aio(parent, create_parents=True)
+            await sandbox.filesystem.write_text.aio(content, path)
+        except modal.exception.SandboxFilesystemError as e:
+            raise ModalSandboxError(str(e)) from e
+
+    async def list_files(self, path: str) -> list[tuple[str, bool]]:
+        """List a sandbox directory as `(name, is_dir)` pairs.
+
+        The Modal-native `FileInfo` entries are normalized to plain tuples here so the
+        provider type does not leak past the session.
+
+        Raises:
+            ModalSandboxError: if the directory cannot be listed.
+        """
+        sandbox = self._require_sandbox()
+        import modal
+
+        try:
+            entries = await sandbox.filesystem.list_files.aio(path)
+        except modal.exception.SandboxFilesystemError as e:
+            raise ModalSandboxError(str(e)) from e
+        return [(entry.name, entry.is_dir()) for entry in entries]

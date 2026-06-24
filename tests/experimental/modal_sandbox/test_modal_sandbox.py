@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import base64
-
 import pytest
 from pydantic_ai import Agent
 from pydantic_ai.exceptions import ModelRetry
@@ -11,7 +9,7 @@ from pydantic_ai.models.test import TestModel
 
 from pydantic_ai_harness.experimental.modal_sandbox import ModalSandbox, ModalSandboxToolset
 
-from .fake_modal import FakeModal
+from .fake_modal import FakeModal, FileInfo
 
 
 def _toolset(
@@ -70,75 +68,61 @@ class TestRunCommand:
 
 class TestReadFile:
     async def test_returns_contents(self, fake_modal: FakeModal) -> None:
-        fake_modal.responder = lambda argv, timeout: ('file body\n', '', 0)
         async with _toolset() as ts:
+            fake_modal.sandboxes[0].files['/etc/hosts'] = 'file body\n'
             assert await ts.read_file('/etc/hosts') == 'file body\n'
-        call = fake_modal.sandboxes[0].exec_calls[-1]
-        assert call.argv == ['cat', '--', '/etc/hosts']
-        assert call.timeout == 30
 
     async def test_at_size_limit_is_not_truncated(self, fake_modal: FakeModal) -> None:
-        fake_modal.responder = lambda argv, timeout: ('x' * 100, '', 0)
         async with _toolset(max_output_chars=100) as ts:
+            fake_modal.sandboxes[0].files['/f'] = 'x' * 100
             assert await ts.read_file('/f') == 'x' * 100
 
     async def test_over_size_limit_keeps_tail(self, fake_modal: FakeModal) -> None:
-        fake_modal.responder = lambda argv, timeout: ('HEAD' + 'T' * 100, '', 0)
         async with _toolset(max_output_chars=100) as ts:
+            fake_modal.sandboxes[0].files['/big'] = 'HEAD' + 'T' * 100
             result = await ts.read_file('/big')
         assert result.endswith('T' * 100)
         assert 'HEAD' not in result
         assert 'output truncated' in result
 
     async def test_error_raises_model_retry(self, fake_modal: FakeModal) -> None:
-        fake_modal.responder = lambda argv, timeout: ('', 'No such file\n', 1)
         async with _toolset() as ts:
+            fake_modal.sandboxes[0].fs_error = fake_modal.filesystem_error_type('No such file: /nope')
             with pytest.raises(ModelRetry, match="Could not read '/nope': No such file"):
-                await ts.read_file('/nope')
-
-    async def test_error_without_stderr_uses_exit_code(self, fake_modal: FakeModal) -> None:
-        fake_modal.responder = lambda argv, timeout: ('', '', 1)
-        async with _toolset() as ts:
-            with pytest.raises(ModelRetry, match='exit code 1'):
                 await ts.read_file('/nope')
 
 
 class TestWriteFile:
-    async def test_encodes_and_writes(self, fake_modal: FakeModal) -> None:
+    async def test_writes_and_creates_parents(self, fake_modal: FakeModal) -> None:
         async with _toolset() as ts:
-            result = await ts.write_file('/tmp/a.py', 'print(1)\n')
-        assert result == "Wrote 9 characters to '/tmp/a.py'."
-        call = fake_modal.sandboxes[0].exec_calls[-1]
-        assert call.argv[:4] == ['sh', '-c', call.argv[2], 'sh']
-        assert call.argv[4] == '/tmp/a.py'
-        assert base64.b64decode(call.argv[5]).decode() == 'print(1)\n'
-        assert call.timeout == 30
+            result = await ts.write_file('/tmp/pkg/a.py', 'print(1)\n')
+        assert result == "Wrote 9 characters to '/tmp/pkg/a.py'."
+        sandbox = fake_modal.sandboxes[0]
+        assert sandbox.files['/tmp/pkg/a.py'] == 'print(1)\n'
+        assert sandbox.made_dirs == ['/tmp/pkg']
 
     async def test_error_raises_model_retry(self, fake_modal: FakeModal) -> None:
-        fake_modal.responder = lambda argv, timeout: ('', 'Permission denied\n', 1)
         async with _toolset() as ts:
+            fake_modal.sandboxes[0].fs_error = fake_modal.filesystem_error_type('Permission denied: /root/x')
             with pytest.raises(ModelRetry, match="Could not write '/root/x': Permission denied"):
                 await ts.write_file('/root/x', 'data')
 
 
 class TestListDirectory:
-    async def test_lists(self, fake_modal: FakeModal) -> None:
-        fake_modal.responder = lambda argv, timeout: ('a\nb/\n', '', 0)
+    async def test_lists_with_trailing_slash_on_dirs(self, fake_modal: FakeModal) -> None:
         async with _toolset() as ts:
-            assert await ts.list_directory('/tmp') == 'a\nb/\n'
-        call = fake_modal.sandboxes[0].exec_calls[-1]
-        assert call.argv == ['ls', '-1Ap', '--', '/tmp']
-        assert call.timeout == 30
+            fake_modal.sandboxes[0].listing = [FileInfo('b', True), FileInfo('a', False)]
+            assert await ts.list_directory('/tmp') == 'a\nb/'
+        assert fake_modal.sandboxes[0].list_paths == ['/tmp']
 
-    async def test_default_path(self, fake_modal: FakeModal) -> None:
-        fake_modal.responder = lambda argv, timeout: ('', '', 0)
+    async def test_default_path_when_empty(self, fake_modal: FakeModal) -> None:
         async with _toolset() as ts:
             assert await ts.list_directory() == '(empty)'
-        assert fake_modal.sandboxes[0].exec_calls[-1].argv == ['ls', '-1Ap', '--', '.']
+        assert fake_modal.sandboxes[0].list_paths == ['.']
 
     async def test_error_raises_model_retry(self, fake_modal: FakeModal) -> None:
-        fake_modal.responder = lambda argv, timeout: ('', 'Not a directory\n', 1)
         async with _toolset() as ts:
+            fake_modal.sandboxes[0].fs_error = fake_modal.filesystem_error_type('Not a directory: /etc/hosts')
             with pytest.raises(ModelRetry, match="Could not list '/etc/hosts': Not a directory"):
                 await ts.list_directory('/etc/hosts')
 
