@@ -45,7 +45,11 @@ class ModalSandbox(AbstractCapability[AgentDepsT]):
     """Container image for owned sandboxes, as a registry tag (e.g. `python:3.12-slim`)."""
 
     sandbox_id: str | None = None
-    """Attach to an existing sandbox by id instead of creating one. Attached sandboxes are not terminated."""
+    """Attach to an existing sandbox by id instead of creating one. Attached sandboxes are not terminated.
+
+    Attach is the only way to reuse a sandbox across runs today; keeping an owned sandbox
+    warm across runs (outer-scope reuse) is not implemented yet.
+    """
 
     app_name: str = 'pydantic-ai-harness'
     """Modal app the owned sandbox is created under."""

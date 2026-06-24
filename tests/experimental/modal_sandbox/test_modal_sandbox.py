@@ -77,18 +77,25 @@ class TestReadFile:
             fake_modal.sandboxes[0].files['/f'] = b'x' * 100
             assert await ts.read_file('/f') == 'x' * 100
 
-    async def test_over_size_limit_keeps_tail(self, fake_modal: FakeModal) -> None:
-        async with _toolset(max_output_chars=100) as ts:
-            fake_modal.sandboxes[0].files['/big'] = b'HEAD' + b'T' * 100
+    async def test_over_size_limit_pages_from_head(self, fake_modal: FakeModal) -> None:
+        async with _toolset(max_output_chars=20) as ts:
+            fake_modal.sandboxes[0].files['/big'] = b'\n'.join(b'line%02d' % i for i in range(10))
             result = await ts.read_file('/big')
-        assert result.endswith('T' * 100)
-        assert 'HEAD' not in result
-        assert 'output truncated' in result
+        # File reads keep the head and tell the model how to page the rest.
+        assert result.startswith('line00')
+        assert 'Use offset=' in result
+
+    async def test_offset_and_limit(self, fake_modal: FakeModal) -> None:
+        async with _toolset() as ts:
+            fake_modal.sandboxes[0].files['/f'] = b'a\nb\nc\nd\ne'
+            result = await ts.read_file('/f', offset=2, limit=2)
+        assert result.startswith('b\nc')
+        assert 'more lines in file. Use offset=4 to continue.' in result
 
     async def test_binary_file_raises_model_retry(self, fake_modal: FakeModal) -> None:
         async with _toolset() as ts:
             fake_modal.sandboxes[0].files['/img.png'] = b'\xff\xfe\x00\x01'
-            with pytest.raises(ModelRetry, match="Could not read '/img.png': not valid UTF-8"):
+            with pytest.raises(ModelRetry, match='not valid UTF-8'):
                 await ts.read_file('/img.png')
 
     async def test_error_raises_model_retry(self, fake_modal: FakeModal) -> None:

@@ -70,6 +70,9 @@ ModalSandbox(sandbox_id='sb-abc123')   # attach to an existing sandbox
 Because each owned run spins up its own sandbox, expect a cold-start cost per
 run; attach a long-lived sandbox when you want to avoid it.
 
+Not shipped yet: keeping an *owned* sandbox warm across runs (outer-scope reuse)
+is not implemented -- use attach mode for reuse for now.
+
 The same lifecycle is available standalone as an async context manager:
 
 ```python

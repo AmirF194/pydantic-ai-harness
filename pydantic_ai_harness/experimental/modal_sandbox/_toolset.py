@@ -2,14 +2,16 @@
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Annotated, Any
 
+from pydantic import Field
 from pydantic_ai import RunContext
 from pydantic_ai.exceptions import ModelRetry
 from pydantic_ai.tools import AgentDepsT
 from pydantic_ai.toolsets import AbstractToolset, FunctionToolset
 from typing_extensions import Self
 
+from pydantic_ai_harness._tool_output import render_file_window, truncate_output
 from pydantic_ai_harness.experimental.modal_sandbox._session import ModalSandboxError, ModalSandboxSession
 
 
@@ -96,17 +98,6 @@ class ModalSandboxToolset(FunctionToolset[AgentDepsT]):
     def _command_timeout(self, timeout_seconds: float | None) -> int:
         return int(timeout_seconds if timeout_seconds is not None else self._default_timeout)
 
-    def _truncate(self, text: str) -> str:
-        """Truncate output to the configured cap, keeping the tail.
-
-        Errors and the `[stderr]` section land at the end, so the head is dropped
-        and the final `max_output_chars` are kept.
-        """
-        if len(text) <= self._max_output_chars:
-            return text
-        marker = f'[... output truncated, showing last {self._max_output_chars} chars]\n'
-        return marker + text[-self._max_output_chars :]
-
     async def run_command(self, command: str, *, timeout_seconds: float | None = None) -> str:
         """Run a shell command in the sandbox and return its output.
 
@@ -127,28 +118,37 @@ class ModalSandboxToolset(FunctionToolset[AgentDepsT]):
             parts.append(f'[stdout]\n{result.stdout}')
         if result.stderr:
             parts.append(f'[stderr]\n{result.stderr}')
-        output = self._truncate('\n'.join(parts) if parts else '(no output)')
+        body = '\n'.join(parts) if parts else '(no output)'
+        # Command output: keep the tail, where errors and the exit status live.
+        output = truncate_output(body, max_bytes=self._max_output_chars, direction='tail')
         if result.returncode:
             return f'{output}\n[exit code: {result.returncode}]'
         return output
 
-    async def read_file(self, path: str) -> str:
+    async def read_file(
+        self,
+        path: str,
+        *,
+        offset: Annotated[int | None, Field(description='Line number to start reading from (1-indexed)')] = None,
+        limit: Annotated[int | None, Field(description='Maximum number of lines to read')] = None,
+    ) -> str:
         """Read a text file from the sandbox and return its contents.
+
+        Large files are truncated to a safety cap; the result ends with the next
+        `offset` to use to page through the rest.
 
         Args:
             path: Path to the file inside the sandbox. Relative paths are resolved
                 against the working directory used by `run_command`.
+            offset: Line number to start reading from (1-indexed).
+            limit: Maximum number of lines to read.
         """
         session = self._require_session()
         try:
             data = await session.read_bytes(path)
         except ModalSandboxError as e:
             raise ModelRetry(f'Could not read {path!r}: {e}')
-        try:
-            content = data.decode('utf-8')
-        except UnicodeDecodeError:
-            raise ModelRetry(f'Could not read {path!r}: not valid UTF-8 text (it may be a binary file).')
-        return self._truncate(content)
+        return render_file_window(data, offset=offset, limit=limit, max_bytes=self._max_output_chars)
 
     async def write_file(self, path: str, content: str) -> str:
         """Write text to a file in the sandbox, creating parent directories.
@@ -180,4 +180,5 @@ class ModalSandboxToolset(FunctionToolset[AgentDepsT]):
         if not entries:
             return '(empty)'
         names = sorted(f'{name}/' if is_dir else name for name, is_dir in entries)
-        return self._truncate('\n'.join(names))
+        # Directory listing is sorted, so keep the head if it overflows the cap.
+        return truncate_output('\n'.join(names), max_bytes=self._max_output_chars, direction='head')
