@@ -101,7 +101,10 @@ directly and requires an asyncio event loop (it does not run under trio).
 `run_command` runs through `sh -c`; `read_file`, `write_file`, and
 `list_directory` use Modal's filesystem API directly (no shell), so writes stream
 the content rather than passing it as a command argument and `write_file` creates
-parent directories.
+parent directories. Modal's filesystem API only accepts absolute paths, so a
+relative path given to a file tool is resolved against the working directory used
+by `run_command` (queried once with `pwd` and cached), keeping both views of the
+tree consistent.
 
 ## Agent spec (YAML/JSON)
 

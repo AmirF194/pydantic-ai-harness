@@ -111,8 +111,10 @@ class TestFilesystem:
 
     async def test_write_at_root_skips_make_directory(self, fake_modal: FakeModal) -> None:
         async with ModalSandboxSession() as session:
-            await session.write_text('file.txt', 'data')
+            await session.write_text('/file.txt', 'data')
+        # The parent is the filesystem root, so no directory is created.
         assert fake_modal.sandboxes[0].made_dirs == []
+        assert '/file.txt' in fake_modal.sandboxes[0].files
 
     async def test_list_files_normalizes_to_name_is_dir(self, fake_modal: FakeModal) -> None:
         async with ModalSandboxSession() as session:
@@ -142,3 +144,34 @@ class TestFilesystem:
         session = ModalSandboxSession()
         with pytest.raises(ModalSandboxError, match='sandbox is not running'):
             await session.read_text('/x')
+
+
+class TestPathResolution:
+    async def test_relative_path_joined_with_pwd(self, fake_modal: FakeModal) -> None:
+        fake_modal.responder = lambda argv, timeout: ('/work\n', '', 0)
+        async with ModalSandboxSession() as session:
+            await session.write_text('pkg/main.py', 'x')
+        sandbox = fake_modal.sandboxes[0]
+        assert '/work/pkg/main.py' in sandbox.files
+        assert sandbox.made_dirs == ['/work/pkg']
+
+    async def test_absolute_path_skips_pwd(self, fake_modal: FakeModal) -> None:
+        async with ModalSandboxSession() as session:
+            await session.write_text('/abs/file.txt', 'x')
+        # No `pwd` lookup is needed for an absolute path.
+        assert fake_modal.sandboxes[0].exec_calls == []
+
+    async def test_cwd_queried_once_and_cached(self, fake_modal: FakeModal) -> None:
+        fake_modal.responder = lambda argv, timeout: ('/work\n', '', 0)
+        async with ModalSandboxSession() as session:
+            fake_modal.sandboxes[0].files['/work/a.txt'] = 'body'
+            await session.read_text('a.txt')
+            await session.list_files('sub')
+        pwd_calls = [c for c in fake_modal.sandboxes[0].exec_calls if c.argv == ['sh', '-c', 'pwd']]
+        assert len(pwd_calls) == 1
+
+    async def test_blank_pwd_falls_back_to_root(self, fake_modal: FakeModal) -> None:
+        fake_modal.responder = lambda argv, timeout: ('', '', 0)
+        async with ModalSandboxSession() as session:
+            await session.write_text('file.txt', 'x')
+        assert '/file.txt' in fake_modal.sandboxes[0].files

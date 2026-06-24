@@ -115,10 +115,19 @@ class TestListDirectory:
             assert await ts.list_directory('/tmp') == 'a\nb/'
         assert fake_modal.sandboxes[0].list_paths == ['/tmp']
 
-    async def test_default_path_when_empty(self, fake_modal: FakeModal) -> None:
+    async def test_default_path_resolves_to_cwd(self, fake_modal: FakeModal) -> None:
+        fake_modal.responder = lambda argv, timeout: ('/work\n', '', 0)
         async with _toolset() as ts:
             assert await ts.list_directory() == '(empty)'
-        assert fake_modal.sandboxes[0].list_paths == ['.']
+        # The default '.' is resolved against the sandbox working directory.
+        assert fake_modal.sandboxes[0].list_paths == ['/work']
+
+    async def test_relative_path_resolved_against_cwd(self, fake_modal: FakeModal) -> None:
+        fake_modal.responder = lambda argv, timeout: ('/work\n', '', 0)
+        async with _toolset() as ts:
+            fake_modal.sandboxes[0].listing = [FileInfo('a.py', False)]
+            assert await ts.list_directory('src') == 'a.py'
+        assert fake_modal.sandboxes[0].list_paths == ['/work/src']
 
     async def test_error_raises_model_retry(self, fake_modal: FakeModal) -> None:
         async with _toolset() as ts:

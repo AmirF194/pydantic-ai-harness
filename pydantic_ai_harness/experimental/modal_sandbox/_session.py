@@ -67,6 +67,7 @@ class ModalSandboxSession:
         self._sandbox_timeout = sandbox_timeout
         self._workdir = workdir
         self._sandbox: modal.Sandbox | None = None
+        self._cwd: str | None = None
 
     @property
     def sandbox_id(self) -> str | None:
@@ -123,6 +124,21 @@ class ModalSandboxSession:
             raise ModalSandboxError('The sandbox is not running; use the session as an async context manager.')
         return sandbox
 
+    async def _resolve(self, path: str) -> str:
+        """Resolve a possibly-relative path against the sandbox working directory.
+
+        Modal's filesystem API only accepts absolute paths, while `run_command` runs
+        in the sandbox working directory. Relative paths are joined with that directory
+        -- queried once with `pwd` and cached -- so the file tools and shell commands
+        share one view of the tree.
+        """
+        if posixpath.isabs(path):
+            return path
+        if self._cwd is None:
+            result = await self.exec(['sh', '-c', 'pwd'])
+            self._cwd = result.stdout.strip() or '/'
+        return posixpath.normpath(posixpath.join(self._cwd, path))
+
     async def exec(self, argv: list[str], *, timeout: int | None = None) -> ExecResult:
         """Run an argument vector in the sandbox (without a shell) and return its result.
 
@@ -143,22 +159,27 @@ class ModalSandboxSession:
     async def read_text(self, path: str) -> str:
         """Read a text file from the sandbox via Modal's filesystem API.
 
+        A relative `path` is resolved against the sandbox working directory (see
+        `_resolve`).
+
         Raises:
             ModalSandboxError: if the file cannot be read (missing, a directory, ...).
         """
         sandbox = self._require_sandbox()
         import modal
 
+        target = await self._resolve(path)
         try:
-            return await sandbox.filesystem.read_text.aio(path)
+            return await sandbox.filesystem.read_text.aio(target)
         except modal.exception.SandboxFilesystemError as e:
             raise ModalSandboxError(str(e)) from e
 
     async def write_text(self, path: str, content: str) -> None:
         """Write text to a file in the sandbox, creating parent directories.
 
-        Unlike shelling out, Modal's filesystem API streams the content, so the size
-        is not bounded by the argument-length limit of a command.
+        A relative `path` is resolved against the sandbox working directory (see
+        `_resolve`). Unlike shelling out, Modal's filesystem API streams the content,
+        so the size is not bounded by the argument-length limit of a command.
 
         Raises:
             ModalSandboxError: if the file cannot be written (bad path, permissions, ...).
@@ -166,19 +187,23 @@ class ModalSandboxSession:
         sandbox = self._require_sandbox()
         import modal
 
-        parent = posixpath.dirname(path)
+        target = await self._resolve(path)
+        # `target` is always absolute, so its parent is at least '/'; only skip the
+        # filesystem root, which always exists.
+        parent = posixpath.dirname(target)
         try:
-            if parent:
+            if parent != '/':
                 await sandbox.filesystem.make_directory.aio(parent, create_parents=True)
-            await sandbox.filesystem.write_text.aio(content, path)
+            await sandbox.filesystem.write_text.aio(content, target)
         except modal.exception.SandboxFilesystemError as e:
             raise ModalSandboxError(str(e)) from e
 
     async def list_files(self, path: str) -> list[tuple[str, bool]]:
         """List a sandbox directory as `(name, is_dir)` pairs.
 
-        The Modal-native `FileInfo` entries are normalized to plain tuples here so the
-        provider type does not leak past the session.
+        A relative `path` is resolved against the sandbox working directory (see
+        `_resolve`). The Modal-native `FileInfo` entries are normalized to plain tuples
+        here so the provider type does not leak past the session.
 
         Raises:
             ModalSandboxError: if the directory cannot be listed.
@@ -186,8 +211,9 @@ class ModalSandboxSession:
         sandbox = self._require_sandbox()
         import modal
 
+        target = await self._resolve(path)
         try:
-            entries = await sandbox.filesystem.list_files.aio(path)
+            entries = await sandbox.filesystem.list_files.aio(target)
         except modal.exception.SandboxFilesystemError as e:
             raise ModalSandboxError(str(e)) from e
         return [(entry.name, entry.is_dir()) for entry in entries]

@@ -136,7 +136,8 @@ class ModalSandboxToolset(FunctionToolset[AgentDepsT]):
         """Read a text file from the sandbox and return its contents.
 
         Args:
-            path: Path to the file inside the sandbox.
+            path: Path to the file inside the sandbox. Relative paths are resolved
+                against the working directory used by `run_command`.
         """
         session = self._require_session()
         try:
@@ -149,7 +150,8 @@ class ModalSandboxToolset(FunctionToolset[AgentDepsT]):
         """Write text to a file in the sandbox, creating parent directories.
 
         Args:
-            path: Path to the file inside the sandbox.
+            path: Path to the file inside the sandbox. Relative paths are resolved
+                against the working directory used by `run_command`.
             content: The text to write.
         """
         session = self._require_session()
@@ -163,7 +165,8 @@ class ModalSandboxToolset(FunctionToolset[AgentDepsT]):
         """List the entries in a sandbox directory (directories shown with a trailing `/`).
 
         Args:
-            path: Directory to list (default: the working directory).
+            path: Directory to list. Relative paths (including the default `.`) are
+                resolved against the working directory used by `run_command`.
         """
         session = self._require_session()
         try:
