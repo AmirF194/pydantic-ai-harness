@@ -103,15 +103,15 @@ class TestExec:
 class TestFilesystem:
     async def test_write_then_read_round_trips(self, fake_modal: FakeModal) -> None:
         async with ModalSandboxSession() as session:
-            await session.write_text('/work/app/main.py', 'print(1)\n')
-            assert await session.read_text('/work/app/main.py') == 'print(1)\n'
+            await session.write_bytes('/work/app/main.py', b'print(1)\n')
+            assert await session.read_bytes('/work/app/main.py') == b'print(1)\n'
         sandbox = fake_modal.sandboxes[0]
         # Parent directories are created before the write.
         assert sandbox.made_dirs == ['/work/app']
 
     async def test_write_at_root_skips_make_directory(self, fake_modal: FakeModal) -> None:
         async with ModalSandboxSession() as session:
-            await session.write_text('/file.txt', 'data')
+            await session.write_bytes('/file.txt', b'data')
         # The parent is the filesystem root, so no directory is created.
         assert fake_modal.sandboxes[0].made_dirs == []
         assert '/file.txt' in fake_modal.sandboxes[0].files
@@ -126,13 +126,13 @@ class TestFilesystem:
         async with ModalSandboxSession() as session:
             fake_modal.sandboxes[0].fs_error = fake_modal.filesystem_error_type('No such file: /x')
             with pytest.raises(ModalSandboxError, match='No such file: /x'):
-                await session.read_text('/x')
+                await session.read_bytes('/x')
 
     async def test_write_error_wrapped(self, fake_modal: FakeModal) -> None:
         async with ModalSandboxSession() as session:
             fake_modal.sandboxes[0].fs_error = fake_modal.filesystem_error_type('Permission denied: /x')
             with pytest.raises(ModalSandboxError, match='Permission denied: /x'):
-                await session.write_text('/x', 'data')
+                await session.write_bytes('/x', b'data')
 
     async def test_list_error_wrapped(self, fake_modal: FakeModal) -> None:
         async with ModalSandboxSession() as session:
@@ -143,29 +143,29 @@ class TestFilesystem:
     async def test_filesystem_without_session_raises(self) -> None:
         session = ModalSandboxSession()
         with pytest.raises(ModalSandboxError, match='sandbox is not running'):
-            await session.read_text('/x')
+            await session.read_bytes('/x')
 
 
 class TestPathResolution:
     async def test_relative_path_joined_with_pwd(self, fake_modal: FakeModal) -> None:
         fake_modal.responder = lambda argv, timeout: ('/work\n', '', 0)
         async with ModalSandboxSession() as session:
-            await session.write_text('pkg/main.py', 'x')
+            await session.write_bytes('pkg/main.py', b'x')
         sandbox = fake_modal.sandboxes[0]
         assert '/work/pkg/main.py' in sandbox.files
         assert sandbox.made_dirs == ['/work/pkg']
 
     async def test_absolute_path_skips_pwd(self, fake_modal: FakeModal) -> None:
         async with ModalSandboxSession() as session:
-            await session.write_text('/abs/file.txt', 'x')
+            await session.write_bytes('/abs/file.txt', b'x')
         # No `pwd` lookup is needed for an absolute path.
         assert fake_modal.sandboxes[0].exec_calls == []
 
     async def test_cwd_queried_once_and_cached(self, fake_modal: FakeModal) -> None:
         fake_modal.responder = lambda argv, timeout: ('/work\n', '', 0)
         async with ModalSandboxSession() as session:
-            fake_modal.sandboxes[0].files['/work/a.txt'] = 'body'
-            await session.read_text('a.txt')
+            fake_modal.sandboxes[0].files['/work/a.txt'] = b'body'
+            await session.read_bytes('a.txt')
             await session.list_files('sub')
         pwd_calls = [c for c in fake_modal.sandboxes[0].exec_calls if c.argv == ['sh', '-c', 'pwd']]
         assert len(pwd_calls) == 1
@@ -173,5 +173,5 @@ class TestPathResolution:
     async def test_blank_pwd_falls_back_to_root(self, fake_modal: FakeModal) -> None:
         fake_modal.responder = lambda argv, timeout: ('', '', 0)
         async with ModalSandboxSession() as session:
-            await session.write_text('file.txt', 'x')
+            await session.write_bytes('file.txt', b'x')
         assert '/file.txt' in fake_modal.sandboxes[0].files

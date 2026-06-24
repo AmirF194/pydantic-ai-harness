@@ -86,17 +86,17 @@ class _FakeFilesystem:
 
     def __init__(self, sandbox: FakeSandbox) -> None:
         self._sandbox = sandbox
-        self.read_text = _AioCallable(self._read_text)
-        self.write_text = _AioCallable(self._write_text)
+        self.read_bytes = _AioCallable(self._read_bytes)
+        self.write_bytes = _AioCallable(self._write_bytes)
         self.make_directory = _AioCallable(self._make_directory)
         self.list_files = _AioCallable(self._list_files)
 
-    def _read_text(self, remote_path: str) -> str:
+    def _read_bytes(self, remote_path: str) -> bytes:
         if self._sandbox.fs_error is not None:
             raise self._sandbox.fs_error
         return self._sandbox.files[remote_path]
 
-    def _write_text(self, data: str, remote_path: str) -> None:
+    def _write_bytes(self, data: bytes, remote_path: str) -> None:
         if self._sandbox.fs_error is not None:
             raise self._sandbox.fs_error
         self._sandbox.files[remote_path] = data
@@ -124,7 +124,7 @@ class FakeSandbox:
         self.terminate = _AioCallable(self._terminate)
         self.detach = _AioCallable(self._detach)
         # Filesystem state the tests read and write.
-        self.files: dict[str, str] = {}
+        self.files: dict[str, bytes] = {}
         self.made_dirs: list[str] = []
         self.list_paths: list[str] = []
         self.listing: list[FileInfo] = []

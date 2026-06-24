@@ -156,11 +156,12 @@ class ModalSandboxSession:
         returncode = await process.wait.aio()
         return ExecResult(stdout=stdout, stderr=stderr, returncode=returncode or 0)
 
-    async def read_text(self, path: str) -> str:
-        """Read a text file from the sandbox via Modal's filesystem API.
+    async def read_bytes(self, path: str) -> bytes:
+        """Read a file's raw bytes from the sandbox via Modal's filesystem API.
 
-        A relative `path` is resolved against the sandbox working directory (see
-        `_resolve`).
+        The session deals in bytes so each tool layer can decode (or not) as it needs;
+        text handling lives above the session, not here. A relative `path` is resolved
+        against the sandbox working directory (see `_resolve`).
 
         Raises:
             ModalSandboxError: if the file cannot be read (missing, a directory, ...).
@@ -170,12 +171,12 @@ class ModalSandboxSession:
 
         target = await self._resolve(path)
         try:
-            return await sandbox.filesystem.read_text.aio(target)
+            return await sandbox.filesystem.read_bytes.aio(target)
         except modal.exception.SandboxFilesystemError as e:
             raise ModalSandboxError(str(e)) from e
 
-    async def write_text(self, path: str, content: str) -> None:
-        """Write text to a file in the sandbox, creating parent directories.
+    async def write_bytes(self, path: str, data: bytes) -> None:
+        """Write raw bytes to a file in the sandbox, creating parent directories.
 
         A relative `path` is resolved against the sandbox working directory (see
         `_resolve`). Unlike shelling out, Modal's filesystem API streams the content,
@@ -194,7 +195,7 @@ class ModalSandboxSession:
         try:
             if parent != '/':
                 await sandbox.filesystem.make_directory.aio(parent, create_parents=True)
-            await sandbox.filesystem.write_text.aio(content, target)
+            await sandbox.filesystem.write_bytes.aio(data, target)
         except modal.exception.SandboxFilesystemError as e:
             raise ModalSandboxError(str(e)) from e
 

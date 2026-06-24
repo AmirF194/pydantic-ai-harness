@@ -141,9 +141,13 @@ class ModalSandboxToolset(FunctionToolset[AgentDepsT]):
         """
         session = self._require_session()
         try:
-            content = await session.read_text(path)
+            data = await session.read_bytes(path)
         except ModalSandboxError as e:
             raise ModelRetry(f'Could not read {path!r}: {e}')
+        try:
+            content = data.decode('utf-8')
+        except UnicodeDecodeError:
+            raise ModelRetry(f'Could not read {path!r}: not valid UTF-8 text (it may be a binary file).')
         return self._truncate(content)
 
     async def write_file(self, path: str, content: str) -> str:
@@ -156,7 +160,7 @@ class ModalSandboxToolset(FunctionToolset[AgentDepsT]):
         """
         session = self._require_session()
         try:
-            await session.write_text(path, content)
+            await session.write_bytes(path, content.encode('utf-8'))
         except ModalSandboxError as e:
             raise ModelRetry(f'Could not write {path!r}: {e}')
         return f'Wrote {len(content)} characters to {path!r}.'

@@ -69,21 +69,27 @@ class TestRunCommand:
 class TestReadFile:
     async def test_returns_contents(self, fake_modal: FakeModal) -> None:
         async with _toolset() as ts:
-            fake_modal.sandboxes[0].files['/etc/hosts'] = 'file body\n'
+            fake_modal.sandboxes[0].files['/etc/hosts'] = b'file body\n'
             assert await ts.read_file('/etc/hosts') == 'file body\n'
 
     async def test_at_size_limit_is_not_truncated(self, fake_modal: FakeModal) -> None:
         async with _toolset(max_output_chars=100) as ts:
-            fake_modal.sandboxes[0].files['/f'] = 'x' * 100
+            fake_modal.sandboxes[0].files['/f'] = b'x' * 100
             assert await ts.read_file('/f') == 'x' * 100
 
     async def test_over_size_limit_keeps_tail(self, fake_modal: FakeModal) -> None:
         async with _toolset(max_output_chars=100) as ts:
-            fake_modal.sandboxes[0].files['/big'] = 'HEAD' + 'T' * 100
+            fake_modal.sandboxes[0].files['/big'] = b'HEAD' + b'T' * 100
             result = await ts.read_file('/big')
         assert result.endswith('T' * 100)
         assert 'HEAD' not in result
         assert 'output truncated' in result
+
+    async def test_binary_file_raises_model_retry(self, fake_modal: FakeModal) -> None:
+        async with _toolset() as ts:
+            fake_modal.sandboxes[0].files['/img.png'] = b'\xff\xfe\x00\x01'
+            with pytest.raises(ModelRetry, match="Could not read '/img.png': not valid UTF-8"):
+                await ts.read_file('/img.png')
 
     async def test_error_raises_model_retry(self, fake_modal: FakeModal) -> None:
         async with _toolset() as ts:
@@ -98,7 +104,7 @@ class TestWriteFile:
             result = await ts.write_file('/tmp/pkg/a.py', 'print(1)\n')
         assert result == "Wrote 9 characters to '/tmp/pkg/a.py'."
         sandbox = fake_modal.sandboxes[0]
-        assert sandbox.files['/tmp/pkg/a.py'] == 'print(1)\n'
+        assert sandbox.files['/tmp/pkg/a.py'] == b'print(1)\n'
         assert sandbox.made_dirs == ['/tmp/pkg']
 
     async def test_error_raises_model_retry(self, fake_modal: FakeModal) -> None:
