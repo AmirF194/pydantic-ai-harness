@@ -33,8 +33,9 @@ _MISSING_MODAL = (
     'Install it with `pip install "pydantic-ai-harness[modal]"`.'
 )
 
-# Modal has no per-exec kill: a command is reaped only by its own server-side timeout (or
-# by the whole sandbox being terminated). So every command we run carries a deadline, even
+# Modal does not currently expose a per-exec kill: a command is reaped by its own
+# server-side timeout (or by the whole sandbox being terminated). So every command we run
+# carries a deadline, even
 # internal ones like the `pwd` used for path resolution, so a cancelled or abandoned run
 # cannot leave a command billing indefinitely. This bounds that internal probe.
 _INTERNAL_EXEC_TIMEOUT = 10
@@ -162,8 +163,8 @@ class ModalSandboxSession:
     async def exec(self, argv: list[str], *, timeout: int | None = None) -> ExecResult:
         """Run an argument vector in the sandbox (without a shell) and return its result.
 
-        Modal has no per-exec kill, so cancelling this coroutine stops us waiting for the
-        command but does not stop the command: it keeps running in the sandbox until its
+        Modal does not currently expose a per-exec kill, so cancelling this coroutine stops
+        us waiting for the command but does not stop the command: it keeps running until its
         `timeout` deadline (or until the sandbox itself is terminated). Pass a finite
         `timeout` so a cancelled or abandoned command cannot run on indefinitely;
         `timeout=None` leaves it unbounded, which is why the toolset always sets one.

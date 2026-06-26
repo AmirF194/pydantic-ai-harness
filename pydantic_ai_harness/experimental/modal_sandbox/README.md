@@ -93,9 +93,9 @@ sandboxes for runs that overlap in time.
 
 ## Cancellation
 
-Modal has no way to kill a single running command, so a command is stopped only
-by its own deadline or by the whole sandbox being terminated. The capability is
-built around that:
+Modal does not currently expose a way to kill a single running command, so a
+command is stopped by its own deadline or by the whole sandbox being terminated.
+The capability is built around that:
 
 - A cancelled run stops waiting for the command immediately, but the command
   keeps running in the sandbox until its deadline. Every `run_command` carries
