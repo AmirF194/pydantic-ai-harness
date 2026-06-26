@@ -1,7 +1,7 @@
 # ModalSandbox
 
-Give an agent an isolated, ephemeral cloud sandbox — powered by
-[Modal](https://modal.com) — to run commands and manage files in, without
+Give an agent an isolated, ephemeral cloud sandbox, powered by
+[Modal](https://modal.com), to run commands and manage files in without
 touching the host.
 
 ## The problem
@@ -56,22 +56,40 @@ so errors survive truncation. A non-zero exit from `run_command` is reported, no
 raised, so the model can react to it; file-tool failures (missing path, etc.)
 come back as a retry prompt.
 
-## Owned vs attached sandboxes
+## Sandbox lifetime
 
 By default the capability is **owned**: each run creates a fresh sandbox and
-terminates it when the run ends, so runs are isolated and nothing leaks. Set
-`sandbox_id` to **attach** to a sandbox you manage yourself — it is reused across
-runs and never terminated by the capability:
+terminates it when the run ends, so runs are isolated and nothing leaks. Because
+each owned run spins up its own sandbox, expect a cold-start cost per run; reuse a
+sandbox across runs when you want to avoid it. There are two ways to reuse one.
+
+**Attach** to a sandbox you manage elsewhere (e.g. created via the Modal CLI) by
+id. It is never terminated by the capability:
 
 ```python
 ModalSandbox(sandbox_id='sb-abc123')   # attach to an existing sandbox
 ```
 
-Because each owned run spins up its own sandbox, expect a cold-start cost per
-run; attach a long-lived sandbox when you want to avoid it.
+**Inject a session** you own to reuse one sandbox across runs while controlling
+its lifetime yourself. The capability uses the session but never opens or
+terminates it, so the owner decides when the sandbox goes away, and can read its
+`sandbox_id`:
 
-Not shipped yet: keeping an *owned* sandbox warm across runs (outer-scope reuse)
-is not implemented -- use attach mode for reuse for now.
+```python
+from pydantic_ai import Agent
+from pydantic_ai_harness.experimental.modal_sandbox import ModalSandbox, ModalSandboxSession
+
+async with ModalSandboxSession(image='python:3.12-slim') as session:
+    print(session.sandbox_id)   # the running sandbox id
+    agent = Agent('anthropic:claude-sonnet-4-6', capabilities=[ModalSandbox(session=session)])
+    await agent.run('clone the repo and install deps')   # same sandbox...
+    await agent.run('run the test suite')                # ...reused across runs
+# the session and its sandbox are torn down here, by the code that owns them
+```
+
+A reused sandbox (attach or injected session) is not concurrency-safe across
+overlapping runs: they share one filesystem and one process space. Use separate
+sandboxes for runs that overlap in time.
 
 `ModalSandbox` is the supported entry point. The capability is built in two
 layers -- a session that owns the sandbox mechanism (commands, file access,
@@ -93,6 +111,7 @@ async with ModalSandboxSession(image='python:3.12-slim') as session:
 ModalSandbox(
     image='python:3.12-slim',     # registry image for owned sandboxes
     sandbox_id=None,              # attach to an existing sandbox instead of creating one
+    session=None,                 # reuse a ModalSandboxSession you own across runs
     app_name='pydantic-ai-harness',  # Modal app the owned sandbox runs under
     create_app_if_missing=True,   # create the app if it does not exist
     sandbox_timeout=300,          # max lifetime (seconds) of an owned sandbox

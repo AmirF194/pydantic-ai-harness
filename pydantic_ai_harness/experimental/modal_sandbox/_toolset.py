@@ -35,6 +35,7 @@ class ModalSandboxToolset(FunctionToolset[AgentDepsT]):
         workdir: str | None,
         default_timeout: float,
         max_output_chars: int,
+        session: ModalSandboxSession | None = None,
     ) -> None:
         super().__init__()
         self._image = image
@@ -45,6 +46,9 @@ class ModalSandboxToolset(FunctionToolset[AgentDepsT]):
         self._workdir = workdir
         self._default_timeout = default_timeout
         self._max_output_chars = max_output_chars
+        # A caller-owned session to reuse instead of opening one per run; when set, this
+        # toolset uses it but never opens or closes it.
+        self._external_session = session
         self._session: ModalSandboxSession | None = None
 
         self.add_function(self.run_command, name='run_command')
@@ -68,10 +72,24 @@ class ModalSandboxToolset(FunctionToolset[AgentDepsT]):
             workdir=self._workdir,
             default_timeout=self._default_timeout,
             max_output_chars=self._max_output_chars,
+            session=self._external_session,
         )
 
     async def __aenter__(self) -> Self:
-        """Open the sandbox session before tools run."""
+        """Make a sandbox session available before tools run.
+
+        With a caller-owned `session`, use it as-is (the caller opened it). Otherwise open a
+        per-run session here so each run gets its own sandbox.
+        """
+        if self._external_session is not None:
+            # The caller owns this session and must open it before the run; check here so an
+            # unopened session fails at run start with a clear message, not mid-tool-call.
+            if self._external_session.sandbox_id is None:
+                raise ModalSandboxError(
+                    'The injected session is not open. Enter it with `async with session:` before running the agent.'
+                )
+            self._session = self._external_session
+            return self
         session = ModalSandboxSession(
             image=self._image,
             sandbox_id=self._sandbox_id,
@@ -85,10 +103,10 @@ class ModalSandboxToolset(FunctionToolset[AgentDepsT]):
         return self
 
     async def __aexit__(self, *args: Any) -> None:
-        """Close the sandbox session, terminating an owned sandbox."""
+        """Close the per-run session; leave a caller-owned session for its owner to close."""
         session = self._session
         self._session = None
-        if session is not None:
+        if session is not None and self._external_session is None:
             await session.__aexit__(*args)
 
     def _require_session(self) -> ModalSandboxSession:
@@ -116,7 +134,13 @@ class ModalSandboxToolset(FunctionToolset[AgentDepsT]):
             Labelled stdout/stderr output, with an exit code on non-zero exit.
         """
         session = self._require_session()
-        result = await session.exec(['sh', '-c', command], timeout=self._command_timeout(timeout_seconds))
+        timeout = self._command_timeout(timeout_seconds)
+        # Surface a sandbox-side failure as a retryable tool error, matching the file tools,
+        # rather than letting it abort the whole run.
+        try:
+            result = await session.exec(['sh', '-c', command], timeout=timeout)
+        except ModalSandboxError as e:
+            raise ModelRetry(str(e))
         parts: list[str] = []
         if result.stdout:
             parts.append(f'[stdout]\n{result.stdout}')
@@ -125,6 +149,8 @@ class ModalSandboxToolset(FunctionToolset[AgentDepsT]):
         body = '\n'.join(parts) if parts else '(no output)'
         # Command output: keep the tail, where errors and the exit status live.
         output = truncate_output(body, max_bytes=self._max_output_chars, direction='tail')
+        if result.timed_out:
+            return f'{output}\n[timed out after {timeout}s]'
         if result.returncode:
             return f'{output}\n[exit code: {result.returncode}]'
         return output

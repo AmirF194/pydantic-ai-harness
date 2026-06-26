@@ -7,7 +7,12 @@ from pydantic_ai import Agent
 from pydantic_ai.exceptions import ModelRetry
 from pydantic_ai.models.test import TestModel
 
-from pydantic_ai_harness.experimental.modal_sandbox import ModalSandbox, ModalSandboxToolset
+from pydantic_ai_harness.experimental.modal_sandbox import (
+    ModalSandbox,
+    ModalSandboxError,
+    ModalSandboxSession,
+    ModalSandboxToolset,
+)
 
 from .fake_modal import FakeModal, FileInfo
 
@@ -21,6 +26,7 @@ def _toolset(
     create_app_if_missing: bool = True,
     sandbox_timeout: int = 300,
     workdir: str | None = None,
+    session: ModalSandboxSession | None = None,
 ) -> ModalSandboxToolset[None]:
     return ModalSandboxToolset[None](
         image=image,
@@ -31,6 +37,7 @@ def _toolset(
         workdir=workdir,
         default_timeout=30.0,
         max_output_chars=max_output_chars,
+        session=session,
     )
 
 
@@ -71,6 +78,22 @@ class TestRunCommand:
         async with _toolset(max_output_chars=100) as ts:
             result = await ts.run_command('big')
         assert 'output truncated' in result
+
+    async def test_timeout_is_reported(self, fake_modal: FakeModal) -> None:
+        # Modal's -1 timeout sentinel becomes a legible note, not a bare exit code.
+        fake_modal.responder = lambda argv, timeout: ('partial\n', '', -1)
+        async with _toolset() as ts:
+            result = await ts.run_command('sleep 99', timeout_seconds=5)
+        assert result == '[stdout]\npartial\n\n[timed out after 5s]'
+
+    async def test_exec_failure_raises_model_retry(self, fake_modal: FakeModal) -> None:
+        def boom(argv: list[str], timeout: int | None) -> tuple[str, str, int]:
+            raise fake_modal.error_type('sandbox gone')
+
+        fake_modal.responder = boom
+        async with _toolset() as ts:
+            with pytest.raises(ModelRetry, match='Command could not run in the sandbox: sandbox gone'):
+                await ts.run_command('echo hi')
 
 
 class TestReadFile:
@@ -189,6 +212,38 @@ class TestToolsetLifecycle:
         assert fake_modal.sandboxes[0].detached is True
 
 
+class TestInjectedSession:
+    async def test_uses_caller_session_without_opening_or_terminating(self, fake_modal: FakeModal) -> None:
+        fake_modal.responder = lambda argv, timeout: ('hi\n', '', 0)
+        async with ModalSandboxSession() as session:
+            # The caller opened exactly one sandbox.
+            assert len(fake_modal.sandboxes) == 1
+            async with _toolset(session=session) as ts:
+                assert await ts.run_command('echo hi') == '[stdout]\nhi\n'
+            # The run reused the caller's sandbox (no new one) and left it running.
+            assert len(fake_modal.sandboxes) == 1
+            assert fake_modal.sandboxes[0].terminated is False
+        # Closing the caller-owned session terminates its sandbox.
+        assert fake_modal.sandboxes[0].terminated is True
+
+    async def test_unopened_session_fails_at_run_start(self, fake_modal: FakeModal) -> None:
+        # A session the caller never entered must fail clearly when the run starts.
+        session = ModalSandboxSession()
+        with pytest.raises(ModalSandboxError, match='injected session is not open'):
+            async with _toolset(session=session):
+                pass  # pragma: no cover
+
+    async def test_for_run_carries_the_session(self, fake_modal: FakeModal) -> None:
+        async with ModalSandboxSession() as session:
+            fresh = await _toolset(session=session).for_run(None)  # type: ignore[arg-type]
+            assert isinstance(fresh, ModalSandboxToolset)
+            async with fresh:
+                await fresh.run_command('echo hi')
+            # The per-run clone reused the injected session rather than opening its own.
+            assert len(fake_modal.sandboxes) == 1
+            assert fake_modal.sandboxes[0].terminated is False
+
+
 class TestCapability:
     def test_defaults(self) -> None:
         cap = ModalSandbox()
@@ -200,6 +255,49 @@ class TestCapability:
 
     def test_get_toolset(self) -> None:
         assert isinstance(ModalSandbox().get_toolset(), ModalSandboxToolset)
+
+    def test_attach_with_only_defaults_is_allowed(self) -> None:
+        cap = ModalSandbox(sandbox_id='sb-keep')
+        assert cap.sandbox_id == 'sb-keep'
+
+    @pytest.mark.parametrize(
+        ('kwargs', 'expected'),
+        [
+            ({'image': 'ubuntu:22.04'}, 'image'),
+            ({'app_name': 'other'}, 'app_name'),
+            ({'create_app_if_missing': False}, 'create_app_if_missing'),
+            ({'sandbox_timeout': 600}, 'sandbox_timeout'),
+            ({'workdir': '/work'}, 'workdir'),
+        ],
+    )
+    def test_attach_rejects_owned_only_settings(self, kwargs: dict[str, object], expected: str) -> None:
+        with pytest.raises(ValueError, match=f'{expected} only apply when creating a sandbox'):
+            ModalSandbox(sandbox_id='sb-keep', **kwargs)  # type: ignore[arg-type]
+
+    def test_attach_error_lists_every_conflicting_setting(self) -> None:
+        with pytest.raises(ValueError, match='image, sandbox_timeout only apply'):
+            ModalSandbox(sandbox_id='sb-keep', image='ubuntu:22.04', sandbox_timeout=600)
+
+    async def test_session_with_only_defaults_is_allowed(self, fake_modal: FakeModal) -> None:
+        async with ModalSandboxSession() as session:
+            cap = ModalSandbox(session=session)
+            assert cap.session is session
+
+    async def test_session_rejects_sandbox_id(self, fake_modal: FakeModal) -> None:
+        async with ModalSandboxSession() as session:
+            with pytest.raises(ValueError, match='sandbox_id cannot be combined with `session`'):
+                ModalSandbox(session=session, sandbox_id='sb-keep')
+
+    async def test_session_rejects_owned_settings(self, fake_modal: FakeModal) -> None:
+        async with ModalSandboxSession() as session:
+            with pytest.raises(ValueError, match='image cannot be combined with `session`'):
+                ModalSandbox(session=session, image='ubuntu:22.04')
+
+    async def test_injected_session_instructions_say_persists(self, fake_modal: FakeModal) -> None:
+        async with ModalSandboxSession() as session:
+            instructions = ModalSandbox(session=session).get_instructions()
+            assert instructions is not None
+            assert 'persists across sessions' in instructions
 
     def test_instructions_enabled_by_default(self) -> None:
         instructions = ModalSandbox().get_instructions()

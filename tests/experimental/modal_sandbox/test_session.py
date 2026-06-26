@@ -107,6 +107,24 @@ class TestExec:
         async with ModalSandboxSession() as session:
             result = await session.exec(['echo', 'done'])
             assert (result.stdout, result.stderr, result.returncode) == ('done\n', '', 0)
+            assert result.timed_out is False
+
+    async def test_timeout_sentinel_sets_timed_out(self, fake_modal: FakeModal) -> None:
+        # Modal returns -1 when it kills a command at its timeout.
+        fake_modal.responder = lambda argv, timeout: ('partial\n', '', -1)
+        async with ModalSandboxSession() as session:
+            result = await session.exec(['sleep', '99'], timeout=1)
+            assert result.timed_out is True
+            assert result.returncode == -1
+
+    async def test_exec_error_wrapped(self, fake_modal: FakeModal) -> None:
+        def boom(argv: list[str], timeout: int | None) -> tuple[str, str, int]:
+            raise fake_modal.error_type('exec boom')
+
+        fake_modal.responder = boom
+        async with ModalSandboxSession() as session:
+            with pytest.raises(ModalSandboxError, match='Command could not run in the sandbox: exec boom'):
+                await session.exec(['whatever'])
 
 
 class TestFilesystem:

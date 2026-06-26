@@ -109,7 +109,9 @@ def truncate_output(
     if not result.truncated:
         return body
     kept = 'last' if direction == 'tail' else 'first'
-    marker = f'[... output truncated to the {kept} {format_size(max_bytes)} ...]'
+    # Name the cap that actually fired so "50KB" is not reported when the line cap stopped us.
+    limit = f'{max_lines} lines' if result.truncated_by == 'lines' else format_size(max_bytes)
+    marker = f'[... output truncated to the {kept} {limit} ...]'
     return f'{marker}\n{body}' if direction == 'tail' else f'{body}\n{marker}'
 
 
@@ -156,7 +158,11 @@ def render_file_window(
 
     if result.first_line_exceeded:
         line_size = format_size(len(lines[start].encode('utf-8')))
-        return f'[Line {start_display} is {line_size}, exceeds the {format_size(max_bytes)} limit and was omitted.]'
+        # Point past the unshowable line so the model can keep paging instead of stalling on it.
+        cont = f' Use offset={start_display + 1} to continue.' if start + 1 < total_lines else ''
+        return (
+            f'[Line {start_display} is {line_size}, exceeds the {format_size(max_bytes)} limit and was omitted.{cont}]'
+        )
 
     body = '\n'.join(result.truncated_lines)
 

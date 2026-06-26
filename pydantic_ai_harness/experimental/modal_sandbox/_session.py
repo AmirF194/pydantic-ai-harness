@@ -24,6 +24,8 @@ class ExecResult:
     stdout: str
     stderr: str
     returncode: int
+    timed_out: bool = False
+    """True if Modal killed the command at its timeout (its `-1` exit sentinel)."""
 
 
 _MISSING_MODAL = (
@@ -159,14 +161,21 @@ class ModalSandboxSession:
             timeout: Optional per-command timeout in seconds, enforced by Modal.
         """
         sandbox = self._require_sandbox()
+        import modal
+
         # Modal buffers exec output server-side and streams it over its own connection,
         # so draining stdout then stderr before waiting cannot deadlock the way OS pipes
         # would. `text=True` (Modal's default) makes the streams yield str.
-        process = await sandbox.exec.aio(*argv, timeout=timeout)
-        stdout = await process.stdout.read.aio()
-        stderr = await process.stderr.read.aio()
-        returncode = await process.wait.aio()
-        return ExecResult(stdout=stdout, stderr=stderr, returncode=returncode or 0)
+        try:
+            process = await sandbox.exec.aio(*argv, timeout=timeout)
+            stdout = await process.stdout.read.aio()
+            stderr = await process.stderr.read.aio()
+            returncode = await process.wait.aio()
+        except modal.exception.Error as e:
+            raise ModalSandboxError(f'Command could not run in the sandbox: {e}') from e
+        # Modal returns `-1` when it kills a command at its timeout (real exits are 0-255,
+        # signals are 128+n), so `-1` flags a timeout rather than a command exit status.
+        return ExecResult(stdout=stdout, stderr=stderr, returncode=returncode, timed_out=returncode == -1)
 
     async def read_bytes(self, path: str) -> bytes:
         """Read a file's raw bytes from the sandbox via Modal's filesystem API.

@@ -71,6 +71,15 @@ class TestTruncateOutput:
         out = truncate_output('a\nb\nc', max_lines=1, direction='tail')
         assert 'truncated to the last' in out
 
+    def test_line_cap_marker_names_lines_not_bytes(self) -> None:
+        # The line cap fired, so the marker must report lines, not the byte cap.
+        out = truncate_output('a\nb\nc', max_lines=1, direction='head')
+        assert 'truncated to the first 1 lines' in out
+
+    def test_byte_cap_marker_names_bytes(self) -> None:
+        out = truncate_output('aaaa\nbbbb\ncccc', max_bytes=4, direction='head')
+        assert 'truncated to the first 4B' in out
+
 
 class TestRenderFileWindow:
     def test_returns_full_small_file(self) -> None:
@@ -110,8 +119,14 @@ class TestRenderFileWindow:
         assert 'limit)' not in out
 
     def test_first_line_too_big_is_omitted(self) -> None:
+        # A single oversized line with nothing after it: no continuation to offer.
         out = render_file_window(b'x' * 200, max_bytes=10)
         assert out == '[Line 1 is 200B, exceeds the 10B limit and was omitted.]'
+
+    def test_first_line_too_big_points_past_it(self) -> None:
+        # An oversized first line with more lines after it must tell the model how to page on.
+        out = render_file_window(b'x' * 200 + b'\nfoo', max_bytes=10)
+        assert out == '[Line 1 is 200B, exceeds the 10B limit and was omitted. Use offset=2 to continue.]'
 
     def test_limit_reaching_eof_has_no_note(self) -> None:
         out = render_file_window(b'a\nb\nc', offset=1, limit=10)
