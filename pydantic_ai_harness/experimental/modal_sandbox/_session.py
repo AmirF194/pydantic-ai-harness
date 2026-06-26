@@ -33,6 +33,12 @@ _MISSING_MODAL = (
     'Install it with `pip install "pydantic-ai-harness[modal]"`.'
 )
 
+# Modal has no per-exec kill: a command is reaped only by its own server-side timeout (or
+# by the whole sandbox being terminated). So every command we run carries a deadline, even
+# internal ones like the `pwd` used for path resolution, so a cancelled or abandoned run
+# cannot leave a command billing indefinitely. This bounds that internal probe.
+_INTERNAL_EXEC_TIMEOUT = 10
+
 
 # This is the mechanism layer: every Modal-specific operation (create/attach,
 # exec, file access, path resolution, lifecycle) is contained here, behind a small
@@ -149,16 +155,23 @@ class ModalSandboxSession:
         if posixpath.isabs(path):
             return path
         if self._cwd is None:
-            result = await self.exec(['sh', '-c', 'pwd'])
+            result = await self.exec(['sh', '-c', 'pwd'], timeout=_INTERNAL_EXEC_TIMEOUT)
             self._cwd = result.stdout.strip() or '/'
         return posixpath.normpath(posixpath.join(self._cwd, path))
 
     async def exec(self, argv: list[str], *, timeout: int | None = None) -> ExecResult:
         """Run an argument vector in the sandbox (without a shell) and return its result.
 
+        Modal has no per-exec kill, so cancelling this coroutine stops us waiting for the
+        command but does not stop the command: it keeps running in the sandbox until its
+        `timeout` deadline (or until the sandbox itself is terminated). Pass a finite
+        `timeout` so a cancelled or abandoned command cannot run on indefinitely;
+        `timeout=None` leaves it unbounded, which is why the toolset always sets one.
+
         Args:
             argv: The command and its arguments.
-            timeout: Optional per-command timeout in seconds, enforced by Modal.
+            timeout: Per-command deadline in seconds, enforced server-side by Modal. None
+                means no deadline (the command can outlive a cancellation).
         """
         sandbox = self._require_sandbox()
         import modal

@@ -196,6 +196,8 @@ class TestPathResolution:
             await session.list_files('sub')
         pwd_calls = [c for c in fake_modal.sandboxes[0].exec_calls if c.argv == ['sh', '-c', 'pwd']]
         assert len(pwd_calls) == 1
+        # The internal pwd probe carries a finite deadline so it cannot orphan on cancel.
+        assert pwd_calls[0].timeout is not None and pwd_calls[0].timeout > 0
 
     async def test_blank_pwd_falls_back_to_root(self, fake_modal: FakeModal) -> None:
         fake_modal.responder = lambda argv, timeout: ('', '', 0)

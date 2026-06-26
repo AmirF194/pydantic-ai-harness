@@ -91,6 +91,23 @@ A reused sandbox (attach or injected session) is not concurrency-safe across
 overlapping runs: they share one filesystem and one process space. Use separate
 sandboxes for runs that overlap in time.
 
+## Cancellation
+
+Modal has no way to kill a single running command, so a command is stopped only
+by its own deadline or by the whole sandbox being terminated. The capability is
+built around that:
+
+- A cancelled run stops waiting for the command immediately, but the command
+  keeps running in the sandbox until its deadline. Every `run_command` carries
+  one (`default_command_timeout`, or the per-call `timeout_seconds`), so a
+  cancelled or abandoned command is reaped within that window rather than running
+  on. Lower `default_command_timeout` to shorten the worst-case window.
+- An owned sandbox is terminated when its run ends or is cancelled; Modal tears
+  it down asynchronously, which also stops anything still running in it.
+- An attached or injected sandbox is never terminated by the capability (its
+  owner controls that), so an in-flight command there is bounded only by its
+  deadline.
+
 `ModalSandbox` is the supported entry point. The capability is built in two
 layers -- a session that owns the sandbox mechanism (commands, file access,
 lifecycle) and a toolset that presents it to the model -- kept separate so the
