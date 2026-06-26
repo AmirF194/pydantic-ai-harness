@@ -85,13 +85,19 @@ class ModalSandbox(AbstractCapability[AgentDepsT]):
     """If True, create the Modal app when it does not already exist."""
 
     sandbox_timeout: int = _DEFAULT_SANDBOX_TIMEOUT
-    """Maximum lifetime in seconds of an owned sandbox before Modal shuts it down."""
+    """Maximum lifetime in seconds of an owned sandbox before Modal shuts it down.
+
+    This bounds the whole sandbox; `default_command_timeout` bounds a single command.
+    """
 
     workdir: str | None = None
     """Working directory for commands inside an owned sandbox (Modal's default when None)."""
 
-    default_timeout: float = 60.0
-    """Default per-command timeout in seconds."""
+    default_command_timeout: float = 60.0
+    """Default timeout in seconds for one `run_command`, used when the model omits one.
+
+    This bounds a single command; `sandbox_timeout` bounds the whole sandbox's lifetime.
+    """
 
     max_output_chars: int = 50_000
     """Maximum characters of output returned to the model."""
@@ -158,7 +164,7 @@ class ModalSandbox(AbstractCapability[AgentDepsT]):
             create_app_if_missing=self.create_app_if_missing,
             sandbox_timeout=self.sandbox_timeout,
             workdir=self.workdir,
-            default_timeout=self.default_timeout,
+            default_command_timeout=self.default_command_timeout,
             max_output_chars=self.max_output_chars,
             session=self.session,
         )

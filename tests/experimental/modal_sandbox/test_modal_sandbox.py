@@ -35,7 +35,7 @@ def _toolset(
         create_app_if_missing=create_app_if_missing,
         sandbox_timeout=sandbox_timeout,
         workdir=workdir,
-        default_timeout=30.0,
+        default_command_timeout=30.0,
         max_output_chars=max_output_chars,
         session=session,
     )
@@ -251,7 +251,7 @@ class TestCapability:
         assert cap.sandbox_id is None
         assert cap.app_name == 'pydantic-ai-harness'
         assert cap.sandbox_timeout == 300
-        assert cap.default_timeout == 60.0
+        assert cap.default_command_timeout == 60.0
 
     def test_get_toolset(self) -> None:
         assert isinstance(ModalSandbox().get_toolset(), ModalSandboxToolset)

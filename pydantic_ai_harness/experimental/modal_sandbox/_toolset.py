@@ -33,7 +33,7 @@ class ModalSandboxToolset(FunctionToolset[AgentDepsT]):
         create_app_if_missing: bool,
         sandbox_timeout: int,
         workdir: str | None,
-        default_timeout: float,
+        default_command_timeout: float,
         max_output_chars: int,
         session: ModalSandboxSession | None = None,
     ) -> None:
@@ -44,7 +44,7 @@ class ModalSandboxToolset(FunctionToolset[AgentDepsT]):
         self._create_app_if_missing = create_app_if_missing
         self._sandbox_timeout = sandbox_timeout
         self._workdir = workdir
-        self._default_timeout = default_timeout
+        self._default_command_timeout = default_command_timeout
         self._max_output_chars = max_output_chars
         # A caller-owned session to reuse instead of opening one per run; when set, this
         # toolset uses it but never opens or closes it.
@@ -70,7 +70,7 @@ class ModalSandboxToolset(FunctionToolset[AgentDepsT]):
             create_app_if_missing=self._create_app_if_missing,
             sandbox_timeout=self._sandbox_timeout,
             workdir=self._workdir,
-            default_timeout=self._default_timeout,
+            default_command_timeout=self._default_command_timeout,
             max_output_chars=self._max_output_chars,
             session=self._external_session,
         )
@@ -117,7 +117,7 @@ class ModalSandboxToolset(FunctionToolset[AgentDepsT]):
     def _command_timeout(self, timeout_seconds: float | None) -> int:
         # Modal takes whole-second timeouts; round fractional values up so a sub-second
         # request is not floored to 0 (which Modal treats as "no timeout").
-        timeout = timeout_seconds if timeout_seconds is not None else self._default_timeout
+        timeout = timeout_seconds if timeout_seconds is not None else self._default_command_timeout
         return max(1, math.ceil(timeout))
 
     async def run_command(self, command: str, *, timeout_seconds: float | None = None) -> str:

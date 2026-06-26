@@ -116,7 +116,7 @@ ModalSandbox(
     create_app_if_missing=True,   # create the app if it does not exist
     sandbox_timeout=300,          # max lifetime (seconds) of an owned sandbox
     workdir=None,                 # working directory for commands (Modal default when None)
-    default_timeout=60.0,         # default per-command timeout (seconds)
+    default_command_timeout=60.0, # default timeout for one run_command (seconds)
     max_output_chars=50_000,      # output cap returned to the model
     include_instructions=True,    # add usage instructions to the prompt
 )
