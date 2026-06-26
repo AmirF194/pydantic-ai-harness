@@ -73,6 +73,7 @@ class ModalSandboxSession:
         create_app_if_missing: bool = True,
         sandbox_timeout: int = 300,
         workdir: str | None = None,
+        env: dict[str, str] | None = None,
     ) -> None:
         self._image = image
         self._sandbox_id = sandbox_id
@@ -80,6 +81,7 @@ class ModalSandboxSession:
         self._create_app_if_missing = create_app_if_missing
         self._sandbox_timeout = sandbox_timeout
         self._workdir = workdir
+        self._env = env
         self._sandbox: modal.Sandbox | None = None
         self._cwd: str | None = None
 
@@ -115,9 +117,14 @@ class ModalSandboxSession:
         # `from_registry` builds the image spec locally (no network), so it has no `.aio` variant.
         # Its typing uses an untyped `**kwargs`, so pyright flags the access.
         image = modal.Image.from_registry(self._image)  # pyright: ignore[reportUnknownMemberType]
+        # Modal types env values as `str | None` (None unsets); widen our `dict[str, str]` to
+        # match, since dict is invariant in its value type.
+        env: dict[str, str | None] | None = (
+            {key: value for key, value in self._env.items()} if self._env is not None else None
+        )
         # `create.aio` is typed with a partially-`Any` coroutine return, so pyright flags the call.
         return await modal.Sandbox.create.aio(  # pyright: ignore[reportUnknownMemberType]
-            app=app, image=image, timeout=self._sandbox_timeout, workdir=self._workdir
+            app=app, image=image, timeout=self._sandbox_timeout, workdir=self._workdir, env=env
         )
 
     async def __aexit__(self, *args: Any) -> None:
@@ -190,6 +197,25 @@ class ModalSandboxSession:
         # Modal returns `-1` when it kills a command at its timeout (real exits are 0-255,
         # signals are 128+n), so `-1` flags a timeout rather than a command exit status.
         return ExecResult(stdout=stdout, stderr=stderr, returncode=returncode, timed_out=returncode == -1)
+
+    async def file_size(self, path: str) -> int:
+        """Return a file's size in bytes via Modal's filesystem API, without reading it.
+
+        Lets a caller check size before reading the whole file. A relative `path` is resolved
+        against the sandbox working directory (see `_resolve`).
+
+        Raises:
+            ModalSandboxError: if the file cannot be stat-ed (missing, a directory, ...).
+        """
+        sandbox = self._require_sandbox()
+        import modal
+
+        target = await self._resolve(path)
+        try:
+            info = await sandbox.filesystem.stat.aio(target)
+        except modal.exception.SandboxFilesystemError as e:
+            raise ModalSandboxError(str(e)) from e
+        return info.size
 
     async def read_bytes(self, path: str) -> bytes:
         """Read a file's raw bytes from the sandbox via Modal's filesystem API.

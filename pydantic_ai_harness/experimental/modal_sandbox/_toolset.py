@@ -12,7 +12,7 @@ from pydantic_ai.tools import AgentDepsT
 from pydantic_ai.toolsets import AbstractToolset, FunctionToolset
 from typing_extensions import Self
 
-from pydantic_ai_harness._tool_output import render_file_window, truncate_output
+from pydantic_ai_harness._tool_output import guard_read_size, render_file_window, truncate_output
 from pydantic_ai_harness.experimental.modal_sandbox._session import ModalSandboxError, ModalSandboxSession
 
 
@@ -35,6 +35,8 @@ class ModalSandboxToolset(FunctionToolset[AgentDepsT]):
         workdir: str | None,
         default_command_timeout: float,
         max_output_chars: int,
+        max_read_bytes: int,
+        env: dict[str, str] | None = None,
         session: ModalSandboxSession | None = None,
     ) -> None:
         super().__init__()
@@ -46,6 +48,8 @@ class ModalSandboxToolset(FunctionToolset[AgentDepsT]):
         self._workdir = workdir
         self._default_command_timeout = default_command_timeout
         self._max_output_chars = max_output_chars
+        self._max_read_bytes = max_read_bytes
+        self._env = env
         # A caller-owned session to reuse instead of opening one per run; when set, this
         # toolset uses it but never opens or closes it.
         self._external_session = session
@@ -72,6 +76,8 @@ class ModalSandboxToolset(FunctionToolset[AgentDepsT]):
             workdir=self._workdir,
             default_command_timeout=self._default_command_timeout,
             max_output_chars=self._max_output_chars,
+            max_read_bytes=self._max_read_bytes,
+            env=self._env,
             session=self._external_session,
         )
 
@@ -97,6 +103,7 @@ class ModalSandboxToolset(FunctionToolset[AgentDepsT]):
             create_app_if_missing=self._create_app_if_missing,
             sandbox_timeout=self._sandbox_timeout,
             workdir=self._workdir,
+            env=self._env,
         )
         await session.__aenter__()
         self._session = session
@@ -175,6 +182,9 @@ class ModalSandboxToolset(FunctionToolset[AgentDepsT]):
         """
         session = self._require_session()
         try:
+            # Check size first: read_bytes pulls the whole file into memory before windowing,
+            # so refuse an oversized file rather than transfer and decode all of it for a slice.
+            guard_read_size(await session.file_size(path), max_bytes=self._max_read_bytes)
             data = await session.read_bytes(path)
         except ModalSandboxError as e:
             raise ModelRetry(f'Could not read {path!r}: {e}')

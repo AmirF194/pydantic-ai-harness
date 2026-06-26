@@ -16,6 +16,9 @@ from pydantic_ai_harness.experimental.modal_sandbox._toolset import ModalSandbox
 _DEFAULT_IMAGE = 'python:3.12-slim'
 _DEFAULT_APP_NAME = 'pydantic-ai-harness'
 _DEFAULT_SANDBOX_TIMEOUT = 300
+# read_file pulls the whole file into memory before windowing it, so cap how large a file
+# it will read; bigger files should be sliced with a shell command instead.
+_DEFAULT_MAX_READ_BYTES = 5 * 1024 * 1024
 
 _OWNED_INSTRUCTIONS = (
     'You have a Modal sandbox: an isolated, ephemeral cloud container. Use `run_command` to run '
@@ -93,6 +96,13 @@ class ModalSandbox(AbstractCapability[AgentDepsT]):
     workdir: str | None = None
     """Working directory for commands inside an owned sandbox (Modal's default when None)."""
 
+    env: dict[str, str] | None = None
+    """Environment variables to set in an owned sandbox.
+
+    Owned sandboxes only. To inject secrets or env into an attached or injected sandbox,
+    set them when you create that sandbox yourself (e.g. with `modal.Secret`).
+    """
+
     default_command_timeout: float = 60.0
     """Default timeout in seconds for one `run_command`, used when the model omits one.
 
@@ -101,6 +111,13 @@ class ModalSandbox(AbstractCapability[AgentDepsT]):
 
     max_output_chars: int = 50_000
     """Maximum characters of output returned to the model."""
+
+    max_read_bytes: int = _DEFAULT_MAX_READ_BYTES
+    """Largest file `read_file` will read whole; larger files are refused with a hint to use shell tools.
+
+    `read_file` loads the whole file before windowing it, so this caps the memory and
+    transfer a single read can cost.
+    """
 
     include_instructions: bool = True
     """If True, add instructions telling the model how to use the sandbox."""
@@ -142,6 +159,7 @@ class ModalSandbox(AbstractCapability[AgentDepsT]):
                 ('create_app_if_missing', self.create_app_if_missing, True),
                 ('sandbox_timeout', self.sandbox_timeout, _DEFAULT_SANDBOX_TIMEOUT),
                 ('workdir', self.workdir, None),
+                ('env', self.env, None),
             )
             if value != default
         ]
@@ -166,5 +184,7 @@ class ModalSandbox(AbstractCapability[AgentDepsT]):
             workdir=self.workdir,
             default_command_timeout=self.default_command_timeout,
             max_output_chars=self.max_output_chars,
+            max_read_bytes=self.max_read_bytes,
+            env=self.env,
             session=self.session,
         )

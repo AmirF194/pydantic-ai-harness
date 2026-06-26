@@ -48,6 +48,24 @@ def format_size(num_bytes: int) -> str:
     return f'{num_bytes / (1024 * 1024):.1f}MB'
 
 
+def guard_read_size(size_bytes: int, *, max_bytes: int) -> None:
+    """Refuse to read a file larger than `max_bytes`, pointing the model at shell tools.
+
+    A `read_file`-style tool loads the whole file before windowing it, so an oversized
+    file would transfer and decode in full just to return a small slice. This is provider
+    agnostic: the caller supplies the size (however its backend reports it) and the policy
+    lives here so every backend refuses the same way.
+
+    Raises:
+        ModelRetry: if the file is too large, telling the model to read part of it instead.
+    """
+    if size_bytes > max_bytes:
+        raise ModelRetry(
+            f'File is {format_size(size_bytes)}, over the {format_size(max_bytes)} read limit. '
+            'Read just the part you need with a shell command instead (e.g. head, tail, sed -n, or grep).'
+        )
+
+
 def truncate(
     lines: list[str],
     *,

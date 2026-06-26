@@ -167,6 +167,17 @@ class TestFilesystem:
             with pytest.raises(ModalSandboxError, match='Not a directory: /x'):
                 await session.list_files('/x')
 
+    async def test_file_size_returns_size_without_reading(self, fake_modal: FakeModal) -> None:
+        async with ModalSandboxSession() as session:
+            fake_modal.sandboxes[0].files['/f'] = b'hello'
+            assert await session.file_size('/f') == 5
+
+    async def test_file_size_error_wrapped(self, fake_modal: FakeModal) -> None:
+        async with ModalSandboxSession() as session:
+            fake_modal.sandboxes[0].fs_error = fake_modal.filesystem_error_type('No such file: /x')
+            with pytest.raises(ModalSandboxError, match='No such file: /x'):
+                await session.file_size('/x')
+
     async def test_filesystem_without_session_raises(self) -> None:
         session = ModalSandboxSession()
         with pytest.raises(ModalSandboxError, match='sandbox is not running'):

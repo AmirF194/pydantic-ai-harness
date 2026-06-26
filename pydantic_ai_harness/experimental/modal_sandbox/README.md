@@ -133,11 +133,25 @@ ModalSandbox(
     create_app_if_missing=True,   # create the app if it does not exist
     sandbox_timeout=300,          # max lifetime (seconds) of an owned sandbox
     workdir=None,                 # working directory for commands (Modal default when None)
+    env=None,                     # environment variables for an owned sandbox (dict)
     default_command_timeout=60.0, # default timeout for one run_command (seconds)
     max_output_chars=50_000,      # output cap returned to the model
+    max_read_bytes=5 * 1024 * 1024,  # refuse read_file on files larger than this
     include_instructions=True,    # add usage instructions to the prompt
 )
 ```
+
+`read_file` loads a file fully before returning a window of it, so it refuses
+files larger than `max_read_bytes` and tells the model to slice them with a shell
+command (`head`, `tail`, `sed -n`, `grep`) instead.
+
+## Not yet supported
+
+- Streaming command output: `run_command` returns once the command finishes (or
+  hits its deadline), not incrementally.
+- Custom-built images, mounts, or `modal.Secret`: `image` takes a registry tag,
+  and `env` takes plain environment variables. For anything richer, create the
+  sandbox yourself with the Modal SDK and pass it via `sandbox_id` or `session`.
 
 Modal's SDK is asyncio-native, so the capability drives its async (`.aio`) API
 directly and requires an asyncio event loop (it does not run under trio).

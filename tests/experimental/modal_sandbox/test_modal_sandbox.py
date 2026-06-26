@@ -26,6 +26,8 @@ def _toolset(
     create_app_if_missing: bool = True,
     sandbox_timeout: int = 300,
     workdir: str | None = None,
+    max_read_bytes: int = 5 * 1024 * 1024,
+    env: dict[str, str] | None = None,
     session: ModalSandboxSession | None = None,
 ) -> ModalSandboxToolset[None]:
     return ModalSandboxToolset[None](
@@ -37,6 +39,8 @@ def _toolset(
         workdir=workdir,
         default_command_timeout=30.0,
         max_output_chars=max_output_chars,
+        max_read_bytes=max_read_bytes,
+        env=env,
         session=session,
     )
 
@@ -134,6 +138,13 @@ class TestReadFile:
             with pytest.raises(ModelRetry, match="Could not read '/nope': No such file"):
                 await ts.read_file('/nope')
 
+    async def test_refuses_file_over_read_limit(self, fake_modal: FakeModal) -> None:
+        async with _toolset(max_read_bytes=1000) as ts:
+            # Report a large size without allocating the bytes; the guard fires before read_bytes.
+            fake_modal.sandboxes[0].stat_sizes['/big.log'] = 5000
+            with pytest.raises(ModelRetry, match='over the 1000B read limit'):
+                await ts.read_file('/big.log')
+
 
 class TestWriteFile:
     async def test_writes_and_creates_parents(self, fake_modal: FakeModal) -> None:
@@ -187,6 +198,11 @@ class TestToolsetLifecycle:
         assert fake_modal.image_tags[-1] == 'ubuntu:22.04'
         assert fake_modal.create_kwargs[-1]['timeout'] == 120
         assert fake_modal.create_kwargs[-1]['workdir'] == '/work'
+
+    async def test_env_passed_to_owned_sandbox(self, fake_modal: FakeModal) -> None:
+        async with _toolset(env={'FOO': 'bar'}):
+            pass
+        assert fake_modal.create_kwargs[-1]['env'] == {'FOO': 'bar'}
 
     async def test_for_run_carries_config_to_a_fresh_instance(self, fake_modal: FakeModal) -> None:
         original = _toolset(image='ubuntu:22.04', app_name='my-app', sandbox_timeout=99)
@@ -268,6 +284,7 @@ class TestCapability:
             ({'create_app_if_missing': False}, 'create_app_if_missing'),
             ({'sandbox_timeout': 600}, 'sandbox_timeout'),
             ({'workdir': '/work'}, 'workdir'),
+            ({'env': {'A': 'b'}}, 'env'),
         ],
     )
     def test_attach_rejects_owned_only_settings(self, kwargs: dict[str, object], expected: str) -> None:
@@ -292,6 +309,11 @@ class TestCapability:
         async with ModalSandboxSession() as session:
             with pytest.raises(ValueError, match='image cannot be combined with `session`'):
                 ModalSandbox(session=session, image='ubuntu:22.04')
+
+    async def test_session_rejects_env(self, fake_modal: FakeModal) -> None:
+        async with ModalSandboxSession() as session:
+            with pytest.raises(ValueError, match='env cannot be combined with `session`'):
+                ModalSandbox(session=session, env={'A': 'b'})
 
     async def test_injected_session_instructions_say_persists(self, fake_modal: FakeModal) -> None:
         async with ModalSandboxSession() as session:

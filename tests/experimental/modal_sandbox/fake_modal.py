@@ -76,6 +76,7 @@ class FileInfo:
 
     name: str
     _is_dir: bool
+    size: int = 0
 
     def is_dir(self) -> bool:
         return self._is_dir
@@ -90,11 +91,19 @@ class _FakeFilesystem:
         self.write_bytes = _AioCallable(self._write_bytes)
         self.make_directory = _AioCallable(self._make_directory)
         self.list_files = _AioCallable(self._list_files)
+        self.stat = _AioCallable(self._stat)
 
     def _read_bytes(self, remote_path: str) -> bytes:
         if self._sandbox.fs_error is not None:
             raise self._sandbox.fs_error
         return self._sandbox.files[remote_path]
+
+    def _stat(self, remote_path: str) -> FileInfo:
+        if self._sandbox.fs_error is not None:
+            raise self._sandbox.fs_error
+        # Size comes from the stored bytes, or an override the test set for this path.
+        size = self._sandbox.stat_sizes.get(remote_path, len(self._sandbox.files.get(remote_path, b'')))
+        return FileInfo(remote_path, False, size=size)
 
     def _write_bytes(self, data: bytes, remote_path: str) -> None:
         if self._sandbox.fs_error is not None:
@@ -126,6 +135,8 @@ class FakeSandbox:
         self.detach = _AioCallable(self._detach)
         # Filesystem state the tests read and write.
         self.files: dict[str, bytes] = {}
+        # Lets a test report a large size for a path without allocating the bytes.
+        self.stat_sizes: dict[str, int] = {}
         self.made_dirs: list[str] = []
         self.list_paths: list[str] = []
         self.listing: list[FileInfo] = []

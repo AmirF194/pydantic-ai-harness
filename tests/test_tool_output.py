@@ -7,10 +7,20 @@ from pydantic_ai.exceptions import ModelRetry
 
 from pydantic_ai_harness._tool_output import (
     format_size,
+    guard_read_size,
     render_file_window,
     truncate,
     truncate_output,
 )
+
+
+class TestGuardReadSize:
+    def test_allows_at_or_under_limit(self) -> None:
+        guard_read_size(1000, max_bytes=1000)  # exactly at the limit: no raise
+
+    def test_refuses_over_limit(self) -> None:
+        with pytest.raises(ModelRetry, match='File is 2.0KB, over the 1000B read limit'):
+            guard_read_size(2048, max_bytes=1000)
 
 
 class TestFormatSize:
