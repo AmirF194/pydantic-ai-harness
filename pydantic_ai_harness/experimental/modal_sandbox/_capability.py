@@ -109,8 +109,12 @@ class ModalSandbox(AbstractCapability[AgentDepsT]):
     This bounds a single command; `sandbox_timeout` bounds the whole sandbox's lifetime.
     """
 
-    max_output_chars: int = 50_000
-    """Maximum characters of output returned to the model."""
+    max_output_bytes: int = 50_000
+    """Maximum output returned to the model, measured in UTF-8 bytes.
+
+    Caps command output and file-read windows. Bytes (not characters) because that is what
+    bounds transfer and memory, and it keeps the same unit as `max_read_bytes`.
+    """
 
     max_read_bytes: int = _DEFAULT_MAX_READ_BYTES
     """Largest file `read_file` will read whole; larger files are refused with a hint to use shell tools.
@@ -183,7 +187,7 @@ class ModalSandbox(AbstractCapability[AgentDepsT]):
             sandbox_timeout=self.sandbox_timeout,
             workdir=self.workdir,
             default_command_timeout=self.default_command_timeout,
-            max_output_chars=self.max_output_chars,
+            max_output_bytes=self.max_output_bytes,
             max_read_bytes=self.max_read_bytes,
             env=self.env,
             session=self.session,

@@ -5,11 +5,23 @@ from __future__ import annotations
 import builtins
 import sys
 
+import anyio
 import pytest
 
 from pydantic_ai_harness.experimental.modal_sandbox import ModalSandboxError, ModalSandboxSession
+from pydantic_ai_harness.experimental.modal_sandbox import _session as session_module
 
-from .fake_modal import FakeModal, FileInfo
+from .fake_modal import FakeModal, FileInfo, _AioCallable
+
+
+class _HangingCall(_AioCallable):
+    """A teardown RPC that never returns, to prove the teardown deadline bounds it."""
+
+    def __init__(self) -> None:
+        super().__init__(lambda: None)
+
+    async def aio(self, *args: object, **kwargs: object) -> None:
+        await anyio.sleep_forever()
 
 
 class TestOwnedLifecycle:
@@ -52,6 +64,19 @@ class TestOwnedLifecycle:
         with pytest.raises(RuntimeError, match='terminate boom'):
             await session.__aexit__(None, None, None)
         # The client is detached even though terminate raised, so the attachment is not leaked.
+        assert fake_modal.sandboxes[0].detached is True
+
+    async def test_teardown_bounded_when_terminate_hangs(
+        self, fake_modal: FakeModal, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # If Modal's control plane stalls, terminate must not hang the caller forever: the
+        # shielded teardown gives each RPC a deadline, and detach still runs after it fires.
+        monkeypatch.setattr(session_module, '_TEARDOWN_TIMEOUT', 0.05)
+        session = ModalSandboxSession()
+        await session.__aenter__()
+        fake_modal.sandboxes[0].terminate = _HangingCall()
+        with anyio.fail_after(5):
+            await session.__aexit__(None, None, None)
         assert fake_modal.sandboxes[0].detached is True
 
 
@@ -183,6 +208,14 @@ class TestFilesystem:
         with pytest.raises(ModalSandboxError, match='sandbox is not running'):
             await session.read_bytes('/x')
 
+    async def test_filesystem_wraps_plain_modal_error(self, fake_modal: FakeModal) -> None:
+        # A non-filesystem Modal error (e.g. a dropped connection) must still come back as a
+        # ModalSandboxError, not leak the raw modal exception to the caller.
+        async with ModalSandboxSession() as session:
+            fake_modal.sandboxes[0].fs_error = fake_modal.error_type('connection lost')
+            with pytest.raises(ModalSandboxError, match='connection lost'):
+                await session.read_bytes('/x')
+
 
 class TestPathResolution:
     async def test_relative_path_joined_with_pwd(self, fake_modal: FakeModal) -> None:
@@ -215,6 +248,32 @@ class TestPathResolution:
         async with ModalSandboxSession() as session:
             await session.write_bytes('file.txt', b'x')
         assert '/file.txt' in fake_modal.sandboxes[0].files
+
+    async def test_absolute_path_normalized(self, fake_modal: FakeModal) -> None:
+        # An absolute path with `..` is normalized before hitting Modal's filesystem API.
+        async with ModalSandboxSession() as session:
+            await session.write_bytes('/work/../data/f.txt', b'x')
+        assert '/data/f.txt' in fake_modal.sandboxes[0].files
+        assert fake_modal.sandboxes[0].made_dirs == ['/data']
+
+    async def test_double_slash_absolute_parent_skips_make_directory(self, fake_modal: FakeModal) -> None:
+        # POSIX normpath preserves a leading '//', so its parent is '//' (still root). The
+        # guard must skip make_directory for it rather than try to create a root alias.
+        async with ModalSandboxSession() as session:
+            await session.write_bytes('//file.txt', b'x')
+        assert fake_modal.sandboxes[0].made_dirs == []
+        assert '//file.txt' in fake_modal.sandboxes[0].files
+
+    async def test_failed_pwd_probe_not_cached(self, fake_modal: FakeModal) -> None:
+        # A timed-out/failed pwd probe must not cache a bogus cwd: it raises and the next
+        # call re-probes rather than silently resolving every relative path against '/'.
+        codes = iter([-1, 0])
+        fake_modal.responder = lambda argv, timeout: ('', '', next(codes))
+        async with ModalSandboxSession() as session:
+            with pytest.raises(ModalSandboxError, match='Could not determine the sandbox working directory'):
+                await session.read_bytes('rel.txt')
+            fake_modal.sandboxes[0].files['/rel.txt'] = b'ok'
+            assert await session.read_bytes('rel.txt') == b'ok'
 
     async def test_cwd_not_carried_across_reentry(self, fake_modal: FakeModal) -> None:
         # A reused session must re-query pwd for the new sandbox rather than reuse the

@@ -34,7 +34,7 @@ class ModalSandboxToolset(FunctionToolset[AgentDepsT]):
         sandbox_timeout: int,
         workdir: str | None,
         default_command_timeout: float,
-        max_output_chars: int,
+        max_output_bytes: int,
         max_read_bytes: int,
         env: dict[str, str] | None = None,
         session: ModalSandboxSession | None = None,
@@ -47,7 +47,7 @@ class ModalSandboxToolset(FunctionToolset[AgentDepsT]):
         self._sandbox_timeout = sandbox_timeout
         self._workdir = workdir
         self._default_command_timeout = default_command_timeout
-        self._max_output_chars = max_output_chars
+        self._max_output_bytes = max_output_bytes
         self._max_read_bytes = max_read_bytes
         self._env = env
         # A caller-owned session to reuse instead of opening one per run; when set, this
@@ -75,7 +75,7 @@ class ModalSandboxToolset(FunctionToolset[AgentDepsT]):
             sandbox_timeout=self._sandbox_timeout,
             workdir=self._workdir,
             default_command_timeout=self._default_command_timeout,
-            max_output_chars=self._max_output_chars,
+            max_output_bytes=self._max_output_bytes,
             max_read_bytes=self._max_read_bytes,
             env=self._env,
             session=self._external_session,
@@ -155,7 +155,7 @@ class ModalSandboxToolset(FunctionToolset[AgentDepsT]):
             parts.append(f'[stderr]\n{result.stderr}')
         body = '\n'.join(parts) if parts else '(no output)'
         # Command output: keep the tail, where errors and the exit status live.
-        output = truncate_output(body, max_bytes=self._max_output_chars, direction='tail')
+        output = truncate_output(body, max_bytes=self._max_output_bytes, direction='tail')
         if result.timed_out:
             return f'{output}\n[timed out after {timeout}s]'
         if result.returncode:
@@ -188,7 +188,7 @@ class ModalSandboxToolset(FunctionToolset[AgentDepsT]):
             data = await session.read_bytes(path)
         except ModalSandboxError as e:
             raise ModelRetry(f'Could not read {path!r}: {e}')
-        return render_file_window(data, offset=offset, limit=limit, max_bytes=self._max_output_chars)
+        return render_file_window(data, offset=offset, limit=limit, max_bytes=self._max_output_bytes)
 
     async def write_file(self, path: str, content: str) -> str:
         """Write text to a file in the sandbox, creating parent directories.
@@ -221,4 +221,4 @@ class ModalSandboxToolset(FunctionToolset[AgentDepsT]):
             return '(empty)'
         names = sorted(f'{name}/' if is_dir else name for name, is_dir in entries)
         # Directory listing is sorted, so keep the head if it overflows the cap.
-        return truncate_output('\n'.join(names), max_bytes=self._max_output_chars, direction='head')
+        return truncate_output('\n'.join(names), max_bytes=self._max_output_bytes, direction='head')

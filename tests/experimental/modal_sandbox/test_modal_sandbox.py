@@ -20,7 +20,7 @@ from .fake_modal import FakeModal, FileInfo
 def _toolset(
     *,
     sandbox_id: str | None = None,
-    max_output_chars: int = 50_000,
+    max_output_bytes: int = 50_000,
     image: str = 'python:3.12-slim',
     app_name: str = 'pydantic-ai-harness',
     create_app_if_missing: bool = True,
@@ -38,7 +38,7 @@ def _toolset(
         sandbox_timeout=sandbox_timeout,
         workdir=workdir,
         default_command_timeout=30.0,
-        max_output_chars=max_output_chars,
+        max_output_bytes=max_output_bytes,
         max_read_bytes=max_read_bytes,
         env=env,
         session=session,
@@ -79,7 +79,7 @@ class TestRunCommand:
 
     async def test_output_truncated(self, fake_modal: FakeModal) -> None:
         fake_modal.responder = lambda argv, timeout: ('x' * 1000, '', 0)
-        async with _toolset(max_output_chars=100) as ts:
+        async with _toolset(max_output_bytes=100) as ts:
             result = await ts.run_command('big')
         assert 'output truncated' in result
 
@@ -107,12 +107,12 @@ class TestReadFile:
             assert await ts.read_file('/etc/hosts') == 'file body\n'
 
     async def test_at_size_limit_is_not_truncated(self, fake_modal: FakeModal) -> None:
-        async with _toolset(max_output_chars=100) as ts:
+        async with _toolset(max_output_bytes=100) as ts:
             fake_modal.sandboxes[0].files['/f'] = b'x' * 100
             assert await ts.read_file('/f') == 'x' * 100
 
     async def test_over_size_limit_pages_from_head(self, fake_modal: FakeModal) -> None:
-        async with _toolset(max_output_chars=20) as ts:
+        async with _toolset(max_output_bytes=20) as ts:
             fake_modal.sandboxes[0].files['/big'] = b'\n'.join(b'line%02d' % i for i in range(10))
             result = await ts.read_file('/big')
         # File reads keep the head and tell the model how to page the rest.

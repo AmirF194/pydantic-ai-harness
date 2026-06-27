@@ -40,6 +40,12 @@ _MISSING_MODAL = (
 # cannot leave a command billing indefinitely. This bounds that internal probe.
 _INTERNAL_EXEC_TIMEOUT = 10
 
+# Teardown runs shielded from cancellation, so an unreachable Modal control plane could
+# otherwise hang the caller forever on exit. Bound each teardown RPC so a stalled
+# terminate/detach gives up rather than wedging the process; the owned sandbox is still
+# reaped server-side by its own `sandbox_timeout`.
+_TEARDOWN_TIMEOUT = 30
+
 
 # This is the mechanism layer: every Modal-specific operation (create/attach,
 # exec, file access, path resolution, lifecycle) is contained here, behind a small
@@ -142,9 +148,13 @@ class ModalSandboxSession:
         with anyio.CancelScope(shield=True):
             try:
                 if owned:
-                    await sandbox.terminate.aio()
+                    # Bound each RPC independently so a stalled terminate still lets detach run;
+                    # a single shared deadline would cancel the detach the moment terminate hung.
+                    with anyio.move_on_after(_TEARDOWN_TIMEOUT):
+                        await sandbox.terminate.aio()
             finally:
-                await sandbox.detach.aio()  # pyright: ignore[reportUnknownMemberType]
+                with anyio.move_on_after(_TEARDOWN_TIMEOUT):
+                    await sandbox.detach.aio()  # pyright: ignore[reportUnknownMemberType]
 
     def _require_sandbox(self) -> modal.Sandbox:
         sandbox = self._sandbox
@@ -161,9 +171,17 @@ class ModalSandboxSession:
         share one view of the tree.
         """
         if posixpath.isabs(path):
-            return path
+            return posixpath.normpath(path)
         if self._cwd is None:
             result = await self.exec(['sh', '-c', 'pwd'], timeout=_INTERNAL_EXEC_TIMEOUT)
+            # Only cache a successful probe. A timeout (returncode -1) or error returns empty
+            # stdout; caching '/' from it would silently mis-resolve every later relative path
+            # with no retry. Leave `_cwd` unset and fail this call so the next one probes again.
+            if result.returncode != 0:
+                raise ModalSandboxError(
+                    'Could not determine the sandbox working directory to resolve a relative '
+                    f'path ({path!r}); use an absolute path or retry.'
+                )
             self._cwd = result.stdout.strip() or '/'
         return posixpath.normpath(posixpath.join(self._cwd, path))
 
@@ -211,9 +229,12 @@ class ModalSandboxSession:
         import modal
 
         target = await self._resolve(path)
+        # Catch `Error`, not just `SandboxFilesystemError`: a transient connection or auth
+        # failure raises a plain Modal `Error` here too, and it must surface as a
+        # ModalSandboxError (a retryable tool error) rather than leak raw to the agent loop.
         try:
             info = await sandbox.filesystem.stat.aio(target)
-        except modal.exception.SandboxFilesystemError as e:
+        except modal.exception.Error as e:
             raise ModalSandboxError(str(e)) from e
         return info.size
 
@@ -233,7 +254,7 @@ class ModalSandboxSession:
         target = await self._resolve(path)
         try:
             return await sandbox.filesystem.read_bytes.aio(target)
-        except modal.exception.SandboxFilesystemError as e:
+        except modal.exception.Error as e:
             raise ModalSandboxError(str(e)) from e
 
     async def write_bytes(self, path: str, data: bytes) -> None:
@@ -250,14 +271,16 @@ class ModalSandboxSession:
         import modal
 
         target = await self._resolve(path)
-        # `target` is always absolute, so its parent is at least '/'; only skip the
-        # filesystem root, which always exists.
+        # `target` is always absolute, so its parent is at least the root, which always
+        # exists -- skip make_directory for it. Test for "no path component" rather than
+        # `== '/'`: POSIX `normpath` preserves a leading '//' as a distinct root spelling,
+        # so a parent of '//' is still the root and must be skipped too.
         parent = posixpath.dirname(target)
         try:
-            if parent != '/':
+            if parent.strip('/'):
                 await sandbox.filesystem.make_directory.aio(parent, create_parents=True)
             await sandbox.filesystem.write_bytes.aio(data, target)
-        except modal.exception.SandboxFilesystemError as e:
+        except modal.exception.Error as e:
             raise ModalSandboxError(str(e)) from e
 
     async def list_files(self, path: str) -> list[tuple[str, bool]]:
@@ -276,6 +299,6 @@ class ModalSandboxSession:
         target = await self._resolve(path)
         try:
             entries = await sandbox.filesystem.list_files.aio(target)
-        except modal.exception.SandboxFilesystemError as e:
+        except modal.exception.Error as e:
             raise ModalSandboxError(str(e)) from e
         return [(entry.name, entry.is_dir()) for entry in entries]
