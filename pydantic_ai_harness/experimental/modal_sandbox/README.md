@@ -51,8 +51,10 @@ same ones the Modal CLI and SDK use.
 | `list_directory` | List a directory's entries (directories shown with a trailing `/`). |
 
 Output is labelled with `[stdout]` / `[stderr]` markers and an `[exit code: N]`
-line on non-zero exit. When it exceeds `max_output_bytes` the **tail** is kept,
-so errors survive truncation. A non-zero exit from `run_command` is reported, not
+line on non-zero exit. Output is capped by two limits, whichever is hit first:
+`max_output_bytes` (UTF-8 bytes) and `max_output_lines` (lines). For commands the
+**tail** is kept, so errors survive truncation; file reads keep the head and
+return the next `offset` to page from. A non-zero exit from `run_command` is reported, not
 raised, so the model can react to it; file-tool failures (missing path, etc.)
 come back as a retry prompt.
 
@@ -136,6 +138,7 @@ ModalSandbox(
     env=None,                     # environment variables for an owned sandbox (dict)
     default_command_timeout=60.0, # default timeout for one run_command (seconds)
     max_output_bytes=50_000,      # output cap returned to the model (UTF-8 bytes)
+    max_output_lines=2000,        # output cap in lines; whichever cap is hit first wins
     max_read_bytes=5 * 1024 * 1024,  # refuse read_file on files larger than this
     include_instructions=True,    # add usage instructions to the prompt
 )

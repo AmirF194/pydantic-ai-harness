@@ -8,6 +8,7 @@ from pydantic_ai.capabilities import AbstractCapability
 from pydantic_ai.tools import AgentDepsT
 from pydantic_ai.toolsets import AgentToolset
 
+from pydantic_ai_harness._tool_output import DEFAULT_MAX_LINES
 from pydantic_ai_harness.experimental.modal_sandbox._session import ModalSandboxSession
 from pydantic_ai_harness.experimental.modal_sandbox._toolset import ModalSandboxToolset
 
@@ -113,7 +114,16 @@ class ModalSandbox(AbstractCapability[AgentDepsT]):
     """Maximum output returned to the model, measured in UTF-8 bytes.
 
     Caps command output and file-read windows. Bytes (not characters) because that is what
-    bounds transfer and memory, and it keeps the same unit as `max_read_bytes`.
+    bounds transfer and memory, and it keeps the same unit as `max_read_bytes`. Whichever of
+    `max_output_bytes` and `max_output_lines` is reached first wins.
+    """
+
+    max_output_lines: int = DEFAULT_MAX_LINES
+    """Maximum lines of output returned to the model, alongside `max_output_bytes`.
+
+    A second cap so many short lines cannot pile up under the byte budget. Whichever cap is
+    reached first wins. Both caps proxy a context budget; a future token-based cap would be
+    additive.
     """
 
     max_read_bytes: int = _DEFAULT_MAX_READ_BYTES
@@ -188,6 +198,7 @@ class ModalSandbox(AbstractCapability[AgentDepsT]):
             workdir=self.workdir,
             default_command_timeout=self.default_command_timeout,
             max_output_bytes=self.max_output_bytes,
+            max_output_lines=self.max_output_lines,
             max_read_bytes=self.max_read_bytes,
             env=self.env,
             session=self.session,

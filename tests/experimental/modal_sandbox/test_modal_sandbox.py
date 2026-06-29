@@ -21,6 +21,7 @@ def _toolset(
     *,
     sandbox_id: str | None = None,
     max_output_bytes: int = 50_000,
+    max_output_lines: int = 2000,
     image: str = 'python:3.12-slim',
     app_name: str = 'pydantic-ai-harness',
     create_app_if_missing: bool = True,
@@ -39,6 +40,7 @@ def _toolset(
         workdir=workdir,
         default_command_timeout=30.0,
         max_output_bytes=max_output_bytes,
+        max_output_lines=max_output_lines,
         max_read_bytes=max_read_bytes,
         env=env,
         session=session,
@@ -144,6 +146,24 @@ class TestReadFile:
             fake_modal.sandboxes[0].stat_sizes['/big.log'] = 5000
             with pytest.raises(ModelRetry, match='over the 1000B read limit'):
                 await ts.read_file('/big.log')
+
+    async def test_line_cap_is_configurable(self, fake_modal: FakeModal) -> None:
+        # Bytes are well under budget, so only the line cap can fire: proves it is plumbed
+        # through, not silently fixed at the helper default.
+        async with _toolset(max_output_lines=3, max_output_bytes=50_000) as ts:
+            fake_modal.sandboxes[0].files['/many'] = b'\n'.join(b'L%d' % i for i in range(20))
+            result = await ts.read_file('/many')
+        assert 'Showing lines 1-3 of 20' in result
+        assert 'Use offset=4 to continue.' in result
+
+    async def test_refuses_file_that_grew_after_stat(self, fake_modal: FakeModal) -> None:
+        async with _toolset(max_read_bytes=1000) as ts:
+            # stat reports under the limit, but the read returns more (the file grew between
+            # the two round-trips). The post-read guard refuses before the decode/window.
+            fake_modal.sandboxes[0].stat_sizes['/grows'] = 10
+            fake_modal.sandboxes[0].files['/grows'] = b'x' * 5000
+            with pytest.raises(ModelRetry, match='over the 1000B read limit'):
+                await ts.read_file('/grows')
 
 
 class TestWriteFile:

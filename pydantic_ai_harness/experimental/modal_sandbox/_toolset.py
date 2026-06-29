@@ -35,6 +35,7 @@ class ModalSandboxToolset(FunctionToolset[AgentDepsT]):
         workdir: str | None,
         default_command_timeout: float,
         max_output_bytes: int,
+        max_output_lines: int,
         max_read_bytes: int,
         env: dict[str, str] | None = None,
         session: ModalSandboxSession | None = None,
@@ -48,6 +49,7 @@ class ModalSandboxToolset(FunctionToolset[AgentDepsT]):
         self._workdir = workdir
         self._default_command_timeout = default_command_timeout
         self._max_output_bytes = max_output_bytes
+        self._max_output_lines = max_output_lines
         self._max_read_bytes = max_read_bytes
         self._env = env
         # A caller-owned session to reuse instead of opening one per run; when set, this
@@ -76,6 +78,7 @@ class ModalSandboxToolset(FunctionToolset[AgentDepsT]):
             workdir=self._workdir,
             default_command_timeout=self._default_command_timeout,
             max_output_bytes=self._max_output_bytes,
+            max_output_lines=self._max_output_lines,
             max_read_bytes=self._max_read_bytes,
             env=self._env,
             session=self._external_session,
@@ -155,7 +158,9 @@ class ModalSandboxToolset(FunctionToolset[AgentDepsT]):
             parts.append(f'[stderr]\n{result.stderr}')
         body = '\n'.join(parts) if parts else '(no output)'
         # Command output: keep the tail, where errors and the exit status live.
-        output = truncate_output(body, max_bytes=self._max_output_bytes, direction='tail')
+        output = truncate_output(
+            body, max_lines=self._max_output_lines, max_bytes=self._max_output_bytes, direction='tail'
+        )
         if result.timed_out:
             return f'{output}\n[timed out after {timeout}s]'
         if result.returncode:
@@ -188,7 +193,14 @@ class ModalSandboxToolset(FunctionToolset[AgentDepsT]):
             data = await session.read_bytes(path)
         except ModalSandboxError as e:
             raise ModelRetry(f'Could not read {path!r}: {e}')
-        return render_file_window(data, offset=offset, limit=limit, max_bytes=self._max_output_bytes)
+        # Re-check against the bytes actually returned. The stat and the read are separate
+        # round-trips, so the file could have grown past the limit in between. Modal's API
+        # has no bounded read, so the transfer already happened, but refusing here still
+        # avoids the large UTF-8 decode and windowing that would otherwise follow.
+        guard_read_size(len(data), max_bytes=self._max_read_bytes)
+        return render_file_window(
+            data, offset=offset, limit=limit, max_lines=self._max_output_lines, max_bytes=self._max_output_bytes
+        )
 
     async def write_file(self, path: str, content: str) -> str:
         """Write text to a file in the sandbox, creating parent directories.
@@ -221,4 +233,6 @@ class ModalSandboxToolset(FunctionToolset[AgentDepsT]):
             return '(empty)'
         names = sorted(f'{name}/' if is_dir else name for name, is_dir in entries)
         # Directory listing is sorted, so keep the head if it overflows the cap.
-        return truncate_output('\n'.join(names), max_bytes=self._max_output_bytes, direction='head')
+        return truncate_output(
+            '\n'.join(names), max_lines=self._max_output_lines, max_bytes=self._max_output_bytes, direction='head'
+        )
