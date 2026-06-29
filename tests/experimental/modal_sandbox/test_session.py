@@ -149,14 +149,14 @@ class TestExec:
         async with ModalSandboxSession() as session:
             result = await session.exec(['x'], timeout=0.2)
             assert fake_modal.sandboxes[0].exec_calls[-1].timeout == 1
-            assert result.timeout == 1
+            assert result.applied_timeout == 1
 
     async def test_timeout_none_stays_unbounded(self, fake_modal: FakeModal) -> None:
         fake_modal.responder = lambda argv, timeout: ('', '', 0)
         async with ModalSandboxSession() as session:
             result = await session.exec(['x'])
             assert fake_modal.sandboxes[0].exec_calls[-1].timeout is None
-            assert result.timeout is None
+            assert result.applied_timeout is None
 
     async def test_exec_error_wrapped(self, fake_modal: FakeModal) -> None:
         def boom(argv: list[str], timeout: int | None) -> tuple[str, str, int]:

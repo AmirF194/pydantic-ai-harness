@@ -116,8 +116,12 @@ class ModalSandbox(AbstractCapability[AgentDepsT]):
 
     Modal has no per-command kill, so a cancelled command keeps running until its deadline;
     this caps how long that worst case can be. An owned command cannot outlive
-    `sandbox_timeout` anyway, so the default ceiling is exact for owned sandboxes. Raise it
-    for an attached or injected sandbox that should allow longer single commands.
+    `sandbox_timeout` anyway, so the default ceiling is exact for owned sandboxes.
+
+    For an attached or injected sandbox the fallback is still `sandbox_timeout`, which is
+    pinned to its default (300s) in those modes because the capability does not know the
+    real lifetime of a sandbox it did not create. So every command there is capped at 300s
+    unless you set `max_command_timeout` to the value the sandbox actually allows.
     """
 
     max_output_bytes: int = 50 * 1024

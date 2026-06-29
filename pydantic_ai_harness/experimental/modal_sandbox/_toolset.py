@@ -1,8 +1,8 @@
-"""Modal sandbox toolset — gives agents a cloud sandbox to work in."""
+"""Modal sandbox toolset: gives agents a cloud sandbox to work in."""
 
 from __future__ import annotations
 
-from typing import Annotated, Any
+from typing import Annotated
 
 from pydantic import Field
 from pydantic_ai import RunContext
@@ -114,7 +114,7 @@ class ModalSandboxToolset(FunctionToolset[AgentDepsT]):
         self._session = session
         return self
 
-    async def __aexit__(self, *args: Any) -> None:
+    async def __aexit__(self, *args: object) -> None:
         """Close the per-run session; leave a caller-owned session for its owner to close."""
         session = self._session
         self._session = None
@@ -123,10 +123,16 @@ class ModalSandboxToolset(FunctionToolset[AgentDepsT]):
 
     def _require_session(self) -> ModalSandboxSession:
         if self._session is None:  # pragma: no cover - tools only run inside the toolset context
-            raise RuntimeError('The Modal sandbox session is not open.')
+            # ModalSandboxError (not a bare RuntimeError) so that, were this ever reached, the
+            # tool wrappers turn it into a ModelRetry like every other session failure.
+            raise ModalSandboxError('The Modal sandbox session is not open.')
         return self._session
 
     def _command_timeout(self, timeout_seconds: float | None) -> float:
+        if timeout_seconds is not None and timeout_seconds <= 0:
+            # Reject rather than let the session floor it to 1s: a 0 or negative request is a
+            # model mistake, and a surprise "[timed out after 1s]" hides that from the model.
+            raise ModelRetry(f'timeout_seconds must be greater than 0, got {timeout_seconds}.')
         requested = timeout_seconds if timeout_seconds is not None else self._default_command_timeout
         # Clamp to a hard ceiling. Modal cannot kill a running command, so a cancelled one
         # runs until its deadline; the ceiling bounds that worst case. It defaults to the
@@ -166,7 +172,7 @@ class ModalSandboxToolset(FunctionToolset[AgentDepsT]):
             body, max_lines=self._max_output_lines, max_bytes=self._max_output_bytes, direction='tail'
         )
         if result.timed_out:
-            return f'{output}\n[timed out after {result.timeout}s]'
+            return f'{output}\n[timed out after {result.applied_timeout}s]'
         if result.returncode:
             return f'{output}\n[exit code: {result.returncode}]'
         return output

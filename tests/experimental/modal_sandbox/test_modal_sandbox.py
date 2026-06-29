@@ -97,6 +97,16 @@ class TestRunCommand:
         # A sub-second timeout must not floor to 0, which Modal treats as "no timeout".
         assert fake_modal.sandboxes[0].exec_calls[-1].timeout == 1
 
+    @pytest.mark.parametrize('bad_timeout', [0, -5.0])
+    async def test_non_positive_timeout_rejected(self, fake_modal: FakeModal, bad_timeout: float) -> None:
+        # A 0 or negative request is a model mistake; reject it rather than let the session
+        # floor it to a surprise 1-second deadline.
+        fake_modal.responder = lambda argv, timeout: ('', '', 0)
+        async with _toolset() as ts:
+            with pytest.raises(ModelRetry, match='timeout_seconds must be greater than 0'):
+                await ts.run_command('echo', timeout_seconds=bad_timeout)
+        assert fake_modal.sandboxes[0].exec_calls == []
+
     async def test_output_truncated(self, fake_modal: FakeModal) -> None:
         fake_modal.responder = lambda argv, timeout: ('x' * 1000, '', 0)
         async with _toolset(max_output_bytes=100) as ts:
@@ -123,8 +133,10 @@ class TestRunCommand:
 class TestReadFile:
     async def test_returns_contents(self, fake_modal: FakeModal) -> None:
         async with _toolset() as ts:
+            # The single trailing newline is dropped with its phantom empty line, so the read
+            # returns the real line content rather than a body counted as two lines.
             fake_modal.sandboxes[0].files['/etc/hosts'] = b'file body\n'
-            assert await ts.read_file('/etc/hosts') == 'file body\n'
+            assert await ts.read_file('/etc/hosts') == 'file body'
 
     async def test_at_size_limit_is_not_truncated(self, fake_modal: FakeModal) -> None:
         async with _toolset(max_output_bytes=100) as ts:

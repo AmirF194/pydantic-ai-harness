@@ -160,3 +160,25 @@ class TestRenderFileWindow:
     def test_limit_reaching_eof_has_no_note(self) -> None:
         out = render_file_window(b'a\nb\nc', offset=1, limit=10)
         assert out == 'a\nb\nc'
+
+    def test_trailing_newline_not_counted_as_extra_line(self) -> None:
+        # 'a\nb\n' is a 2-line file; the final '' from the trailing newline must not be
+        # counted, so a full read returns the two lines and adds no continuation note.
+        assert render_file_window(b'a\nb\n') == 'a\nb'
+
+    def test_trailing_newline_limit_does_not_advertise_phantom_line(self) -> None:
+        # With limit == real line count, end reaches EOF, so there is nothing more to page:
+        # the phantom trailing '' must not trigger a "1 more lines" note.
+        out = render_file_window(b'a\nb\n', offset=1, limit=2)
+        assert out == 'a\nb'
+        assert 'more lines' not in out
+
+    def test_offset_at_trailing_newline_phantom_line_rejected(self) -> None:
+        # Paging to the line after the last real one must be refused, not return ''.
+        with pytest.raises(ModelRetry, match='beyond end of file'):
+            render_file_window(b'a\nb\n', offset=3)
+
+    def test_empty_file_reads_as_one_empty_line(self) -> None:
+        # The single-element guard keeps an empty file readable rather than collapsing it
+        # to zero lines (which would make a no-offset read raise "beyond end of file").
+        assert render_file_window(b'') == ''

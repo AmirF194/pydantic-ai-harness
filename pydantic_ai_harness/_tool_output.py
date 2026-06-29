@@ -1,8 +1,7 @@
 """Shared presentation helpers for file-read and command-output tools.
 
 Pure formatting with no I/O and no backend coupling, so any toolset can opt in to the
-same windowing and truncation behavior. Ported from the execution-environment work in
-PR #261 (`_truncate.py` / `_read_file`).
+same windowing and truncation behavior.
 
 `read_file`-style tools want `render_file_window` (line-addressable, head-first, with a
 continuation offset). Free-form command output wants `truncate_output` (tail-first, so
@@ -170,8 +169,14 @@ def render_file_window(
 
     # Split on '\n' only, not str.splitlines(): splitlines() also breaks on '\r', '\v',
     # '\f', and Unicode separators, which would make line numbers disagree with editors
-    # and grep -n. A trailing '\n' yields a final '' element, so total_lines counts it.
+    # and grep -n.
     lines = text.split('\n')
+    # A trailing newline yields a final '' element; drop it so a newline-terminated file
+    # (the common case) reports its true line count and does not advertise a phantom extra
+    # line to page to. Keep it for a single-element list so an empty file still reads as one
+    # empty line rather than zero.
+    if len(lines) > 1 and lines[-1] == '':
+        lines = lines[:-1]
     total_lines = len(lines)
 
     start = offset - 1 if offset is not None else 0

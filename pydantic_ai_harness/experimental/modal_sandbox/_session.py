@@ -5,7 +5,7 @@ from __future__ import annotations
 import math
 import posixpath
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
 
 import anyio
 from typing_extensions import Self
@@ -27,8 +27,12 @@ class ExecResult:
     returncode: int
     timed_out: bool = False
     """True if Modal killed the command at its timeout (its `-1` exit sentinel)."""
-    timeout: int | None = None
-    """The whole-second deadline Modal enforced for this command, or None if unbounded."""
+    applied_timeout: int | None = None
+    """The whole-second deadline Modal enforced for this command, or None if unbounded.
+
+    This is the quantized value actually sent to Modal, not the (possibly fractional)
+    timeout the caller requested, so the caller can report the exact deadline.
+    """
 
 
 _MISSING_MODAL = (
@@ -136,7 +140,7 @@ class ModalSandboxSession:
             app=app, image=image, timeout=self._sandbox_timeout, workdir=self._workdir, env=env
         )
 
-    async def __aexit__(self, *args: Any) -> None:
+    async def __aexit__(self, *args: object) -> None:
         """Release the sandbox: terminate it when owned, and always detach the client."""
         sandbox = self._sandbox
         self._sandbox = None
@@ -224,7 +228,7 @@ class ModalSandboxSession:
         # Modal returns `-1` when it kills a command at its timeout (real exits are 0-255,
         # signals are 128+n), so `-1` flags a timeout rather than a command exit status.
         return ExecResult(
-            stdout=stdout, stderr=stderr, returncode=returncode, timed_out=returncode == -1, timeout=deadline
+            stdout=stdout, stderr=stderr, returncode=returncode, timed_out=returncode == -1, applied_timeout=deadline
         )
 
     async def file_size(self, path: str) -> int:
