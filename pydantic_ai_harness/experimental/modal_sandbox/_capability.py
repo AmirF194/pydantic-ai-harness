@@ -110,6 +110,16 @@ class ModalSandbox(AbstractCapability[AgentDepsT]):
     This bounds a single command; `sandbox_timeout` bounds the whole sandbox's lifetime.
     """
 
+    max_command_timeout: float | None = None
+    """Hard ceiling in seconds for any single `run_command`, including a model-supplied
+    `timeout_seconds`. None falls back to `sandbox_timeout`.
+
+    Modal has no per-command kill, so a cancelled command keeps running until its deadline;
+    this caps how long that worst case can be. An owned command cannot outlive
+    `sandbox_timeout` anyway, so the default ceiling is exact for owned sandboxes. Raise it
+    for an attached or injected sandbox that should allow longer single commands.
+    """
+
     max_output_bytes: int = 50 * 1024
     """Maximum output returned to the model, measured in UTF-8 bytes.
 
@@ -199,6 +209,7 @@ class ModalSandbox(AbstractCapability[AgentDepsT]):
             sandbox_timeout=self.sandbox_timeout,
             workdir=self.workdir,
             default_command_timeout=self.default_command_timeout,
+            max_command_timeout=self.max_command_timeout,
             max_output_bytes=self.max_output_bytes,
             max_output_lines=self.max_output_lines,
             max_read_bytes=self.max_read_bytes,

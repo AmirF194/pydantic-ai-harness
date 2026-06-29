@@ -103,7 +103,9 @@ The capability is built around that:
   keeps running in the sandbox until its deadline. Every `run_command` carries
   one (`default_command_timeout`, or the per-call `timeout_seconds`), so a
   cancelled or abandoned command is reaped within that window rather than running
-  on. Lower `default_command_timeout` to shorten the worst-case window.
+  on. Lower `default_command_timeout` to shorten the worst-case window. A
+  model-supplied `timeout_seconds` is capped at `max_command_timeout` (which
+  defaults to `sandbox_timeout`), so the model cannot ask for an unbounded one.
 - An owned sandbox is terminated when its run ends or is cancelled; Modal tears
   it down asynchronously, which also stops anything still running in it.
 - An attached or injected sandbox is never terminated by the capability (its
@@ -137,6 +139,7 @@ ModalSandbox(
     workdir=None,                 # working directory for commands (Modal default when None)
     env=None,                     # environment variables for an owned sandbox (dict)
     default_command_timeout=60.0, # default timeout for one run_command (seconds)
+    max_command_timeout=None,     # hard ceiling for one command; None -> sandbox_timeout
     max_output_bytes=50 * 1024,   # output cap returned to the model (UTF-8 bytes)
     max_output_lines=2000,        # output cap in lines; whichever cap is hit first wins
     max_read_bytes=5 * 1024 * 1024,  # refuse read_file on files larger than this

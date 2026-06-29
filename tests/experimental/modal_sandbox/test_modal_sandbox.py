@@ -27,6 +27,7 @@ def _toolset(
     create_app_if_missing: bool = True,
     sandbox_timeout: int = 300,
     workdir: str | None = None,
+    max_command_timeout: float | None = None,
     max_read_bytes: int = 5 * 1024 * 1024,
     env: dict[str, str] | None = None,
     session: ModalSandboxSession | None = None,
@@ -39,6 +40,7 @@ def _toolset(
         sandbox_timeout=sandbox_timeout,
         workdir=workdir,
         default_command_timeout=30.0,
+        max_command_timeout=max_command_timeout,
         max_output_bytes=max_output_bytes,
         max_output_lines=max_output_lines,
         max_read_bytes=max_read_bytes,
@@ -71,6 +73,22 @@ class TestRunCommand:
         async with _toolset() as ts:
             await ts.run_command('echo', timeout_seconds=12.0)
         assert fake_modal.sandboxes[0].exec_calls[-1].timeout == 12
+
+    async def test_timeout_clamped_to_sandbox_timeout(self, fake_modal: FakeModal) -> None:
+        # Modal cannot kill a running command, so a model-supplied timeout is capped. With no
+        # explicit ceiling it falls back to the sandbox lifetime.
+        fake_modal.responder = lambda argv, timeout: (str(timeout), '', 0)
+        async with _toolset(sandbox_timeout=120) as ts:
+            await ts.run_command('echo', timeout_seconds=9999)
+        assert fake_modal.sandboxes[0].exec_calls[-1].timeout == 120
+
+    async def test_max_command_timeout_overrides_ceiling(self, fake_modal: FakeModal) -> None:
+        # An explicit ceiling lets an attached/injected sandbox allow longer or shorter
+        # single commands than the sandbox lifetime.
+        fake_modal.responder = lambda argv, timeout: (str(timeout), '', 0)
+        async with _toolset(sandbox_timeout=120, max_command_timeout=50) as ts:
+            await ts.run_command('echo', timeout_seconds=9999)
+        assert fake_modal.sandboxes[0].exec_calls[-1].timeout == 50
 
     async def test_fractional_timeout_rounds_up(self, fake_modal: FakeModal) -> None:
         fake_modal.responder = lambda argv, timeout: (str(timeout), '', 0)
