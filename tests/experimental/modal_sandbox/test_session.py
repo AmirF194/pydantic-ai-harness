@@ -142,6 +142,22 @@ class TestExec:
             assert result.timed_out is True
             assert result.returncode == -1
 
+    async def test_fractional_timeout_rounded_to_whole_seconds(self, fake_modal: FakeModal) -> None:
+        # The session owns Modal's whole-second quantization: a sub-second deadline rounds up
+        # to 1 (Modal treats 0 as "no timeout") and the applied value rides back on the result.
+        fake_modal.responder = lambda argv, timeout: ('', '', 0)
+        async with ModalSandboxSession() as session:
+            result = await session.exec(['x'], timeout=0.2)
+            assert fake_modal.sandboxes[0].exec_calls[-1].timeout == 1
+            assert result.timeout == 1
+
+    async def test_timeout_none_stays_unbounded(self, fake_modal: FakeModal) -> None:
+        fake_modal.responder = lambda argv, timeout: ('', '', 0)
+        async with ModalSandboxSession() as session:
+            result = await session.exec(['x'])
+            assert fake_modal.sandboxes[0].exec_calls[-1].timeout is None
+            assert result.timeout is None
+
     async def test_exec_error_wrapped(self, fake_modal: FakeModal) -> None:
         def boom(argv: list[str], timeout: int | None) -> tuple[str, str, int]:
             raise fake_modal.error_type('exec boom')

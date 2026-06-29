@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import posixpath
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
@@ -26,6 +27,8 @@ class ExecResult:
     returncode: int
     timed_out: bool = False
     """True if Modal killed the command at its timeout (its `-1` exit sentinel)."""
+    timeout: int | None = None
+    """The whole-second deadline Modal enforced for this command, or None if unbounded."""
 
 
 _MISSING_MODAL = (
@@ -185,7 +188,7 @@ class ModalSandboxSession:
             self._cwd = result.stdout.strip() or '/'
         return posixpath.normpath(posixpath.join(self._cwd, path))
 
-    async def exec(self, argv: list[str], *, timeout: int | None = None) -> ExecResult:
+    async def exec(self, argv: list[str], *, timeout: float | None = None) -> ExecResult:
         """Run an argument vector in the sandbox (without a shell) and return its result.
 
         Modal does not currently expose a per-exec kill, so cancelling this coroutine stops
@@ -202,11 +205,17 @@ class ModalSandboxSession:
         sandbox = self._require_sandbox()
         import modal
 
+        # Modal takes whole-second timeouts and treats 0 as "no timeout", so round a finite
+        # request up and floor it at 1. Owning this here keeps the Modal quantization in the
+        # mechanism layer: any caller passing a fractional or sub-second deadline still gets a
+        # finite, Modal-legal one. The applied value rides back on ExecResult so the caller
+        # can report the exact deadline without re-deriving it.
+        deadline = None if timeout is None else max(1, math.ceil(timeout))
         # Modal buffers exec output server-side and streams it over its own connection,
         # so draining stdout then stderr before waiting cannot deadlock the way OS pipes
         # would. `text=True` (Modal's default) makes the streams yield str.
         try:
-            process = await sandbox.exec.aio(*argv, timeout=timeout)
+            process = await sandbox.exec.aio(*argv, timeout=deadline)
             stdout = await process.stdout.read.aio()
             stderr = await process.stderr.read.aio()
             returncode = await process.wait.aio()
@@ -214,7 +223,9 @@ class ModalSandboxSession:
             raise ModalSandboxError(f'Command could not run in the sandbox: {e}') from e
         # Modal returns `-1` when it kills a command at its timeout (real exits are 0-255,
         # signals are 128+n), so `-1` flags a timeout rather than a command exit status.
-        return ExecResult(stdout=stdout, stderr=stderr, returncode=returncode, timed_out=returncode == -1)
+        return ExecResult(
+            stdout=stdout, stderr=stderr, returncode=returncode, timed_out=returncode == -1, timeout=deadline
+        )
 
     async def file_size(self, path: str) -> int:
         """Return a file's size in bytes via Modal's filesystem API, without reading it.

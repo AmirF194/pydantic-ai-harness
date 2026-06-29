@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import math
 from typing import Annotated, Any
 
 from pydantic import Field
@@ -127,15 +126,14 @@ class ModalSandboxToolset(FunctionToolset[AgentDepsT]):
             raise RuntimeError('The Modal sandbox session is not open.')
         return self._session
 
-    def _command_timeout(self, timeout_seconds: float | None) -> int:
+    def _command_timeout(self, timeout_seconds: float | None) -> float:
         requested = timeout_seconds if timeout_seconds is not None else self._default_command_timeout
         # Clamp to a hard ceiling. Modal cannot kill a running command, so a cancelled one
         # runs until its deadline; the ceiling bounds that worst case. It defaults to the
-        # sandbox lifetime, beyond which an owned command cannot run anyway.
+        # sandbox lifetime, beyond which an owned command cannot run anyway. The session
+        # quantizes this to a whole-second, Modal-legal deadline.
         ceiling = self._max_command_timeout if self._max_command_timeout is not None else self._sandbox_timeout
-        # Modal takes whole-second timeouts; round fractional values up so a sub-second
-        # request is not floored to 0 (which Modal treats as "no timeout").
-        return max(1, math.ceil(min(requested, ceiling)))
+        return min(requested, ceiling)
 
     async def run_command(self, command: str, *, timeout_seconds: float | None = None) -> str:
         """Run a shell command in the sandbox and return its output.
@@ -151,11 +149,10 @@ class ModalSandboxToolset(FunctionToolset[AgentDepsT]):
             Labelled stdout/stderr output, with an exit code on non-zero exit.
         """
         session = self._require_session()
-        timeout = self._command_timeout(timeout_seconds)
         # Surface a sandbox-side failure as a retryable tool error, matching the file tools,
         # rather than letting it abort the whole run.
         try:
-            result = await session.exec(['sh', '-c', command], timeout=timeout)
+            result = await session.exec(['sh', '-c', command], timeout=self._command_timeout(timeout_seconds))
         except ModalSandboxError as e:
             raise ModelRetry(str(e))
         parts: list[str] = []
@@ -169,7 +166,7 @@ class ModalSandboxToolset(FunctionToolset[AgentDepsT]):
             body, max_lines=self._max_output_lines, max_bytes=self._max_output_bytes, direction='tail'
         )
         if result.timed_out:
-            return f'{output}\n[timed out after {timeout}s]'
+            return f'{output}\n[timed out after {result.timeout}s]'
         if result.returncode:
             return f'{output}\n[exit code: {result.returncode}]'
         return output
