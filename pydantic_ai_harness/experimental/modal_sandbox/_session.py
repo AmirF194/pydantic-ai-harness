@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 import anyio
+import anyio.lowlevel
 from typing_extensions import Self
 
 if TYPE_CHECKING:
@@ -115,9 +116,22 @@ class ModalSandboxSession:
         except ImportError as e:
             raise ModalSandboxError(_MISSING_MODAL) from e
         try:
-            self._sandbox = await self._open_sandbox()
+            # Shield creation so a cancellation arriving mid-create cannot drop the sandbox
+            # handle before we store it. Without this, an owned sandbox created server-side
+            # would be orphaned (reaped only by its own `sandbox_timeout`) because `__aexit__`
+            # would see no handle to terminate. The cold-start wait is brief, and we honor the
+            # cancellation at the checkpoint just below.
+            with anyio.CancelScope(shield=True):
+                self._sandbox = await self._open_sandbox()
         except modal.exception.Error as e:
             raise ModalSandboxError(f'Could not start Modal sandbox: {e}') from e
+        try:
+            # If the run was cancelled during the shielded create, this raises; tear the
+            # just-created sandbox down here rather than leaving it for `sandbox_timeout`.
+            await anyio.lowlevel.checkpoint()
+        except BaseException:
+            await self.__aexit__(None, None, None)
+            raise
         return self
 
     async def _open_sandbox(self) -> modal.Sandbox:

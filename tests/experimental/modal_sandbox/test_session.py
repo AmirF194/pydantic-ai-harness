@@ -79,6 +79,20 @@ class TestOwnedLifecycle:
             await session.__aexit__(None, None, None)
         assert fake_modal.sandboxes[0].detached is True
 
+    async def test_cancel_during_enter_terminates_created_sandbox(self, fake_modal: FakeModal) -> None:
+        # A run cancelled while the sandbox is being created must not orphan it: creation is
+        # shielded so the handle survives, then the cancellation tears the sandbox down here
+        # instead of leaving it for `sandbox_timeout` to reap.
+        session = ModalSandboxSession()
+        with anyio.CancelScope() as scope:
+            scope.cancel()
+            await session.__aenter__()
+        # The scope absorbed the cancellation; the created sandbox was terminated and detached,
+        # and the session holds no handle.
+        assert fake_modal.sandboxes[0].terminated is True
+        assert fake_modal.sandboxes[0].detached is True
+        assert session.sandbox_id is None
+
 
 class TestAttachLifecycle:
     async def test_attaches_detaches_but_does_not_terminate(self, fake_modal: FakeModal) -> None:
