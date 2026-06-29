@@ -137,7 +137,7 @@ ModalSandbox(
     workdir=None,                 # working directory for commands (Modal default when None)
     env=None,                     # environment variables for an owned sandbox (dict)
     default_command_timeout=60.0, # default timeout for one run_command (seconds)
-    max_output_bytes=50_000,      # output cap returned to the model (UTF-8 bytes)
+    max_output_bytes=50 * 1024,   # output cap returned to the model (UTF-8 bytes)
     max_output_lines=2000,        # output cap in lines; whichever cap is hit first wins
     max_read_bytes=5 * 1024 * 1024,  # refuse read_file on files larger than this
     include_instructions=True,    # add usage instructions to the prompt

@@ -60,6 +60,20 @@ class TestTruncate:
         assert result.first_line_exceeded is True
         assert result.truncated_by == 'bytes'
 
+    def test_tail_keeps_partial_suffix_of_oversized_last_line(self) -> None:
+        # Command output (tail) keeps the end of a single over-long line, not nothing, so
+        # the error/exit region survives.
+        result = truncate(['x' * 100], max_bytes=10, direction='tail')
+        assert result.truncated_lines == ['x' * 10]
+        assert result.truncated_by == 'bytes'
+        assert result.first_line_exceeded is False
+
+    def test_tail_suffix_drops_partial_multibyte_char(self) -> None:
+        # Cutting the byte-suffix mid-character must not raise and must drop the partial byte.
+        result = truncate(['é' * 10], max_bytes=5, direction='tail')  # 'é' is 2 bytes
+        assert result.truncated_lines == ['éé']  # 4 bytes; the partial leading byte is dropped
+        assert result.truncated_by == 'bytes'
+
 
 class TestTruncateOutput:
     def test_untruncated_returns_body(self) -> None:
@@ -89,6 +103,11 @@ class TestTruncateOutput:
     def test_byte_cap_marker_names_bytes(self) -> None:
         out = truncate_output('aaaa\nbbbb\ncccc', max_bytes=4, direction='head')
         assert 'truncated to the first 4B' in out
+
+    def test_oversized_single_line_command_keeps_suffix(self) -> None:
+        out = truncate_output('y' * 100, max_bytes=10, direction='tail')
+        assert out.startswith('[... output truncated to the last 10B ...]')
+        assert out.rstrip().endswith('y' * 10)
 
 
 class TestRenderFileWindow:

@@ -48,6 +48,11 @@ def format_size(num_bytes: int) -> str:
     return f'{num_bytes / (1024 * 1024):.1f}MB'
 
 
+def _tail_bytes(line: str, max_bytes: int) -> str:
+    """Return the last `max_bytes` UTF-8 bytes of `line`, dropping any partial leading char."""
+    return line.encode('utf-8')[-max_bytes:].decode('utf-8', errors='ignore')
+
+
 def guard_read_size(size_bytes: int, *, max_bytes: int) -> None:
     """Refuse to read a file larger than `max_bytes`, pointing the model at shell tools.
 
@@ -83,9 +88,14 @@ def truncate(
     if direction == 'tail':
         lines = lines[::-1]
 
-    # A line wider than the byte cap can't be shown partially (we never split a line), so
-    # keep nothing and flag it -- the caller reports the line's size and omits it.
+    # A single line wider than the byte cap is handled by direction. For `tail` (command
+    # output) keep a byte-suffix of that line: the end is where errors and exit status sit,
+    # so one huge final line (a big JSON blob, a long log record) should still show its tail
+    # rather than vanish. For `head` (file reads) we cannot show a useful prefix of an
+    # arbitrary line, so omit it and let the caller point the model at a shell slice.
     if lines and len(lines[0].encode('utf-8')) > max_bytes:
+        if direction == 'tail':
+            return TruncationResult(truncated_lines=[_tail_bytes(lines[0], max_bytes)], truncated_by='bytes')
         return TruncationResult(truncated_lines=[], truncated_by='bytes', first_line_exceeded=True)
 
     kept: list[str] = []
