@@ -167,7 +167,7 @@ class ModalSandbox(AbstractCapability[AgentDepsT]):
             if conflicts:
                 raise ValueError(
                     f'{", ".join(conflicts)} cannot be combined with `session`, which already owns '
-                    'the sandbox and its configuration.'
+                    'the sandbox and its configuration.' + self._command_ceiling_hint(conflicts)
                 )
             return
         if self.sandbox_id is None:
@@ -177,7 +177,19 @@ class ModalSandbox(AbstractCapability[AgentDepsT]):
             raise ValueError(
                 f'{", ".join(ignored)} only apply when creating a sandbox, but `sandbox_id` attaches '
                 'to an existing one. Remove them, or drop `sandbox_id` to create a sandbox.'
+                + self._command_ceiling_hint(ignored)
             )
+
+    def _command_ceiling_hint(self, rejected: list[str]) -> str:
+        """Redirect a rejected `sandbox_timeout` to the setting that works in reuse modes.
+
+        `sandbox_timeout` is the natural-but-wrong reach for "let commands run longer" on a
+        reused sandbox (it only sizes an owned sandbox's lifetime). The per-command ceiling
+        there is `max_command_timeout`, so point the user at it instead of just rejecting.
+        """
+        if 'sandbox_timeout' not in rejected:
+            return ''
+        return ' To raise the per-command timeout ceiling on a reused sandbox, set `max_command_timeout`.'
 
     def _non_default_owned_settings(self) -> list[str]:
         """Names of the owned-sandbox creation settings left at a non-default value."""

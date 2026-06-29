@@ -8,6 +8,7 @@ the session returns it. The fake records calls and lets each test decide what
 
 from __future__ import annotations
 
+import posixpath
 import types
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -36,7 +37,9 @@ class _AioCallable:
     def __init__(self, fn: Callable[..., Any]) -> None:
         self._fn = fn
 
-    def __call__(self, *args: Any, **kwargs: Any) -> Any:
+    def __call__(self, *args: Any, **kwargs: Any) -> Any:  # pragma: no cover - capability only uses `.aio`
+        # Modal's callables work sync or async; we mirror both for fidelity, but the
+        # capability drives the async `.aio` path exclusively, so this never runs in tests.
         return self._fn(*args, **kwargs)
 
     async def aio(self, *args: Any, **kwargs: Any) -> Any:
@@ -94,32 +97,35 @@ class _FakeFilesystem:
         self.stat = _AioCallable(self._stat)
 
     def _read_bytes(self, remote_path: str) -> bytes:
-        if self._sandbox.fs_error is not None:
-            raise self._sandbox.fs_error
+        self._check(remote_path)
         return self._sandbox.files[remote_path]
 
     def _stat(self, remote_path: str) -> FileInfo:
-        if self._sandbox.fs_error is not None:
-            raise self._sandbox.fs_error
+        self._check(remote_path)
         # Size comes from the stored bytes, or an override the test set for this path.
         size = self._sandbox.stat_sizes.get(remote_path, len(self._sandbox.files.get(remote_path, b'')))
         return FileInfo(remote_path, False, size=size)
 
     def _write_bytes(self, data: bytes, remote_path: str) -> None:
-        if self._sandbox.fs_error is not None:
-            raise self._sandbox.fs_error
+        self._check(remote_path)
         self._sandbox.files[remote_path] = data
 
     def _make_directory(self, remote_path: str, *, create_parents: bool = True) -> None:
-        if self._sandbox.fs_error is not None:
-            raise self._sandbox.fs_error
+        self._check(remote_path)
         self._sandbox.made_dirs.append(remote_path)
 
     def _list_files(self, remote_path: str) -> list[FileInfo]:
-        if self._sandbox.fs_error is not None:
-            raise self._sandbox.fs_error
+        self._check(remote_path)
         self._sandbox.list_paths.append(remote_path)
         return self._sandbox.listing
+
+    def _check(self, remote_path: str) -> None:
+        # Real Modal's filesystem API only accepts absolute paths; assert it here so a
+        # regression that let a relative path bypass `_resolve` fails in the fake the way it
+        # would in prod, instead of silently keying the in-memory store on a relative path.
+        assert posixpath.isabs(remote_path), f'Modal filesystem requires an absolute path, got {remote_path!r}'
+        if self._sandbox.fs_error is not None:
+            raise self._sandbox.fs_error
 
 
 class FakeSandbox:

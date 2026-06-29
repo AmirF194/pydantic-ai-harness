@@ -345,6 +345,16 @@ class TestCapability:
         with pytest.raises(ValueError, match='image, sandbox_timeout only apply'):
             ModalSandbox(sandbox_id='sb-keep', image='ubuntu:22.04', sandbox_timeout=600)
 
+    def test_attach_rejecting_sandbox_timeout_points_at_max_command_timeout(self) -> None:
+        # The reuse-mode redirect: a rejected sandbox_timeout names the setting that works.
+        with pytest.raises(ValueError, match='set `max_command_timeout`'):
+            ModalSandbox(sandbox_id='sb-keep', sandbox_timeout=600)
+
+    def test_attach_rejecting_other_settings_omits_the_ceiling_hint(self) -> None:
+        with pytest.raises(ValueError, match='workdir only apply') as exc:
+            ModalSandbox(sandbox_id='sb-keep', workdir='/work')
+        assert 'max_command_timeout' not in str(exc.value)
+
     async def test_session_with_only_defaults_is_allowed(self, fake_modal: FakeModal) -> None:
         async with ModalSandboxSession() as session:
             cap = ModalSandbox(session=session)
@@ -364,6 +374,11 @@ class TestCapability:
         async with ModalSandboxSession() as session:
             with pytest.raises(ValueError, match='env cannot be combined with `session`'):
                 ModalSandbox(session=session, env={'A': 'b'})
+
+    async def test_session_rejecting_sandbox_timeout_points_at_max_command_timeout(self, fake_modal: FakeModal) -> None:
+        async with ModalSandboxSession() as session:
+            with pytest.raises(ValueError, match='set `max_command_timeout`'):
+                ModalSandbox(session=session, sandbox_timeout=600)
 
     async def test_injected_session_instructions_say_persists(self, fake_modal: FakeModal) -> None:
         async with ModalSandboxSession() as session:
