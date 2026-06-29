@@ -158,6 +158,11 @@ command (`head`, `tail`, `sed -n`, `grep`) instead.
 - Custom-built images, mounts, or `modal.Secret`: `image` takes a registry tag,
   and `env` takes plain environment variables. For anything richer, create the
   sandbox yourself with the Modal SDK and pass it via `sandbox_id` or `session`.
+- Spilling full output to a file: when command output or a file read is
+  truncated, the model is pointed at a shell slice (`head`, `tail`, `sed -n`,
+  `offset`) rather than the whole output being written to a file in the sandbox
+  for it to open. This is a deliberate choice for now; the shell-slice hint
+  covers the same need without managing temporary files.
 
 Modal's SDK is asyncio-native, so the capability drives its async (`.aio`) API
 directly and requires an asyncio event loop (it does not run under trio).
