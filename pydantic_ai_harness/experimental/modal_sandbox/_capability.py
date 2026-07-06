@@ -37,7 +37,7 @@ _ATTACHED_INSTRUCTIONS = (
 
 
 @dataclass
-class ModalSandbox(AbstractCapability[AgentDepsT]):
+class ModalSandboxCapability(AbstractCapability[AgentDepsT]):
     """Access to an isolated cloud sandbox powered by [Modal](https://modal.com).
 
     Gives the agent tools to run commands and manage files inside a Modal sandbox,
@@ -53,9 +53,9 @@ class ModalSandbox(AbstractCapability[AgentDepsT]):
 
     ```python
     from pydantic_ai import Agent
-    from pydantic_ai_harness.experimental.modal_sandbox import ModalSandbox
+    from pydantic_ai_harness.experimental.modal_sandbox import ModalSandboxCapability
 
-    agent = Agent('anthropic:claude-sonnet-4-6', capabilities=[ModalSandbox()])
+    agent = Agent('anthropic:claude-sonnet-4-6', capabilities=[ModalSandboxCapability()])
     result = agent.run_sync('Write a Python script that prints the first 10 primes and run it.')
     print(result.output)
     ```

@@ -1,4 +1,4 @@
-# ModalSandbox
+# ModalSandboxCapability
 
 Give an agent an isolated, ephemeral cloud sandbox, powered by
 [Modal](https://modal.com), to run commands and manage files in without
@@ -13,16 +13,16 @@ clean container, use it for a task, and have it disposed of automatically.
 
 ## The solution
 
-`ModalSandbox` gives the agent shell and file tools wired to a
+`ModalSandboxCapability` gives the agent shell and file tools wired to a
 [Modal sandbox](https://modal.com/docs/guide/sandbox). By default each run gets a
 fresh sandbox created from an image and terminated when the run ends; the
 container is the isolation boundary.
 
 ```python
 from pydantic_ai import Agent
-from pydantic_ai_harness.experimental.modal_sandbox import ModalSandbox
+from pydantic_ai_harness.experimental.modal_sandbox import ModalSandboxCapability
 
-agent = Agent('anthropic:claude-sonnet-4-6', capabilities=[ModalSandbox()])
+agent = Agent('anthropic:claude-sonnet-4-6', capabilities=[ModalSandboxCapability()])
 
 result = agent.run_sync('Write a Python script that prints the first 10 primes and run it.')
 print(result.output)
@@ -60,8 +60,9 @@ come back as a retry prompt.
 
 The cap also bounds memory, not just what the model sees: a command that floods
 `stdout` has only its last `max_output_bytes` retained client-side (whole output
-chunks are dropped from the front, so a multi-byte character is never split), so
-runaway output cannot exhaust memory.
+chunks are dropped from the front). Command output is read as bytes and decoded
+as UTF-8 with `errors='replace'`, so binary or invalid UTF-8 output is reported
+with replacement characters instead of crashing the run.
 
 ## Failure handling
 
@@ -89,7 +90,7 @@ sandbox across runs when you want to avoid it. There are two ways to reuse one.
 id. It is never terminated by the capability:
 
 ```python
-ModalSandbox(sandbox_id='sb-abc123')   # attach to an existing sandbox
+ModalSandboxCapability(sandbox_id='sb-abc123')   # attach to an existing sandbox
 ```
 
 **Inject a session** you own to reuse one sandbox across runs while controlling
@@ -99,11 +100,11 @@ terminates it, so the owner decides when the sandbox goes away, and can read its
 
 ```python
 from pydantic_ai import Agent
-from pydantic_ai_harness.experimental.modal_sandbox import ModalSandbox, ModalSandboxSession
+from pydantic_ai_harness.experimental.modal_sandbox import ModalSandboxCapability, ModalSandboxSession
 
 async with ModalSandboxSession(image='python:3.12-slim') as session:
     print(session.sandbox_id)   # the running sandbox id
-    agent = Agent('anthropic:claude-sonnet-4-6', capabilities=[ModalSandbox(session=session)])
+    agent = Agent('anthropic:claude-sonnet-4-6', capabilities=[ModalSandboxCapability(session=session)])
     await agent.run('clone the repo and install deps')   # same sandbox...
     await agent.run('run the test suite')                # ...reused across runs
 # the session and its sandbox are torn down here, by the code that owns them
@@ -132,7 +133,7 @@ The capability is built around that:
   owner controls that), so an in-flight command there is bounded only by its
   deadline.
 
-`ModalSandbox` is the supported entry point. The capability is built in two
+`ModalSandboxCapability` is the supported entry point. The capability is built in two
 layers -- a session that owns the sandbox mechanism (commands, file access,
 lifecycle) and a toolset that presents it to the model -- kept separate so the
 internals can change without affecting the tools. The session is also usable on
@@ -149,7 +150,7 @@ async with ModalSandboxSession(image='python:3.12-slim') as session:
 ## Configuration
 
 ```python
-ModalSandbox(
+ModalSandboxCapability(
     image='python:3.12-slim',     # registry image for owned sandboxes
     sandbox_id=None,              # attach to an existing sandbox instead of creating one
     session=None,                 # reuse a ModalSandboxSession you own across runs
@@ -208,23 +209,23 @@ tree consistent.
 
 ## Agent spec (YAML/JSON)
 
-`ModalSandbox` works with Pydantic AI's
+`ModalSandboxCapability` works with Pydantic AI's
 [agent spec](https://ai.pydantic.dev/agent-spec/):
 
 ```yaml
 # agent.yaml
 model: anthropic:claude-sonnet-4-6
 capabilities:
-  - ModalSandbox:
+  - ModalSandboxCapability:
       image: python:3.12-slim
       sandbox_timeout: 600
 ```
 
 ```python
 from pydantic_ai import Agent
-from pydantic_ai_harness.experimental.modal_sandbox import ModalSandbox
+from pydantic_ai_harness.experimental.modal_sandbox import ModalSandboxCapability
 
-agent = Agent.from_file('agent.yaml', custom_capability_types=[ModalSandbox])
+agent = Agent.from_file('agent.yaml', custom_capability_types=[ModalSandboxCapability])
 ```
 
 ## Further reading

@@ -1,4 +1,4 @@
-"""A controllable fake `modal` SDK for ModalSandbox tests.
+"""A controllable fake `modal` SDK for ModalSandboxCapability tests.
 
 Tests never reach real Modal: a fake `modal` module is injected into `sys.modules`
 (via the `fake_modal` fixture in `conftest.py`), so the lazy `import modal` inside
@@ -16,18 +16,26 @@ from typing import Any
 
 import anyio.lowlevel
 
+StreamData = bytes | str
 # A responder maps (argv, timeout) to (stdout, stderr, exit_code).
-Responder = Callable[[list[str], 'int | None'], 'tuple[str, str, int]']
+Responder = Callable[[list[str], 'int | None'], 'tuple[StreamData, StreamData, int]']
 
 
-def _echo_responder(argv: list[str], timeout: int | None) -> tuple[str, str, int]:
-    return (' '.join(argv) + '\n', '', 0)
+def _echo_responder(argv: list[str], timeout: int | None) -> tuple[bytes, bytes, int]:
+    return (' '.join(argv) + '\n').encode(), b'', 0
+
+
+def _stream_bytes(data: StreamData) -> bytes:
+    if isinstance(data, bytes):
+        return data
+    return data.encode()
 
 
 @dataclass
 class ExecCall:
     argv: list[str]
     timeout: int | None
+    text: bool
 
 
 class _AioCallable:
@@ -61,11 +69,11 @@ class _FakeStream:
     single chunk (the realistic "one message" case, and what most tests want).
     """
 
-    def __init__(self, data: str, chunk_size: int | None) -> None:
+    def __init__(self, data: bytes, chunk_size: int | None) -> None:
         self._data = data
         self._chunk_size = chunk_size
         self.read = _AioCallable(lambda: self._data)
-        self._pending: list[str] = []
+        self._pending: list[bytes] = []
         self._pos = 0
 
     def __aiter__(self) -> _FakeStream:
@@ -76,7 +84,7 @@ class _FakeStream:
         self._pos = 0
         return self
 
-    async def __anext__(self) -> str:
+    async def __anext__(self) -> bytes:
         if self._pos >= len(self._pending):
             raise StopAsyncIteration
         piece = self._pending[self._pos]
@@ -85,7 +93,7 @@ class _FakeStream:
 
 
 class _FakeProcess:
-    def __init__(self, stdout: str, stderr: str, returncode: int, chunk_size: int | None) -> None:
+    def __init__(self, stdout: bytes, stderr: bytes, returncode: int, chunk_size: int | None) -> None:
         self.stdout = _FakeStream(stdout, chunk_size)
         self.stderr = _FakeStream(stderr, chunk_size)
         self._returncode = returncode
@@ -123,6 +131,10 @@ class FakeSandboxFilesystemError(FakeModalError):
 
 class FakeSandboxFilesystemNotFoundError(FakeSandboxFilesystemError):
     """Stand-in for `modal.exception.SandboxFilesystemNotFoundError` (a missing file, recoverable)."""
+
+
+class FakeSandboxFilesystemPathAlreadyExistsError(FakeSandboxFilesystemError):
+    """Stand-in for `modal.exception.SandboxFilesystemPathAlreadyExistsError`."""
 
 
 @dataclass
@@ -164,6 +176,8 @@ class _FakeFilesystem:
 
     def _make_directory(self, remote_path: str, *, create_parents: bool = True) -> None:
         self._check(remote_path)
+        if self._sandbox.make_directory_error is not None:
+            raise self._sandbox.make_directory_error
         self._sandbox.made_dirs.append(remote_path)
 
     def _list_files(self, remote_path: str) -> list[FileInfo]:
@@ -191,6 +205,7 @@ class FakeSandbox:
         self.exec = _AioCallable(self._exec)
         self.terminate = _AioCallable(self._terminate)
         self.detach = _AioCallable(self._detach)
+        self.poll = _AioCallable(self._poll)
         # Filesystem state the tests read and write.
         self.files: dict[str, bytes] = {}
         # Lets a test report a large size for a path without allocating the bytes.
@@ -199,17 +214,19 @@ class FakeSandbox:
         self.list_paths: list[str] = []
         self.listing: list[FileInfo] = []
         self.fs_error: Exception | None = None
+        self.make_directory_error: Exception | None = None
+        self.poll_result: int | None = None
         self._filesystem = _FakeFilesystem(self)
 
     @property
     def filesystem(self) -> _FakeFilesystem:
         return self._filesystem
 
-    def _exec(self, *args: str, timeout: int | None = None, **kwargs: object) -> _FakeProcess:
+    def _exec(self, *args: str, timeout: int | None = None, text: bool = True, **kwargs: object) -> _FakeProcess:
         argv = list(args)
-        self.exec_calls.append(ExecCall(argv=argv, timeout=timeout))
+        self.exec_calls.append(ExecCall(argv=argv, timeout=timeout, text=text))
         stdout, stderr, code = self._control.responder(argv, timeout)
-        return _FakeProcess(stdout, stderr, code, self._control.output_chunk_size)
+        return _FakeProcess(_stream_bytes(stdout), _stream_bytes(stderr), code, self._control.output_chunk_size)
 
     def _terminate(self) -> None:
         if self.terminate_error is not None:
@@ -218,6 +235,13 @@ class FakeSandbox:
 
     def _detach(self) -> None:
         self.detached = True
+
+    def _poll(self) -> int | None:
+        if self.poll_result is not None:
+            return self.poll_result
+        if self.terminated:
+            return 0
+        return None
 
 
 class FakeModal:
@@ -232,6 +256,7 @@ class FakeModal:
         self.attach_ids: list[str] = []
         self.create_error: Exception | None = None
         self.attach_error: Exception | None = None
+        self.attach_poll_result: int | None = None
         # How the fake splits exec output when the bounded reader iterates it; None yields the
         # whole output as one chunk. A test bounding output sets a small size to force drops.
         self.output_chunk_size: int | None = None
@@ -263,6 +288,10 @@ class FakeModal:
         """A missing *file* (Modal `SandboxFilesystemNotFoundError`) -- recoverable, retried."""
         return FakeSandboxFilesystemNotFoundError
 
+    @property
+    def path_already_exists_type(self) -> type[Exception]:
+        return FakeSandboxFilesystemPathAlreadyExistsError
+
     def _build_module(self) -> types.ModuleType:
         control = self
         module = types.ModuleType('modal')
@@ -288,6 +317,7 @@ class FakeModal:
             if control.attach_error is not None:
                 raise control.attach_error
             sandbox = FakeSandbox(control, sandbox_id)
+            sandbox.poll_result = control.attach_poll_result
             control.sandboxes.append(sandbox)
             return sandbox
 
@@ -312,5 +342,6 @@ class FakeModal:
             SandboxTimeoutError=FakeSandboxTimeoutError,
             SandboxFilesystemError=FakeSandboxFilesystemError,
             SandboxFilesystemNotFoundError=FakeSandboxFilesystemNotFoundError,
+            SandboxFilesystemPathAlreadyExistsError=FakeSandboxFilesystemPathAlreadyExistsError,
         )
         return module

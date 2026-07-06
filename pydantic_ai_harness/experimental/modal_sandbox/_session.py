@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import codecs
 import math
 import posixpath
 from collections import deque
+from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
@@ -62,7 +64,7 @@ class ExecResult:
 
 
 _MISSING_MODAL = (
-    "The 'modal' package is required for the ModalSandbox capability. "
+    "The 'modal' package is required for ModalSandboxCapability. "
     'Install it with `pip install "pydantic-ai-harness[modal]"`.'
 )
 
@@ -203,7 +205,12 @@ class ModalSandboxSession:
         import modal
 
         if self._sandbox_id is not None:
-            return await modal.Sandbox.from_id.aio(self._sandbox_id)
+            sandbox = await modal.Sandbox.from_id.aio(self._sandbox_id)
+            if await sandbox.poll.aio() is not None:
+                raise ModalSandboxUnavailableError(
+                    f'Could not attach to Modal sandbox {self._sandbox_id!r}: it does not exist or has terminated.'
+                )
+            return sandbox
         app = await modal.App.lookup.aio(self._app_name, create_if_missing=self._create_app_if_missing)
         # `from_registry` builds the image spec locally (no network), so it has no `.aio` variant.
         # Its typing uses an untyped `**kwargs`, so pyright flags the access.
@@ -281,7 +288,7 @@ class ModalSandboxSession:
         return ModalSandboxError(f'Could not start Modal sandbox: {e}')
 
     def _use_error(self, e: modal.exception.Error, context: str | None = None) -> ModalSandboxError:
-        """Map a Modal error raised while *using* the sandbox to a ModalSandbox error.
+        """Map a Modal error raised while *using* the sandbox to a ModalSandboxCapability error.
 
         A terminated or missing sandbox and rejected credentials are terminal -- retrying cannot
         help, so the toolset ends the run instead of prompting the model to try again.
@@ -362,9 +369,9 @@ class ModalSandboxSession:
         deadline = None if timeout is None else max(1, math.ceil(timeout))
         # Modal buffers exec output server-side and streams it over its own connection,
         # so draining stdout then stderr before waiting cannot deadlock the way OS pipes
-        # would. `text=True` (Modal's default) makes the streams yield str.
+        # would. Modal's text mode decodes strictly, so read bytes and decode here.
         try:
-            process = await sandbox.exec.aio(*argv, timeout=deadline)
+            process = await sandbox.exec.aio(*argv, timeout=deadline, text=False)
             stdout = await self._read_stream(process.stdout, max_output_bytes)
             stderr = await self._read_stream(process.stderr, max_output_bytes)
             returncode = await process.wait.aio()
@@ -382,27 +389,34 @@ class ModalSandboxSession:
         )
 
     @staticmethod
-    async def _read_stream(stream: modal.io_streams.StreamReader[str], max_output_bytes: int | None) -> str:
+    def _decode_stream_chunks(chunks: Iterable[bytes]) -> str:
+        decoder = codecs.getincrementaldecoder('utf-8')(errors='replace')
+        parts = [decoder.decode(chunk, final=False) for chunk in chunks]
+        parts.append(decoder.decode(b'', final=True))
+        return ''.join(parts)
+
+    @staticmethod
+    async def _read_stream(stream: modal.io_streams.StreamReader[bytes], max_output_bytes: int | None) -> str:
         """Drain a Modal exec stream, optionally retaining only its last `max_output_bytes`.
 
         Unbounded (`max_output_bytes is None`) reads the whole stream in one call. Bounded
         keeps a ring of the most recent chunks: once the retained bytes exceed the cap the
         oldest whole chunk is dropped, so retention overshoots by at most one transport chunk
         and the newest output -- where a command's error and exit status sit -- always
-        survives. Whole chunks are dropped, never split, so a multi-byte character is intact.
+        survives. Retained bytes are decoded as UTF-8 with replacement after chunk selection.
         """
         if max_output_bytes is None:
-            return await stream.read.aio()
-        chunks: deque[tuple[str, int]] = deque()
+            return ModalSandboxSession._decode_stream_chunks([await stream.read.aio()])
+        chunks: deque[tuple[bytes, int]] = deque()
         retained = 0
         async for chunk in stream:
-            size = len(chunk.encode('utf-8'))
+            size = len(chunk)
             chunks.append((chunk, size))
             retained += size
             while retained > max_output_bytes and len(chunks) > 1:
                 _, dropped = chunks.popleft()
                 retained -= dropped
-        return ''.join(text for text, _ in chunks)
+        return ModalSandboxSession._decode_stream_chunks(chunk for chunk, _ in chunks)
 
     async def file_size(self, path: str) -> int:
         """Return a file's size in bytes via Modal's filesystem API, without reading it.
@@ -466,7 +480,10 @@ class ModalSandboxSession:
         parent = posixpath.dirname(target)
         try:
             if parent.strip('/'):
-                await sandbox.filesystem.make_directory.aio(parent, create_parents=True)
+                try:
+                    await sandbox.filesystem.make_directory.aio(parent, create_parents=True)
+                except modal.exception.SandboxFilesystemPathAlreadyExistsError:
+                    pass
             await sandbox.filesystem.write_bytes.aio(data, target)
         except modal.exception.Error as e:
             raise self._use_error(e) from e

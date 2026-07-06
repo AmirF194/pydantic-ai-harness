@@ -1,4 +1,4 @@
-"""Tests for the ModalSandbox capability and ModalSandboxToolset."""
+"""Tests for the ModalSandboxCapability and ModalSandboxToolset."""
 
 from __future__ import annotations
 
@@ -8,7 +8,7 @@ from pydantic_ai.exceptions import ModelRetry
 from pydantic_ai.models.test import TestModel
 
 from pydantic_ai_harness.experimental.modal_sandbox import (
-    ModalSandbox,
+    ModalSandboxCapability,
     ModalSandboxError,
     ModalSandboxSession,
     ModalSandboxToolset,
@@ -353,7 +353,7 @@ class TestInjectedSession:
 
 class TestCapability:
     def test_defaults(self) -> None:
-        cap = ModalSandbox()
+        cap = ModalSandboxCapability()
         assert cap.image == 'python:3.12-slim'
         assert cap.sandbox_id is None
         assert cap.app_name == 'pydantic-ai-harness'
@@ -361,10 +361,10 @@ class TestCapability:
         assert cap.default_command_timeout == 60.0
 
     def test_get_toolset(self) -> None:
-        assert isinstance(ModalSandbox().get_toolset(), ModalSandboxToolset)
+        assert isinstance(ModalSandboxCapability().get_toolset(), ModalSandboxToolset)
 
     def test_attach_with_only_defaults_is_allowed(self) -> None:
-        cap = ModalSandbox(sandbox_id='sb-keep')
+        cap = ModalSandboxCapability(sandbox_id='sb-keep')
         assert cap.sandbox_id == 'sb-keep'
 
     @pytest.mark.parametrize(
@@ -380,80 +380,80 @@ class TestCapability:
     )
     def test_attach_rejects_owned_only_settings(self, kwargs: dict[str, object], expected: str) -> None:
         with pytest.raises(ValueError, match=f'{expected} only apply when creating a sandbox'):
-            ModalSandbox(sandbox_id='sb-keep', **kwargs)  # type: ignore[arg-type]
+            ModalSandboxCapability(sandbox_id='sb-keep', **kwargs)  # type: ignore[arg-type]
 
     def test_attach_error_lists_every_conflicting_setting(self) -> None:
         with pytest.raises(ValueError, match='image, sandbox_timeout only apply'):
-            ModalSandbox(sandbox_id='sb-keep', image='ubuntu:22.04', sandbox_timeout=600)
+            ModalSandboxCapability(sandbox_id='sb-keep', image='ubuntu:22.04', sandbox_timeout=600)
 
     def test_attach_rejecting_sandbox_timeout_points_at_max_command_timeout(self) -> None:
         # The reuse-mode redirect: a rejected sandbox_timeout names the setting that works.
         with pytest.raises(ValueError, match='set `max_command_timeout`'):
-            ModalSandbox(sandbox_id='sb-keep', sandbox_timeout=600)
+            ModalSandboxCapability(sandbox_id='sb-keep', sandbox_timeout=600)
 
     def test_attach_rejecting_other_settings_omits_the_ceiling_hint(self) -> None:
         with pytest.raises(ValueError, match='workdir only apply') as exc:
-            ModalSandbox(sandbox_id='sb-keep', workdir='/work')
+            ModalSandboxCapability(sandbox_id='sb-keep', workdir='/work')
         assert 'max_command_timeout' not in str(exc.value)
 
     async def test_session_with_only_defaults_is_allowed(self, fake_modal: FakeModal) -> None:
         async with ModalSandboxSession() as session:
-            cap = ModalSandbox(session=session)
+            cap = ModalSandboxCapability(session=session)
             assert cap.session is session
 
     async def test_session_rejects_sandbox_id(self, fake_modal: FakeModal) -> None:
         async with ModalSandboxSession() as session:
             with pytest.raises(ValueError, match='sandbox_id cannot be combined with `session`'):
-                ModalSandbox(session=session, sandbox_id='sb-keep')
+                ModalSandboxCapability(session=session, sandbox_id='sb-keep')
 
     async def test_session_rejects_owned_settings(self, fake_modal: FakeModal) -> None:
         async with ModalSandboxSession() as session:
             with pytest.raises(ValueError, match='image cannot be combined with `session`'):
-                ModalSandbox(session=session, image='ubuntu:22.04')
+                ModalSandboxCapability(session=session, image='ubuntu:22.04')
 
     async def test_session_rejects_env(self, fake_modal: FakeModal) -> None:
         async with ModalSandboxSession() as session:
             with pytest.raises(ValueError, match='env cannot be combined with `session`'):
-                ModalSandbox(session=session, env={'A': 'b'})
+                ModalSandboxCapability(session=session, env={'A': 'b'})
 
     async def test_session_rejecting_sandbox_timeout_points_at_max_command_timeout(self, fake_modal: FakeModal) -> None:
         async with ModalSandboxSession() as session:
             with pytest.raises(ValueError, match='set `max_command_timeout`'):
-                ModalSandbox(session=session, sandbox_timeout=600)
+                ModalSandboxCapability(session=session, sandbox_timeout=600)
 
     async def test_injected_session_instructions_say_persists(self, fake_modal: FakeModal) -> None:
         async with ModalSandboxSession() as session:
-            instructions = ModalSandbox(session=session).get_instructions()
+            instructions = ModalSandboxCapability(session=session).get_instructions()
             assert instructions is not None
             assert 'persists across sessions' in instructions
 
     def test_instructions_enabled_by_default(self) -> None:
-        instructions = ModalSandbox().get_instructions()
+        instructions = ModalSandboxCapability().get_instructions()
         assert instructions is not None
         assert 'Modal sandbox' in instructions
         assert 'run_command' in instructions
 
     def test_instructions_can_be_disabled(self) -> None:
-        assert ModalSandbox(include_instructions=False).get_instructions() is None
+        assert ModalSandboxCapability(include_instructions=False).get_instructions() is None
 
     def test_owned_instructions_say_reset_between_sessions(self) -> None:
-        instructions = ModalSandbox().get_instructions()
+        instructions = ModalSandboxCapability().get_instructions()
         assert instructions is not None
         assert 'reset between' in instructions
 
     def test_attached_instructions_say_persists(self) -> None:
-        instructions = ModalSandbox(sandbox_id='sb-keep').get_instructions()
+        instructions = ModalSandboxCapability(sandbox_id='sb-keep').get_instructions()
         assert instructions is not None
         assert 'persists across sessions' in instructions
         assert 'reset between' not in instructions
 
     def test_exported_from_experimental_namespace(self) -> None:
         import pydantic_ai_harness
-        from pydantic_ai_harness.experimental.modal_sandbox import ModalSandbox as Exported
+        from pydantic_ai_harness.experimental.modal_sandbox import ModalSandboxCapability as Exported
 
-        assert Exported is ModalSandbox
+        assert Exported is ModalSandboxCapability
         # Experimental capabilities are reached via the experimental namespace, not the package root.
-        assert 'ModalSandbox' not in pydantic_ai_harness.__all__
+        assert 'ModalSandboxCapability' not in pydantic_ai_harness.__all__
 
     @pytest.mark.anyio(backends=['asyncio'])
     async def test_agent_integration(self, fake_modal: FakeModal) -> None:
@@ -462,7 +462,7 @@ class TestCapability:
         if sniffio.current_async_library() != 'asyncio':  # pragma: no cover
             pytest.skip('Agent.run() requires asyncio')
         model = TestModel(custom_output_text='done', call_tools=[])
-        agent: Agent[None, str] = Agent(model, capabilities=[ModalSandbox()])
+        agent: Agent[None, str] = Agent(model, capabilities=[ModalSandboxCapability()])
         result = await agent.run('set up the project')
         assert result.output == 'done'
         assert fake_modal.sandboxes[0].terminated is True

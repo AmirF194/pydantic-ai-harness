@@ -48,6 +48,7 @@ class TestOwnedLifecycle:
         # An owned sandbox is terminated and the client detached on exit.
         assert fake_modal.sandboxes[0].terminated is True
         assert fake_modal.sandboxes[0].detached is True
+        assert await fake_modal.sandboxes[0].poll.aio() == 0
 
     async def test_default_app_and_image(self, fake_modal: FakeModal) -> None:
         async with ModalSandboxSession():
@@ -117,6 +118,13 @@ class TestAttachLifecycle:
         # An attached sandbox keeps running (no terminate) but the client is detached.
         assert fake_modal.sandboxes[0].terminated is False
         assert fake_modal.sandboxes[0].detached is True
+
+    async def test_attach_to_terminated_sandbox_fails_at_enter(self, fake_modal: FakeModal) -> None:
+        fake_modal.attach_poll_result = 0
+        with pytest.raises(ModalSandboxUnavailableError, match='does not exist or has terminated'):
+            async with ModalSandboxSession(sandbox_id='sb-finished'):
+                pass  # pragma: no cover
+        assert fake_modal.attach_ids == ['sb-finished']
 
 
 class TestErrors:
@@ -189,6 +197,7 @@ class TestExec:
             call = fake_modal.sandboxes[0].exec_calls[-1]
             assert call.argv == ['whatever']
             assert call.timeout == 5
+            assert call.text is False
 
     async def test_zero_exit_code(self, fake_modal: FakeModal) -> None:
         fake_modal.responder = lambda argv, timeout: ('done\n', '', 0)
@@ -257,6 +266,25 @@ class TestExec:
             result = await session.exec(['x'], max_output_bytes=100)
             assert result.stdout == 'short'
 
+    async def test_invalid_utf8_output_uses_replacement_characters(self, fake_modal: FakeModal) -> None:
+        fake_modal.responder = lambda argv, timeout: (b'\xff\xfeok', b'', 0)
+        async with ModalSandboxSession() as session:
+            result = await session.exec(['binary'])
+            assert result.stdout == '\ufffd\ufffdok'
+
+    async def test_incomplete_utf8_tail_uses_replacement_character(self, fake_modal: FakeModal) -> None:
+        fake_modal.responder = lambda argv, timeout: (b'ok\xe2\x82', b'', 0)
+        async with ModalSandboxSession() as session:
+            result = await session.exec(['partial'])
+            assert result.stdout == 'ok\ufffd'
+
+    async def test_bounded_output_decodes_split_utf8_chunks(self, fake_modal: FakeModal) -> None:
+        fake_modal.output_chunk_size = 1
+        fake_modal.responder = lambda argv, timeout: (b'\xe2\x82\xacOK', b'', 0)
+        async with ModalSandboxSession() as session:
+            result = await session.exec(['unicode'], max_output_bytes=16)
+            assert result.stdout == '\u20acOK'
+
     async def test_exec_on_terminated_sandbox_is_unavailable(self, fake_modal: FakeModal) -> None:
         # The sandbox died (e.g. hit its lifetime): exec against it is terminal, so the run can
         # end with an actionable message instead of retrying against a dead sandbox.
@@ -286,6 +314,12 @@ class TestFilesystem:
         sandbox = fake_modal.sandboxes[0]
         # Parent directories are created before the write.
         assert sandbox.made_dirs == ['/work/app']
+
+    async def test_existing_parent_directory_is_write_success(self, fake_modal: FakeModal) -> None:
+        async with ModalSandboxSession() as session:
+            fake_modal.sandboxes[0].make_directory_error = fake_modal.path_already_exists_type('already exists')
+            await session.write_bytes('/work/app/main.py', b'print(1)\n')
+            assert await session.read_bytes('/work/app/main.py') == b'print(1)\n'
 
     async def test_write_at_root_skips_make_directory(self, fake_modal: FakeModal) -> None:
         async with ModalSandboxSession() as session:
