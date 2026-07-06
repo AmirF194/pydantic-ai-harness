@@ -58,6 +58,26 @@ return the next `offset` to page from. A non-zero exit from `run_command` is rep
 raised, so the model can react to it; file-tool failures (missing path, etc.)
 come back as a retry prompt.
 
+The cap also bounds memory, not just what the model sees: a command that floods
+`stdout` has only its last `max_output_bytes` retained client-side (whole output
+chunks are dropped from the front, so a multi-byte character is never split), so
+runaway output cannot exhaust memory.
+
+## Failure handling
+
+Failures split into two kinds:
+
+- **Recoverable** -- a bad path, a command that exits non-zero, a transient
+  sandbox-side error. These come back to the model as a retry (`ModelRetry`) or,
+  for `run_command`, as reported output it can react to. Retrying can plausibly
+  work, so the run continues.
+- **Terminal** -- the sandbox itself is gone (terminated, or expired at its
+  `sandbox_timeout`) or the credentials were rejected. Re-running the command
+  cannot fix these, so the tool raises `ModalSandboxUnavailableError` /
+  `ModalSandboxTerminalError` and the run ends with an actionable message instead
+  of looping the model against a dead sandbox. If owned runs legitimately hit the
+  lifetime, raise `sandbox_timeout`.
+
 ## Sandbox lifetime
 
 By default the capability is **owned**: each run creates a fresh sandbox and
@@ -149,7 +169,19 @@ ModalSandbox(
 
 `read_file` loads a file fully before returning a window of it, so it refuses
 files larger than `max_read_bytes` and tells the model to slice them with a shell
-command (`head`, `tail`, `sed -n`, `grep`) instead.
+command (`head`, `tail`, `sed -n`, `grep`) instead. That guard reads the size from
+a `stat` first, so it bounds regular files with an honest, stable size. It is not
+a defense against a special or virtual file (a device like `/dev/zero`, a FIFO)
+whose reported size is misleading: Modal's filesystem API has no bounded read, so
+such a path would still transfer unboundedly. Use `run_command` for those. The
+worst case is bounded by the owned sandbox's `sandbox_timeout` (which reaps it),
+but it can still cost memory within that window, so keep the file tools to real
+files and reach for a shell command otherwise.
+
+`list_directory` reads the whole directory listing before capping it (Modal has
+no streaming list API), so listing a directory with a very large number of
+entries costs memory proportional to the entry count. Point the model at a
+narrowed `run_command` (`ls | head`, `find -maxdepth`) for directories that big.
 
 ## Not yet supported
 

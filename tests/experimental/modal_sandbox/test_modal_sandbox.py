@@ -12,6 +12,7 @@ from pydantic_ai_harness.experimental.modal_sandbox import (
     ModalSandboxError,
     ModalSandboxSession,
     ModalSandboxToolset,
+    ModalSandboxUnavailableError,
 )
 
 from .fake_modal import FakeModal, FileInfo
@@ -122,12 +123,33 @@ class TestRunCommand:
 
     async def test_exec_failure_raises_model_retry(self, fake_modal: FakeModal) -> None:
         def boom(argv: list[str], timeout: int | None) -> tuple[str, str, int]:
-            raise fake_modal.error_type('sandbox gone')
+            raise fake_modal.error_type('transient blip')
 
         fake_modal.responder = boom
         async with _toolset() as ts:
-            with pytest.raises(ModelRetry, match='Command could not run in the sandbox: sandbox gone'):
+            with pytest.raises(ModelRetry, match='Command could not run in the sandbox: transient blip'):
                 await ts.run_command('echo hi')
+
+    async def test_terminal_failure_ends_the_run(self, fake_modal: FakeModal) -> None:
+        # A dead sandbox is terminal: run_command must not turn it into a ModelRetry (which
+        # would loop the model against a sandbox that is never coming back). It propagates.
+        def gone(argv: list[str], timeout: int | None) -> tuple[str, str, int]:
+            raise fake_modal.sandbox_terminated_type('sandbox terminated')
+
+        fake_modal.responder = gone
+        async with _toolset() as ts:
+            with pytest.raises(ModalSandboxUnavailableError, match='no longer running'):
+                await ts.run_command('echo hi')
+
+    async def test_output_is_bounded_end_to_end(self, fake_modal: FakeModal) -> None:
+        # A command that floods stdout is capped before it reaches the model, and the cut is
+        # marked. One-char chunks drive the session's bounded reader.
+        fake_modal.output_chunk_size = 1
+        fake_modal.responder = lambda argv, timeout: ('A' * 500 + 'END', '', 0)
+        async with _toolset(max_output_bytes=50) as ts:
+            result = await ts.run_command('flood')
+        assert 'output truncated' in result
+        assert result.endswith('END')  # the tail, where the exit status lives, survives
 
 
 class TestReadFile:
@@ -195,12 +217,19 @@ class TestReadFile:
             with pytest.raises(ModelRetry, match='over the 1000B read limit'):
                 await ts.read_file('/grows')
 
+    async def test_terminal_error_ends_the_run(self, fake_modal: FakeModal) -> None:
+        # A missing sandbox during a read is terminal, not a retryable "could not read".
+        async with _toolset() as ts:
+            fake_modal.sandboxes[0].fs_error = fake_modal.unavailable_type('sandbox not found')
+            with pytest.raises(ModalSandboxUnavailableError):
+                await ts.read_file('/x')
+
 
 class TestWriteFile:
     async def test_writes_and_creates_parents(self, fake_modal: FakeModal) -> None:
         async with _toolset() as ts:
             result = await ts.write_file('/tmp/pkg/a.py', 'print(1)\n')
-        assert result == "Wrote 9 characters to '/tmp/pkg/a.py'."
+        assert result == "Wrote 9 bytes to '/tmp/pkg/a.py'."
         sandbox = fake_modal.sandboxes[0]
         assert sandbox.files['/tmp/pkg/a.py'] == b'print(1)\n'
         assert sandbox.made_dirs == ['/tmp/pkg']
@@ -210,6 +239,12 @@ class TestWriteFile:
             fake_modal.sandboxes[0].fs_error = fake_modal.filesystem_error_type('Permission denied: /root/x')
             with pytest.raises(ModelRetry, match="Could not write '/root/x': Permission denied"):
                 await ts.write_file('/root/x', 'data')
+
+    async def test_terminal_error_ends_the_run(self, fake_modal: FakeModal) -> None:
+        async with _toolset() as ts:
+            fake_modal.sandboxes[0].fs_error = fake_modal.unavailable_type('sandbox not found')
+            with pytest.raises(ModalSandboxUnavailableError):
+                await ts.write_file('/x', 'data')
 
 
 class TestListDirectory:
@@ -238,6 +273,12 @@ class TestListDirectory:
             fake_modal.sandboxes[0].fs_error = fake_modal.filesystem_error_type('Not a directory: /etc/hosts')
             with pytest.raises(ModelRetry, match="Could not list '/etc/hosts': Not a directory"):
                 await ts.list_directory('/etc/hosts')
+
+    async def test_terminal_error_ends_the_run(self, fake_modal: FakeModal) -> None:
+        async with _toolset() as ts:
+            fake_modal.sandboxes[0].fs_error = fake_modal.unavailable_type('sandbox not found')
+            with pytest.raises(ModalSandboxUnavailableError):
+                await ts.list_directory('/x')
 
 
 class TestToolsetLifecycle:

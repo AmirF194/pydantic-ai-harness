@@ -8,7 +8,12 @@ import sys
 import anyio
 import pytest
 
-from pydantic_ai_harness.experimental.modal_sandbox import ModalSandboxError, ModalSandboxSession
+from pydantic_ai_harness.experimental.modal_sandbox import (
+    ModalSandboxError,
+    ModalSandboxSession,
+    ModalSandboxTerminalError,
+    ModalSandboxUnavailableError,
+)
 from pydantic_ai_harness.experimental.modal_sandbox import _session as session_module
 
 from .fake_modal import FakeModal, FileInfo, _AioCallable
@@ -64,6 +69,16 @@ class TestOwnedLifecycle:
         with pytest.raises(RuntimeError, match='terminate boom'):
             await session.__aexit__(None, None, None)
         # The client is detached even though terminate raised, so the attachment is not leaked.
+        assert fake_modal.sandboxes[0].detached is True
+
+    async def test_terminating_an_already_gone_sandbox_is_not_an_error(self, fake_modal: FakeModal) -> None:
+        # An owned run that outlived its sandbox_timeout self-terminates; the teardown terminate
+        # then hits "already gone". That is success, not a failure to raise -- a raise here would
+        # mask the terminal error the tool already surfaced.
+        session = ModalSandboxSession()
+        await session.__aenter__()
+        fake_modal.sandboxes[0].terminate_error = fake_modal.sandbox_terminated_type('already terminated')
+        await session.__aexit__(None, None, None)
         assert fake_modal.sandboxes[0].detached is True
 
     async def test_teardown_bounded_when_terminate_hangs(
@@ -130,6 +145,40 @@ class TestErrors:
         with pytest.raises(ModalSandboxError, match='sandbox is not running'):
             await session.exec(['echo', 'hi'])
 
+    async def test_create_auth_error_is_terminal(self, fake_modal: FakeModal) -> None:
+        # Rejected credentials cannot be fixed by retrying, so surface a terminal error with
+        # an actionable message rather than a generic create failure.
+        fake_modal.create_error = fake_modal.auth_type('bad token')
+        with pytest.raises(ModalSandboxTerminalError, match='Modal rejected the credentials'):
+            async with ModalSandboxSession():
+                pass  # pragma: no cover
+
+    async def test_attach_to_missing_sandbox_is_unavailable(self, fake_modal: FakeModal) -> None:
+        # Attaching to an id that does not exist (or has terminated) is terminal: there is no
+        # sandbox to talk to, so retrying cannot help.
+        fake_modal.attach_error = fake_modal.unavailable_type('no such sandbox')
+        with pytest.raises(ModalSandboxUnavailableError, match='does not exist or has terminated'):
+            async with ModalSandboxSession(sandbox_id='sb-missing'):
+                pass  # pragma: no cover
+
+    async def test_owned_create_raising_gone_maps_to_unavailable(self, fake_modal: FakeModal) -> None:
+        # An owned create that comes back already gone (e.g. the app was deleted mid-create) is
+        # terminal too, with the lifetime-oriented message rather than the attach one.
+        fake_modal.create_error = fake_modal.unavailable_type('vanished mid-create')
+        with pytest.raises(ModalSandboxUnavailableError, match='no longer running'):
+            async with ModalSandboxSession():
+                pass  # pragma: no cover
+
+    async def test_create_timeout_does_not_hang(self, fake_modal: FakeModal, monkeypatch: pytest.MonkeyPatch) -> None:
+        # A wedged control plane must not make enter uncancellable: the bounded, shielded
+        # create gives up after its deadline and fails instead of hanging forever.
+        monkeypatch.setattr(session_module, '_CREATE_TIMEOUT', 0.05)
+        fake_modal.module.Sandbox.create = _HangingCall()  # type: ignore[attr-defined]
+        with anyio.fail_after(5):
+            with pytest.raises(ModalSandboxError, match='did not complete within'):
+                async with ModalSandboxSession():
+                    pass  # pragma: no cover
+
 
 class TestExec:
     async def test_returns_stdout_stderr_nonzero_code(self, fake_modal: FakeModal) -> None:
@@ -179,6 +228,53 @@ class TestExec:
         fake_modal.responder = boom
         async with ModalSandboxSession() as session:
             with pytest.raises(ModalSandboxError, match='Command could not run in the sandbox: exec boom'):
+                await session.exec(['whatever'])
+
+    async def test_sentinel_without_deadline_is_not_a_timeout(self, fake_modal: FakeModal) -> None:
+        # -1 is only Modal's timeout sentinel when we set a deadline. With no deadline, a -1
+        # from some other cause must not be mislabelled as a timeout.
+        fake_modal.responder = lambda argv, timeout: ('', '', -1)
+        async with ModalSandboxSession() as session:
+            result = await session.exec(['x'])
+            assert result.returncode == -1
+            assert result.timed_out is False
+
+    async def test_bounded_output_keeps_the_tail(self, fake_modal: FakeModal) -> None:
+        # A flood of output must not balloon client memory: with a cap only the last bytes are
+        # retained. One-char chunks make the drop loop run per character.
+        fake_modal.output_chunk_size = 1
+        fake_modal.responder = lambda argv, timeout: ('0123456789', 'ABCDEFGHIJ', 0)
+        async with ModalSandboxSession() as session:
+            result = await session.exec(['big'], timeout=5, max_output_bytes=4)
+            # The end of each stream survives -- that is where errors and exit status sit.
+            assert result.stdout == '6789'
+            assert result.stderr == 'GHIJ'
+
+    async def test_bounded_output_under_cap_is_whole(self, fake_modal: FakeModal) -> None:
+        fake_modal.output_chunk_size = 1
+        fake_modal.responder = lambda argv, timeout: ('short', '', 0)
+        async with ModalSandboxSession() as session:
+            result = await session.exec(['x'], max_output_bytes=100)
+            assert result.stdout == 'short'
+
+    async def test_exec_on_terminated_sandbox_is_unavailable(self, fake_modal: FakeModal) -> None:
+        # The sandbox died (e.g. hit its lifetime): exec against it is terminal, so the run can
+        # end with an actionable message instead of retrying against a dead sandbox.
+        def gone(argv: list[str], timeout: int | None) -> tuple[str, str, int]:
+            raise fake_modal.sandbox_terminated_type('sandbox terminated')
+
+        fake_modal.responder = gone
+        async with ModalSandboxSession(sandbox_timeout=120) as session:
+            with pytest.raises(ModalSandboxUnavailableError, match='no longer running'):
+                await session.exec(['whatever'])
+
+    async def test_exec_auth_error_is_terminal(self, fake_modal: FakeModal) -> None:
+        def denied(argv: list[str], timeout: int | None) -> tuple[str, str, int]:
+            raise fake_modal.auth_type('token expired')
+
+        fake_modal.responder = denied
+        async with ModalSandboxSession() as session:
+            with pytest.raises(ModalSandboxTerminalError, match='Modal rejected the credentials'):
                 await session.exec(['whatever'])
 
 
@@ -246,6 +342,22 @@ class TestFilesystem:
             with pytest.raises(ModalSandboxError, match='connection lost'):
                 await session.read_bytes('/x')
 
+    async def test_missing_file_is_recoverable_not_terminal(self, fake_modal: FakeModal) -> None:
+        # A missing *file* is the model's mistake to fix (a retry), not a dead sandbox: it must
+        # stay a plain ModalSandboxError so the toolset retries rather than ending the run.
+        async with ModalSandboxSession() as session:
+            fake_modal.sandboxes[0].fs_error = fake_modal.file_not_found_type('No such file: /x')
+            with pytest.raises(ModalSandboxError) as exc:
+                await session.read_bytes('/x')
+            assert not isinstance(exc.value, ModalSandboxTerminalError)
+
+    async def test_missing_sandbox_during_read_is_terminal(self, fake_modal: FakeModal) -> None:
+        # A missing *sandbox* (not a missing file) is terminal: the whole sandbox is gone.
+        async with ModalSandboxSession() as session:
+            fake_modal.sandboxes[0].fs_error = fake_modal.unavailable_type('sandbox not found')
+            with pytest.raises(ModalSandboxUnavailableError, match='no longer running'):
+                await session.read_bytes('/x')
+
 
 class TestPathResolution:
     async def test_relative_path_joined_with_pwd(self, fake_modal: FakeModal) -> None:
@@ -304,6 +416,19 @@ class TestPathResolution:
                 await session.read_bytes('rel.txt')
             fake_modal.sandboxes[0].files['/rel.txt'] = b'ok'
             assert await session.read_bytes('rel.txt') == b'ok'
+
+    async def test_concurrent_relative_paths_probe_pwd_once(self, fake_modal: FakeModal) -> None:
+        # A batch of concurrent tool calls resolving relative paths must share one `pwd` probe,
+        # not fire one each: the probe is single-flighted behind a lock.
+        fake_modal.responder = lambda argv, timeout: ('/work\n', '', 0)
+        async with ModalSandboxSession() as session:
+            async with anyio.create_task_group() as tg:
+                tg.start_soon(session.write_bytes, 'a.txt', b'x')
+                tg.start_soon(session.write_bytes, 'b.txt', b'y')
+        pwd_calls = [c for c in fake_modal.sandboxes[0].exec_calls if c.argv == ['sh', '-c', 'pwd']]
+        assert len(pwd_calls) == 1
+        assert '/work/a.txt' in fake_modal.sandboxes[0].files
+        assert '/work/b.txt' in fake_modal.sandboxes[0].files
 
     async def test_cwd_not_carried_across_reentry(self, fake_modal: FakeModal) -> None:
         # A reused session must re-query pwd for the new sandbox rather than reuse the

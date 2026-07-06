@@ -14,6 +14,8 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
+import anyio.lowlevel
+
 # A responder maps (argv, timeout) to (stdout, stderr, exit_code).
 Responder = Callable[[list[str], 'int | None'], 'tuple[str, str, int]']
 
@@ -43,19 +45,49 @@ class _AioCallable:
         return self._fn(*args, **kwargs)
 
     async def aio(self, *args: Any, **kwargs: Any) -> Any:
+        # A real Modal `.aio` call suspends (it awaits gRPC); yield here so a concurrent
+        # batch of tool calls actually interleaves in tests -- otherwise the sync fake would
+        # run each call start-to-finish and hide races like a duplicated `pwd` probe.
+        await anyio.lowlevel.checkpoint()
         return self._fn(*args, **kwargs)
 
 
 class _FakeStream:
-    def __init__(self, data: str) -> None:
+    """Mimics a Modal exec stdio stream: readable whole via `.read.aio()`, or iterable.
+
+    The session reads unbounded output with `.read.aio()` and bounded output by iterating
+    chunks. `chunk_size` controls how the iterable path splits the data, so a test can drive
+    the bounded reader's drop logic with more than one chunk. `None` yields the data as a
+    single chunk (the realistic "one message" case, and what most tests want).
+    """
+
+    def __init__(self, data: str, chunk_size: int | None) -> None:
         self._data = data
+        self._chunk_size = chunk_size
         self.read = _AioCallable(lambda: self._data)
+        self._pending: list[str] = []
+        self._pos = 0
+
+    def __aiter__(self) -> _FakeStream:
+        if self._chunk_size is None:
+            self._pending = [self._data] if self._data else []
+        else:
+            self._pending = [self._data[i : i + self._chunk_size] for i in range(0, len(self._data), self._chunk_size)]
+        self._pos = 0
+        return self
+
+    async def __anext__(self) -> str:
+        if self._pos >= len(self._pending):
+            raise StopAsyncIteration
+        piece = self._pending[self._pos]
+        self._pos += 1
+        return piece
 
 
 class _FakeProcess:
-    def __init__(self, stdout: str, stderr: str, returncode: int) -> None:
-        self.stdout = _FakeStream(stdout)
-        self.stderr = _FakeStream(stderr)
+    def __init__(self, stdout: str, stderr: str, returncode: int, chunk_size: int | None) -> None:
+        self.stdout = _FakeStream(stdout, chunk_size)
+        self.stderr = _FakeStream(stderr, chunk_size)
         self._returncode = returncode
         self.returncode: int | None = None
         self.wait = _AioCallable(self._wait)
@@ -69,8 +101,28 @@ class FakeModalError(Exception):
     """Stand-in for `modal.exception.Error`."""
 
 
+class FakeNotFoundError(FakeModalError):
+    """Stand-in for `modal.exception.NotFoundError` (the sandbox itself is missing/gone)."""
+
+
+class FakeAuthError(FakeModalError):
+    """Stand-in for `modal.exception.AuthError`."""
+
+
+class FakeSandboxTerminatedError(FakeModalError):
+    """Stand-in for `modal.exception.SandboxTerminatedError`."""
+
+
+class FakeSandboxTimeoutError(FakeModalError):
+    """Stand-in for `modal.exception.SandboxTimeoutError`."""
+
+
 class FakeSandboxFilesystemError(FakeModalError):
     """Stand-in for `modal.exception.SandboxFilesystemError`."""
+
+
+class FakeSandboxFilesystemNotFoundError(FakeSandboxFilesystemError):
+    """Stand-in for `modal.exception.SandboxFilesystemNotFoundError` (a missing file, recoverable)."""
 
 
 @dataclass
@@ -157,7 +209,7 @@ class FakeSandbox:
         argv = list(args)
         self.exec_calls.append(ExecCall(argv=argv, timeout=timeout))
         stdout, stderr, code = self._control.responder(argv, timeout)
-        return _FakeProcess(stdout, stderr, code)
+        return _FakeProcess(stdout, stderr, code, self._control.output_chunk_size)
 
     def _terminate(self) -> None:
         if self.terminate_error is not None:
@@ -179,6 +231,10 @@ class FakeModal:
         self.image_tags: list[str] = []
         self.attach_ids: list[str] = []
         self.create_error: Exception | None = None
+        self.attach_error: Exception | None = None
+        # How the fake splits exec output when the bounded reader iterates it; None yields the
+        # whole output as one chunk. A test bounding output sets a small size to force drops.
+        self.output_chunk_size: int | None = None
         self.module = self._build_module()
 
     @property
@@ -188,6 +244,24 @@ class FakeModal:
     @property
     def filesystem_error_type(self) -> type[Exception]:
         return FakeSandboxFilesystemError
+
+    @property
+    def unavailable_type(self) -> type[Exception]:
+        """A missing/terminated *sandbox* (Modal `NotFoundError`) -- terminal, not retried."""
+        return FakeNotFoundError
+
+    @property
+    def auth_type(self) -> type[Exception]:
+        return FakeAuthError
+
+    @property
+    def sandbox_terminated_type(self) -> type[Exception]:
+        return FakeSandboxTerminatedError
+
+    @property
+    def file_not_found_type(self) -> type[Exception]:
+        """A missing *file* (Modal `SandboxFilesystemNotFoundError`) -- recoverable, retried."""
+        return FakeSandboxFilesystemNotFoundError
 
     def _build_module(self) -> types.ModuleType:
         control = self
@@ -211,6 +285,8 @@ class FakeModal:
 
         def sandbox_from_id(sandbox_id: str) -> FakeSandbox:
             control.attach_ids.append(sandbox_id)
+            if control.attach_error is not None:
+                raise control.attach_error
             sandbox = FakeSandbox(control, sandbox_id)
             control.sandboxes.append(sandbox)
             return sandbox
@@ -229,6 +305,12 @@ class FakeModal:
         module.Image = Image  # type: ignore[attr-defined]
         module.Sandbox = Sandbox  # type: ignore[attr-defined]
         module.exception = types.SimpleNamespace(  # type: ignore[attr-defined]
-            Error=FakeModalError, SandboxFilesystemError=FakeSandboxFilesystemError
+            Error=FakeModalError,
+            NotFoundError=FakeNotFoundError,
+            AuthError=FakeAuthError,
+            SandboxTerminatedError=FakeSandboxTerminatedError,
+            SandboxTimeoutError=FakeSandboxTimeoutError,
+            SandboxFilesystemError=FakeSandboxFilesystemError,
+            SandboxFilesystemNotFoundError=FakeSandboxFilesystemNotFoundError,
         )
         return module

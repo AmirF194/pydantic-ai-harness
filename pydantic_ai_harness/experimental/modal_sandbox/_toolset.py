@@ -12,7 +12,11 @@ from pydantic_ai.toolsets import AbstractToolset, FunctionToolset
 from typing_extensions import Self
 
 from pydantic_ai_harness._tool_output import guard_read_size, render_file_window, truncate_output
-from pydantic_ai_harness.experimental.modal_sandbox._session import ModalSandboxError, ModalSandboxSession
+from pydantic_ai_harness.experimental.modal_sandbox._session import (
+    ModalSandboxError,
+    ModalSandboxSession,
+    ModalSandboxTerminalError,
+)
 
 
 class ModalSandboxToolset(FunctionToolset[AgentDepsT]):
@@ -155,10 +159,17 @@ class ModalSandboxToolset(FunctionToolset[AgentDepsT]):
             Labelled stdout/stderr output, with an exit code on non-zero exit.
         """
         session = self._require_session()
-        # Surface a sandbox-side failure as a retryable tool error, matching the file tools,
-        # rather than letting it abort the whole run.
+        # Surface a recoverable sandbox-side failure as a retryable tool error, matching the
+        # file tools. A terminal failure (the sandbox is gone, or credentials were rejected)
+        # propagates instead: retrying the command cannot fix it, so end the run cleanly.
         try:
-            result = await session.exec(['sh', '-c', command], timeout=self._command_timeout(timeout_seconds))
+            result = await session.exec(
+                ['sh', '-c', command],
+                timeout=self._command_timeout(timeout_seconds),
+                max_output_bytes=self._max_output_bytes,
+            )
+        except ModalSandboxTerminalError:
+            raise
         except ModalSandboxError as e:
             raise ModelRetry(str(e))
         parts: list[str] = []
@@ -201,6 +212,8 @@ class ModalSandboxToolset(FunctionToolset[AgentDepsT]):
             # so refuse an oversized file rather than transfer and decode all of it for a slice.
             guard_read_size(await session.file_size(path), max_bytes=self._max_read_bytes)
             data = await session.read_bytes(path)
+        except ModalSandboxTerminalError:
+            raise
         except ModalSandboxError as e:
             raise ModelRetry(f'Could not read {path!r}: {e}')
         # Re-check against the bytes actually returned. The stat and the read are separate
@@ -221,11 +234,14 @@ class ModalSandboxToolset(FunctionToolset[AgentDepsT]):
             content: The text to write.
         """
         session = self._require_session()
+        data = content.encode('utf-8')
         try:
-            await session.write_bytes(path, content.encode('utf-8'))
+            await session.write_bytes(path, data)
+        except ModalSandboxTerminalError:
+            raise
         except ModalSandboxError as e:
             raise ModelRetry(f'Could not write {path!r}: {e}')
-        return f'Wrote {len(content)} characters to {path!r}.'
+        return f'Wrote {len(data)} bytes to {path!r}.'
 
     async def list_directory(self, path: str = '.') -> str:
         """List the entries in a sandbox directory (directories shown with a trailing `/`).
@@ -237,6 +253,8 @@ class ModalSandboxToolset(FunctionToolset[AgentDepsT]):
         session = self._require_session()
         try:
             entries = await session.list_files(path)
+        except ModalSandboxTerminalError:
+            raise
         except ModalSandboxError as e:
             raise ModelRetry(f'Could not list {path!r}: {e}')
         if not entries:
