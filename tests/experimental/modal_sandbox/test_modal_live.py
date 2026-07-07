@@ -11,15 +11,18 @@ Admission rule:
   A test belongs here only when its docstring can name the fake-encoded assumption
   it validates against real Modal behavior.
 
-Transition map:
-  * TestRealExecution: `exec(argv, timeout=...)` becomes `run(..., shell=...)`; `returncode` becomes
-    `exit_code`; timeout checks catch `CommandTimeoutError` and assert `.stdout`.
-  * TestCreateConfiguration: create-time `env` and `workdir` assertions retarget to the future sandbox
-    configuration surface, with probes run through `Sandbox.run(...)`.
-  * TestRealFilesystem: byte file operations retarget to `pydantic-sandboxes` file APIs; the relative
-    path case becomes explicit `resolve()` / `working_dir()` coverage.
-  * TestRealLifecycle: dead sandbox checks retarget from `ModalSandboxUnavailableError` to
-    `SandboxNotFoundError`, and attach/reuse maps to the provider-agnostic attach surface.
+Portability:
+  These assert durable sandbox behaviors, not Modal-specific spellings, so if the Modal
+  mechanism is later swapped for a different backend the suite retargets rather than gets
+  rewritten:
+  * TestRealExecution: the exec call and its result fields rename; a timeout is checked via the
+    backend's raised timeout error carrying the pre-kill output, not the `-1` sentinel.
+  * TestCreateConfiguration: create-time `env` and `workdir` assertions move to the backend's
+    sandbox-configuration surface.
+  * TestRealFilesystem: byte file operations move to the backend's file API; the relative-path
+    case becomes explicit resolution against the working directory.
+  * TestRealLifecycle: dead-sandbox checks become the backend's typed not-found error, and
+    attach/reuse maps to its attach surface.
 
 Gating:
   * `modal_live` marker: CI can select this tier with `-m modal_live`; the normal suite can deselect it.
@@ -102,7 +105,7 @@ class TestRealExecution:
         """Validates the fake-encoded assumption that output printed before an infra timeout is preserved."""
         result = await session.exec(['sh', '-c', 'echo DIAGNOSTIC; sleep 30'], timeout=2)
 
-        # Durable assertion: future `pydantic-sandboxes` exposes this on `CommandTimeoutError.stdout`.
+        # Durable assertion: a backend that raises a typed timeout error would expose this as its retained stdout.
         assert 'DIAGNOSTIC' in result.stdout
         assert result.timed_out is True
 
@@ -218,8 +221,8 @@ class TestRealFilesystem:
     async def test_workdir_and_relative_file_resolution_share_one_view(self) -> None:
         """Validates the fake-encoded assumption that relative file API paths share the process cwd view.
 
-        Future `pydantic-sandboxes` retarget: callers resolve explicitly via `sandbox.resolve()` /
-        `working_dir()`, because the provider-agnostic seam rejects implicit relative paths.
+        Portability: on a backend whose filesystem seam rejects relative paths, callers resolve
+        explicitly against the working directory, and this test then covers that resolution instead.
         """
         filename = f'{_unique("rel")}.txt'
         async with ModalSandboxSession(image=_IMAGE, sandbox_timeout=120, workdir='/tmp') as session:
@@ -235,9 +238,10 @@ class TestRealLifecycle:
     async def test_sandbox_timeout_expiry_mid_session_is_unavailable(self) -> None:
         """Validates the fake-encoded assumption that real Modal expiry raises an unavailable sandbox error.
 
-        Migration note: the post-expiry command must retarget to `SandboxNotFoundError` (fatal), not base
-        `SandboxError` (retryable); this test is the forcing function for that mapping decision in the
-        pydantic-sandboxes Modal adapter.
+        Migration note: on a backend swap, the post-expiry command must retarget to a typed
+        not-found error (fatal, aborts the run), not a generic retryable error (which would drive a
+        doomed retry loop against a dead sandbox); this test is the forcing function for that
+        mapping decision.
         """
         async with ModalSandboxSession(image=_IMAGE, sandbox_timeout=15) as session:
             await anyio.sleep(25)
