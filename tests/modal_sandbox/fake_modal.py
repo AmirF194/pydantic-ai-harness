@@ -1,4 +1,4 @@
-"""A controllable fake `modal` SDK for ModalSandboxCapability tests.
+"""A controllable fake `modal` SDK for ModalSandbox tests.
 
 Tests never reach real Modal: a fake `modal` module is injected into `sys.modules`
 (via the `fake_modal` fixture in `conftest.py`), so the lazy `import modal` inside
@@ -69,12 +69,18 @@ class _FakeStream:
     single chunk (the realistic "one message" case, and what most tests want).
     """
 
-    def __init__(self, data: bytes, chunk_size: int | None) -> None:
+    def __init__(self, data: bytes, chunk_size: int | None, error: Exception | None = None) -> None:
         self._data = data
         self._chunk_size = chunk_size
-        self.read = _AioCallable(lambda: self._data)
+        self._error = error
+        self.read = _AioCallable(self._read)
         self._pending: list[bytes] = []
         self._pos = 0
+
+    def _read(self) -> bytes:
+        if self._error is not None:
+            raise self._error
+        return self._data
 
     def __aiter__(self) -> _FakeStream:
         if self._chunk_size is None:
@@ -85,6 +91,8 @@ class _FakeStream:
         return self
 
     async def __anext__(self) -> bytes:
+        if self._error is not None:
+            raise self._error
         if self._pos >= len(self._pending):
             raise StopAsyncIteration
         piece = self._pending[self._pos]
@@ -93,14 +101,26 @@ class _FakeStream:
 
 
 class _FakeProcess:
-    def __init__(self, stdout: bytes, stderr: bytes, returncode: int, chunk_size: int | None) -> None:
-        self.stdout = _FakeStream(stdout, chunk_size)
-        self.stderr = _FakeStream(stderr, chunk_size)
+    def __init__(
+        self,
+        stdout: bytes,
+        stderr: bytes,
+        returncode: int,
+        chunk_size: int | None,
+        stdout_error: Exception | None,
+        stderr_error: Exception | None,
+        wait_error: Exception | None,
+    ) -> None:
+        self.stdout = _FakeStream(stdout, chunk_size, stdout_error)
+        self.stderr = _FakeStream(stderr, chunk_size, stderr_error)
         self._returncode = returncode
+        self._wait_error = wait_error
         self.returncode: int | None = None
         self.wait = _AioCallable(self._wait)
 
     def _wait(self) -> int:
+        if self._wait_error is not None:
+            raise self._wait_error
         self.returncode = self._returncode
         return self._returncode
 
@@ -216,6 +236,7 @@ class FakeSandbox:
         self.fs_error: Exception | None = None
         self.make_directory_error: Exception | None = None
         self.poll_result: int | None = None
+        self.poll_error: Exception | None = None
         self._filesystem = _FakeFilesystem(self)
 
     @property
@@ -226,17 +247,28 @@ class FakeSandbox:
         argv = list(args)
         self.exec_calls.append(ExecCall(argv=argv, timeout=timeout, text=text))
         stdout, stderr, code = self._control.responder(argv, timeout)
-        return _FakeProcess(_stream_bytes(stdout), _stream_bytes(stderr), code, self._control.output_chunk_size)
+        return _FakeProcess(
+            _stream_bytes(stdout),
+            _stream_bytes(stderr),
+            code,
+            self._control.output_chunk_size,
+            self._control.stdout_error,
+            self._control.stderr_error,
+            self._control.wait_error,
+        )
 
-    def _terminate(self) -> None:
+    def _terminate(self, *, wait: bool = False) -> int | None:
         if self.terminate_error is not None:
             raise self.terminate_error
         self.terminated = True
+        return 0 if wait else None
 
     def _detach(self) -> None:
         self.detached = True
 
     def _poll(self) -> int | None:
+        if self.poll_error is not None:
+            raise self.poll_error
         if self.poll_result is not None:
             return self.poll_result
         if self.terminated:
@@ -257,6 +289,9 @@ class FakeModal:
         self.create_error: Exception | None = None
         self.attach_error: Exception | None = None
         self.attach_poll_result: int | None = None
+        self.stdout_error: Exception | None = None
+        self.stderr_error: Exception | None = None
+        self.wait_error: Exception | None = None
         # How the fake splits exec output when the bounded reader iterates it; None yields the
         # whole output as one chunk. A test bounding output sets a small size to force drops.
         self.output_chunk_size: int | None = None

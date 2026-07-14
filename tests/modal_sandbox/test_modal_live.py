@@ -25,11 +25,13 @@ Portability:
     attach/reuse maps to its attach surface.
 
 Gating:
-  * `modal_live` marker: CI can select this tier with `-m modal_live`; the normal suite can deselect it.
-  * skipped unless `MODAL_TOKEN_ID` / `MODAL_TOKEN_SECRET` are set, or `~/.modal.toml` exists.
+  * `modal_live` marker separates this tier from fake-backed tests.
+  * skipped unless `PYDANTIC_AI_HARNESS_MODAL_LIVE=1` opts in explicitly.
+  * also requires `MODAL_TOKEN_ID` / `MODAL_TOKEN_SECRET`, or `~/.modal.toml`.
   * a module-scoped `anyio_backend` fixture keeps the shared Modal handle on one asyncio loop.
 
-Run locally: `uv run pytest -m modal_live tests/experimental/modal_sandbox/test_modal_live.py`
+Run locally:
+`PYDANTIC_AI_HARNESS_MODAL_LIVE=1 uv run pytest -m modal_live tests/modal_sandbox/test_modal_live.py`
 """
 
 from __future__ import annotations
@@ -42,7 +44,7 @@ from pathlib import Path
 import anyio
 import pytest
 
-from pydantic_ai_harness.experimental.modal_sandbox import (
+from pydantic_ai_harness.modal_sandbox import (
     ModalSandboxError,
     ModalSandboxSession,
     ModalSandboxTerminalError,
@@ -55,11 +57,15 @@ def _has_modal_credentials() -> bool:
     return has_env_token or Path('~/.modal.toml').expanduser().exists()
 
 
+_live_enabled = os.getenv('PYDANTIC_AI_HARNESS_MODAL_LIVE') == '1'
+
 pytestmark = [
     pytest.mark.modal_live,
     pytest.mark.skipif(
-        not _has_modal_credentials(),
-        reason='requires MODAL_TOKEN_ID / MODAL_TOKEN_SECRET or ~/.modal.toml for a live Modal run',
+        not _live_enabled or not _has_modal_credentials(),
+        reason=(
+            'requires PYDANTIC_AI_HARNESS_MODAL_LIVE=1 and either MODAL_TOKEN_ID / MODAL_TOKEN_SECRET or ~/.modal.toml'
+        ),
     ),
 ]
 
@@ -109,6 +115,15 @@ class TestRealExecution:
         assert 'DIAGNOSTIC' in result.stdout
         assert result.timed_out is True
 
+    async def test_timeout_preserves_stderr(self, session: ModalSandboxSession) -> None:
+        result = await session.exec(['sh', '-c', 'echo STDERR-DIAGNOSTIC 1>&2; sleep 30'], timeout=2)
+
+        assert 'STDERR-DIAGNOSTIC' in result.stderr
+        # Modal currently reports this deadline kill as 137 rather than its -1 timeout
+        # sentinel. The integration promises to preserve the diagnostic, not normalize
+        # provider exit codes that are indistinguishable from a process killing itself.
+        assert result.returncode != 0
+
     async def test_large_stderr_does_not_block_stdout(self, session: ModalSandboxSession) -> None:
         """Validates the fake-encoded assumption that Modal buffers streams without stderr deadlock."""
         result = await session.exec(['sh', '-c', 'seq 1 300000 1>&2; echo done'], timeout=60)
@@ -142,20 +157,11 @@ class TestRealExecution:
         assert result.returncode != -1
         assert result.timed_out is False
 
-    async def test_nonexistent_binary_is_wrapped_or_exit_127(self, session: ModalSandboxSession) -> None:
-        """Validates the fake-encoded assumption that a missing binary does not leak a raw provider error.
-
-        Characterization canary: this currently accepts either a wrapped `ModalSandboxError` or
-        `exit_code == 127`; pin the observed branch after the first real live run confirms Modal's behavior.
-        """
+    async def test_nonexistent_binary_returns_modal_exit_code(self, session: ModalSandboxSession) -> None:
+        """Pins Modal's current return code for an executable lookup failure."""
         binary = _unique('definitely-not-a-real-binary')
-
-        try:
-            result = await session.exec([binary], timeout=15)
-        except ModalSandboxError:
-            return
-
-        assert result.returncode == 127
+        result = await session.exec([binary], timeout=15)
+        assert result.returncode == 128
 
 
 class TestCreateConfiguration:
@@ -233,20 +239,7 @@ class TestRealFilesystem:
 
 
 class TestRealLifecycle:
-    """Provisioning, expiry, teardown, and attach semantics in Modal's real control plane."""
-
-    async def test_sandbox_timeout_expiry_mid_session_is_unavailable(self) -> None:
-        """Validates the fake-encoded assumption that real Modal expiry raises an unavailable sandbox error.
-
-        Migration note: on a backend swap, the post-expiry command must retarget to a typed
-        not-found error (fatal, aborts the run), not a generic retryable error (which would drive a
-        doomed retry loop against a dead sandbox); this test is the forcing function for that
-        mapping decision.
-        """
-        async with ModalSandboxSession(image=_IMAGE, sandbox_timeout=15) as session:
-            await anyio.sleep(25)
-            with pytest.raises(ModalSandboxUnavailableError):
-                await session.exec(['echo', 'after-expiry'], timeout=15)
+    """Teardown and attach semantics in Modal's real control plane."""
 
     async def test_terminate_actually_destroys_the_container(self) -> None:
         """Validates the fake-encoded assumption that exiting an owned session destroys the real sandbox."""

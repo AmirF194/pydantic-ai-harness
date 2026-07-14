@@ -1,7 +1,7 @@
-"""Shared presentation helpers for file-read and command-output tools.
+"""Presentation helpers for Modal sandbox file and command output.
 
-Pure formatting with no I/O and no backend coupling, so any toolset can opt in to the
-same windowing and truncation behavior.
+Pure formatting stays separate from the Modal I/O layer so output behavior can be
+tested without provisioning a sandbox.
 
 `read_file`-style tools want `render_file_window` (line-addressable, head-first, with a
 continuation offset). Free-form command output wants `truncate_output` (tail-first, so

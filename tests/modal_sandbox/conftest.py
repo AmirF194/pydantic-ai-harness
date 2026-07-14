@@ -1,4 +1,4 @@
-"""Shared fixtures for ModalSandboxCapability tests."""
+"""Shared fixtures for ModalSandbox tests."""
 
 from __future__ import annotations
 

@@ -1,24 +1,59 @@
-"""Tests for the ModalSandboxCapability and ModalSandboxToolset."""
+"""Tests for the public Modal sandbox capability API."""
 
 from __future__ import annotations
 
-import pytest
-from pydantic_ai import Agent
-from pydantic_ai.exceptions import ModelRetry
-from pydantic_ai.models.test import TestModel
+import inspect
+from collections.abc import AsyncGenerator, Mapping
+from contextlib import asynccontextmanager
+from typing import Protocol, TypeGuard, runtime_checkable
 
-from pydantic_ai_harness.experimental.modal_sandbox import (
-    ModalSandboxCapability,
+import pytest
+from pydantic_ai import Agent, RunContext
+from pydantic_ai.exceptions import ModelRetry
+from pydantic_ai.messages import ModelMessage, ModelResponse, TextPart, ToolCallPart, ToolReturnPart
+from pydantic_ai.models.function import AgentInfo, FunctionModel
+from pydantic_ai.models.test import TestModel
+from pydantic_ai.toolsets import AbstractToolset
+from pydantic_ai.usage import RunUsage
+
+from pydantic_ai_harness.modal_sandbox import (
+    ModalSandbox,
     ModalSandboxError,
     ModalSandboxSession,
-    ModalSandboxToolset,
     ModalSandboxUnavailableError,
 )
 
 from .fake_modal import FakeModal, FileInfo
 
 
-def _toolset(
+@runtime_checkable
+class _ModalSandboxTools(Protocol):  # pragma: no cover - structural typing only
+    async def run_command(self, command: str, *, timeout_seconds: float | None = None) -> str: ...
+
+    async def read_file(self, path: str, *, offset: int = 1, limit: int | None = None) -> str: ...
+
+    async def write_file(self, path: str, content: str) -> str: ...
+
+    async def list_directory(self, path: str = '.') -> str: ...
+
+
+def _is_abstract_toolset(value: object) -> TypeGuard[AbstractToolset[None]]:
+    return isinstance(value, AbstractToolset)
+
+
+def _run_context() -> RunContext[None]:
+    return RunContext[None](
+        deps=None,
+        model=TestModel(),
+        usage=RunUsage(),
+        prompt=None,
+        messages=[],
+        run_step=0,
+    )
+
+
+@asynccontextmanager
+async def _toolset(
     *,
     sandbox_id: str | None = None,
     max_output_bytes: int = 50_000,
@@ -28,12 +63,12 @@ def _toolset(
     create_app_if_missing: bool = True,
     sandbox_timeout: int = 300,
     workdir: str | None = None,
-    max_command_timeout: float | None = None,
+    max_command_timeout: int | None = None,
     max_read_bytes: int = 5 * 1024 * 1024,
-    env: dict[str, str] | None = None,
+    env: Mapping[str, str] | None = None,
     session: ModalSandboxSession | None = None,
-) -> ModalSandboxToolset[None]:
-    return ModalSandboxToolset[None](
+) -> AsyncGenerator[_ModalSandboxTools]:
+    toolset = ModalSandbox[None](
         image=image,
         sandbox_id=sandbox_id,
         app_name=app_name,
@@ -47,7 +82,14 @@ def _toolset(
         max_read_bytes=max_read_bytes,
         env=env,
         session=session,
-    )
+    ).get_toolset()
+    if not _is_abstract_toolset(toolset):  # pragma: no cover - capability contract
+        raise AssertionError('ModalSandbox must return an AbstractToolset')
+    run_toolset = await toolset.for_run(_run_context())
+    if not isinstance(run_toolset, _ModalSandboxTools):  # pragma: no cover - capability contract
+        raise AssertionError('ModalSandbox toolset is missing its public tools')
+    async with run_toolset:
+        yield run_toolset
 
 
 class TestRunCommand:
@@ -151,6 +193,26 @@ class TestRunCommand:
         assert 'output truncated' in result
         assert result.endswith('END')  # the tail, where the exit status lives, survives
 
+    async def test_output_is_bounded_when_one_chunk_exceeds_limit(self, fake_modal: FakeModal) -> None:
+        fake_modal.responder = lambda argv, timeout: ('A' * 500 + 'END', '', 0)
+        async with _toolset(max_output_bytes=50) as ts:
+            result = await ts.run_command('flood')
+        assert 'output truncated' in result
+        assert result.endswith('END')
+
+    async def test_output_line_cap_keeps_last_lines(self, fake_modal: FakeModal) -> None:
+        fake_modal.responder = lambda argv, timeout: ('first\nsecond\nthird', '', 0)
+        async with _toolset(max_output_lines=1) as ts:
+            result = await ts.run_command('many-lines')
+        assert 'truncated to the last 1 lines' in result
+        assert result.endswith('third')
+
+    async def test_multibyte_output_truncation_drops_partial_character(self, fake_modal: FakeModal) -> None:
+        fake_modal.responder = lambda argv, timeout: ('é' * 20, '', 0)
+        async with _toolset(max_output_bytes=5) as ts:
+            result = await ts.run_command('unicode')
+        assert 'output truncated to the last 5B' in result
+
 
 class TestReadFile:
     async def test_returns_contents(self, fake_modal: FakeModal) -> None:
@@ -199,6 +261,12 @@ class TestReadFile:
             with pytest.raises(ModelRetry, match='over the 1000B read limit'):
                 await ts.read_file('/big.log')
 
+    async def test_read_limit_formats_megabytes(self, fake_modal: FakeModal) -> None:
+        async with _toolset(max_read_bytes=1000) as ts:
+            fake_modal.sandboxes[0].stat_sizes['/big.log'] = 3 * 1024 * 1024
+            with pytest.raises(ModelRetry, match='File is 3.0MB'):
+                await ts.read_file('/big.log')
+
     async def test_line_cap_is_configurable(self, fake_modal: FakeModal) -> None:
         # Bytes are well under budget, so only the line cap can fire: proves it is plumbed
         # through, not silently fixed at the helper default.
@@ -217,11 +285,59 @@ class TestReadFile:
             with pytest.raises(ModelRetry, match='over the 1000B read limit'):
                 await ts.read_file('/grows')
 
+    @pytest.mark.parametrize(
+        ('kwargs', 'message'),
+        [
+            ({'offset': 0}, 'offset must be >= 1'),
+            ({'limit': 0}, 'limit must be >= 1'),
+            ({'offset': 99}, 'beyond end of file'),
+        ],
+    )
+    async def test_invalid_window_is_a_model_retry(
+        self, fake_modal: FakeModal, kwargs: dict[str, int], message: str
+    ) -> None:
+        async with _toolset() as ts:
+            fake_modal.sandboxes[0].files['/f'] = b'one\ntwo'
+            with pytest.raises(ModelRetry, match=message):
+                await ts.read_file('/f', **kwargs)
+
+    async def test_oversized_first_line_is_omitted(self, fake_modal: FakeModal) -> None:
+        async with _toolset(max_output_bytes=10) as ts:
+            fake_modal.sandboxes[0].files['/f'] = b'x' * 200
+            result = await ts.read_file('/f')
+        assert result == '[Line 1 is 200B, exceeds the 10B limit and was omitted.]'
+
+    async def test_oversized_first_line_points_to_next_line(self, fake_modal: FakeModal) -> None:
+        async with _toolset(max_output_bytes=10) as ts:
+            fake_modal.sandboxes[0].files['/f'] = b'x' * 200 + b'\nnext'
+            result = await ts.read_file('/f')
+        assert 'Use offset=2 to continue.' in result
+
+    async def test_byte_cap_returns_continuation_offset(self, fake_modal: FakeModal) -> None:
+        async with _toolset(max_output_bytes=12) as ts:
+            fake_modal.sandboxes[0].files['/f'] = b'line00\nline01\nline02'
+            result = await ts.read_file('/f')
+        assert '(12B limit). Use offset=' in result
+
     async def test_terminal_error_ends_the_run(self, fake_modal: FakeModal) -> None:
         # A missing sandbox during a read is terminal, not a retryable "could not read".
         async with _toolset() as ts:
             fake_modal.sandboxes[0].fs_error = fake_modal.unavailable_type('sandbox not found')
+            fake_modal.sandboxes[0].poll_result = 0
             with pytest.raises(ModalSandboxUnavailableError):
+                await ts.read_file('/x')
+
+    async def test_wrapped_not_found_is_recoverable_while_sandbox_runs(self, fake_modal: FakeModal) -> None:
+        async with _toolset() as ts:
+            fake_modal.sandboxes[0].fs_error = fake_modal.unavailable_type('filesystem request failed')
+            with pytest.raises(ModelRetry, match='filesystem request failed'):
+                await ts.read_file('/x')
+
+    async def test_wrapped_auth_error_is_terminal(self, fake_modal: FakeModal) -> None:
+        async with _toolset() as ts:
+            fake_modal.sandboxes[0].fs_error = fake_modal.filesystem_error_type('filesystem request failed')
+            fake_modal.sandboxes[0].poll_error = fake_modal.auth_type('unauthenticated')
+            with pytest.raises(ModalSandboxError, match='Modal rejected the credentials'):
                 await ts.read_file('/x')
 
 
@@ -243,6 +359,7 @@ class TestWriteFile:
     async def test_terminal_error_ends_the_run(self, fake_modal: FakeModal) -> None:
         async with _toolset() as ts:
             fake_modal.sandboxes[0].fs_error = fake_modal.unavailable_type('sandbox not found')
+            fake_modal.sandboxes[0].poll_result = 0
             with pytest.raises(ModalSandboxUnavailableError):
                 await ts.write_file('/x', 'data')
 
@@ -268,6 +385,12 @@ class TestListDirectory:
             assert await ts.list_directory('src') == 'a.py'
         assert fake_modal.sandboxes[0].list_paths == ['/work/src']
 
+    async def test_relative_path_preserves_parent_segments(self, fake_modal: FakeModal) -> None:
+        fake_modal.responder = lambda argv, timeout: ('/work\n', '', 0)
+        async with _toolset() as ts:
+            await ts.list_directory('link/../secret')
+        assert fake_modal.sandboxes[0].list_paths == ['/work/link/../secret']
+
     async def test_error_raises_model_retry(self, fake_modal: FakeModal) -> None:
         async with _toolset() as ts:
             fake_modal.sandboxes[0].fs_error = fake_modal.filesystem_error_type('Not a directory: /etc/hosts')
@@ -277,6 +400,7 @@ class TestListDirectory:
     async def test_terminal_error_ends_the_run(self, fake_modal: FakeModal) -> None:
         async with _toolset() as ts:
             fake_modal.sandboxes[0].fs_error = fake_modal.unavailable_type('sandbox not found')
+            fake_modal.sandboxes[0].poll_result = 0
             with pytest.raises(ModalSandboxUnavailableError):
                 await ts.list_directory('/x')
 
@@ -296,9 +420,9 @@ class TestToolsetLifecycle:
         assert fake_modal.create_kwargs[-1]['env'] == {'FOO': 'bar'}
 
     async def test_for_run_carries_config_to_a_fresh_instance(self, fake_modal: FakeModal) -> None:
-        original = _toolset(image='ubuntu:22.04', app_name='my-app', sandbox_timeout=99)
-        fresh = await original.for_run(None)  # type: ignore[arg-type]
-        assert isinstance(fresh, ModalSandboxToolset)
+        original = ModalSandbox[None](image='ubuntu:22.04', app_name='my-app', sandbox_timeout=99).get_toolset()
+        assert _is_abstract_toolset(original)
+        fresh = await original.for_run(_run_context())
         assert fresh is not original
         async with fresh:
             pass
@@ -306,10 +430,12 @@ class TestToolsetLifecycle:
         assert fake_modal.app_lookups[-1]['name'] == 'my-app'
         assert fake_modal.create_kwargs[-1]['timeout'] == 99
 
-    async def test_aexit_without_session_is_safe(self) -> None:
-        ts = _toolset()
-        await ts.__aexit__(None, None, None)
-        assert ts._session is None
+    async def test_agent_level_toolset_enter_does_not_create_a_sandbox(self, fake_modal: FakeModal) -> None:
+        toolset = ModalSandbox[None]().get_toolset()
+        assert _is_abstract_toolset(toolset)
+        async with toolset:
+            pass
+        assert fake_modal.sandboxes == []
 
     async def test_attached_sandbox_not_terminated(self, fake_modal: FakeModal) -> None:
         async with _toolset(sandbox_id='sb-keep') as ts:
@@ -342,9 +468,11 @@ class TestInjectedSession:
 
     async def test_for_run_carries_the_session(self, fake_modal: FakeModal) -> None:
         async with ModalSandboxSession() as session:
-            fresh = await _toolset(session=session).for_run(None)  # type: ignore[arg-type]
-            assert isinstance(fresh, ModalSandboxToolset)
+            original = ModalSandbox[None](session=session).get_toolset()
+            assert _is_abstract_toolset(original)
+            fresh = await original.for_run(_run_context())
             async with fresh:
+                assert isinstance(fresh, _ModalSandboxTools)
                 await fresh.run_command('echo hi')
             # The per-run clone reused the injected session rather than opening its own.
             assert len(fake_modal.sandboxes) == 1
@@ -353,7 +481,7 @@ class TestInjectedSession:
 
 class TestCapability:
     def test_defaults(self) -> None:
-        cap = ModalSandboxCapability()
+        cap = ModalSandbox()
         assert cap.image == 'python:3.12-slim'
         assert cap.sandbox_id is None
         assert cap.app_name == 'pydantic-ai-harness'
@@ -361,10 +489,35 @@ class TestCapability:
         assert cap.default_command_timeout == 60.0
 
     def test_get_toolset(self) -> None:
-        assert isinstance(ModalSandboxCapability().get_toolset(), ModalSandboxToolset)
+        assert isinstance(ModalSandbox().get_toolset(), AbstractToolset)
+
+    def test_serialization_name(self) -> None:
+        assert ModalSandbox.get_serialization_name() == 'ModalSandbox'
+
+    def test_configuration_is_keyword_only(self) -> None:
+        parameters = list(inspect.signature(ModalSandbox).parameters.values())
+        assert parameters
+        assert all(parameter.kind is inspect.Parameter.KEYWORD_ONLY for parameter in parameters)
+
+    @pytest.mark.parametrize(
+        ('name', 'value'),
+        [
+            ('sandbox_timeout', 0),
+            ('max_output_bytes', -1),
+            ('max_output_lines', 0),
+            ('max_read_bytes', -1),
+            ('default_command_timeout', 0),
+            ('default_command_timeout', float('nan')),
+            ('default_command_timeout', float('inf')),
+            ('max_command_timeout', 0),
+        ],
+    )
+    def test_rejects_invalid_limits(self, name: str, value: object) -> None:
+        with pytest.raises(ValueError, match=name):
+            ModalSandbox(**{name: value})  # type: ignore[arg-type]
 
     def test_attach_with_only_defaults_is_allowed(self) -> None:
-        cap = ModalSandboxCapability(sandbox_id='sb-keep')
+        cap = ModalSandbox(sandbox_id='sb-keep')
         assert cap.sandbox_id == 'sb-keep'
 
     @pytest.mark.parametrize(
@@ -380,80 +533,83 @@ class TestCapability:
     )
     def test_attach_rejects_owned_only_settings(self, kwargs: dict[str, object], expected: str) -> None:
         with pytest.raises(ValueError, match=f'{expected} only apply when creating a sandbox'):
-            ModalSandboxCapability(sandbox_id='sb-keep', **kwargs)  # type: ignore[arg-type]
+            ModalSandbox(sandbox_id='sb-keep', **kwargs)  # type: ignore[arg-type]
 
     def test_attach_error_lists_every_conflicting_setting(self) -> None:
         with pytest.raises(ValueError, match='image, sandbox_timeout only apply'):
-            ModalSandboxCapability(sandbox_id='sb-keep', image='ubuntu:22.04', sandbox_timeout=600)
+            ModalSandbox(sandbox_id='sb-keep', image='ubuntu:22.04', sandbox_timeout=600)
 
     def test_attach_rejecting_sandbox_timeout_points_at_max_command_timeout(self) -> None:
         # The reuse-mode redirect: a rejected sandbox_timeout names the setting that works.
         with pytest.raises(ValueError, match='set `max_command_timeout`'):
-            ModalSandboxCapability(sandbox_id='sb-keep', sandbox_timeout=600)
+            ModalSandbox(sandbox_id='sb-keep', sandbox_timeout=600)
 
     def test_attach_rejecting_other_settings_omits_the_ceiling_hint(self) -> None:
         with pytest.raises(ValueError, match='workdir only apply') as exc:
-            ModalSandboxCapability(sandbox_id='sb-keep', workdir='/work')
+            ModalSandbox(sandbox_id='sb-keep', workdir='/work')
         assert 'max_command_timeout' not in str(exc.value)
 
     async def test_session_with_only_defaults_is_allowed(self, fake_modal: FakeModal) -> None:
         async with ModalSandboxSession() as session:
-            cap = ModalSandboxCapability(session=session)
+            cap = ModalSandbox(session=session)
             assert cap.session is session
 
     async def test_session_rejects_sandbox_id(self, fake_modal: FakeModal) -> None:
         async with ModalSandboxSession() as session:
             with pytest.raises(ValueError, match='sandbox_id cannot be combined with `session`'):
-                ModalSandboxCapability(session=session, sandbox_id='sb-keep')
+                ModalSandbox(session=session, sandbox_id='sb-keep')
 
     async def test_session_rejects_owned_settings(self, fake_modal: FakeModal) -> None:
         async with ModalSandboxSession() as session:
             with pytest.raises(ValueError, match='image cannot be combined with `session`'):
-                ModalSandboxCapability(session=session, image='ubuntu:22.04')
+                ModalSandbox(session=session, image='ubuntu:22.04')
 
     async def test_session_rejects_env(self, fake_modal: FakeModal) -> None:
         async with ModalSandboxSession() as session:
             with pytest.raises(ValueError, match='env cannot be combined with `session`'):
-                ModalSandboxCapability(session=session, env={'A': 'b'})
+                ModalSandbox(session=session, env={'A': 'b'})
 
     async def test_session_rejecting_sandbox_timeout_points_at_max_command_timeout(self, fake_modal: FakeModal) -> None:
         async with ModalSandboxSession() as session:
             with pytest.raises(ValueError, match='set `max_command_timeout`'):
-                ModalSandboxCapability(session=session, sandbox_timeout=600)
+                ModalSandbox(session=session, sandbox_timeout=600)
 
     async def test_injected_session_instructions_say_persists(self, fake_modal: FakeModal) -> None:
         async with ModalSandboxSession() as session:
-            instructions = ModalSandboxCapability(session=session).get_instructions()
+            instructions = ModalSandbox(session=session).get_instructions()
             assert instructions is not None
             assert 'persists across sessions' in instructions
 
     def test_instructions_enabled_by_default(self) -> None:
-        instructions = ModalSandboxCapability().get_instructions()
+        instructions = ModalSandbox().get_instructions()
         assert instructions is not None
         assert 'Modal sandbox' in instructions
         assert 'run_command' in instructions
 
     def test_instructions_can_be_disabled(self) -> None:
-        assert ModalSandboxCapability(include_instructions=False).get_instructions() is None
+        assert ModalSandbox(include_instructions=False).get_instructions() is None
 
     def test_owned_instructions_say_reset_between_sessions(self) -> None:
-        instructions = ModalSandboxCapability().get_instructions()
+        instructions = ModalSandbox().get_instructions()
         assert instructions is not None
         assert 'reset between' in instructions
 
     def test_attached_instructions_say_persists(self) -> None:
-        instructions = ModalSandboxCapability(sandbox_id='sb-keep').get_instructions()
+        instructions = ModalSandbox(sandbox_id='sb-keep').get_instructions()
         assert instructions is not None
         assert 'persists across sessions' in instructions
         assert 'reset between' not in instructions
 
-    def test_exported_from_experimental_namespace(self) -> None:
+    def test_exported_from_capability_submodule(self) -> None:
         import pydantic_ai_harness
-        from pydantic_ai_harness.experimental.modal_sandbox import ModalSandboxCapability as Exported
+        import pydantic_ai_harness.modal_sandbox as modal_sandbox
+        from pydantic_ai_harness.modal_sandbox import ModalSandbox as Exported
 
-        assert Exported is ModalSandboxCapability
-        # Experimental capabilities are reached via the experimental namespace, not the package root.
-        assert 'ModalSandboxCapability' not in pydantic_ai_harness.__all__
+        assert Exported is ModalSandbox
+        assert 'ModalSandboxToolset' not in modal_sandbox.__all__
+        assert 'ModalSandboxExecResult' in modal_sandbox.__all__
+        # Capabilities with optional dependencies are imported from their submodule, not the package root.
+        assert 'ModalSandbox' not in pydantic_ai_harness.__all__
 
     @pytest.mark.anyio(backends=['asyncio'])
     async def test_agent_integration(self, fake_modal: FakeModal) -> None:
@@ -462,7 +618,54 @@ class TestCapability:
         if sniffio.current_async_library() != 'asyncio':  # pragma: no cover
             pytest.skip('Agent.run() requires asyncio')
         model = TestModel(custom_output_text='done', call_tools=[])
-        agent: Agent[None, str] = Agent(model, capabilities=[ModalSandboxCapability()])
+        agent: Agent[None, str] = Agent(model, capabilities=[ModalSandbox()])
         result = await agent.run('set up the project')
         assert result.output == 'done'
         assert fake_modal.sandboxes[0].terminated is True
+
+    @pytest.mark.anyio(backends=['asyncio'])
+    async def test_agent_can_call_run_command(self, fake_modal: FakeModal) -> None:
+        import sniffio
+
+        if sniffio.current_async_library() != 'asyncio':  # pragma: no cover
+            pytest.skip('Agent.run() requires asyncio')
+        fake_modal.responder = lambda argv, timeout: ('hello\n', '', 0)
+
+        def call_then_finish(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+            if not any(isinstance(part, ToolReturnPart) for message in messages for part in message.parts):
+                return ModelResponse(
+                    parts=[ToolCallPart('run_command', {'command': 'echo hello'}, tool_call_id='run-1')]
+                )
+            return ModelResponse(parts=[TextPart('done')])
+
+        agent: Agent[None, str] = Agent(FunctionModel(call_then_finish), capabilities=[ModalSandbox()])
+        result = await agent.run('run a command')
+
+        assert result.output == 'done'
+        tool_returns = [
+            part.content
+            for message in result.all_messages()
+            for part in message.parts
+            if isinstance(part, ToolReturnPart) and part.tool_name == 'run_command'
+        ]
+        assert tool_returns == ['[stdout]\nhello\n']
+        assert fake_modal.sandboxes[0].terminated is True
+
+    @pytest.mark.anyio(backends=['asyncio'])
+    async def test_agent_context_does_not_create_an_unused_base_sandbox(self, fake_modal: FakeModal) -> None:
+        import sniffio
+
+        if sniffio.current_async_library() != 'asyncio':  # pragma: no cover
+            pytest.skip('Agent.run() requires asyncio')
+        model = TestModel(custom_output_text='done', call_tools=[])
+        agent: Agent[None, str] = Agent(model, capabilities=[ModalSandbox()])
+
+        async with agent:
+            assert fake_modal.sandboxes == []
+            assert (await agent.run('first')).output == 'done'
+            assert len(fake_modal.sandboxes) == 1
+            assert fake_modal.sandboxes[0].terminated is True
+            assert (await agent.run('second')).output == 'done'
+
+        assert len(fake_modal.sandboxes) == 2
+        assert all(sandbox.terminated for sandbox in fake_modal.sandboxes)

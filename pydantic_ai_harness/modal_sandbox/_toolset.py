@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import math
+from collections.abc import Mapping
 from typing import Annotated
 
 from pydantic import Field
@@ -11,12 +13,12 @@ from pydantic_ai.tools import AgentDepsT
 from pydantic_ai.toolsets import AbstractToolset, FunctionToolset
 from typing_extensions import Self
 
-from pydantic_ai_harness._tool_output import guard_read_size, render_file_window, truncate_output
-from pydantic_ai_harness.experimental.modal_sandbox._session import (
+from pydantic_ai_harness.modal_sandbox._session import (
     ModalSandboxError,
     ModalSandboxSession,
     ModalSandboxTerminalError,
 )
+from pydantic_ai_harness.modal_sandbox._tool_output import guard_read_size, render_file_window, truncate_output
 
 
 class ModalSandboxToolset(FunctionToolset[AgentDepsT]):
@@ -24,7 +26,8 @@ class ModalSandboxToolset(FunctionToolset[AgentDepsT]):
 
     Holds the sandbox configuration and, for each run, opens a `ModalSandboxSession`
     (creating a fresh sandbox, or attaching to `sandbox_id`) that the tools execute
-    against. The sandbox is torn down when the run ends if this toolset owns it.
+    against. When the run ends, an owned session requests termination and waits for
+    a bounded period; `sandbox_timeout` is the server-side cleanup backstop.
     """
 
     def __init__(
@@ -37,12 +40,13 @@ class ModalSandboxToolset(FunctionToolset[AgentDepsT]):
         sandbox_timeout: int,
         workdir: str | None,
         default_command_timeout: float,
-        max_command_timeout: float | None,
+        max_command_timeout: int | None,
         max_output_bytes: int,
         max_output_lines: int,
         max_read_bytes: int,
-        env: dict[str, str] | None = None,
+        env: Mapping[str, str] | None = None,
         session: ModalSandboxSession | None = None,
+        _run_scoped: bool = False,
     ) -> None:
         super().__init__()
         self._image = image
@@ -56,11 +60,12 @@ class ModalSandboxToolset(FunctionToolset[AgentDepsT]):
         self._max_output_bytes = max_output_bytes
         self._max_output_lines = max_output_lines
         self._max_read_bytes = max_read_bytes
-        self._env = env
+        self._env = dict(env) if env is not None else None
         # A caller-owned session to reuse instead of opening one per run; when set, this
         # toolset uses it but never opens or closes it.
         self._external_session = session
         self._session: ModalSandboxSession | None = None
+        self._run_scoped = _run_scoped
 
         self.add_function(self.run_command, name='run_command')
         self.add_function(self.read_file, name='read_file')
@@ -72,7 +77,7 @@ class ModalSandboxToolset(FunctionToolset[AgentDepsT]):
 
         `get_toolset` builds one shared instance at agent construction; this toolset
         opens a per-run sandbox in `__aenter__`, so each run needs its own instance
-        whose `__aexit__` tears that sandbox down.
+        whose `__aexit__` requests that sandbox's termination.
         """
         return ModalSandboxToolset[AgentDepsT](
             image=self._image,
@@ -88,6 +93,7 @@ class ModalSandboxToolset(FunctionToolset[AgentDepsT]):
             max_read_bytes=self._max_read_bytes,
             env=self._env,
             session=self._external_session,
+            _run_scoped=True,
         )
 
     async def __aenter__(self) -> Self:
@@ -96,6 +102,8 @@ class ModalSandboxToolset(FunctionToolset[AgentDepsT]):
         With a caller-owned `session`, use it as-is (the caller opened it). Otherwise open a
         per-run session here so each run gets its own sandbox.
         """
+        if not self._run_scoped:
+            return self
         if self._external_session is not None:
             # The caller owns this session and must open it before the run; check here so an
             # unopened session fails at run start with a clear message, not mid-tool-call.
@@ -132,18 +140,18 @@ class ModalSandboxToolset(FunctionToolset[AgentDepsT]):
             raise ModalSandboxError('The Modal sandbox session is not open.')
         return self._session
 
-    def _command_timeout(self, timeout_seconds: float | None) -> float:
-        if timeout_seconds is not None and timeout_seconds <= 0:
+    def _command_timeout(self, timeout_seconds: float | None) -> int:
+        if timeout_seconds is not None and (not math.isfinite(timeout_seconds) or timeout_seconds <= 0):
             # Reject rather than let the session floor it to 1s: a 0 or negative request is a
             # model mistake, and a surprise "[timed out after 1s]" hides that from the model.
             raise ModelRetry(f'timeout_seconds must be greater than 0, got {timeout_seconds}.')
         requested = timeout_seconds if timeout_seconds is not None else self._default_command_timeout
         # Clamp to a hard ceiling. Modal cannot kill a running command, so a cancelled one
         # runs until its deadline; the ceiling bounds that worst case. It defaults to the
-        # sandbox lifetime, beyond which an owned command cannot run anyway. The session
-        # quantizes this to a whole-second, Modal-legal deadline.
+        # sandbox lifetime, beyond which an owned command cannot run anyway. Round up before
+        # clamping so the whole-second Modal deadline cannot exceed the configured ceiling.
         ceiling = self._max_command_timeout if self._max_command_timeout is not None else self._sandbox_timeout
-        return min(requested, ceiling)
+        return min(max(1, math.ceil(requested)), ceiling)
 
     async def run_command(self, command: str, *, timeout_seconds: float | None = None) -> str:
         """Run a shell command in the sandbox and return its output.

@@ -8,13 +8,12 @@ import sys
 import anyio
 import pytest
 
-from pydantic_ai_harness.experimental.modal_sandbox import (
+from pydantic_ai_harness.modal_sandbox import (
     ModalSandboxError,
     ModalSandboxSession,
     ModalSandboxTerminalError,
     ModalSandboxUnavailableError,
 )
-from pydantic_ai_harness.experimental.modal_sandbox import _session as session_module
 
 from .fake_modal import FakeModal, FileInfo, _AioCallable
 
@@ -87,7 +86,7 @@ class TestOwnedLifecycle:
     ) -> None:
         # If Modal's control plane stalls, terminate must not hang the caller forever: the
         # shielded teardown gives each RPC a deadline, and detach still runs after it fires.
-        monkeypatch.setattr(session_module, '_TEARDOWN_TIMEOUT', 0.05)
+        monkeypatch.setattr('pydantic_ai_harness.modal_sandbox._session._TEARDOWN_TIMEOUT', 0.05)
         session = ModalSandboxSession()
         await session.__aenter__()
         fake_modal.sandboxes[0].terminate = _HangingCall()
@@ -169,18 +168,39 @@ class TestErrors:
             async with ModalSandboxSession(sandbox_id='sb-missing'):
                 pass  # pragma: no cover
 
-    async def test_owned_create_raising_gone_maps_to_unavailable(self, fake_modal: FakeModal) -> None:
-        # An owned create that comes back already gone (e.g. the app was deleted mid-create) is
-        # terminal too, with the lifetime-oriented message rather than the attach one.
+    async def test_owned_create_not_found_is_a_generic_start_failure(self, fake_modal: FakeModal) -> None:
+        # A NotFound during creation can refer to app or image configuration, not a sandbox
+        # that was already usable, so do not misclassify it as terminal sandbox expiry.
         fake_modal.create_error = fake_modal.unavailable_type('vanished mid-create')
-        with pytest.raises(ModalSandboxUnavailableError, match='no longer running'):
+        with pytest.raises(ModalSandboxError, match='Could not start Modal sandbox: vanished mid-create') as exc:
             async with ModalSandboxSession():
                 pass  # pragma: no cover
+        assert not isinstance(exc.value, ModalSandboxTerminalError)
+
+    @pytest.mark.parametrize('value', [0, -1, True])
+    def test_invalid_sandbox_timeout_rejected(self, value: int) -> None:
+        with pytest.raises(ValueError, match='sandbox_timeout must be a positive integer'):
+            ModalSandboxSession(sandbox_timeout=value)
+
+    @pytest.mark.parametrize(
+        ('kwargs', 'expected'),
+        [
+            ({'image': 'ubuntu:22.04'}, 'image'),
+            ({'app_name': 'other'}, 'app_name'),
+            ({'create_app_if_missing': False}, 'create_app_if_missing'),
+            ({'sandbox_timeout': 600}, 'sandbox_timeout'),
+            ({'workdir': '/work'}, 'workdir'),
+            ({'env': {'A': 'b'}}, 'env'),
+        ],
+    )
+    def test_attach_rejects_owned_configuration(self, kwargs: dict[str, object], expected: str) -> None:
+        with pytest.raises(ValueError, match=f'{expected} only apply when creating a sandbox'):
+            ModalSandboxSession(sandbox_id='sb-existing', **kwargs)  # type: ignore[arg-type]
 
     async def test_create_timeout_does_not_hang(self, fake_modal: FakeModal, monkeypatch: pytest.MonkeyPatch) -> None:
         # A wedged control plane must not make enter uncancellable: the bounded, shielded
         # create gives up after its deadline and fails instead of hanging forever.
-        monkeypatch.setattr(session_module, '_CREATE_TIMEOUT', 0.05)
+        monkeypatch.setattr('pydantic_ai_harness.modal_sandbox._session._CREATE_TIMEOUT', 0.05)
         fake_modal.module.Sandbox.create = _HangingCall()  # type: ignore[attr-defined]
         with anyio.fail_after(5):
             with pytest.raises(ModalSandboxError, match='did not complete within'):
@@ -230,6 +250,18 @@ class TestExec:
             assert fake_modal.sandboxes[0].exec_calls[-1].timeout is None
             assert result.applied_timeout is None
 
+    @pytest.mark.parametrize('timeout', [0, -1, float('nan'), float('inf')])
+    async def test_invalid_timeout_rejected(self, fake_modal: FakeModal, timeout: float) -> None:
+        async with ModalSandboxSession() as session:
+            with pytest.raises(ValueError, match='timeout must be a positive finite number'):
+                await session.exec(['x'], timeout=timeout)
+
+    @pytest.mark.parametrize('max_output_bytes', [0, -1, True])
+    async def test_invalid_output_limit_rejected(self, fake_modal: FakeModal, max_output_bytes: int) -> None:
+        async with ModalSandboxSession() as session:
+            with pytest.raises(ValueError, match='max_output_bytes must be a positive integer'):
+                await session.exec(['x'], max_output_bytes=max_output_bytes)
+
     async def test_exec_error_wrapped(self, fake_modal: FakeModal) -> None:
         def boom(argv: list[str], timeout: int | None) -> tuple[str, str, int]:
             raise fake_modal.error_type('exec boom')
@@ -258,6 +290,13 @@ class TestExec:
             # The end of each stream survives -- that is where errors and exit status sit.
             assert result.stdout == '6789'
             assert result.stderr == 'GHIJ'
+
+    async def test_bounded_output_keeps_exact_tail_from_one_large_chunk(self, fake_modal: FakeModal) -> None:
+        fake_modal.responder = lambda argv, timeout: ('0123456789', 'ABCDEFGHIJ', 0)
+        async with ModalSandboxSession() as session:
+            result = await session.exec(['big'], timeout=5, max_output_bytes=4)
+        assert result.stdout == '6789'
+        assert result.stderr == 'GHIJ'
 
     async def test_bounded_output_under_cap_is_whole(self, fake_modal: FakeModal) -> None:
         fake_modal.output_chunk_size = 1
@@ -304,6 +343,16 @@ class TestExec:
         async with ModalSandboxSession() as session:
             with pytest.raises(ModalSandboxTerminalError, match='Modal rejected the credentials'):
                 await session.exec(['whatever'])
+
+    @pytest.mark.parametrize('failure_point', ['stdout', 'stderr', 'wait'])
+    @pytest.mark.parametrize('max_output_bytes', [None, 100], ids=['unbounded', 'bounded'])
+    async def test_process_stream_error_is_wrapped(
+        self, fake_modal: FakeModal, failure_point: str, max_output_bytes: int | None
+    ) -> None:
+        setattr(fake_modal, f'{failure_point}_error', fake_modal.error_type(f'{failure_point} failed'))
+        async with ModalSandboxSession() as session:
+            with pytest.raises(ModalSandboxError, match=f'Command could not run.*{failure_point} failed'):
+                await session.exec(['whatever'], max_output_bytes=max_output_bytes)
 
 
 class TestFilesystem:
@@ -389,7 +438,35 @@ class TestFilesystem:
         # A missing *sandbox* (not a missing file) is terminal: the whole sandbox is gone.
         async with ModalSandboxSession() as session:
             fake_modal.sandboxes[0].fs_error = fake_modal.unavailable_type('sandbox not found')
+            fake_modal.sandboxes[0].poll_result = 0
             with pytest.raises(ModalSandboxUnavailableError, match='no longer running'):
+                await session.read_bytes('/x')
+
+    async def test_wrapped_auth_failure_during_read_is_terminal(self, fake_modal: FakeModal) -> None:
+        async with ModalSandboxSession() as session:
+            fake_modal.sandboxes[0].fs_error = fake_modal.filesystem_error_type('filesystem failed')
+            fake_modal.sandboxes[0].poll_error = fake_modal.auth_type('bad token')
+            with pytest.raises(ModalSandboxTerminalError, match='Modal rejected the credentials'):
+                await session.read_bytes('/x')
+
+    async def test_direct_auth_failure_during_read_is_terminal(self, fake_modal: FakeModal) -> None:
+        async with ModalSandboxSession() as session:
+            fake_modal.sandboxes[0].fs_error = fake_modal.auth_type('bad token')
+            with pytest.raises(ModalSandboxTerminalError, match='Modal rejected the credentials'):
+                await session.read_bytes('/x')
+
+    async def test_poll_unavailable_after_filesystem_error_is_terminal(self, fake_modal: FakeModal) -> None:
+        async with ModalSandboxSession() as session:
+            fake_modal.sandboxes[0].fs_error = fake_modal.filesystem_error_type('filesystem failed')
+            fake_modal.sandboxes[0].poll_error = fake_modal.unavailable_type('sandbox gone')
+            with pytest.raises(ModalSandboxUnavailableError, match='no longer running'):
+                await session.read_bytes('/x')
+
+    async def test_poll_failure_preserves_original_filesystem_error(self, fake_modal: FakeModal) -> None:
+        async with ModalSandboxSession() as session:
+            fake_modal.sandboxes[0].fs_error = fake_modal.filesystem_error_type('filesystem failed')
+            fake_modal.sandboxes[0].poll_error = fake_modal.error_type('poll failed')
+            with pytest.raises(ModalSandboxError, match='filesystem failed'):
                 await session.read_bytes('/x')
 
 
@@ -425,12 +502,13 @@ class TestPathResolution:
             await session.write_bytes('file.txt', b'x')
         assert '/file.txt' in fake_modal.sandboxes[0].files
 
-    async def test_absolute_path_normalized(self, fake_modal: FakeModal) -> None:
-        # An absolute path with `..` is normalized before hitting Modal's filesystem API.
+    async def test_absolute_path_preserves_parent_segments(self, fake_modal: FakeModal) -> None:
+        # Do not normalize before the remote filesystem resolves symlinks: /work/.. can
+        # differ from / when /work itself is a symlink.
         async with ModalSandboxSession() as session:
             await session.write_bytes('/work/../data/f.txt', b'x')
-        assert '/data/f.txt' in fake_modal.sandboxes[0].files
-        assert fake_modal.sandboxes[0].made_dirs == ['/data']
+        assert '/work/../data/f.txt' in fake_modal.sandboxes[0].files
+        assert fake_modal.sandboxes[0].made_dirs == ['/work/../data']
 
     async def test_double_slash_absolute_parent_skips_make_directory(self, fake_modal: FakeModal) -> None:
         # POSIX normpath preserves a leading '//', so its parent is '//' (still root). The
