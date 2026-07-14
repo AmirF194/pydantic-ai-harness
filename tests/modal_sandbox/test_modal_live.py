@@ -248,7 +248,8 @@ class TestRealLifecycle:
             assert sandbox_id is not None
 
         became_unavailable = False
-        for attempt in range(6):
+        attempts = 8
+        for attempt in range(attempts):
             try:
                 async with ModalSandboxSession(sandbox_id=sandbox_id):
                     pass  # pragma: no cover
@@ -256,7 +257,7 @@ class TestRealLifecycle:
                 became_unavailable = True
                 break
             # Modal can lag about 30s before reporting external termination to a fresh attach.
-            if attempt < 5:
+            if attempt < attempts - 1:
                 await anyio.sleep(5)
 
         assert became_unavailable
