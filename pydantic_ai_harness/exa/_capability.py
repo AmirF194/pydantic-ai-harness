@@ -17,8 +17,8 @@ _INSTRUCTIONS = (
 )
 
 _DEEP_INSTRUCTIONS = _INSTRUCTIONS + (
-    ' For questions that need synthesis across many sources, escalate to `deep_search`: it is '
-    'slower and costs more per call, but returns a cited answer in one step.'
+    ' For questions that need synthesis across many sources, escalate to `deep_search`: it runs '
+    'a full research pass in a single call, so save it for the questions that deserve that depth.'
 )
 
 
@@ -57,9 +57,10 @@ class ExaSearch(AbstractCapability[AgentDepsT]):
     """Also expose the `deep_search` tool. Off by default.
 
     Deep search (Exa search `type='deep'`) runs a multi-step agentic search
-    and synthesizes a cited answer in one call. It is markedly slower and more
-    expensive per call than `web_search`, and the model decides when to invoke
-    tools, so the extra spend is opt-in rather than the default.
+    and synthesizes a cited answer in one call. Each call invests more time
+    and search depth than `web_search` (Exa's research-grade mode), and the
+    model decides when to invoke tools, so that investment is opt-in rather
+    than the default.
     """
 
     client: ExaClient | None = None

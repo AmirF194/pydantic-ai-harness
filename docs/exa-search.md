@@ -72,9 +72,9 @@ hard error: the run continues and the model can correct the URL or rephrase.
 `deep_search` calls Exa search with `type='deep'` and a plain-text output
 schema: Exa expands the question into multiple queries, searches, and returns
 an answer grounded in citations -- all in **one tool call**, with the cited
-sources listed under the answer. It is markedly slower and more expensive per
-call than `web_search`, and the model decides when to invoke tools, so the
-tool is off by default -- enable it explicitly:
+sources listed under the answer. Each call invests more time and search depth
+than `web_search` (Exa's research-grade mode), and the model decides when to
+invoke tools, so the tool is off by default -- enable it explicitly:
 
 ```python
 from pydantic_ai_harness.exa import ExaSearch

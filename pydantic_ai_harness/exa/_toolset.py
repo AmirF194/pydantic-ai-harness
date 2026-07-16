@@ -136,9 +136,8 @@ class ExaSearchToolset(FunctionToolset[AgentDepsT]):
     async def deep_search(self, question: str) -> str:
         """Run Exa's multi-step deep search and return a synthesized answer with its sources.
 
-        Slower and more expensive per call than `web_search`; suited to
-        questions that need synthesis across many sources rather than a quick
-        survey.
+        A full research pass in a single call; suited to questions that need
+        synthesis across many sources rather than a quick survey.
 
         Args:
             question: The research question to answer.
