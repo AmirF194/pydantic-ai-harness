@@ -2,12 +2,22 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from collections.abc import Sequence
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING
 
 from pydantic_ai.capabilities import AbstractCapability
 from pydantic_ai.tools import AgentDepsT
 
-from pydantic_ai_harness.exa._toolset import ExaClient, ExaSearchToolset
+from pydantic_ai_harness.exa._toolset import (
+    EXA_MAX_NUM_RESULTS,
+    EXA_MAX_PAGE_TEXT_CHARS,
+    ExaClient,
+    ExaSearchToolset,
+)
+
+if TYPE_CHECKING:
+    from pydantic_ai._instructions import AgentInstructions
 
 _INSTRUCTIONS = (
     'You have web research tools backed by the Exa search API. Start broad: use `web_search` '
@@ -26,11 +36,11 @@ _DEEP_INSTRUCTIONS = _INSTRUCTIONS + (
 class ExaSearch(AbstractCapability[AgentDepsT]):
     """Web research for agents, backed by the [Exa](https://exa.ai) search API.
 
-    Adds two tools: `web_search`, which returns search results together with
-    page text, and `get_page`, which retrieves the text of a specific URL.
-    Set `include_deep_search=True` to also expose `deep_search`, which runs
-    Exa's multi-step deep search and returns a synthesized, cited answer in
-    one tool call.
+    Adds two tools: `web_search`, which returns search results with their most
+    relevant excerpts, and `get_page`, which retrieves the full text of a
+    specific URL. Set `include_deep_search=True` to also expose `deep_search`,
+    which runs Exa's multi-step deep search and returns a synthesized, cited
+    answer in one tool call.
 
     ```python
     from pydantic_ai import Agent
@@ -44,13 +54,14 @@ class ExaSearch(AbstractCapability[AgentDepsT]):
     """
 
     num_results: int = 5
-    """Number of results `web_search` returns per query."""
+    """Number of results `web_search` returns per query (1 to 100, the Exa API range)."""
 
     max_text_chars: int = 10_000
-    """Maximum characters of page text returned per result.
+    """Maximum characters of page text `get_page` returns (1 to 10,000, the Exa API range).
 
-    Sent to Exa as the contents cap and re-enforced when tool output is
-    formatted, so page text stays bounded even with a custom `client`.
+    One character of headroom above the cap is requested from Exa so local
+    truncation can detect a longer page and append a truncation marker. At the
+    API ceiling of 10,000 no headroom exists, so the marker cannot fire there.
     """
 
     include_deep_search: bool = False
@@ -63,6 +74,27 @@ class ExaSearch(AbstractCapability[AgentDepsT]):
     than the default.
     """
 
+    include_domains: Sequence[str] = field(default_factory=list[str])
+    """If non-empty, search results only come from these domains (allowlist).
+
+    Applies to `web_search` and `deep_search`. Mutually exclusive with
+    `exclude_domains`.
+    """
+
+    exclude_domains: Sequence[str] = field(default_factory=list[str])
+    """Search results never come from these domains (denylist).
+
+    Applies to `web_search` and `deep_search`. Mutually exclusive with
+    `include_domains`.
+    """
+
+    guidance: str | None = None
+    """Custom research guidance for the system prompt.
+
+    Leave as `None` for the default guidance (which adapts to
+    `include_deep_search`), or set `''` to contribute no instructions at all.
+    """
+
     client: ExaClient | None = None
     """Exa client to use; when `None`, an `exa_py.AsyncExa` is built from `EXA_API_KEY`.
 
@@ -70,12 +102,26 @@ class ExaSearch(AbstractCapability[AgentDepsT]):
     key explicitly, point at a different base URL, or substitute a fake in tests.
     """
 
-    def get_instructions(self) -> str:
+    def __post_init__(self) -> None:
+        """Validate configuration against the Exa API's documented bounds."""
+        if not 1 <= self.num_results <= EXA_MAX_NUM_RESULTS:
+            raise ValueError(f'num_results must be between 1 and {EXA_MAX_NUM_RESULTS}, got {self.num_results}')
+        if not 1 <= self.max_text_chars <= EXA_MAX_PAGE_TEXT_CHARS:
+            raise ValueError(
+                f'max_text_chars must be between 1 and {EXA_MAX_PAGE_TEXT_CHARS}, got {self.max_text_chars}'
+            )
+        if self.include_domains and self.exclude_domains:
+            raise ValueError('Specify include_domains or exclude_domains, not both.')
+
+    def get_instructions(self) -> AgentInstructions[AgentDepsT] | None:
         """Static research guidance: search wide, read the promising pages in full, cite URLs.
 
-        When `include_deep_search` is set, the guidance also covers when to
-        escalate to `deep_search`.
+        When `include_deep_search` is set, the default guidance also covers
+        when to escalate to `deep_search`. A non-`None` `guidance` replaces the
+        default; `''` disables instructions entirely.
         """
+        if self.guidance is not None:
+            return self.guidance or None
         return _DEEP_INSTRUCTIONS if self.include_deep_search else _INSTRUCTIONS
 
     def get_toolset(self) -> ExaSearchToolset[AgentDepsT]:
@@ -85,4 +131,31 @@ class ExaSearch(AbstractCapability[AgentDepsT]):
             num_results=self.num_results,
             max_text_chars=self.max_text_chars,
             include_deep_search=self.include_deep_search,
+            include_domains=self.include_domains,
+            exclude_domains=self.exclude_domains,
+        )
+
+    @classmethod
+    def from_spec(
+        cls,
+        *,
+        num_results: int = 5,
+        max_text_chars: int = 10_000,
+        include_deep_search: bool = False,
+        include_domains: Sequence[str] = (),
+        exclude_domains: Sequence[str] = (),
+        guidance: str | None = None,
+    ) -> ExaSearch[AgentDepsT]:
+        """Construct the capability from serializable spec options.
+
+        The `client` field is not spec-serializable, so spec-loaded instances
+        always build the default `exa_py.AsyncExa` from `EXA_API_KEY`.
+        """
+        return cls(
+            num_results=num_results,
+            max_text_chars=max_text_chars,
+            include_deep_search=include_deep_search,
+            include_domains=list(include_domains),
+            exclude_domains=list(exclude_domains),
+            guidance=guidance,
         )
