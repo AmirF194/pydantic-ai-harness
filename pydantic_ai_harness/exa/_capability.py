@@ -16,6 +16,11 @@ _INSTRUCTIONS = (
     'the pages you relied on in your answer.'
 )
 
+_DEEP_INSTRUCTIONS = _INSTRUCTIONS + (
+    ' For questions that need synthesis across many sources, escalate to `deep_search`: it is '
+    'slower and costs more per call, but returns a cited answer in one step.'
+)
+
 
 @dataclass
 class ExaSearch(AbstractCapability[AgentDepsT]):
@@ -23,6 +28,9 @@ class ExaSearch(AbstractCapability[AgentDepsT]):
 
     Adds two tools: `web_search`, which returns search results together with
     page text, and `get_page`, which retrieves the text of a specific URL.
+    Set `include_deep_search=True` to also expose `deep_search`, which runs
+    Exa's multi-step deep search and returns a synthesized, cited answer in
+    one tool call.
 
     ```python
     from pydantic_ai import Agent
@@ -45,6 +53,15 @@ class ExaSearch(AbstractCapability[AgentDepsT]):
     formatted, so page text stays bounded even with a custom `client`.
     """
 
+    include_deep_search: bool = False
+    """Also expose the `deep_search` tool. Off by default.
+
+    Deep search (Exa search `type='deep'`) runs a multi-step agentic search
+    and synthesizes a cited answer in one call. It is markedly slower and more
+    expensive per call than `web_search`, and the model decides when to invoke
+    tools, so the extra spend is opt-in rather than the default.
+    """
+
     client: ExaClient | None = None
     """Exa client to use; when `None`, an `exa_py.AsyncExa` is built from `EXA_API_KEY`.
 
@@ -53,13 +70,18 @@ class ExaSearch(AbstractCapability[AgentDepsT]):
     """
 
     def get_instructions(self) -> str:
-        """Static research guidance: search wide, read the promising pages in full, cite URLs."""
-        return _INSTRUCTIONS
+        """Static research guidance: search wide, read the promising pages in full, cite URLs.
+
+        When `include_deep_search` is set, the guidance also covers when to
+        escalate to `deep_search`.
+        """
+        return _DEEP_INSTRUCTIONS if self.include_deep_search else _INSTRUCTIONS
 
     def get_toolset(self) -> ExaSearchToolset[AgentDepsT]:
-        """Build the toolset providing the `web_search` and `get_page` tools."""
+        """Build the toolset providing the `web_search`, `get_page`, and optional `deep_search` tools."""
         return ExaSearchToolset[AgentDepsT](
             client=self.client,
             num_results=self.num_results,
             max_text_chars=self.max_text_chars,
+            include_deep_search=self.include_deep_search,
         )
