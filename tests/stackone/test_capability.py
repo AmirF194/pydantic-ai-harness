@@ -89,13 +89,15 @@ class TestStackOne:
         assert tool_call_names(result.all_messages()) == {'bamboohr_search_actions', 'bamboohr_execute_action'}
         assert 'must never be guessed' in request_instructions(result.all_messages())
 
-    async def test_code_mode_metadata(self, stackone_server: FastMCP, run_context: RunContext[None]):
-        capability = StackOne(account_id='45320', api_key='key', client=stackone_server, code_mode=True)
+    async def test_metadata_merged_onto_tools(self, stackone_server: FastMCP, run_context: RunContext[None]):
+        capability = StackOne(
+            account_id='45320', api_key='key', client=stackone_server, metadata={'code_mode': True, 'team': 'hr'}
+        )
         toolset = capability.get_toolset()
         async with toolset:
             tools = await toolset.get_tools(run_context)
         assert tools
-        assert all(
-            tool.tool_def.metadata is not None and tool.tool_def.metadata.get('code_mode') is True
-            for tool in tools.values()
-        )
+        for tool in tools.values():
+            assert tool.tool_def.metadata is not None
+            assert tool.tool_def.metadata.get('code_mode') is True
+            assert tool.tool_def.metadata.get('team') == 'hr'

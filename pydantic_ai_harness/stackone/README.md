@@ -28,7 +28,7 @@ result = agent.run_sync('List the first 5 employees')
 print(result.output)
 ```
 
-A linked account is one authenticated connection to one provider. `actions` globs (case-insensitive `fnmatch` over the `{connector}_{action}_{entity}` tool names) control which actions the agent sees. The lower-level `StackOneToolset` is also public for `Agent(toolsets=[...])` and combinators like `approval_required()`; it carries no instructions of its own.
+A linked account is one authenticated connection to one provider.
 
 ## Tool modes
 
@@ -37,19 +37,30 @@ A linked account is one authenticated connection to one provider. `actions` glob
 | `search_execute` | Two server-side meta-tools: search the catalog, execute an action by id | Any catalog size; constant prompt footprint |
 | `individual` | One tool per enabled action, each with its own schema | Filtered or moderate catalogs; per-tool validation, filtering, approval |
 
-The default (`tool_mode=None`) resolves to `search_execute`, or `individual` when `actions` globs are given, since the globs only apply to individually registered tools. Provider catalogs can be large enough in `individual` mode to exceed model context windows, so constrain `individual` mode with `actions`, or use `defer_loading=True` (with a stable `id`) for Pydantic AI's [deferred tool loading](https://ai.pydantic.dev/deferred-tools/). In `search_execute` mode individual action names never reach the agent, so `actions` globs cannot apply (explicitly combining them warns), and combining `defer_loading` with `search_execute` stacks one discovery hop on another, which also warns.
+The default (`tool_mode=None`) resolves to `search_execute`, or `individual` when `actions` are given. `actions` are case-insensitive `fnmatch` globs over full tool names, which follow `{connector}_{action}_{entity}` (for example `['*_list_*', 'bamboohr_get_employee']`); they only apply to individually registered tools. Provider catalogs can be large enough in `individual` mode to exceed model context windows, so constrain `individual` mode with `actions`. In `search_execute` mode individual action names never reach the agent, so `actions` cannot apply; explicitly requesting `search_execute` alongside `actions` warns.
 
-## How it composes
+## Agent spec (YAML/JSON)
 
-- `code_mode=True` tags every tool with `code_mode=True` metadata for [`CodeMode`](../code_mode/README.md)`(tools={'code_mode': True})`.
-- Wrap write actions (`*_create_*`, `*_update_*`, `*_delete_*`) with [tool approval](https://ai.pydantic.dev/deferred-tools/#human-in-the-loop-tool-approval).
-- All configuration is agent-spec expressible; keep the API key in the environment, not the spec file:
+The capability works with Pydantic AI's [agent spec](https://ai.pydantic.dev/agent-spec/) format for defining agents in YAML or JSON. Keep the API key in the `STACKONE_API_KEY` environment variable rather than in the file:
 
 ```yaml
+# agent.yaml
+model: openai:gpt-5.2
 capabilities:
-  - type: StackOne
-    account_id: '45320'
-    actions: ['*_list_*']
+  - StackOne:
+      account_id: '45320'
+      actions: ['*_list_*']
 ```
 
-The API may change while the capability stabilizes; breaking changes ship deprecation warnings where practical.
+```python {test="skip"}
+from pydantic_ai import Agent
+from pydantic_ai_harness.stackone import StackOne
+
+agent = Agent.from_file('agent.yaml', custom_capability_types=[StackOne])
+```
+
+Pass `custom_capability_types` so the spec loader knows how to instantiate `StackOne`.
+
+The lower-level `StackOneToolset` is public for use with `Agent(toolsets=[...])` and core toolset combinators.
+
+This capability's API may change while it stabilizes; breaking changes ship deprecation warnings where practical.

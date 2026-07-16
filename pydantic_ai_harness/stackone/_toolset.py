@@ -1,9 +1,8 @@
 """StackOne wire contract and toolset.
 
-StackOne (https://docs.stackone.com) exposes actions on a user's linked SaaS
-accounts (HRIS, ATS, CRM, and more) through an MCP endpoint. This module owns
-the wire contract: endpoint path, header names, and the tool naming
-convention. A StackOne API change should be a diff to this file only.
+This module owns the StackOne wire contract: endpoint path, header names, and
+the tool naming convention. A StackOne API change should be a diff to this
+file only.
 
 Wire contract (https://docs.stackone.com/mcp/quickstart):
 
@@ -21,9 +20,9 @@ from __future__ import annotations
 import base64
 import os
 import warnings
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from fnmatch import fnmatch
-from typing import Literal
+from typing import Any, Literal
 
 from pydantic_ai.exceptions import UserError
 from pydantic_ai.tools import AgentDepsT, RunContext, ToolDefinition
@@ -78,8 +77,7 @@ def resolve_api_key(api_key: str | None) -> str:
     resolved = api_key or os.environ.get(STACKONE_API_KEY_ENV)
     if not resolved:
         raise UserError(
-            f'A StackOne API key is required: pass `api_key` or set the `{STACKONE_API_KEY_ENV}` '
-            'environment variable. Keys are managed at https://app.stackone.com.'
+            f'A StackOne API key is required: pass `api_key` or set the `{STACKONE_API_KEY_ENV}` environment variable.'
         )
     return resolved
 
@@ -142,7 +140,7 @@ class StackOneToolset(WrapperToolset[AgentDepsT]):
         base_url: str = STACKONE_BASE_URL,
         actions: Sequence[str] = (),
         tool_mode: ToolMode | None = None,
-        code_mode: bool = False,
+        metadata: Mapping[str, Any] | None = None,
         client: MCPToolsetClient | None = None,
         id: str = 'stackone',
     ) -> None:
@@ -159,9 +157,9 @@ class StackOneToolset(WrapperToolset[AgentDepsT]):
                 registers two server-side meta-tools that search the catalog and execute
                 actions by id, keeping the prompt footprint constant for large catalogs.
                 `None` picks `search_execute`, or `individual` when `actions` are given.
-            code_mode: Tag every tool with `code_mode=True` metadata so a
-                `CodeMode(tools={'code_mode': True})` capability exposes StackOne calls
-                inside its sandbox.
+            metadata: Metadata merged onto every tool, available to tool-selection
+                machinery such as `CodeMode(tools={'code_mode': True})` or custom
+                `prepare_tools` hooks.
             client: Replacement for the default `{base_url}/mcp` connection: anything
                 `MCPToolset` accepts (URL, `FastMCP` server, prebuilt `fastmcp.Client`).
                 Auth headers and the `search_execute` query parameter are only applied
@@ -179,6 +177,6 @@ class StackOneToolset(WrapperToolset[AgentDepsT]):
         toolset: AbstractToolset[AgentDepsT] = MCPToolset(resolved, id=id, headers=headers)
         if mode == 'individual' and actions:
             toolset = toolset.filtered(_action_filter(actions))
-        if code_mode:
-            toolset = toolset.with_metadata(code_mode=True)
+        if metadata:
+            toolset = toolset.with_metadata(**metadata)
         super().__init__(wrapped=toolset)

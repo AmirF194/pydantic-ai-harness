@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import warnings
-from collections.abc import Sequence
-from dataclasses import dataclass
+from collections.abc import Mapping, Sequence
+from dataclasses import KW_ONLY, dataclass
+from typing import Any
 
 from pydantic_ai.capabilities import AbstractCapability
 from pydantic_ai.tools import AgentDepsT
@@ -44,6 +45,8 @@ class StackOne(AbstractCapability[AgentDepsT]):
     account_id: str
     """The linked account to act on (one account is one provider connection)."""
 
+    _: KW_ONLY
+
     api_key: str | None = None
     """StackOne API key. Defaults to the `STACKONE_API_KEY` environment variable."""
 
@@ -63,8 +66,9 @@ class StackOne(AbstractCapability[AgentDepsT]):
     include_instructions: bool = True
     """Inject StackOne usage instructions into the system prompt."""
 
-    code_mode: bool = False
-    """Tag tools with `code_mode=True` metadata for `CodeMode(tools={'code_mode': True})`."""
+    metadata: Mapping[str, Any] | None = None
+    """Metadata merged onto every tool, available to tool-selection machinery such as
+    `CodeMode(tools={'code_mode': True})` or custom `prepare_tools` hooks."""
 
     client: MCPToolsetClient | None = None
     """Replacement for the default `{base_url}/mcp` connection; see `StackOneToolset`."""
@@ -87,7 +91,7 @@ class StackOne(AbstractCapability[AgentDepsT]):
             base_url=self.base_url,
             actions=self.actions,
             tool_mode=self.tool_mode,
-            code_mode=self.code_mode,
+            metadata=self.metadata,
             client=self.client,
             id=self.id or 'stackone',
         )
