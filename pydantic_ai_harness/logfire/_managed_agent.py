@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import dataclasses
 import json
 import warnings
 from collections.abc import Callable, Mapping
@@ -13,9 +12,9 @@ import logfire
 from logfire.variables import Variable
 from pydantic import BaseModel, ConfigDict, Field
 from pydantic_ai import AbstractToolset, RunContext, TemplateStr, ToolDefinition, WrapperToolset
-from pydantic_ai.capabilities import AbstractCapability
+from pydantic_ai.exceptions import UserError
 from pydantic_ai.messages import ModelRequest
-from pydantic_ai.models import Model, ModelRequestContext, infer_model
+from pydantic_ai.models import ModelRequestContext
 from pydantic_ai.settings import ModelSettings
 from pydantic_ai.tools import AgentDepsT
 from pydantic_ai.toolsets.abstract import ToolsetTool
@@ -24,11 +23,12 @@ from pydantic_ai_harness.logfire._managed_variable import ManagedVariableCapabil
 
 if TYPE_CHECKING:
     from pydantic_ai.agent.abstract import AgentModelSettings
+    from pydantic_ai.capabilities import AgentModel, ModelSelection
     from pydantic_ai.capabilities.abstract import WrapRunHandler
+    from pydantic_ai.models import ModelSelectionContext
     from pydantic_ai.run import AgentRunResult
 
 _AGENT_VARIABLE_PREFIX = 'agent__'
-_FRAMEWORK_HAS_GET_MODEL = 'get_model' in vars(AbstractCapability)
 
 
 class AgentConfigSettings(BaseModel):
@@ -240,12 +240,14 @@ class ManagedAgent(ManagedVariableCapability[AgentDepsT, AgentConfig]):
     version baggage remains active for the whole run. Managed settings override constructor settings;
     settings passed to `run()` override both.
 
-    On Pydantic AI versions with the `get_model` capability surface, an explicitly named variable can
-    supply the model during run setup. This lets a model-less `Agent(None, ...)` run from managed
-    config, while a call-site `run(model=...)` still wins. Nameless capabilities cannot source a model
-    at setup because the agent name is only available from a run context. They use the per-request
-    model swap instead, as do older Pydantic AI versions without `get_model`. Inferred models are
-    cached by model string.
+    The managed `model` is sourced during model selection, so it slots in with the right precedence:
+    a call-site `run(model=...)` beats it, it beats the agent's constructor model, and a fully
+    model-less `Agent(None, ...)` -- named or nameless -- can be driven entirely from managed config.
+    A named capability supplies the model statically (resolved once at run setup); a nameless one
+    supplies a selector that derives its variable from the agent when the model is first selected,
+    then reuses that choice for the rest of the run. Callable `targeting_key`/`attributes` don't
+    participate in model selection (it runs before a run context exists) -- only the static `label`
+    and static targeting inputs do.
 
     Tool overrides change only the definitions shown to the model. Renames route back to the original
     implementation, collisions retain the original name with a warning, and unknown tool keys are
@@ -276,8 +278,8 @@ class ManagedAgent(ManagedVariableCapability[AgentDepsT, AgentConfig]):
     name: str | Variable[AgentConfig] | None = None
     """Bare variable name, pre-built variable, or `None` to derive it from the agent name.
 
-    Nameless derivation cannot source a managed model during run setup; it uses the per-request
-    fallback instead.
+    A nameless capability derives its variable (and can source the model) from the agent's `name`
+    the first time it's needed in a run; the agent must then have a `name`.
     """
     default: AgentConfig | None = None
     """Code-side fallback config; omitted sections preserve the corresponding agent behavior."""
@@ -287,7 +289,6 @@ class ManagedAgent(ManagedVariableCapability[AgentDepsT, AgentConfig]):
     _auto_create_in_wrap_run: ClassVar[bool] = False
 
     def __post_init__(self) -> None:
-        self._model_cache: dict[str, Model] = {}
         self._setup_variable(
             self.name, prefix=_AGENT_VARIABLE_PREFIX, value_type=AgentConfig, default=self.default or AgentConfig()
         )
@@ -315,18 +316,68 @@ class ManagedAgent(ManagedVariableCapability[AgentDepsT, AgentConfig]):
 
         return model_settings
 
-    def get_model(self) -> str | None:
-        """Source the managed model during run setup when the backing variable is already known.
+    def get_model(self) -> AgentModel[AgentDepsT] | None:
+        """Source the managed model with the right precedence (`run(model=...)` > managed > constructor).
 
-        Pydantic AI applies an explicit `run(model=...)` after capability models, so the call-site
-        model wins. A nameless capability returns `None` because deriving its variable requires the
-        run context; `before_model_request` supplies its compatibility fallback.
+        When the backing variable is already known (an explicit `name` or `Variable`), the model is
+        sourced statically here, so Pydantic AI resolves it once at run setup. When the capability is
+        nameless, the variable is derived from the agent's `name`, which isn't available until a
+        [`ModelSelectionContext`][pydantic_ai.models.ModelSelectionContext] exists, so a selector
+        callable is returned instead: it derives and resolves the variable the first time Pydantic AI
+        selects the model for the run. Either way a fully model-less agent can be driven entirely
+        from Logfire, and a call-site `run(model=...)` still wins.
+
+        Both paths read the value with a **bare** `variable.get()` -- they read `.value` and never
+        enter the [`ResolvedVariable`][logfire.variables.ResolvedVariable] as a context manager -- so
+        model selection contributes no baggage: [`wrap_run`][pydantic_ai_harness.logfire.ManagedAgent.wrap_run]
+        stays the sole owner of the run's resolution baggage. Model selection runs before a
+        `RunContext` exists, so callable `targeting_key`/`attributes` can't participate (a
+        `ModelSelectionContext` is deliberately narrower); only the static `label` and static
+        targeting inputs do. That early read and `wrap_run`'s authoritative resolve return a
+        consistent value -- `get()` is a cheap lookup over the SDK's cached config, and resolution is
+        deterministic within a run.
         """
-        if self._name_omitted:
-            return None
+        if not self._name_omitted:
+            return self._resolve_model_value(self._variable)
+        return self._model_selector()
+
+    def _resolve_model_value(self, variable: Variable[AgentConfig]) -> str | None:
+        """Bare-read the managed value's `model` via static targeting -- no CM entry, so no baggage."""
         targeting_key = None if callable(self.targeting_key) else self.targeting_key
         attributes = None if callable(self.attributes) else self.attributes
-        return self._variable.get(targeting_key=targeting_key, attributes=attributes, label=self.label).value.model
+        return variable.get(targeting_key=targeting_key, attributes=attributes, label=self.label).value.model
+
+    def _model_selector(self) -> Callable[[ModelSelectionContext[AgentDepsT]], ModelSelection]:
+        """Build the per-run selector a nameless `get_model` returns.
+
+        Pydantic AI evaluates a selector once per new request step, but the managed model is a
+        run-stable config value, so the selector memoizes its first choice and every later step
+        reuses it -- one resolve per run, matching the static (named) path rather than re-reading the
+        variable each step. A fresh selector (and fresh memo) is built per `get_model` call, i.e. per
+        run, so nothing leaks across runs. On the first evaluation it derives the backing variable
+        from `ctx.agent` (the same derivation `wrap_run` performs), reads the managed model, and
+        falls back to the model Pydantic AI already selected (`ctx.model`) when none is managed --
+        raising only when there is no model at all (a nameless, model-less agent with nothing
+        published yet), so the misconfiguration surfaces clearly instead of downstream.
+        """
+        selected: list[ModelSelection] = []
+
+        def select(ctx: ModelSelectionContext[AgentDepsT]) -> ModelSelection:
+            if not selected:
+                model = self._resolve_model_value(self._ensure_variable_for_agent(ctx.agent))
+                if model is not None:
+                    selected.append(model)
+                elif ctx.model is not None:
+                    selected.append(ctx.model)
+                else:
+                    raise UserError(
+                        'A nameless `ManagedAgent` on a model-less agent has no model to run: the agent '
+                        'defines no model and none is published in Logfire yet. Give the agent a model, '
+                        'pass one to `run(model=...)`, or publish a `model` in the managed config.'
+                    )
+            return selected[0]
+
+        return select
 
     def get_wrapper_toolset(self, toolset: AbstractToolset[AgentDepsT]) -> AbstractToolset[AgentDepsT]:
         """Wrap the agent toolset with managed LLM-facing definition overlays."""
@@ -358,23 +409,14 @@ class ManagedAgent(ManagedVariableCapability[AgentDepsT, AgentConfig]):
     async def before_model_request(
         self, ctx: RunContext[AgentDepsT], request_context: ModelRequestContext
     ) -> ModelRequestContext:
-        """Capture the creation baseline and apply the per-request managed-model fallback.
+        """Capture the code-side creation baseline on the first eligible model request.
 
-        Modern explicitly named capabilities source their model through `get_model`. Nameless
-        capabilities and older Pydantic AI versions instead swap the request model here, reusing an
-        inferred-model cache across runs.
+        The managed model itself is sourced at run setup by
+        [`get_model`][pydantic_ai_harness.logfire.ManagedAgent.get_model], so this hook only snapshots
+        the code-side agent for auto-create and leaves the request untouched.
         """
         self._auto_create_snapshot(request_context)
-        if _FRAMEWORK_HAS_GET_MODEL and not self._name_omitted:
-            return request_context
-        resolved = self.resolved
-        if resolved is None or resolved.value.model is None:
-            return request_context
-        model_string = resolved.value.model
-        model = self._model_cache.get(model_string)
-        if model is None:
-            model = self._model_cache[model_string] = infer_model(model_string)
-        return dataclasses.replace(request_context, model=model)
+        return request_context
 
     def _auto_create_snapshot(self, request_context: ModelRequestContext) -> None:
         """Create the code-side `AgentConfig` baseline at the first eligible model request.

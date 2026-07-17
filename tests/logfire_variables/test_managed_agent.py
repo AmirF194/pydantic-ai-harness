@@ -299,23 +299,25 @@ async def test_managed_model_runs_model_less_agent_and_run_model_wins() -> None:
     assert result.output == 'call-site'
 
 
-async def test_nameless_model_fallback_and_cache(monkeypatch: pytest.MonkeyPatch) -> None:
-    from pydantic_ai_harness.logfire import _managed_agent
+async def test_nameless_model_selector_resolves_once_per_run(monkeypatch: pytest.MonkeyPatch) -> None:
+    # A nameless capability's selector is evaluated once per request step, but the managed model is a
+    # run-stable value, so it memoizes and resolves the variable exactly once even across steps.
+    resolves: list[str] = []
+    original = ManagedAgent[Any]._resolve_model_value
 
-    inferred: list[str] = []
-    original_infer = _managed_agent.infer_model
+    def counting(self: ManagedAgent[Any], variable: Variable[Any]) -> str | None:
+        resolves.append(variable.name)
+        return original(self, variable)
 
-    def recording_infer(model: str):
-        inferred.append(model)
-        return original_infer(model)
+    monkeypatch.setattr(ManagedAgent, '_resolve_model_value', counting)
 
-    monkeypatch.setattr(_managed_agent, '_FRAMEWORK_HAS_GET_MODEL', False)
-    monkeypatch.setattr(_managed_agent, 'infer_model', recording_infer)
+    def a_tool() -> str:
+        return 'ok'
+
     capability = ManagedAgent(default=AgentConfig(model='test'))
-    agent = Agent(TestModel(), name='nameless_model', capabilities=[capability])
-    await agent.run('hello')
-    await agent.run('again')
-    assert inferred == ['test']
+    # A model-less agent with one tool: `TestModel` calls the tool (step 1) then answers (step 2).
+    await Agent(None, name='multi_step', tools=[a_tool], capabilities=[capability]).run('hello')
+    assert resolves == ['agent__multi_step']
 
 
 async def test_known_variable_skips_snapshot_build(capfire: CaptureLogfire, monkeypatch: pytest.MonkeyPatch) -> None:

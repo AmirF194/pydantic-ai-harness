@@ -28,6 +28,7 @@ from typing_extensions import TypeVar
 if TYPE_CHECKING:
     from logfire import Logfire
     from logfire.variables import ResolvedVariable, VariableConfig
+    from pydantic_ai.agent.abstract import AbstractAgent
     from pydantic_ai.capabilities.abstract import WrapRunHandler
     from pydantic_ai.run import AgentRunResult
 
@@ -228,11 +229,23 @@ class ManagedVariableCapability(AbstractCapability[AgentDepsT], Generic[AgentDep
     def _ensure_variable(self, ctx: RunContext[AgentDepsT]) -> Variable[ValueT]:
         """Return the backing variable, building it from the running agent's `name` on first use.
 
+        Thin wrapper over [`_ensure_variable_for_agent`][] reading the agent off a `RunContext`. Model
+        selection (which has a `ModelSelectionContext`, not a `RunContext`) calls the agent-based
+        method directly, so both entry points build the same variable and share the cache.
+        """
+        return self._ensure_variable_for_agent(ctx.agent)
+
+    def _ensure_variable_for_agent(self, agent: AbstractAgent[AgentDepsT, Any] | None) -> Variable[ValueT]:
+        """Return the backing variable, building it from the agent's `name` on first use.
+
         For an eagerly-built variable (an explicit `name` or `Variable` was given) this just returns
-        it. For a nameless capability it derives `<prefix><agent name>` from `ctx.agent.name` once,
+        it. For a nameless capability it derives `<prefix><agent name>` from `agent.name` once,
         caching the result on the capability so later runs and the other run-time surfaces reuse it.
-        Raises [`UserError`][pydantic_ai.exceptions.UserError] when there is no agent name to derive
-        from -- a nameless managed capability requires the agent to have a `name`.
+        Takes the agent directly (rather than a `RunContext`) so both the run-time hooks and model
+        selection -- which sees a narrower `ModelSelectionContext` before any `RunContext` exists --
+        derive the same variable. Raises [`UserError`][pydantic_ai.exceptions.UserError] when there
+        is no agent name to derive from -- a nameless managed capability requires the agent to have a
+        `name`.
         """
         variable = self._built_variable
         if variable is not None:
@@ -244,7 +257,7 @@ class ManagedVariableCapability(AbstractCapability[AgentDepsT], Generic[AgentDep
             variable = self._built_variable
             if variable is not None:
                 return variable
-            agent_name = ctx.agent.name if ctx.agent is not None else None
+            agent_name = agent.name if agent is not None else None
             if not agent_name:
                 raise UserError(
                     'A managed capability without an explicit `name` derives its backing variable from '

@@ -32,10 +32,9 @@ a nameless capability on a nameless agent raises a clear error. The derived name
 exactly the way the Logfire UI normalizes observed agent names (lowercased, non-alphanumeric runs
 collapsed to `_`), so the variable the SDK resolves is the variable the UI creates when you manage
 an observed agent. Pass an explicit `name` to decouple the variable from the agent's name, or to
-share one variable across agents. One edge: a nameless `ManagedAgent` can't *source* the model at
-run setup (there's no agent yet at that point) -- it can only override the model on an agent that
-already has one. Pass an explicit `name` when you need it to source the model for a model-less
-agent.
+share one variable across agents. A nameless capability derives its variable -- and can source the
+model for a model-less agent -- from the agent's `name` the first time it's needed in a run, so
+naming the agent is all it takes.
 
 They share one contract: **the code-defined agent is the fallback.** Every managed value is a
 patch on what's written in code -- absent fields keep their code values, and a missing, invalid,
@@ -352,11 +351,13 @@ The variable holds an `AgentConfig`:
   with a warning (other patches still apply) rather than breaking the run.
 - An override keyed to a tool that no longer exists is inert -- that's the drift case (the tool was
   removed or renamed in code), and the Logfire UI is where it becomes visible.
-- **Model precedence:** the managed `model` is sourced at run setup via the capability's `get_model`
-  hook, so it slots in with the right precedence -- a call-site `run(model=...)` beats it, it beats
-  the agent's constructor model, and a fully model-less agent can be driven entirely from Logfire.
-  (On older pydantic-ai without the `get_model` hook, the model is instead swapped per request, which
-  requires a code-side model and can't beat a per-run `model=`.)
+- **Model precedence:** the managed `model` is sourced during model selection via the capability's
+  `get_model` hook, so it slots in with the right precedence -- a call-site `run(model=...)` beats
+  it, it beats the agent's constructor model, and a fully model-less agent (named or nameless) can be
+  driven entirely from Logfire. A named capability sources it statically (once per run); a nameless
+  one derives its variable from the agent when the model is first selected and then reuses that
+  choice for the run. Callable `targeting_key`/`attributes` don't participate in model selection (it
+  runs before a run context exists) -- only the static `label` and static targeting inputs do.
 - **Settings precedence:** managed settings merge **over** the agent's constructor `model_settings`
   and **under** per-run `model_settings=`, so run arguments always win.
 - **Adoption reporting:** for the run's duration, `logfire.managed.applied_sections` baggage names

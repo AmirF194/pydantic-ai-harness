@@ -116,8 +116,8 @@ def test_ensure_variable_returns_variable_built_while_awaiting_lock() -> None:
             return False
 
     capability._build_lock = cast(Any, _RaceLock())
-    # `ctx` is only touched after the second check builds a new variable; here it returns first.
-    assert capability._ensure_variable(cast(Any, None)) is built
+    # `agent` is only touched after the second check builds a new variable; here it returns first.
+    assert capability._ensure_variable_for_agent(cast(Any, None)) is built
 
 
 def test_auto_create_marking_rechecks_guard_under_lock(monkeypatch: pytest.MonkeyPatch) -> None:

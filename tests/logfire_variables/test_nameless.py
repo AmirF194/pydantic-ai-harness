@@ -42,5 +42,21 @@ def test_explicit_name_rules_unchanged() -> None:
         ManagedAgent('Checkout Agent')
 
 
-def test_nameless_get_model_returns_none() -> None:
-    assert ManagedAgent().get_model() is None
+def test_nameless_get_model_returns_selector() -> None:
+    # A nameless capability can't source the model statically (no agent yet), so `get_model` hands
+    # back a selector Pydantic AI evaluates once it has a `ModelSelectionContext`.
+    assert callable(ManagedAgent().get_model())
+
+
+async def test_nameless_sources_model_for_model_less_agent() -> None:
+    # The nameless selector derives `agent__solo` from the agent's name and drives a model-less agent.
+    capability = ManagedAgent(default=AgentConfig(model='test'))
+    result = await Agent(None, name='solo', capabilities=[capability]).run('hello')
+    assert result.output.startswith('success')
+    assert capability._variable.name == 'agent__solo'
+
+
+async def test_nameless_model_less_agent_without_managed_model_raises() -> None:
+    agent = Agent(None, name='unpublished', capabilities=[ManagedAgent()])
+    with pytest.raises(UserError, match='no model to run'):
+        await agent.run('hello')
