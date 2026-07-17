@@ -128,7 +128,7 @@ as the capability matures.
 - The monitor only implements `for_run` and `after_model_request`; it adds no
   tools, instructions, or model settings, so it composes with any other
   capability, toolset, or `ToolSearch` setup without interference.
-- Per-run state (the high-water mark) is materialized in `for_run`, so one
+- Per-run state (the per-key marks and timing) is materialized in `for_run`, so one
   `CacheStabilityMonitor` instance can be reused across many `Agent.run` calls --
   each run is judged independently.
 
