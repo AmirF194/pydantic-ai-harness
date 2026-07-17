@@ -15,7 +15,7 @@ Pydantic AI's [capabilities](https://ai.pydantic.dev/capabilities/) and [hooks](
 
 The [capability matrix](#capability-matrix) tracks where we are. [Tell us what to prioritize.](#help-us-prioritize)
 
-**Contents:** [Installation](#installation) · [Quick start](#quick-start) · [Capability matrix](#capability-matrix) · [An ecosystem agent](#an-ecosystem-agent) · [Help us prioritize](#help-us-prioritize) · [Build your own](#build-your-own) · [Contributing](#contributing) · [Version policy](#version-policy) · [Pydantic AI references](#pydantic-ai-references) · [License](#license)
+**Contents:** [Installation](#installation) · [Quick start](#quick-start) · [DynamicWorkflow](#orchestrating-sub-agents-dynamicworkflow) · [Capability matrix](#capability-matrix) · [An ecosystem agent](#an-ecosystem-agent) · [Help us prioritize](#help-us-prioritize) · [Build your own](#build-your-own) · [Contributing](#contributing) · [Version policy](#version-policy) · [Pydantic AI references](#pydantic-ai-references) · [License](#license)
 
 ## Installation
 
@@ -26,13 +26,15 @@ uv add pydantic-ai-harness
 Extras for specific capabilities:
 
 ```bash
-uv add "pydantic-ai-harness[codemode]"   # CodeMode (adds the Monty sandbox)
-uv add "pydantic-ai-harness[logfire]"     # ManagedPrompt (Logfire-managed prompts)
+uv add "pydantic-ai-harness[codemode]"          # CodeMode (adds the Monty sandbox)
+uv add "pydantic-ai-harness[dynamic-workflow]"  # DynamicWorkflow (adds the Monty sandbox)
+uv add "pydantic-ai-harness[logfire]"           # ManagedPrompt (Logfire-managed prompts)
+uv add "pydantic-ai-harness[acp]"               # ACP (serve an agent to editors over the Agent Client Protocol)
 ```
 
 The `code-mode` extra is also supported as an alias.
 
-Requires Python 3.10+ and `pydantic-ai-slim>=1.95.1`.
+Requires Python 3.10+ and `pydantic-ai-slim>=2.1.0`.
 
 ## Quick start
 
@@ -92,7 +94,47 @@ practices and warning of a "normalization of deviance" as engineers stop reviewi
 
 [![Logfire trace from the Quick start run](docs/images/quick-start-trace.png)](https://logfire-us.pydantic.dev/public-trace/84bcf123-2106-49da-9f6f-5c26395339bb?spanId=7650806a0785b946)
 
-**[See this run as a public Logfire trace →](https://logfire-us.pydantic.dev/public-trace/84bcf123-2106-49da-9f6f-5c26395339bb?spanId=7650806a0785b946)** Each `run_code` span fans out into the tool calls the model issued from inside the sandbox -- it's the easiest way to understand what code mode actually did.
+**[See this run as a public Logfire trace ->](https://logfire-us.pydantic.dev/public-trace/84bcf123-2106-49da-9f6f-5c26395339bb?spanId=7650806a0785b946)** Each `run_code` span fans out into the tool calls the model issued from inside the sandbox -- it's the easiest way to understand what code mode actually did.
+
+## Orchestrating sub-agents: DynamicWorkflow
+
+`CodeMode` gives the model one script for its *tools*. `DynamicWorkflow` does the same for *sub-agents*. Without it, an orchestrator delegates one tool call at a time: call a sub-agent, wait, read the result into context, think, call the next one. Ten delegations cost ten model round-trips, and every intermediate result flows through the orchestrator's context whether it needed to see it or not.
+
+With it, the model writes one Python script in which each sub-agent is an async function, and the whole tree runs in a single tool call:
+
+```python
+from pydantic_ai import Agent
+from pydantic_ai_harness.dynamic_workflow import DynamicWorkflow
+
+reviewer = Agent('anthropic:claude-sonnet-4-6', name='reviewer', description='Reviews code for bugs.')
+summarizer = Agent('anthropic:claude-sonnet-4-6', name='summarizer', description='Summarizes findings.')
+
+orchestrator = Agent(
+    'anthropic:claude-opus-4-7',
+    capabilities=[DynamicWorkflow(agents=[reviewer, summarizer])],
+)
+```
+
+The script the model writes looks like this -- fan out, chain, and only the last line's value returns to its context:
+
+```python
+import asyncio
+
+reports = await asyncio.gather(
+    reviewer(task="Review auth.py for bugs:\n<file contents>"),
+    reviewer(task="Review parser.py for bugs:\n<file contents>"),
+)
+await summarizer(task="Summarize these findings:\n" + "\n\n".join(reports))
+```
+
+It composes with the rest of the harness:
+
+- **Budgets**: `max_agent_calls` is an exact, host-enforced ceiling on sub-agent runs (it holds even under concurrent fan-out), and by default the whole tree's token spend lands on the parent run's `usage`.
+- **On-demand**: `defer_loading=True` keeps the catalog out of the prompt until the model loads the capability, and `reveal()` adds a sub-agent mid-run without disturbing the prompt cache.
+
+`DynamicWorkflow`'s API is subject to change while planned extensions (structured sub-agent inputs, durable workflows) settle the call contract. Breaking changes ship deprecation warnings where practical.
+
+[Full tutorial →](pydantic_ai_harness/dynamic_workflow/)
 
 ## Capability matrix
 
@@ -106,23 +148,29 @@ We studied leading coding agents, agent frameworks, and Claw-style assistants to
 | | **Tool search** | Progressive tool discovery for large tool sets | :white_check_mark: [Pydantic&nbsp;AI](https://pydantic.dev/docs/ai/tools-toolsets/toolsets/#deferred-loading) | |
 | | **File system** | Read, write, edit, search files with path traversal prevention | :white_check_mark: [Docs](pydantic_ai_harness/filesystem/) | [pydantic-ai-backend](https://github.com/vstorm-co/pydantic-ai-backend) (vstorm&#8209;co) |
 | | **Shell** | Execute commands with allowlists, denylists, and timeouts | :white_check_mark: [Docs](pydantic_ai_harness/shell/) | [pydantic-ai-backend](https://github.com/vstorm-co/pydantic-ai-backend) (vstorm&#8209;co) |
-| | **Repo context injection** | Auto-load CLAUDE.md/AGENTS.md and repo structure | :construction: [PR&nbsp;#175](https://github.com/pydantic/pydantic-ai-harness/pull/175) | [pydantic-deep](https://github.com/vstorm-co/pydantic-deepagents) (vstorm&#8209;co) |
+| | **Repo context injection** | Auto-load CLAUDE.md/AGENTS.md and repo structure | :white_check_mark: [Docs](pydantic_ai_harness/context/) | [pydantic-deep](https://github.com/vstorm-co/pydantic-deepagents) (vstorm&#8209;co) |
+| | **Docs lookup** | On-demand `read_pyai_docs` tool for Pydantic AI docs | :white_check_mark: [Docs](pydantic_ai_harness/docs/) | |
 | | **Verification loop** | Run tests after edits, auto-fix failures | :construction: [PR&nbsp;#169](https://github.com/pydantic/pydantic-ai-harness/pull/169) | |
-| **Context management** | **Sliding window** | Trim conversation history to stay within token limits | :construction: [PR&nbsp;#191](https://github.com/pydantic/pydantic-ai-harness/pull/191) | [summarization-pydantic-ai](https://github.com/vstorm-co/summarization-pydantic-ai) (vstorm&#8209;co) |
-| | **Context compaction** | LLM-powered summarization of older messages | :construction: [PR&nbsp;#191](https://github.com/pydantic/pydantic-ai-harness/pull/191) | [summarization-pydantic-ai](https://github.com/vstorm-co/summarization-pydantic-ai) (vstorm&#8209;co) |
-| | **Limit warnings** | Warn agent before hitting context/iteration limits | :construction: [PR&nbsp;#191](https://github.com/pydantic/pydantic-ai-harness/pull/191) | [summarization-pydantic-ai](https://github.com/vstorm-co/summarization-pydantic-ai) (vstorm&#8209;co) |
-| | **Tool output management** | Truncate, summarize, or spill large tool outputs | :construction: [PR&nbsp;#185](https://github.com/pydantic/pydantic-ai-harness/pull/185) | |
+| **Editor integration** | **ACP** | Serve an agent to editors (Zed, etc.) over the [Agent Client Protocol](https://agentclientprotocol.com) -- streamed text, diff-rendered edits, tool approval | :white_check_mark: [Docs](pydantic_ai_harness/experimental/acp/) (experimental) | |
+| **Prompt management** | **Managed prompt** | Back an agent's instructions with a [Logfire](https://pydantic.dev/logfire)-managed prompt, editable without shipping code | :white_check_mark: [Docs](pydantic_ai_harness/logfire/) | |
+| **Context management** | **Sliding window** | Trim conversation history to stay within token limits | :white_check_mark: [Docs](pydantic_ai_harness/compaction/) | [summarization-pydantic-ai](https://github.com/vstorm-co/summarization-pydantic-ai) (vstorm&#8209;co) |
+| | **Context compaction** | LLM-powered summarization of older messages | :white_check_mark: [Docs](pydantic_ai_harness/compaction/) | [summarization-pydantic-ai](https://github.com/vstorm-co/summarization-pydantic-ai) (vstorm&#8209;co) |
+| | **Limit warnings** | Warn agent before hitting context/iteration limits | :white_check_mark: [Docs](pydantic_ai_harness/compaction/) | [summarization-pydantic-ai](https://github.com/vstorm-co/summarization-pydantic-ai) (vstorm&#8209;co) |
+| | **Tool output management** | Truncate, summarize, or spill large tool outputs | :white_check_mark: [Docs](pydantic_ai_harness/overflowing_tool_output/) | |
 | | **System reminders** | Inject periodic reminders to counteract instruction drift | :construction: [PR&nbsp;#181](https://github.com/pydantic/pydantic-ai-harness/pull/181) | |
-| **Memory &&nbsp;persistence** | **Memory** | Persistent key-value memory across sessions | :construction: [PR&nbsp;#179](https://github.com/pydantic/pydantic-ai-harness/pull/179) | [pydantic-deep](https://github.com/vstorm-co/pydantic-deepagents) (vstorm&#8209;co) |
-| | **Session persistence** | Save and restore full conversation state | :construction: [PR&nbsp;#176](https://github.com/pydantic/pydantic-ai-harness/pull/176) | |
-| | **Checkpointing** | Save, rewind, and fork conversation state | :memo: [#196](https://github.com/pydantic/pydantic-ai-harness/issues/196) | [pydantic-deep](https://github.com/vstorm-co/pydantic-deepagents) (vstorm&#8209;co) |
-| **Agent orchestration** | **Sub-agents** | Delegate subtasks to specialized child agents | :construction: [PR&nbsp;#178](https://github.com/pydantic/pydantic-ai-harness/pull/178) | [subagents-pydantic-ai](https://github.com/vstorm-co/subagents-pydantic-ai) (vstorm&#8209;co) |
+| **Memory &&nbsp;persistence** | **Memory** | Persistent, namespaced notebook with bounded prompt injection, on-demand search, and concurrency-safe stores | :white_check_mark: [Docs](pydantic_ai_harness/memory/) | [pydantic-deep](https://github.com/vstorm-co/pydantic-deepagents) (vstorm&#8209;co) |
+| | **Session persistence** | Save and restore full conversation state | :white_check_mark: [Docs](pydantic_ai_harness/step_persistence/) | |
+| | **Checkpointing** | Snapshot, resume (`continue_run`), and fork (`fork_run`) a run | :white_check_mark: [Docs](pydantic_ai_harness/step_persistence/) | [pydantic-deep](https://github.com/vstorm-co/pydantic-deepagents) (vstorm&#8209;co) |
+| | **Media externalization** | Offload large `BinaryContent` to content-addressed stores (building blocks) | :white_check_mark: [Docs](pydantic_ai_harness/media/) | |
+| **Agent orchestration** | **Sub-agents** | Delegate subtasks to specialized child agents | :white_check_mark: [Docs](pydantic_ai_harness/subagents/) | [subagents-pydantic-ai](https://github.com/vstorm-co/subagents-pydantic-ai) (vstorm&#8209;co) |
+| | **Dynamic workflow** | Orchestrate sub-agents from a model-written Python script -- fan-out, chaining, voting in one tool call | :white_check_mark: [Docs](pydantic_ai_harness/dynamic_workflow/) | |
 | | **Skills** | Progressive tool loading -- search, activate, deactivate | :construction: [PR&nbsp;#183](https://github.com/pydantic/pydantic-ai-harness/pull/183) | [pydantic-ai-skills](https://github.com/DougTrajano/pydantic-ai-skills) (DougTrajano), [pydantic-deep](https://github.com/vstorm-co/pydantic-deepagents) (vstorm&#8209;co) |
-| | **Planning** | Break complex tasks into structured plans before execution | :construction: [PR&nbsp;#180](https://github.com/pydantic/pydantic-ai-harness/pull/180) | |
+| | **Planning** | Break complex tasks into structured plans before execution | :white_check_mark: [Docs](pydantic_ai_harness/planning/) | |
+| | **Runtime authoring** | Let an agent author, validate, and load real capabilities at runtime | :white_check_mark: [Docs](pydantic_ai_harness/runtime_authoring/) | |
 | | **Task tracking** | Track tasks, subtasks, and dependencies | :memo: [#65](https://github.com/pydantic/pydantic-ai-harness/issues/65) | [pydantic-ai-todo](https://github.com/vstorm-co/pydantic-ai-todo) (vstorm&#8209;co) |
 | | **Teams** | Multi-agent teams with shared state and message bus | :memo: [#195](https://github.com/pydantic/pydantic-ai-harness/issues/195) | [pydantic-deep](https://github.com/vstorm-co/pydantic-deepagents) (vstorm&#8209;co) |
-| **Safety &&nbsp;guardrails** | **Input guardrails** | Validate user input before the agent run starts | :construction: [PR&nbsp;#182](https://github.com/pydantic/pydantic-ai-harness/pull/182) | [pydantic-ai-shields](https://github.com/vstorm-co/pydantic-ai-shields) (vstorm&#8209;co) |
-| | **Output guardrails** | Validate model output after the run completes | :construction: [PR&nbsp;#182](https://github.com/pydantic/pydantic-ai-harness/pull/182) | [pydantic-ai-shields](https://github.com/vstorm-co/pydantic-ai-shields) (vstorm&#8209;co) |
+| **Safety &&nbsp;guardrails** | **Input guardrails** | Validate user input before the agent run starts | :white_check_mark: [Docs](pydantic_ai_harness/guardrails/) | [pydantic-ai-shields](https://github.com/vstorm-co/pydantic-ai-shields) (vstorm&#8209;co) |
+| | **Output guardrails** | Validate model output after the run completes | :white_check_mark: [Docs](pydantic_ai_harness/guardrails/) | [pydantic-ai-shields](https://github.com/vstorm-co/pydantic-ai-shields) (vstorm&#8209;co) |
 | | **Cost/token budgets** | Enforce token and cost limits per run | :construction: [PR&nbsp;#182](https://github.com/pydantic/pydantic-ai-harness/pull/182) | [pydantic-ai-shields](https://github.com/vstorm-co/pydantic-ai-shields) (vstorm&#8209;co) |
 | | **Tool access control** | Block tools or require approval before execution | :construction: [PR&nbsp;#182](https://github.com/pydantic/pydantic-ai-harness/pull/182) | [pydantic-ai-shields](https://github.com/vstorm-co/pydantic-ai-shields) (vstorm&#8209;co) |
 | | **Async guardrails** | Run validation concurrently with model requests | :construction: [PR&nbsp;#182](https://github.com/pydantic/pydantic-ai-harness/pull/182) | [pydantic-ai-shields](https://github.com/vstorm-co/pydantic-ai-shields) (vstorm&#8209;co) |
@@ -134,6 +182,7 @@ We studied leading coding agents, agent frameworks, and Claw-style assistants to
 | | **Tool orphan repair** | Fix orphaned tool calls in conversation history | :construction: [PR&nbsp;#184](https://github.com/pydantic/pydantic-ai-harness/pull/184) | |
 | **Reasoning** | **Adaptive reasoning** | Adjust thinking effort based on task complexity | :construction: [PR&nbsp;#174](https://github.com/pydantic/pydantic-ai-harness/pull/174) | |
 | | **Current time** | Inject current date/time into system prompt | :construction: [PR&nbsp;#170](https://github.com/pydantic/pydantic-ai-harness/pull/170) | |
+| **Prompt management** | **Managed prompt** | Serve Logfire-managed prompts as instructions, so you can edit and roll them out without a code deploy | :white_check_mark: [Docs](pydantic_ai_harness/logfire/) | |
 
 > Packages by [vstorm-co](https://github.com/vstorm-co) are endorsed by the Pydantic AI team. We're working with them to upstream some of their implementations into this repo.
 
@@ -278,8 +327,8 @@ make testcov   # pytest with 100% branch coverage
 
 Pydantic AI Harness uses **0.x versioning** to signal that APIs are still stabilizing. During 0.x:
 
-- **Minor releases** (0.1 → 0.2) may include breaking changes -- renamed parameters, changed defaults, restructured APIs. As the library grows, especially as capabilities gain provider-native support (starting as a local implementation, then auto-switching to the provider's built-in API when available), we may need to reshape APIs we couldn't fully anticipate in the initial design.
-- **Patch releases** (0.1.0 → 0.1.1) will not intentionally break existing behavior.
+- **Minor releases** (0.1 -> 0.2) may include breaking changes -- renamed parameters, changed defaults, restructured APIs. As the library grows, especially as capabilities gain provider-native support (starting as a local implementation, then auto-switching to the provider's built-in API when available), we may need to reshape APIs we couldn't fully anticipate in the initial design.
+- **Patch releases** (0.1.0 -> 0.1.1) will not intentionally break existing behavior.
 - **All breaking changes** are documented in release notes with migration guidance.
 - Where practical, we'll keep the previous behavior available under a deprecated name or configuration option before removing it.
 

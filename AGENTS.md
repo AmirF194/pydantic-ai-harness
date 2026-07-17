@@ -21,7 +21,7 @@ change instead of reimplementing core behavior in harness.
 - **Capability**: an `AbstractCapability` subclass that bundles tools, hooks, instructions, and model settings into a reusable unit. This is the core abstraction of pydantic-ai-harness.
 - **Hook**: a lifecycle method on `AbstractCapability` that intercepts agent graph execution (e.g. `before_model_request`, `wrap_run`, `after_tool_execute`)
 - **Toolset**: a collection of tools that a capability can provide to the agent
-- **Guard**: a type of capability that validates inputs/outputs or controls tool access (e.g. `InputGuardrail`, `CostGuard`)
+- **Guard**: a type of capability that validates inputs/outputs or controls tool access (e.g. `InputGuard`, `OutputGuard`)
 - **Harness**: this package -- a collection of pre-made capabilities for Pydantic AI.
 - **AICA**: AI Code Assistant -- the automated agent that implements issues, reviews plans, and handles PR feedback
 - **Ralph loop**: the state-machine-based workflow that drives AICA through phases (TRIAGE -> GOALS -> PLAN -> CODE -> VERIFY -> REVIEW -> PUBLISH)
@@ -44,9 +44,12 @@ Before implementing or reviewing a capability change:
    signatures when needed. Do not assume a contributor's local checkout layout.
 5. Use `pydantic_ai_harness.code_mode` as the exemplar for capability shape,
    docs, tests, and public exports until another capability becomes a better
-   example. `code_mode` is a released top-level capability; new capabilities
-   start under `pydantic_ai_harness.experimental` (see
-   `agent_docs/capability-authoring.md`, "Experimental Vs Released Exports").
+   example. Capabilities live in their own top-level submodule
+   `pydantic_ai_harness/<name>/` (module name = capability name; one module per
+   capability or strategy) and are not re-exported from the root `__init__.py`,
+   so each keeps its own optional dependencies. The `experimental` tier is
+   retired; ACP is the sole remaining experimental capability (see
+   `agent_docs/capability-authoring.md`, "Capability Submodules And Exports").
 
 ## Capabilities API reference
 
@@ -111,19 +114,18 @@ Always run `make lint && make typecheck && make test` before committing.
 
 ## File structure
 
-```
-pydantic_ai_harness/
-  __init__.py          # public API re-exports
-  <capability>/        # each capability gets its own package
-    __init__.py        # public exports for the capability
-    _capability.py     # capability class (AbstractCapability subclass)
-    _toolset.py        # toolset implementation
-    README.md          # standalone docs for the capability
-tests/
-  conftest.py          # shared fixtures (TestModel, test_agent)
-  <capability>/        # tests mirror source packages
-    test_<capability>.py
-```
+The tree is discoverable by listing it; only the conventions that are not are
+recorded here.
+
+Each released capability is a self-contained package under
+`pydantic_ai_harness/<capability>/` (naming and exports are covered in the
+preflight above), with tests under `tests/<capability>/`. It ships **two**
+hand-maintained docs that must stay in sync: the `README.md` next to the code
+(GitHub/PyPI) and the `docs/<capability>.md` page (the docs site at
+pydantic.dev/docs/ai/harness). The `docs/` folder is flat -- there are no
+`capabilities/` or `experimental/` subdirectories. A user-facing change updates
+both; `agent_docs/review-checklist.md` "Docs" and the `docs-parity-reviewer`
+subagent enforce the parity before merge.
 
 Do not add placeholder template files for new capabilities. Start from the
 existing `CodeMode` package shape, then delete what the new capability does not
@@ -138,6 +140,14 @@ need.
 - Prefer tests through `Agent(..., capabilities=[...])` when that is the public
   behavior. Use direct `Toolset`/`RunContext` tests for lower-level lifecycle,
   schema, retry, or wrapper behavior that is hard to isolate through `Agent`.
+- Don't import private (`_`-prefixed) helpers into tests. Exercise them through
+  the capability's public surface so tests survive internal refactors: drive the
+  behavior through `Agent(..., capabilities=[...])`, or import the public class
+  re-exported from the capability package's `__init__.py` (e.g.
+  `from pydantic_ai_harness.filesystem import FileSystemToolset`, not
+  `from pydantic_ai_harness.filesystem._toolset import _content_hash`). When a
+  branch is only reachable by calling a private helper directly, mark it
+  `# pragma: no cover` rather than reaching into the helper from a test.
 
 ## Contributing rules for AICAs
 
@@ -145,4 +155,3 @@ need.
 - Always link sources for any claims made during research
 - Run `make lint && make typecheck && make test` before every commit
 - Commit messages should summarize the "why", not the "what"
-- All GitHub comments must start with "Claude here: "

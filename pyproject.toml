@@ -29,7 +29,7 @@ classifiers = [
 ]
 dependencies = [
     "httpx>=0.28.1",
-    "pydantic-ai-slim>=1.105.0",
+    "pydantic-ai-slim>=2.1.0",
 ]
 
 [project.optional-dependencies]
@@ -48,7 +48,14 @@ dbos = [
 ]
 logfire = [
     'logfire>=4.31.0',
-    "pydantic-ai-slim[spec]>=1.105.0",
+    "pydantic-ai-slim[spec]>=2.1.0",
+]
+dynamic-workflow = [
+    "pydantic-monty>=0.0.16",
+]
+acp = [
+    # The SDK breaks across minors, so cap per minor.
+    "agent-client-protocol>=0.11,<0.12",
 ]
 
 [project.urls]
@@ -70,7 +77,7 @@ dev = [
     'logfire[httpx]>=4.31.0',
     'dirty-equals>=0.9.0',
     'inline-snapshot>=0.32.5',
-    'pydantic-ai-slim[spec]>=1.95.1',
+    'pydantic-ai-slim[spec]>=2.1.0',
     "pytest-examples>=0.0.18",
     "pytest-recording>=0.13.4",
 ]
