@@ -15,9 +15,9 @@ lives at the wire level in `tests/` (VCR cassette prefix assertion), not here.
 
 from __future__ import annotations
 
+import time
 import warnings
 from dataclasses import dataclass, field, replace
-from datetime import datetime
 
 from pydantic_ai.capabilities import AbstractCapability
 from pydantic_ai.messages import ModelResponse
@@ -27,12 +27,33 @@ from pydantic_ai.tools import AgentDepsT, RunContext
 # A response's (provider_name, model_name) -- identifies which provider cache the tokens came from.
 _CacheKey = tuple[str | None, str | None]
 
+# Monotonic clock seam. Referenced as `_now()` so a test can monkeypatch it to drive
+# inter-request gaps deterministically; `response.timestamp` is unusable for this because
+# it is provider-populated and can skew or run backwards across a provider switch.
+_now = time.monotonic
+
 _SILENCE_HINT = (
     '    import warnings\n'
     '    from pydantic_ai_harness.cache_stability import CacheBustWarning\n'
     "    warnings.filterwarnings('ignore', category=CacheBustWarning)  # silence\n"
     "    warnings.filterwarnings('error', category=CacheBustWarning)   # escalate in dev/CI"
 )
+
+
+@dataclass
+class _KeyState:
+    """Per-(provider, model) cache observation: the established prefix and when it was last seen."""
+
+    prefix: int
+    seen_at: float
+
+
+@dataclass
+class _RunState:
+    """Per-run cache-observation state, rebuilt fresh for each run so runs are judged alone."""
+
+    step: int = 0
+    keys: dict[_CacheKey, _KeyState] = field(default_factory=dict[_CacheKey, _KeyState])
 
 
 class CacheBustWarning(UserWarning):
@@ -72,16 +93,19 @@ class CacheStabilityMonitor(AbstractCapability[AgentDepsT]):
     """Warn when a run's prompt cache hit collapses between requests.
 
     Attach it to any agent whose model uses prompt caching. On each response the monitor
-    reads `usage.cache_read_tokens` and tracks the largest cacheable prefix the run has
-    established so far (`cache_read_tokens + cache_write_tokens`, a high-water mark), keyed by
-    the response's `(provider_name, model_name)`. When a later request for the same key reads
-    back fewer than `collapse_ratio` of that established prefix, it emits a `CacheBustWarning`.
+    reads `usage.cache_read_tokens` and tracks the cacheable prefix the run has established
+    (`cache_read_tokens + cache_write_tokens`), keyed by the response's
+    `(provider_name, model_name)`. When a later request for the same key reads back fewer than
+    `collapse_ratio` of that established prefix, it emits a `CacheBustWarning` and re-baselines
+    the tracked prefix to the collapsed value, so a sustained collapse warns once rather than on
+    every subsequent request.
 
     Keying per provider and model means a mid-run model switch does not warn: a `FallbackModel`
-    failover or a per-step model change uses a different cache key, so it starts a fresh high-water
-    mark for that key instead of comparing against the previous model's. Marks are kept per key
+    failover or a per-step model change uses a different cache key, so it starts a fresh mark
+    for that key instead of comparing against the previous model's. Marks are kept per key
     rather than reset, so switching back to an earlier model within its cache TTL still compares
-    against that model's established prefix.
+    against that model's established prefix -- and the expiry hedge measures the gap against that
+    same model's previous request, not whatever ran in between.
 
     Because message history is append-only, a stable prefix means each request reads back at
     least what the previous one cached. A large drop is the observable signature of a collapse,
@@ -107,7 +131,8 @@ class CacheStabilityMonitor(AbstractCapability[AgentDepsT]):
 
     Conservative by default (0.5): only a drop below half the previously-cached prefix counts
     as a collapse, so ordinary provider rounding or a partial cache miss does not fire. Raise
-    it toward 1.0 to warn on smaller regressions.
+    it toward 1.0 to warn on smaller regressions. Must be greater than 0.0 (a ratio of 0.0
+    could never warn, so it is rejected rather than treated as a silent disable switch).
     """
 
     min_prefix_tokens: int = 1024
@@ -120,26 +145,27 @@ class CacheStabilityMonitor(AbstractCapability[AgentDepsT]):
     cache_ttl_seconds: float = 300.0
     """Assumed provider cache TTL, in seconds (Anthropic's default is 300, refreshed on each hit).
 
-    Message-only: when the gap since the previous request in the run exceeds this, the warning
-    notes that the collapse may be a provider-side cache expiry rather than a moved prefix. It
-    does not change whether a warning fires. Lower it for providers with a shorter cache lifetime.
+    Message-only: when the gap since the previous request for the same model exceeds this, the
+    warning notes that the collapse may be a provider-side cache expiry rather than a moved
+    prefix. It does not change whether a warning fires. Lower it for providers with a shorter
+    cache lifetime.
     """
+    # TODO(#6337): once ModelProfile.prompt_cache_retention ships, prefer the per-model profile
+    # value over this single default -- the monitor is already keyed per model.
 
-    _marks: dict[_CacheKey, int] = field(default_factory=dict[_CacheKey, int], compare=False)
-    _step: int = field(default=0, compare=False)
-    _last_time: datetime | None = field(default=None, compare=False)
+    _state: _RunState = field(init=False, default_factory=_RunState, compare=False, repr=False)
 
     def __post_init__(self) -> None:
-        if not 0.0 <= self.collapse_ratio <= 1.0:
-            raise ValueError('collapse_ratio must be between 0.0 and 1.0')
+        if not 0.0 < self.collapse_ratio <= 1.0:
+            raise ValueError('collapse_ratio must be greater than 0.0 and at most 1.0')
         if self.min_prefix_tokens < 0:
             raise ValueError('min_prefix_tokens must be non-negative')
-        if self.cache_ttl_seconds < 0:
-            raise ValueError('cache_ttl_seconds must be non-negative')
+        if self.cache_ttl_seconds <= 0:
+            raise ValueError('cache_ttl_seconds must be positive')
 
     async def for_run(self, ctx: RunContext[AgentDepsT]) -> AbstractCapability[AgentDepsT]:
-        """Reset per-run state (per-key high-water marks, step, timing) so each run is judged alone."""
-        return replace(self, _marks={}, _step=0, _last_time=None)
+        """Give this run a fresh per-key state (marks, timing, step) so each run is judged alone."""
+        return replace(self)
 
     async def after_model_request(
         self,
@@ -149,30 +175,39 @@ class CacheStabilityMonitor(AbstractCapability[AgentDepsT]):
         response: ModelResponse,
     ) -> ModelResponse:
         """Compare this response's cache read against the established prefix for its model, then update it."""
-        self._step += 1
+        state = self._state
+        state.step += 1
         usage = response.usage
         read = usage.cache_read_tokens
         key = (response.provider_name, response.model_name)
-        established = self._marks.get(key, 0)
-        # 0.0 on the run's first request, which has no predecessor to measure a gap against.
-        gap = 0.0 if self._last_time is None else (response.timestamp - self._last_time).total_seconds()
-        self._last_time = response.timestamp
+        now = _now()
+        entry = state.keys.get(key)
+        if entry is None:
+            established, prev_seen = 0, now
+        else:
+            established, prev_seen = entry.prefix, entry.seen_at
+        new_prefix = read + usage.cache_write_tokens
         if established >= self.min_prefix_tokens and read < established * self.collapse_ratio:
             wasted = established - read
+            gap = now - prev_seen
             if gap > self.cache_ttl_seconds:
                 expiry = (
-                    f' -- the previous request was ~{gap:.0f}s earlier, '
+                    f' -- the previous request for this model was ~{gap:.0f}s earlier, '
                     f'past the assumed ~{self.cache_ttl_seconds:.0f}s cache TTL'
                 )
             else:
                 expiry = ' (e.g. a gap longer than the cache TTL)'
             warnings.warn(
-                f'Cache hit collapsed at model request {self._step}: read {read} cached tokens but '
+                f'Cache hit collapsed at model request {state.step}: read {read} cached tokens but '
                 f'a prior request established ~{established} (~{wasted} tokens re-sent uncached). '
                 f"The cacheable prefix moved between requests, or the provider's cache expired{expiry}.\n\n"
                 f'To silence or escalate:\n\n{_SILENCE_HINT}\n',
                 CacheBustWarning,
                 stacklevel=2,
             )
-        self._marks[key] = max(established, read + usage.cache_write_tokens)
+            # Re-baseline to the collapsed prefix so a sustained collapse warns once, not per step.
+            prefix = new_prefix
+        else:
+            prefix = max(established, new_prefix)
+        state.keys[key] = _KeyState(prefix, now)
         return response

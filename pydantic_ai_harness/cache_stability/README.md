@@ -13,25 +13,30 @@ that collapse visible.
 
 This is the **observe** signal: it reads the provider's own verdict rather than
 guessing from the structured request. On each response it reads
-`usage.cache_read_tokens` and tracks the largest cacheable prefix the run has
-established (`cache_read_tokens + cache_write_tokens`, a high-water mark), keyed by
-the response's `(provider_name, model_name)`. Because message history is
-append-only, a stable prefix means each request for that model reads back at least
-what the previous one cached; a large drop is the observable signature of a
-collapse.
+`usage.cache_read_tokens` and tracks the cacheable prefix the run has established
+(`cache_read_tokens + cache_write_tokens`), keyed by the response's
+`(provider_name, model_name)`. Because message history is append-only, a stable
+prefix means each request for that model reads back at least what the previous one
+cached; a large drop is the observable signature of a collapse.
+
+When a request reads back less than `collapse_ratio` of the established prefix, the
+monitor warns and re-baselines the tracked prefix to the collapsed value. A sustained
+collapse -- for example caching toggled off mid-run, which reports `read == 0,
+write == 0` on every remaining step -- therefore warns once, not on every request.
 
 Keying per provider and model means a mid-run model switch does not warn: a
 `FallbackModel` failover or a per-step model change uses a different cache key, so
-the monitor starts a fresh high-water mark for it instead of comparing against the
-previous model's. Marks are kept per key rather than reset, so switching back to an
-earlier model within its cache TTL still compares against that model's prefix.
+the monitor starts a fresh mark for it instead of comparing against the previous
+model's. Marks are kept per key rather than reset, so switching back to an earlier
+model within its cache TTL still compares against that model's prefix.
 
 A collapse has two shapes the monitor cannot tell apart, so the warning names both:
 the cacheable prefix moved, or the provider's cache expired under an unchanged prefix
 (a gap between requests longer than the cache TTL -- Anthropic's default is 5 minutes,
-refreshed on each hit). When the gap since the previous request exceeds
+refreshed on each hit). When the gap since the same model's previous request exceeds
 `cache_ttl_seconds`, the message reports the gap so a long tool or approval pause
-isn't mistaken for a moved prefix.
+isn't mistaken for a moved prefix. The gap is timed per model, so switching away and
+back measures the returning model's own idle time, not whatever ran in between.
 
 The verdict is cross-provider for free -- pyai normalizes every provider into the
 `cache_read_tokens` / `cache_write_tokens` fields on `RequestUsage`.
@@ -43,9 +48,10 @@ The verdict is cross-provider for free -- pyai normalizes every provider into th
 > from pydantic_ai_harness.cache_stability import CacheStabilityMonitor
 > ```
 
-This is a preview capability: its surface is not a committed public API and may
-change or be removed in any release. It is the opt-in observe arm of the broader
-prompt-cache-prefix-stability work.
+Cache Stability Monitor is a released, non-experimental capability. Pydantic AI
+Harness is still on 0.x releases, so the API may change between minor releases. See
+the repository [version policy](https://github.com/pydantic/pydantic-ai-harness#version-policy).
+It is the opt-in observe arm of the broader prompt-cache-prefix-stability work.
 
 ## Minimal usage
 
@@ -67,14 +73,15 @@ belongs at the wire level in tests, not here.
 - `collapse_ratio` (default `0.5`): warn when a request reads back less than this
   fraction of the established prefix. Conservative by default so ordinary rounding
   or a partial miss does not fire; raise toward `1.0` to warn on smaller
-  regressions.
+  regressions. It must be greater than `0.0` -- a ratio of `0.0` could never warn,
+  so it is rejected rather than treated as a silent disable switch.
 - `min_prefix_tokens` (default `1024`): only judge collapse once the established
   prefix reaches this many tokens. Below a provider's minimum cacheable size
   (Anthropic's is 1024) `cache_read_tokens` is noisy or zero.
 - `cache_ttl_seconds` (default `300`): the assumed provider cache TTL. Message-only
-  -- when the gap since the previous request exceeds it, the warning notes the
-  collapse may be a cache expiry rather than a moved prefix. It does not change
-  whether a warning fires. Lower it for providers with a shorter cache lifetime.
+  -- when the gap since the same model's previous request exceeds it, the warning
+  notes the collapse may be a cache expiry rather than a moved prefix. It does not
+  change whether a warning fires. Lower it for providers with a shorter cache lifetime.
 
 ## Silencing and escalation
 

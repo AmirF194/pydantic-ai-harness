@@ -11,7 +11,6 @@ that explicitly.
 from __future__ import annotations
 
 import warnings
-from datetime import datetime, timedelta, timezone
 
 import pytest
 from pydantic_ai import Agent
@@ -64,9 +63,9 @@ def _agent(usages: list[RequestUsage], monitor: CacheStabilityMonitor[None]) -> 
 def _agent_from_responses(responses: list[ModelResponse], monitor: CacheStabilityMonitor[None]) -> Agent[None, str]:
     """Agent whose model replays preset `ModelResponse`s, one per step.
 
-    Lets a test control `provider_name` and `timestamp` per response (a model switch, a wall-clock
-    gap) -- fields `FunctionModel` leaves untouched -- which the simpler `_agent` helper can't.
-    Every response but the last must carry a tool call so the run keeps stepping.
+    Lets a test control `provider_name` per response (a mid-run model switch) -- a field
+    `FunctionModel` leaves untouched -- which the simpler `_agent` helper can't. Every response
+    but the last must carry a tool call so the run keeps stepping.
     """
     state = {'i': 0}
 
@@ -79,6 +78,17 @@ def _agent_from_responses(responses: list[ModelResponse], monitor: CacheStabilit
         return 'ok'
 
     return Agent(FunctionModel(fn), deps_type=type(None), capabilities=[monitor], tools=[noop])
+
+
+def _install_clock(monkeypatch: pytest.MonkeyPatch, times: list[float]) -> None:
+    """Drive the monitor's monotonic clock with a preset sequence, one value per model request.
+
+    The monitor calls its `_now` seam exactly once per response, so `times` must have one entry
+    per step. This controls the inter-request gap deterministically instead of relying on
+    wall-clock timing.
+    """
+    seq = iter(times)
+    monkeypatch.setattr('pydantic_ai_harness.cache_stability._capability._now', lambda: next(seq))
 
 
 async def test_collapse_warns() -> None:
@@ -190,12 +200,40 @@ async def test_switch_back_within_ttl_uses_preserved_mark() -> None:
     assert result.output == 'done'
 
 
-async def test_expiry_gap_named_when_beyond_ttl() -> None:
+async def test_expiry_gap_named_when_beyond_ttl(monkeypatch: pytest.MonkeyPatch) -> None:
     """A collapse after a gap longer than the assumed TTL names the gap, avoiding mis-attribution."""
-    base = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    _install_clock(monkeypatch, [0.0, 400.0])
+    usages = [_usage(read=0, write=8000), _usage(read=100)]
+    agent = _agent(usages, CacheStabilityMonitor())
+    with pytest.warns(CacheBustWarning, match='past the assumed') as record:
+        await agent.run('hi')
+    assert '400s earlier' in str(record[0].message)
+
+
+async def test_small_gap_keeps_generic_expiry_hedge(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A collapse with a short inter-request gap keeps the generic TTL hedge, not a concrete gap."""
+    _install_clock(monkeypatch, [0.0, 5.0])
+    usages = [_usage(read=0, write=8000), _usage(read=100)]
+    agent = _agent(usages, CacheStabilityMonitor())
+    with pytest.warns(CacheBustWarning) as record:
+        await agent.run('hi')
+    message = str(record[0].message)
+    assert 'e.g. a gap longer than the cache TTL' in message
+    assert 'past the assumed' not in message
+
+
+async def test_expiry_gap_measured_per_key_after_switch_away_and_back(monkeypatch: pytest.MonkeyPatch) -> None:
+    """After switching away and back, the expiry gap is measured against the same model's last request.
+
+    A global last-observation clock would time the gap from whatever ran in between (model B at
+    250s), report ~150s, and withhold the expiry hedge exactly when expiry is the likely cause.
+    Keying the clock per model measures A's own gap (400s) and names it.
+    """
+    _install_clock(monkeypatch, [0.0, 250.0, 400.0])
     responses = [
-        ModelResponse(parts=[ToolCallPart('noop', {})], usage=_usage(read=0, write=8000), timestamp=base),
-        ModelResponse(parts=[TextPart('done')], usage=_usage(read=100), timestamp=base + timedelta(seconds=400)),
+        ModelResponse(parts=[ToolCallPart('noop', {})], usage=_usage(read=0, write=8000), provider_name='anthropic'),
+        ModelResponse(parts=[ToolCallPart('noop', {})], usage=_usage(read=0, write=8000), provider_name='openai'),
+        ModelResponse(parts=[TextPart('done')], usage=_usage(read=100), provider_name='anthropic'),
     ]
     agent = _agent_from_responses(responses, CacheStabilityMonitor())
     with pytest.warns(CacheBustWarning, match='past the assumed') as record:
@@ -203,19 +241,20 @@ async def test_expiry_gap_named_when_beyond_ttl() -> None:
     assert '400s earlier' in str(record[0].message)
 
 
-async def test_small_gap_keeps_generic_expiry_hedge() -> None:
-    """A collapse with a short inter-request gap keeps the generic TTL hedge, not a concrete gap."""
-    base = datetime(2026, 1, 1, tzinfo=timezone.utc)
-    responses = [
-        ModelResponse(parts=[ToolCallPart('noop', {})], usage=_usage(read=0, write=8000), timestamp=base),
-        ModelResponse(parts=[TextPart('done')], usage=_usage(read=100), timestamp=base + timedelta(seconds=5)),
-    ]
-    agent = _agent_from_responses(responses, CacheStabilityMonitor())
+async def test_caching_off_mid_run_warns_once_not_per_step() -> None:
+    """A `0/0` response after an established prefix warns once, not on every remaining request.
+
+    Caching toggled off mid-run reports read==0, write==0. Against a high-water mark that only
+    grew, that tripped the collapse check on every subsequent step. Re-baselining the mark to the
+    collapsed prefix surfaces the collapse once and then stays quiet.
+    """
+    usages = [_usage(read=0, write=8000), _usage(read=0, write=0), _usage(read=0, write=0)]
+    agent = _agent(usages, CacheStabilityMonitor())
     with pytest.warns(CacheBustWarning) as record:
         await agent.run('hi')
-    message = str(record[0].message)
-    assert 'e.g. a gap longer than the cache TTL' in message
-    assert 'past the assumed' not in message
+    busts = [w for w in record if issubclass(w.category, CacheBustWarning)]
+    assert len(busts) == 1
+    assert 'request 2' in str(busts[0].message)
 
 
 def test_invalid_config_rejected() -> None:
@@ -228,3 +267,19 @@ def test_invalid_config_rejected() -> None:
         CacheStabilityMonitor[None](min_prefix_tokens=-1)
     with pytest.raises(ValueError, match='cache_ttl_seconds'):
         CacheStabilityMonitor[None](cache_ttl_seconds=-1.0)
+
+
+def test_config_boundaries() -> None:
+    """`collapse_ratio=0.0` (never warns) and `cache_ttl_seconds=0.0` are rejected; `1.0` is accepted."""
+    with pytest.raises(ValueError, match='collapse_ratio'):
+        CacheStabilityMonitor[None](collapse_ratio=0.0)
+    with pytest.raises(ValueError, match='cache_ttl_seconds'):
+        CacheStabilityMonitor[None](cache_ttl_seconds=0.0)
+    # The upper bound is inclusive: 1.0 warns on any regression at all.
+    CacheStabilityMonitor[None](collapse_ratio=1.0)
+
+
+def test_per_run_state_is_not_constructor_surface() -> None:
+    """Per-run marks/timing live in non-init state, so they can't be seeded through the constructor."""
+    with pytest.raises(TypeError):
+        CacheStabilityMonitor[None](_state=None)  # pyright: ignore[reportCallIssue]
