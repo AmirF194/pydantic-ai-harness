@@ -42,10 +42,16 @@ _SILENCE_HINT = (
 
 @dataclass
 class _KeyState:
-    """Per-(provider, model) cache observation: the established prefix and when it was last seen."""
+    """Per-(provider, model) cache observation.
+
+    `prefix` is the high-water mark of the established cacheable prefix, `seen_at` is when this
+    key was last observed, and `collapsed` latches whether the last observation was already a
+    collapse -- so a sustained collapse warns once and re-arms only after the cache re-stabilizes.
+    """
 
     prefix: int
     seen_at: float
+    collapsed: bool = False
 
 
 @dataclass
@@ -93,12 +99,12 @@ class CacheStabilityMonitor(AbstractCapability[AgentDepsT]):
     """Warn when a run's prompt cache hit collapses between requests.
 
     Attach it to any agent whose model uses prompt caching. On each response the monitor
-    reads `usage.cache_read_tokens` and tracks the cacheable prefix the run has established
-    (`cache_read_tokens + cache_write_tokens`), keyed by the response's
-    `(provider_name, model_name)`. When a later request for the same key reads back fewer than
-    `collapse_ratio` of that established prefix, it emits a `CacheBustWarning` and re-baselines
-    the tracked prefix to the collapsed value, so a sustained collapse warns once rather than on
-    every subsequent request.
+    reads `usage.cache_read_tokens` and tracks the largest cacheable prefix the run has
+    established (`cache_read_tokens + cache_write_tokens`, a high-water mark), keyed by the
+    response's `(provider_name, model_name)`. When a later request for the same key reads back
+    fewer than `collapse_ratio` of that established prefix, it emits a `CacheBustWarning` once
+    and then stays quiet about that collapse until a healthy read-back re-stabilizes the cache,
+    so a sustained collapse warns once rather than on every subsequent request.
 
     Keying per provider and model means a mid-run model switch does not warn: a `FallbackModel`
     failover or a per-step model change uses a different cache key, so it starts a fresh mark
@@ -183,11 +189,14 @@ class CacheStabilityMonitor(AbstractCapability[AgentDepsT]):
         now = _now()
         entry = state.keys.get(key)
         if entry is None:
-            established, prev_seen = 0, now
+            established, prev_seen, collapsed = 0, now, False
         else:
-            established, prev_seen = entry.prefix, entry.seen_at
-        new_prefix = read + usage.cache_write_tokens
-        if established >= self.min_prefix_tokens and read < established * self.collapse_ratio:
+            established, prev_seen, collapsed = entry.prefix, entry.seen_at, entry.collapsed
+        is_collapse = established >= self.min_prefix_tokens and read < established * self.collapse_ratio
+        # Warn on the transition into a collapse only; the latch keeps a sustained collapse -- and a
+        # provider that keeps writing an unread cache (read stays low, write stays high) -- to one
+        # warning, and re-arms once a healthy read-back clears it.
+        if is_collapse and not collapsed:
             wasted = established - read
             gap = now - prev_seen
             if gap > self.cache_ttl_seconds:
@@ -205,9 +214,5 @@ class CacheStabilityMonitor(AbstractCapability[AgentDepsT]):
                 CacheBustWarning,
                 stacklevel=2,
             )
-            # Re-baseline to the collapsed prefix so a sustained collapse warns once, not per step.
-            prefix = new_prefix
-        else:
-            prefix = max(established, new_prefix)
-        state.keys[key] = _KeyState(prefix, now)
+        state.keys[key] = _KeyState(max(established, read + usage.cache_write_tokens), now, is_collapse)
         return response

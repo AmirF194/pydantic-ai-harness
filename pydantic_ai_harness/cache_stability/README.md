@@ -13,16 +13,19 @@ that collapse visible.
 
 This is the **observe** signal: it reads the provider's own verdict rather than
 guessing from the structured request. On each response it reads
-`usage.cache_read_tokens` and tracks the cacheable prefix the run has established
-(`cache_read_tokens + cache_write_tokens`), keyed by the response's
-`(provider_name, model_name)`. Because message history is append-only, a stable
-prefix means each request for that model reads back at least what the previous one
-cached; a large drop is the observable signature of a collapse.
+`usage.cache_read_tokens` and tracks the largest cacheable prefix the run has
+established (`cache_read_tokens + cache_write_tokens`, a high-water mark), keyed by
+the response's `(provider_name, model_name)`. Because message history is
+append-only, a stable prefix means each request for that model reads back at least
+what the previous one cached; a large drop is the observable signature of a
+collapse.
 
 When a request reads back less than `collapse_ratio` of the established prefix, the
-monitor warns and re-baselines the tracked prefix to the collapsed value. A sustained
-collapse -- for example caching toggled off mid-run, which reports `read == 0,
-write == 0` on every remaining step -- therefore warns once, not on every request.
+monitor warns once and latches that key, staying quiet about the collapse until a
+healthy read-back re-stabilizes the cache. A sustained collapse -- caching toggled
+off mid-run (`read == 0, write == 0`), or a prefix that moves every request so the
+provider keeps writing a cache nothing reads back -- therefore warns once, not on
+every request.
 
 Keying per provider and model means a mid-run model switch does not warn: a
 `FallbackModel` failover or a per-step model change uses a different cache key, so
@@ -120,8 +123,8 @@ import logging
 logging.captureWarnings(True)  # warnings.warn(...) -> the 'py.warnings' logger -> Logfire
 ```
 
-For now the monitor emits a warning only; a dedicated Logfire event may be added
-as the capability matures.
+The monitor's signal is the `CacheBustWarning`; routing it through `logging` is how
+it reaches Logfire.
 
 ## Composition
 

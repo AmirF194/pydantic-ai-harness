@@ -244,9 +244,9 @@ async def test_expiry_gap_measured_per_key_after_switch_away_and_back(monkeypatc
 async def test_caching_off_mid_run_warns_once_not_per_step() -> None:
     """A `0/0` response after an established prefix warns once, not on every remaining request.
 
-    Caching toggled off mid-run reports read==0, write==0. Against a high-water mark that only
-    grew, that tripped the collapse check on every subsequent step. Re-baselining the mark to the
-    collapsed prefix surfaces the collapse once and then stays quiet.
+    Caching toggled off mid-run reports read==0, write==0. Against a mark that only grew, that
+    tripped the collapse check on every subsequent step. The collapse latch surfaces it once and
+    then stays quiet until a healthy read-back re-arms it.
     """
     usages = [_usage(read=0, write=8000), _usage(read=0, write=0), _usage(read=0, write=0)]
     agent = _agent(usages, CacheStabilityMonitor())
@@ -255,6 +255,45 @@ async def test_caching_off_mid_run_warns_once_not_per_step() -> None:
     busts = [w for w in record if issubclass(w.category, CacheBustWarning)]
     assert len(busts) == 1
     assert 'request 2' in str(busts[0].message)
+
+
+async def test_sustained_collapse_with_cache_writes_warns_once() -> None:
+    """A run that keeps writing an unread cache (read stays low, write stays high) warns once.
+
+    Each step reports read==0, write==2000: the prefix moves every request, so the provider
+    re-writes a cache nothing reads back. Re-baselining the mark to `read + write` would hold it
+    at 2000 and re-warn; re-baselining to `read` would still let the intervening `max()` re-grow
+    it and warn every other step. The collapse latch is what holds it to a single warning.
+    """
+    usages = [
+        _usage(read=0, write=8000),
+        _usage(read=0, write=2000),
+        _usage(read=0, write=2000),
+        _usage(read=0, write=2000),
+    ]
+    agent = _agent(usages, CacheStabilityMonitor())
+    with pytest.warns(CacheBustWarning) as record:
+        await agent.run('hi')
+    busts = [w for w in record if issubclass(w.category, CacheBustWarning)]
+    assert len(busts) == 1
+    assert 'request 2' in str(busts[0].message)
+
+
+async def test_recollapse_after_restabilize_warns_again() -> None:
+    """The latch re-arms: a healthy read-back between two collapses lets the second one warn."""
+    usages = [
+        _usage(read=0, write=8000),  # establish 8000
+        _usage(read=100),  # collapse -> warn (request 2)
+        _usage(read=8000, write=200),  # healthy read-back re-stabilizes, clearing the latch
+        _usage(read=100),  # collapse again -> warn (request 4)
+    ]
+    agent = _agent(usages, CacheStabilityMonitor())
+    with pytest.warns(CacheBustWarning) as record:
+        await agent.run('hi')
+    busts = [str(w.message) for w in record if issubclass(w.category, CacheBustWarning)]
+    assert len(busts) == 2
+    assert 'request 2' in busts[0]
+    assert 'request 4' in busts[1]
 
 
 def test_invalid_config_rejected() -> None:
