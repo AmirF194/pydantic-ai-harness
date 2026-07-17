@@ -1149,14 +1149,10 @@ class TestOnRunErrorSnapshot:
             capabilities=[StepPersistence(store=store, agent_name='delegate')],
             output_type=str,
         )
-        retried = {'done': False}
 
         @agent.output_validator
         def gate(value: str) -> str:  # pyright: ignore[reportUnusedFunction]
-            if not retried['done']:
-                retried['done'] = True
-                raise ModelRetry('call a tool first')
-            return value
+            raise ModelRetry('call a tool first')
 
         @agent.tool_plain
         def lookup() -> str:  # pyright: ignore[reportUnusedFunction]
