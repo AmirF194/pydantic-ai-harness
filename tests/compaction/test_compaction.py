@@ -16,10 +16,13 @@ from pydantic_ai.messages import (
     TextPart,
     ToolCallPart,
     ToolReturnPart,
+    ToolSearchReturnContent,
+    ToolSearchReturnPart,
     UserPromptPart,
 )
 from pydantic_ai.models import Model, ModelRequestContext, ModelRequestParameters
 from pydantic_ai.models.test import TestModel
+from pydantic_ai.toolsets._tool_search import parse_discovered_tools
 from pydantic_ai.usage import RunUsage
 
 from pydantic_ai_harness.compaction import (
@@ -1580,6 +1583,36 @@ class TestClearToolResults:
         twice = await cap.compact(once, ctx)
         assert _return_contents(twice) == ['[tool result cleared]']
         assert _call_args(twice) == ['{}']
+
+    @pytest.mark.anyio
+    async def test_preserves_typed_tool_search_return(self):
+        # `ToolSearchReturnPart` subclasses `ToolReturnPart` but carries structured content that
+        # core's `parse_discovered_tools` re-reads on the next request. Blanking it to a string
+        # crashed that reader; clearing must skip typed subclasses and touch only plain results.
+        cap = ClearToolResults(max_messages=1, keep_pairs=0)
+        search_content: ToolSearchReturnContent = {'discovered_tools': [{'name': 'alpha'}, {'name': 'beta'}]}
+        messages: list[ModelMessage] = [
+            _tool_call('fn', 'u1'),
+            _tool_return('fn', 'u1', 'plain result'),
+            ModelResponse(parts=[ToolCallPart(tool_name='search_tools', args='{}', tool_call_id='ts1')]),
+            ModelRequest(parts=[ToolSearchReturnPart(content=search_content, tool_call_id='ts1')]),
+        ]
+        result = await cap.before_model_request(_make_ctx(), _make_request_context(messages))
+
+        returns = {
+            p.tool_call_id: p
+            for m in result.messages
+            if isinstance(m, ModelRequest)
+            for p in m.parts
+            if isinstance(p, ToolReturnPart)
+        }
+        # Plain result blanked, typed search return kept intact (concrete type + structured content).
+        assert type(returns['u1']) is ToolReturnPart
+        assert returns['u1'].content == cap.placeholder
+        assert type(returns['ts1']) is ToolSearchReturnPart
+        assert returns['ts1'].content == search_content
+        # The real next-request regression: core still recovers the discovered names.
+        assert parse_discovered_tools(result.messages) == {'alpha', 'beta'}
 
 
 # ---------------------------------------------------------------------------
