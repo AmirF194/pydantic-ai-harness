@@ -38,8 +38,21 @@ def test_localstack_ci_gates_the_aggregate_check() -> None:
 
     # The aggregate `check` job must depend on localstack-integration so a live
     # test failure blocks merges rather than passing silently.
-    needs = next(line for line in lines if line.strip().startswith('needs: [lint, test'))
+    needs = next(line for line in lines if line.strip().startswith('needs: [') and 'coverage' in line)
     assert 'localstack-integration' in needs
+
+
+def test_localstack_integration_is_scoped_to_localstack_changes() -> None:
+    lines = _workflow_lines()
+
+    # On a pull request the live job runs only when LocalStack paths change, so
+    # unrelated PRs don't pull the image, install the AWS CLI, or spend the token.
+    assert any('needs.changes.outputs.localstack' in line for line in lines)
+    assert any("- 'pydantic_ai_harness/localstack/**'" in line for line in lines)
+
+    # A skipped live job must not fail the required aggregate check; a job that
+    # actually runs and fails still votes (see allowed-skips semantics).
+    assert any('allowed-skips: changes, localstack-integration' in line for line in lines)
 
 
 def test_localstack_ci_scopes_the_auth_token_to_the_test_step() -> None:
