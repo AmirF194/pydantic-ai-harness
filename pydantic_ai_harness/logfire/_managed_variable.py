@@ -1,6 +1,6 @@
 """Shared base for capabilities backed by a Logfire managed variable.
 
-`ManagedPrompt` and `ManagedToolDefinitions` both resolve a Logfire
+`ManagedPrompt` and `ManagedAgent` both resolve a Logfire
 [managed variable](https://logfire.pydantic.dev/docs/reference/advanced/managed-variables/) once per
 run and keep its baggage active for the whole run. This base owns that shared plumbing -- the
 targeting inputs, the per-run resolution context variable, `get_ordering`, and `wrap_run` -- so each
@@ -9,12 +9,13 @@ capability only declares its own variable and exposes the resolved value through
 
 from __future__ import annotations
 
+import re
 import threading
 import warnings
 from collections.abc import Callable, Mapping
 from contextvars import ContextVar
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Generic
+from typing import TYPE_CHECKING, Any, ClassVar, Generic
 
 import logfire
 from logfire.variables import Variable, VariableAlreadyExistsError
@@ -26,7 +27,7 @@ from typing_extensions import TypeVar
 
 if TYPE_CHECKING:
     from logfire import Logfire
-    from logfire.variables import ResolvedVariable
+    from logfire.variables import ResolvedVariable, VariableConfig
     from pydantic_ai.capabilities.abstract import WrapRunHandler
     from pydantic_ai.run import AgentRunResult
 
@@ -67,16 +68,26 @@ def _reset_auto_create_guard() -> None:  # pyright: ignore[reportUnusedFunction]
         _auto_create_attempted.clear()
 
 
-def _spawn_create(variable: Variable[Any]) -> None:
+def _normalize_agent_name(name: str) -> str:
+    """Normalize a telemetry agent name exactly as the Logfire managed-agents UI does.
+
+    The rule trims and lowercases the name, replaces hyphens and every other non-`[a-z0-9_]`
+    character with `_`, collapses runs of underscores, and strips underscores from both ends. The
+    SDK and UI must apply the same rule so they land on the same variable for a given agent name.
+    """
+    return re.sub(r'_+', '_', re.sub(r'[^a-z0-9_]', '_', name.strip().lower().replace('-', '_'))).strip('_')
+
+
+def _spawn_create(variable: Variable[Any], config: VariableConfig | None = None) -> None:
     """Run the (blocking, sync-HTTP) creation off the run's thread so it never blocks or fails it.
 
     Isolated as a module-level function so tests can monkeypatch it to run `_create_variable`
     inline for determinism.
     """
-    threading.Thread(target=_create_variable, args=(variable,), daemon=True).start()
+    threading.Thread(target=_create_variable, args=(variable, config), daemon=True).start()
 
 
-def _create_variable(variable: Variable[Any]) -> None:
+def _create_variable(variable: Variable[Any], config: VariableConfig | None = None) -> None:
     """Create the variable in Logfire from its code default, JSON schema, and description.
 
     Best-effort: an already-existing variable (a race with another process or the UI) is fine, and
@@ -88,7 +99,7 @@ def _create_variable(variable: Variable[Any]) -> None:
     if not callable(create):  # pragma: no cover
         return
     try:
-        create(variable.to_config())
+        create(config or variable.to_config())
     except VariableAlreadyExistsError:
         # The variable already exists server-side (another process or the UI created it first).
         pass
@@ -168,6 +179,9 @@ class ManagedVariableCapability(AbstractCapability[AgentDepsT], Generic[AgentDep
     _resolved: ContextVar[ResolvedVariable[ValueT] | None] = field(init=False, repr=False, compare=False)
     """Per-run resolution, isolated across concurrent runs via the context variable."""
 
+    _auto_create_in_wrap_run: ClassVar[bool] = True
+    """Whether the base run wrapper triggers auto-create; subclasses with richer config set `False`."""
+
     def _new_resolved(self) -> ContextVar[ResolvedVariable[ValueT] | None]:
         """A fresh per-run resolution context variable; `None` means nothing is resolved yet."""
         return ContextVar('managed_variable_resolved', default=None)
@@ -238,7 +252,10 @@ class ManagedVariableCapability(AbstractCapability[AgentDepsT], Generic[AgentDep
                     'explicit `name` to the capability.'
                 )
             variable = self._build_managed_variable(
-                agent_name, prefix=deferred.prefix, value_type=deferred.value_type, default=deferred.default
+                _normalize_agent_name(agent_name),
+                prefix=deferred.prefix,
+                value_type=deferred.value_type,
+                default=deferred.default,
             )
             self._variable = variable
             return variable
@@ -293,7 +310,7 @@ class ManagedVariableCapability(AbstractCapability[AgentDepsT], Generic[AgentDep
         """Run outermost so the resolution's baggage envelops the whole run, including the run span."""
         return CapabilityOrdering(position='outermost', wraps=[Instrumentation])
 
-    def _maybe_auto_create(self, variable: Variable[Any]) -> None:
+    def _maybe_auto_create(self, variable: Variable[Any], config: VariableConfig | None = None) -> None:
         """Kick off background creation of the backing variable, at most once per process per name."""
         name = variable.name
         with _auto_create_lock:
@@ -301,9 +318,30 @@ class ManagedVariableCapability(AbstractCapability[AgentDepsT], Generic[AgentDep
                 return
             # Mark before spawning: one attempt per process, so a failed create doesn't retry.
             _auto_create_attempted.add(name)
-        _spawn_create(variable)
+        _spawn_create(variable, config)
 
-    def _maybe_auto_create_for(self, resolved: ResolvedVariable[ValueT]) -> None:
+    def _should_auto_create_for(self, resolved: ResolvedVariable[ValueT]) -> bool:
+        """Whether a configured provider does not recognize this variable and creation is still eligible.
+
+        Auto-create is for exactly one case: a provider is configured but has no entry for this name,
+        so resolution fell back to the code default. logfire >= 4.37 reports that as `'code_default'`
+        (older SDKs as `'unrecognized_variable'`), but `'code_default'` also covers "no provider
+        configured" and "known variable with no targeted value" -- neither of which should create
+        anything. The once-per-process guard is only peeked at here; `_maybe_auto_create` re-checks
+        and marks it under the same lock, making concurrent callers race-safe.
+        """
+        if not self.auto_create or resolution_reason(resolved) not in _CODE_DEFAULT_REASONS:
+            return False
+        variable = self._variable
+        with _auto_create_lock:
+            if variable.name in _auto_create_attempted:
+                return False
+        provider = variable.logfire_instance.config.get_variable_provider()
+        if isinstance(provider, NoOpVariableProvider):
+            return False
+        return provider.get_variable_config(variable.name) is None
+
+    def _maybe_auto_create_for(self, resolved: ResolvedVariable[ValueT], config: VariableConfig | None = None) -> None:
         """Trigger background auto-create when a configured provider doesn't recognize the variable yet.
 
         Auto-create is for exactly one case: a provider is configured but has no entry for this name,
@@ -314,18 +352,8 @@ class ManagedVariableCapability(AbstractCapability[AgentDepsT], Generic[AgentDep
         that has no config for this name. A `resolved`/`context_override` value isn't a candidate at
         all, and is filtered out by the reason check up front.
         """
-        # Always called after `_resolve` has built/resolved the variable for this run.
-        variable = self._variable
-        if not self.auto_create or resolution_reason(resolved) not in _CODE_DEFAULT_REASONS:
-            return
-        provider = variable.logfire_instance.config.get_variable_provider()
-        if isinstance(provider, NoOpVariableProvider):
-            # No provider to create into (the `'no_provider'` case).
-            return
-        if provider.get_variable_config(variable.name) is not None:
-            # The provider already knows this variable (a configured value, or one awaiting a target).
-            return
-        self._maybe_auto_create(variable)
+        if self._should_auto_create_for(resolved):
+            self._maybe_auto_create(self._variable, config)
 
     def _resolve(self, ctx: RunContext[AgentDepsT]) -> ResolvedVariable[ValueT]:
         """Resolve the backing variable for this run using the capability's targeting inputs.
@@ -351,63 +379,11 @@ class ManagedVariableCapability(AbstractCapability[AgentDepsT], Generic[AgentDep
     async def wrap_run(self, ctx: RunContext[AgentDepsT], *, handler: WrapRunHandler) -> AgentRunResult[Any]:
         """Resolve the variable once and keep its baggage active for the duration of the run."""
         resolved = self._resolve(ctx)
-        self._maybe_auto_create_for(resolved)
+        if self._auto_create_in_wrap_run:
+            self._maybe_auto_create_for(resolved)
         with resolved:
             token = self._resolved.set(resolved)
             try:
                 return await handler()
             finally:
                 self._resolved.reset(token)
-
-    def _resolved_holder(self, resolved: ResolvedVariable[ValueT]) -> _ResolvedVariableHolder[AgentDepsT, ValueT]:
-        """Build the per-run sibling that holds `resolved`'s baggage open for the run.
-
-        For capabilities whose [`for_run`][pydantic_ai.capabilities.AbstractCapability.for_run]
-        resolves the value early and materializes child capabilities from it (e.g.
-        [`ManagedMCP`][pydantic_ai_harness.logfire.ManagedMCP] and
-        [`ManagedSkills`][pydantic_ai_harness.logfire.ManagedSkills]): the children carry the
-        behavior, while this holder does exactly what the base's `wrap_run` does for the simple
-        capabilities -- enter the resolution as baggage, mirror it onto the owner's `resolved`
-        property, and trigger auto-create -- so both flow through the run as siblings.
-        """
-        return _ResolvedVariableHolder[AgentDepsT, ValueT](
-            resolution=resolved,
-            resolution_holder=self._resolved,
-            trigger_auto_create=self._maybe_auto_create_for,
-        )
-
-
-@dataclass
-class _ResolvedVariableHolder(AbstractCapability[AgentDepsT], Generic[AgentDepsT, ValueT]):
-    """Per-run capability that holds a resolved managed variable's baggage open for the run.
-
-    Built by [`ManagedVariableCapability._resolved_holder`][] for capabilities that resolve their
-    value in `for_run` (rather than `wrap_run`) to materialize child capabilities from it. It keeps
-    the [`ResolvedVariable`][logfire.variables.ResolvedVariable] open as a context manager for the
-    whole run, sets the owner's per-run resolution context variable so `resolved` reflects it, and
-    triggers auto-create -- the same plumbing the base's `wrap_run` performs for the simple
-    per-surface capabilities, factored out here so `ManagedMCP` and `ManagedSkills` share it.
-    """
-
-    resolution: ResolvedVariable[ValueT] = field(repr=False, compare=False)
-    """The resolved variable for this run (resolved in the owner's `for_run`, entered here)."""
-
-    resolution_holder: ContextVar[ResolvedVariable[ValueT] | None] = field(repr=False, compare=False)
-    """The owner's per-run context variable, set for the run so the owner's `resolved` reflects it."""
-
-    trigger_auto_create: Callable[[ResolvedVariable[ValueT]], None] = field(repr=False, compare=False)
-    """The owner's auto-create hook, invoked when the provider doesn't recognize the variable yet."""
-
-    def get_ordering(self) -> CapabilityOrdering:
-        """Run outermost so the resolution's baggage envelops the whole run, including the run span."""
-        return CapabilityOrdering(position='outermost', wraps=[Instrumentation])
-
-    async def wrap_run(self, ctx: RunContext[AgentDepsT], *, handler: WrapRunHandler) -> AgentRunResult[Any]:
-        """Keep the (already-resolved) variable's baggage active for the run, and auto-create if new."""
-        self.trigger_auto_create(self.resolution)
-        with self.resolution:
-            token = self.resolution_holder.set(self.resolution)
-            try:
-                return await handler()
-            finally:
-                self.resolution_holder.reset(token)

@@ -3,48 +3,42 @@
 Drive agent configuration from [Logfire managed variables](https://logfire.pydantic.dev/docs/reference/advanced/managed-variables/),
 so you can iterate on it from the Logfire UI -- versioned, labelled, and rolled out -- without redeploying.
 
-Each capability manages one surface of the agent, so you adopt exactly as much as you want:
+Two capabilities cover the two managed surfaces:
 
-- [`ManagedPrompt`](#managedprompt) -- the agent's instructions
-- [`ManagedToolDefinitions`](#managedtooldefinitions) -- the LLM-facing definitions (name,
-  description, parameter docs) of the agent's tools
-- [`ManagedSettings`](#managedsettings) -- the agent's model and model settings
-- [`ManagedMCP`](#managedmcp) -- the connection to an MCP server, and which of its tools the agent uses
-- [`ManagedSkills`](#managedskills) -- a catalog of instructions-only skills the model loads on demand
-
-...or manage the whole shape at once:
-
-- [`ManagedAgentSpec`](#managedagentspec) -- the agent's instructions, model, settings, and
-  capabilities together, as one versioned `AgentSpec`
+- [`ManagedPrompt`](#managedprompt) -- one managed prompt (`prompt__<name>`), shareable across agents
+- [`ManagedAgent`](#managedagent) -- the whole agent config (`agent__<name>`): instructions, model,
+  model settings, and the LLM-facing definitions of the agent's tools, as one variable matching
+  Logfire's Managed agents UI
 
 Each capability takes an optional `name` that selects its backing variable. **When you omit it, the
-name defaults to the agent's own `name`** -- so `ManagedPrompt(default=...)` on an
-`Agent(..., name='weather_agent')` resolves `prompt__weather_agent`, and you don't repeat the name
-per capability:
+name defaults to the agent's own `name`** -- so `ManagedAgent()` on an
+`Agent(..., name='checkout_assistant')` resolves `agent__checkout_assistant`:
 
 ```python
 from pydantic_ai import Agent
 
-from pydantic_ai_harness.logfire import ManagedPrompt, ManagedSettings, ManagedToolDefinitions
+from pydantic_ai_harness.logfire import ManagedAgent
 
 agent = Agent(
     'openai:gpt-5',
-    name='weather_agent',
+    name='checkout_assistant',
     tools=[...],
-    capabilities=[ManagedPrompt(default=...), ManagedSettings(), ManagedToolDefinitions()],
-)  # -> prompt__weather_agent, agent__weather_agent, tool_definitions__weather_agent
+    capabilities=[ManagedAgent(label='production')],  # -> agent__checkout_assistant
+)
 ```
 
 The agent must then have a `name` (pass `name=` or let pydantic-ai infer it from the assignment);
-a nameless capability on a nameless agent raises a clear error. Pass an explicit `name` to decouple
-the variable from the agent's name, or to share one variable across agents. One edge: a nameless
-`ManagedSettings`/`ManagedAgentSpec` can't *source* the model at run setup (there's no agent yet at
-that point) -- it can only override the model on an agent that already has one. Pass an explicit
-`name` when you need it to source the model for a model-less agent (until pydantic-ai#4977 lands a
-construction-time agent hook that will let the nameless case source it too).
+a nameless capability on a nameless agent raises a clear error. The derived name is normalized
+exactly the way the Logfire UI normalizes observed agent names (lowercased, non-alphanumeric runs
+collapsed to `_`), so the variable the SDK resolves is the variable the UI creates when you manage
+an observed agent. Pass an explicit `name` to decouple the variable from the agent's name, or to
+share one variable across agents. One edge: a nameless `ManagedAgent` can't *source* the model at
+run setup (there's no agent yet at that point) -- it can only override the model on an agent that
+already has one. Pass an explicit `name` when you need it to source the model for a model-less
+agent.
 
 They share one contract: **the code-defined agent is the fallback.** Every managed value is a
-patch on what's written in code -- unset fields keep their code values, and a missing, invalid,
+patch on what's written in code -- absent fields keep their code values, and a missing, invalid,
 or unreachable remote value degrades to exactly the agent the developer wrote, never a crashed
 run. Values resolve **once per run** and the resolved label + version ride as baggage on every
 span of the run, so traces always show which version produced which behavior. Each capability's
@@ -53,8 +47,11 @@ from `pydantic_ai_harness.logfire`) to read *why* it resolved the way it did (e.
 `'code_default'` fallback), across logfire SDK versions.
 
 **Auto-create on first use:** when the backing variable doesn't exist in Logfire yet, it is
-created in the background on first use -- from the code default, with the payload's JSON schema
-and description -- so the Logfire UI becomes the editing surface without a manual create step.
+created in the background on first use -- with the payload's JSON schema and description -- so the
+Logfire UI becomes the editing surface without a manual create step. `ManagedAgent` additionally
+writes the variable's `example` as an `AgentConfig`-shaped snapshot of the code-side agent taken
+from the first model request (instructions, model, effective settings, and each tool's description
+and parameter descriptions) -- the baseline the Logfire UI's override editor and optimizer read.
 Opt out per capability with `auto_create=False`.
 
 Install the extra:
@@ -202,8 +199,10 @@ block invalidates the cached prefix for the affected runs.
 | `targeting_key` per user/tenant with multiple labels in play | Cache lanes per assigned label; deterministic per key but still N lanes overall. |
 | Mid-traffic label flip in the Logfire UI | One-shot cold-invalidation for everyone on that label. |
 
-In short: pinning a `label` keeps the cache hot; using `ManagedPrompt` as an A/B platform is opt-in
-cache cost. If you don't need rollouts, `label='production'` is the recommended default.
+In short: pinning a `label` keeps the cache hot; using managed values as an A/B platform is opt-in
+cache cost. If you don't need rollouts, `label='production'` is the recommended default. The same
+applies to `ManagedAgent`'s `instructions` section -- and to its `tool_definitions`, which sit even
+earlier in the cached prefix.
 
 ### Using your own variable
 
@@ -252,373 +251,117 @@ Logfire instance instead of the module-level default.
   [`targeting_context`](https://logfire.pydantic.dev/docs/reference/advanced/managed-variables/)
   in an outer scope; `ManagedPrompt` only needs `targeting_key`/`attributes` when the key
   comes from the agent's `RunContext`.
+- `prompt__` is reserved for Logfire's first-party Prompt management, so `ManagedPrompt` can't
+  auto-create its variable through the generic write API -- it warns once; create the prompt via
+  the Logfire UI's Prompts flow.
 
-## `ManagedToolDefinitions`
+## `ManagedAgent`
 
-Override the LLM-facing definitions of an agent's tools -- name, description, and parameter
-descriptions -- from one managed variable.
-
-### The problem
-
-Tools and their descriptions are half of what the model sees when deciding what to do -- as much
-a part of the "prompt" as the instructions. But tool definitions live in code, so tuning how a
-tool is framed to the model (or letting an optimizer propose that tuning) takes a redeploy per
-tweak.
-
-### The solution
-
-Drop `ManagedToolDefinitions` onto the agent and every tool's *definition* becomes manageable
-from Logfire, while the tool itself -- its implementation and its parameter schema structure --
-stays exactly as written in code. A tool is the executable unit; the tool definition is the
-LLM-facing spec, and only that spec is remotely patchable, so a remote value can never drift
-from the validator the tool actually runs against.
-
-### Usage
-
-The name `checkout_assistant` is declared as the managed variable
-`tool_definitions__checkout_assistant`, holding a list of per-tool overrides (omit `name` to default
-it to the agent's own `name`, `tool_definitions__<agent name>`):
-
-```python
-import logfire
-from pydantic_ai import Agent
-
-from pydantic_ai_harness.logfire import ManagedToolDefinitions
-
-logfire.configure()
-
-def get_weather(city: str) -> str:
-    return f'The weather in {city} is sunny.'
-
-agent = Agent(
-    'openai:gpt-5',
-    tools=[get_weather],
-    capabilities=[ManagedToolDefinitions('checkout_assistant', label='production')],
-)
-```
-
-Each entry in the list is a `ToolDefinitionOverride` keyed to a tool by its original (code-side)
-`name`; every other field is optional and unset fields keep the tool's own definition:
-
-```json
-[
-  {
-    "name": "get_weather",
-    "new_name": "lookup_weather",
-    "description": "Look up the current weather for a city.",
-    "parameter_descriptions": {"city": "City name, e.g. 'London'"}
-  }
-]
-```
-
-### Notes
-
-- **Renames round-trip:** `new_name` changes the name the model is shown; a call to the renamed
-  tool routes back to the original implementation, and `ctx.tool_name` inside the tool is the
-  original name. A rename that collides with a name another tool already advertises is dropped
-  with a warning (other patches still apply) rather than breaking the run.
-- An override whose `name` matches no tool on the agent is inert -- that's the drift case (the
-  tool was removed or renamed in code), and the Logfire UI is where it becomes visible.
-- Only the `description` strings inside the parameter schema can be patched; parameter names,
-  types, and required-ness are deliberately fixed in code.
-
-## `ManagedSettings`
-
-Back an agent's model and model settings with a Logfire-managed variable.
+Back a whole agent's configuration -- instructions, model, model settings, and the LLM-facing
+definitions of its tools -- with one `agent__<name>` variable, the same variable Logfire's
+Managed agents UI edits.
 
 ### The problem
 
-Model choice and sampling settings are the cheapest knobs to tune and the most annoying to
-redeploy for -- switching model for a canary, nudging temperature, or capping output tokens
-shouldn't require a release.
+An agent's behavior is spread across knobs that all live in code: the instructions, the model and
+its sampling settings, and the tool descriptions that make up half of what the model sees. Tuning
+any of them -- or letting Logfire's optimizer propose the tuning -- takes a redeploy per tweak, and
+tuning them *together* (a new prompt that only works with a smarter model) takes coordinated
+redeploys.
 
 ### The solution
 
-`ManagedSettings` resolves an `agent__<name>` variable whose value patches the agent's model
-and model settings. Settings merge **over** the agent's constructor `model_settings` and
-**under** per-run `model_settings=`, so run arguments always win.
+`ManagedAgent` resolves one `AgentConfig` value per run with **presence semantics**: each section
+that is present -- `instructions`, `model`, `settings`, `tool_definitions` -- is managed from
+Logfire, and each absent section keeps the code-defined behavior. The whole config versions and
+rolls out as one unit, so a prompt change and the model change it depends on land atomically.
+Removing a section in Logfire is a deliberate revert-to-code.
 
 ### Usage
 
 ```python
 import logfire
 from pydantic_ai import Agent
-
-from pydantic_ai_harness.logfire import ManagedSettings
-
-logfire.configure()
-
-agent = Agent(
-    'openai:gpt-5',
-    capabilities=[ManagedSettings('checkout_assistant', label='production')],
-)
-```
-
-The `model` and every setting sit at the **top level** -- `model` alongside `temperature`,
-`max_tokens`, and the rest -- so the JSON reads flat. The setting keys are the canonical,
-cross-framework ones (they match `pydantic_ai.settings.ModelSettings`), with a nested
-`provider_options` escape hatch for provider-specific settings
-(`provider_options.openai.reasoning_effort` lowers to the `openai_reasoning_effort` model setting,
-and a provider-specific value wins over its canonical counterpart):
-
-```json
-{
-  "model": "openai:gpt-5",
-  "temperature": 0.4,
-  "max_tokens": 2048,
-  "thinking": "high",
-  "provider_options": {
-    "anthropic": {"thinking": {"type": "enabled", "budget_tokens": 16384}}
-  }
-}
-```
-
-`model` is a first-class field, not a setting: pydantic-ai keeps the model id separate from
-`ModelSettings` (which has no `model` key), so there's no collision putting it alongside the
-settings, and it's excluded when the payload is lowered to `ModelSettings`.
-
-### Notes
-
-- **Model precedence:** the managed `model` is sourced at run setup via the capability's `get_model`
-  hook, so it slots in with the right precedence -- a call-site `run(model=...)` beats it, it beats
-  the agent's constructor model, and a fully model-less agent can be driven entirely from Logfire.
-  (On older pydantic-ai without the `get_model` hook, the model is instead swapped per request, which
-  requires a code-side model and can't beat a per-run `model=`.)
-- **Optional `name`:** omit `name` to default the backing variable to the agent's own `name`
-  (`agent__<agent name>`). The one caveat is model *sourcing*: a nameless capability can't source the
-  model at run setup (there's no agent yet then), only override it on an agent that already has a
-  model. Pass an explicit `name` to source the model for a model-less agent (until pydantic-ai#4977
-  adds a construction-time agent hook).
-- `thinking` accepts `true`/`false` or an effort level (`'minimal'` ... `'xhigh'`), exactly like
-  the unified `thinking` model setting; per-provider lowering (e.g. effort to budget tokens) is
-  pydantic-ai's existing behavior.
-
-## `ManagedAgentSpec`
-
-Back a whole agent's shape -- instructions, model, model settings, and capabilities -- with a single
-Logfire-managed [`AgentSpec`](https://ai.pydantic.dev/api/agent/#pydantic_ai.agent.spec.AgentSpec).
-
-### The problem
-
-The per-surface capabilities above each manage one knob. Sometimes you want to steer the agent's
-whole configuration together -- swap the model *and* nudge the instructions *and* enable a
-capability -- and have that land as one atomic, versioned change you can roll out or roll back in a
-single step, rather than coordinating several variables.
-
-### The solution
-
-`ManagedAgentSpec` resolves an `agentspec__<name>` variable whose value is an entire `AgentSpec`.
-Its instructions, model, settings, and `capabilities` all layer onto the code-defined agent, so one
-managed value drives the whole shape. It composes with the per-surface capabilities and with your
-code-defined tools and capabilities -- the spec adds, it never removes.
-
-### Usage
-
-The name `checkout_assistant` is declared as the managed variable `agentspec__checkout_assistant`,
-matching the naming Logfire's "Agent Specs" surface uses:
-
-```python
-import logfire
-from pydantic_ai import Agent
-
-from pydantic_ai_harness.logfire import ManagedAgentSpec
-
-logfire.configure()
-
-agent = Agent(
-    'openai:gpt-5',
-    capabilities=[ManagedAgentSpec('checkout_assistant', label='production')],
-)
-```
-
-The value is a JSON `AgentSpec`: its `instructions` add to the agent's own, `model_settings` merge
-over the agent's (under per-run `model_settings=`), `model` is sourced at run setup (below a per-run
-`model=`, above the constructor model), and each entry in `capabilities` is materialized from the
-capability registry:
-
-```json
-{
-  "model": "openai:gpt-5",
-  "instructions": "Be concise and always confirm the order id before refunding.",
-  "model_settings": {"temperature": 0.3},
-  "capabilities": [{"Thinking": {"effort": "high"}}]
-}
-```
-
-Reference your own capability classes by name by passing them as `custom_capability_types`; built-in
-capability names (e.g. `Thinking`) are always available.
-
-For the common case -- an agent whose whole shape is managed -- the `ManagedAgent` sugar builds the
-agent for you in one call:
-
-```python
-import logfire
 
 from pydantic_ai_harness.logfire import ManagedAgent
 
 logfire.configure()
 
-agent = ManagedAgent('checkout_assistant', model='openai:gpt-5', label='production')
-result = agent.run_sync('Refund my last order.')
-```
 
-`ManagedAgent` returns a real `Agent` (not a builder); the managed values just flow in per run. The
-spec's `model` is sourced at run setup, so `model` here is an optional fallback for before any spec
-is published (and a call-site `run(model=...)` still wins). On older pydantic-ai without the
-`get_model` hook, pass a fallback `model` so the agent has a code-side model to override per request.
+def get_weather(city: str) -> str:
+    return f'The weather in {city} is sunny.'
 
-### Notes
-
-- **Additive, never destructive:** a missing, invalid, or unreachable value degrades to exactly the
-  agent the developer wrote. Local tools, toolsets, and code-defined capabilities always stay in code.
-- **Capabilities materialize per run:** an unknown capability name, or one whose construction fails,
-  is skipped with a warning rather than crashing the run.
-- **Model precedence:** as with [`ManagedSettings`](#managedsettings), the spec's `model` is sourced
-  at run setup via the capability's `get_model` hook, so it slots in with the right precedence -- a
-  call-site `run(model=...)` beats it, it beats the agent's constructor model, and a fully model-less
-  agent (or `ManagedAgent` with no fallback `model`) can be driven entirely from Logfire. (On older
-  pydantic-ai without the `get_model` hook, the model is instead swapped per request, which requires a
-  code-side or `ManagedAgent` fallback model and can't beat a per-run `model=`.)
-- **Optional `name`:** omit `name` to default the backing variable to the agent's own `name`
-  (`agentspec__<agent name>`; for `ManagedAgent`, pass the agent's `name` through). As with
-  `ManagedSettings`, a nameless capability can only *override* the model, not source it at run setup;
-  pass an explicit `name` to source the model for a model-less agent (until pydantic-ai#4977).
-- The spec resolves **once per run**, in `for_run` (earlier than the per-surface capabilities, since
-  the resolved spec decides what the run is assembled from), and its label + version ride as baggage
-  on every span of the run. `ManagedAgentSpec.resolved` exposes the active run's `ResolvedVariable`.
-
-## `ManagedMCP`
-
-Point the agent at an [MCP](https://ai.pydantic.dev/mcp/client/) server -- and steer which of its
-tools the agent uses, how they're namespaced, and how the server is framed -- from one managed
-variable.
-
-### The problem
-
-Which MCP server an agent talks to, and which of that server's tools it's allowed to use, is
-deployment configuration that tends to be baked into code: swapping a staging endpoint for
-production, rotating a token, or narrowing a noisy server down to the two tools you actually want
-all mean a redeploy.
-
-### The solution
-
-Drop `ManagedMCP` onto the agent and the *connection* becomes manageable from Logfire: the URL, the
-auth, a tool filter, a namespace prefix, and a description. The server still runs its own tools --
-**nothing executable is ever downloaded from Logfire.** The managed value only decides *which
-already-trusted server* the agent connects to and *how*; the server is connected locally (via the
-[`MCP`](https://ai.pydantic.dev/capabilities/) capability), so credentials, hooks, and tracing stay
-under your control.
-
-### Usage
-
-The name `github` is declared as the managed variable `mcp__github`, holding a `ManagedMCPValue`
-(omit `name` to default it to the agent's own `name`, `mcp__<agent name>`):
-
-```python
-import logfire
-from pydantic_ai import Agent
-
-from pydantic_ai_harness.logfire import ManagedMCP
-
-logfire.configure()
 
 agent = Agent(
     'openai:gpt-5',
-    capabilities=[ManagedMCP('github', label='production')],
+    name='checkout_assistant',
+    tools=[get_weather],
+    capabilities=[ManagedAgent(label='production')],  # -> agent__checkout_assistant
 )
 ```
 
-The value carries the connection and the knobs around it -- every field but `url` is optional:
+The variable holds an `AgentConfig`:
 
 ```json
 {
-  "url": "https://mcp.example.com/github",
-  "authorization": "Bearer ghp_...",
-  "headers": {"X-Env": "prod"},
-  "tools": ["search_issues", "create_issue"],
-  "tool_prefix": "gh",
-  "description": "GitHub issue tools."
+  "instructions": "You are a concise checkout assistant. @{prompt__support_tone}@",
+  "model": "openai:gpt-5",
+  "settings": {
+    "temperature": 0.4,
+    "max_tokens": 2048,
+    "thinking": "high",
+    "provider_options": {
+      "anthropic": {"thinking": {"type": "enabled", "budget_tokens": 16384}}
+    }
+  },
+  "tool_definitions": {
+    "get_weather": {
+      "new_name": "lookup_weather",
+      "description": "Look up the current weather for a city.",
+      "parameter_descriptions": {"city": "City name, e.g. 'London'"}
+    }
+  }
 }
 ```
 
-### Notes
-
-- **Connection, not code:** the managed value only ever configures a connection to a server you
-  already trust; it can't introduce runnable code. Connecting a server locally needs the `mcp` extra
-  (`pip install 'pydantic-ai-slim[mcp]'`); the requirement surfaces only once a `url` is published.
-- **No URL, no server:** with no `url` published (the empty code default), the capability contributes
-  nothing and the agent runs exactly as coded -- the same additive-fallback contract as the others.
-- `tools` filters the server's tools by their own names *before* `tool_prefix` namespaces them, so
-  `tools=["search"]` with `tool_prefix="gh"` advertises just `gh_search`.
-- **Optional `name`:** omit `name` to default the backing variable to the agent's own `name`
-  (`mcp__<agent name>`). Resolves **once per run**, in `for_run` (the connection decides what toolset
-  the run is assembled from), with its label + version riding as baggage on every span of the run.
-
-## `ManagedSkills`
-
-Publish a catalog of **skills** -- named, described bundles of instructions the model pulls in on
-demand -- from one managed variable.
-
-### The problem
-
-A capable agent often needs a lot of situational guidance: how to handle refunds, how shipping
-works, what the escalation policy is. Pasting all of it into the system prompt bloats every request
-(and its cost), and editing any of it means a redeploy.
-
-### The solution
-
-Drop `ManagedSkills` onto the agent and publish skills from Logfire. Each skill is **instructions
-only** -- a `name`, a `description`, and `instructions` -- and carries no tool code, so a managed
-skill can only ever add guidance, never run code. That's a deliberate safety limit: downloading
-runnable tools from a remote UI is unsafe, so skills stop at instructions.
-
-Skills use the framework's **progressive disclosure** (`defer_loading`): the model first sees only a
-short catalog -- each skill's `name` and `description` -- next to a `load_capability` tool the
-framework provides. A skill's `instructions` are added only after the model loads it, so a large
-skill library costs a short catalog rather than a bloated prompt.
-
-### Usage
-
-The name `support_agent` is declared as the managed variable `skill__support_agent`, holding a list
-of `ManagedSkill`s (omit `name` to default it to the agent's own `name`, `skill__<agent name>`):
-
-```python
-import logfire
-from pydantic_ai import Agent
-
-from pydantic_ai_harness.logfire import ManagedSkills
-
-logfire.configure()
-
-agent = Agent(
-    'openai:gpt-5',
-    capabilities=[ManagedSkills('support_agent', label='production')],
-)
-```
-
-Each entry is a `ManagedSkill` -- the `description` is the catalog blurb the model routes on; the
-`instructions` are revealed only once it loads the skill:
-
-```json
-[
-  {
-    "name": "refunds",
-    "description": "How to handle refund requests.",
-    "instructions": "Refunds are allowed within 30 days of purchase. Always confirm the order id first."
-  }
-]
-```
+- `instructions` supports Logfire's `@{other_variable}@` composition -- the reference expands at
+  resolution time, so a managed agent can share a `prompt__` variable with other agents. `{{...}}`
+  runtime placeholders pass through verbatim unless `render_template=True` renders them against
+  `deps` (like `ManagedPrompt`).
+- `model` is a pydantic-ai model string. It's a first-class field, not a setting: pydantic-ai keeps
+  the model id separate from `ModelSettings` (which has no `model` key), so there's no collision
+  putting them side by side.
+- `settings` keys are the canonical, cross-framework ones (they match
+  `pydantic_ai.settings.ModelSettings`), with a nested `provider_options` escape hatch for
+  provider-specific settings (`provider_options.openai.reasoning_effort` lowers to the
+  `openai_reasoning_effort` model setting, and a provider-specific value wins over its canonical
+  counterpart). `thinking` accepts `true`/`false` or an effort level (`'minimal'` ... `'xhigh'`),
+  exactly like the unified `thinking` model setting.
+- `tool_definitions` is keyed by each tool's original (code-side) name; every override field is
+  optional and unset fields keep the tool's own definition.
 
 ### Notes
 
-- **Instructions only -- safe by construction:** a skill can never download or run tool code; it only
-  contributes guidance. This is the deliberate difference from [`ManagedMCP`](#managedmcp), which
-  connects an (already-trusted) server rather than shipping code.
-- **Progressive disclosure:** each skill is a deferred capability. The catalog and `load_capability`
-  tool are provided by the framework for any deferred capability; `ManagedSkills` just contributes the
-  skills. Instructions load only when the model asks for them.
-- Two skills sharing a `name` would collide on their capability id, so the last one wins and a warning
-  is emitted rather than breaking the run. An empty or invalid list simply adds no skills.
-- **Optional `name`:** omit `name` to default the backing variable to the agent's own `name`
-  (`skill__<agent name>`). Resolves **once per run**, in `for_run` (the deferred skills must be in
-  place before the catalog is assembled), with its label + version riding as baggage on every span.
+- **Tool definitions are overlays, never code:** the tool itself -- its implementation and its
+  parameter schema structure -- stays exactly as written in code. Only the LLM-facing spec (name,
+  description, parameter description strings) is remotely patchable, so a remote value can never
+  drift from the validator the tool actually runs against.
+- **Renames round-trip:** `new_name` changes the name the model is shown; a call to the renamed
+  tool routes back to the original implementation, and `ctx.tool_name` inside the tool is the
+  original name. A rename that collides with a name another tool already advertises is dropped
+  with a warning (other patches still apply) rather than breaking the run.
+- An override keyed to a tool that no longer exists is inert -- that's the drift case (the tool was
+  removed or renamed in code), and the Logfire UI is where it becomes visible.
+- **Model precedence:** the managed `model` is sourced at run setup via the capability's `get_model`
+  hook, so it slots in with the right precedence -- a call-site `run(model=...)` beats it, it beats
+  the agent's constructor model, and a fully model-less agent can be driven entirely from Logfire.
+  (On older pydantic-ai without the `get_model` hook, the model is instead swapped per request, which
+  requires a code-side model and can't beat a per-run `model=`.)
+- **Settings precedence:** managed settings merge **over** the agent's constructor `model_settings`
+  and **under** per-run `model_settings=`, so run arguments always win.
+- **Adoption reporting:** for the run's duration, `logfire.managed.applied_sections` baggage names
+  the sections the capability applied (e.g. `instructions,settings`), which the Logfire UI reads to
+  distinguish a wired-up managed agent from one whose config resolves but isn't applied. `model` is
+  reported when present even if a call-site `run(model=...)` outranked it that run.
+- `ManagedAgent.resolved` exposes the active run's `ResolvedVariable`, and resolution is isolated
+  per run, exactly like `ManagedPrompt`.

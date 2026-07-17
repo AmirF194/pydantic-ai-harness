@@ -118,3 +118,16 @@ def test_ensure_variable_returns_variable_built_while_awaiting_lock() -> None:
     capability._build_lock = cast(Any, _RaceLock())
     # `ctx` is only touched after the second check builds a new variable; here it returns first.
     assert capability._ensure_variable(cast(Any, None)) is built
+
+
+def test_auto_create_marking_rechecks_guard_under_lock(monkeypatch: pytest.MonkeyPatch) -> None:
+    capability = _StrVariable('guard_recheck')
+    spawned: list[str] = []
+
+    def record(variable: Variable[Any], config: Any = None) -> None:
+        spawned.append(variable.name)
+
+    monkeypatch.setattr('pydantic_ai_harness.logfire._managed_variable._spawn_create', record)
+    capability._maybe_auto_create(capability._variable)
+    capability._maybe_auto_create(capability._variable)
+    assert spawned == ['var__guard_recheck']

@@ -62,7 +62,7 @@ def spawned(monkeypatch: pytest.MonkeyPatch) -> list[str]:
     """
     names: list[str] = []
 
-    def record(variable: Variable[Any]) -> None:
+    def record(variable: Variable[Any], config: VariableConfig | None = None) -> None:
         names.append(variable.name)
 
     monkeypatch.setattr(_managed_variable, '_spawn_create', record)
@@ -74,9 +74,9 @@ def spawned_inline(monkeypatch: pytest.MonkeyPatch) -> list[str]:
     """Record spawned names and run creation inline on the calling thread for determinism."""
     names: list[str] = []
 
-    def record_and_create(variable: Variable[Any]) -> None:
+    def record_and_create(variable: Variable[Any], config: VariableConfig | None = None) -> None:
         names.append(variable.name)
-        _managed_variable._create_variable(variable)
+        _managed_variable._create_variable(variable, config)
 
     monkeypatch.setattr(_managed_variable, '_spawn_create', record_and_create)
     return names
