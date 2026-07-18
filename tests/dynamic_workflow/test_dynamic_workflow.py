@@ -1280,7 +1280,7 @@ async def test_cancellation_closes_unscheduled_coroutines() -> None:
             task = asyncio.ensure_future(executor.run(state))
             await started.wait()
             task.cancel()
-            with pytest.raises(asyncio.CancelledError):
+            with pytest.raises(asyncio.CancelledError):  # pragma: no branch
                 await task
 
 

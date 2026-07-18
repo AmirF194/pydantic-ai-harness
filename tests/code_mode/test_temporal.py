@@ -172,7 +172,7 @@ class SandboxRestrictionWorkflow:
             subprocess.run([sys.executable, '-c', 'pass'], check=True)
         except RestrictedWorkflowAccessError as e:
             return e.qualified_name
-        return 'subprocess was allowed'
+        return 'subprocess was allowed'  # pragma: no cover
 
 
 # ---------------------------------------------------------------------------
