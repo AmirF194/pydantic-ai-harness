@@ -80,17 +80,17 @@ lint = [
 ]
 
 [tool.uv.sources]
-# TEMPORARY PIN — remove when pydantic-ai#6333 is released.
-# pydantic-ai#6333 (branch `capability-run-spec`) adds the `AbstractCapability.get_model()` hook that
-# `ManagedAgent` uses to source the agent's model with correct precedence (fixing the
-# model-less-agent and `run(model=...)`-loses-to-managed-model limits). Its selector form —
-# `get_model()` returning a callable that receives `ModelSelectionContext` (with `.agent`/`.deps`) —
-# is what lets a *nameless* `ManagedAgent` source the model too, deriving its variable from the
-# agent at selection time. Once that PR is released to PyPI, drop this source so we resolve
-# `pydantic-ai-slim` from the `>=` floor above.
-# NOTE: `pydantic-ai-slim` lives in the `pydantic_ai_slim/` subdirectory of the monorepo. Pinned to
-# an explicit rev (not the branch) so the resolution is reproducible and doesn't drift as the branch moves.
-pydantic-ai-slim = { git = 'https://github.com/pydantic/pydantic-ai.git', rev = '3b3bab4220d9086b00cac3d2f8975a178c06b9b6', subdirectory = 'pydantic_ai_slim' }
+# TEMPORARY PIN — remove when the pydantic-ai release that includes #6333 lands on PyPI.
+# pydantic-ai#6333 (MERGED to `main`) adds the `AbstractCapability.get_model()` hook that `ManagedAgent`
+# uses to source the agent's model with correct precedence (fixing the model-less-agent and
+# `run(model=...)`-loses-to-managed-model limits). Its selector form — `get_model()` returning a
+# callable that receives `ModelSelectionContext` (with `.agent`/`.deps`) — is what lets a *nameless*
+# `ManagedAgent` source the model too, deriving its variable from the agent at selection time. The
+# current PyPI release (2.12.0) predates the merge, so we pin to the merge commit on `main` until the
+# next release ships the hook, at which point this source drops and we resolve from the `>=` floor above.
+# NOTE: `pydantic-ai-slim` lives in the `pydantic_ai_slim/` subdirectory of the monorepo. Pinned to an
+# explicit rev (not `branch = 'main'`) so the resolution is reproducible and doesn't drift as main moves.
+pydantic-ai-slim = { git = 'https://github.com/pydantic/pydantic-ai.git', rev = '9688a9cca2fcf81451cdac35e701250dbdfec75e', subdirectory = 'pydantic_ai_slim' }
 
 [tool.hatch.version]
 source = 'uv-dynamic-versioning'
