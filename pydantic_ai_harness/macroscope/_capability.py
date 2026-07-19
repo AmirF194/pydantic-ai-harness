@@ -54,8 +54,11 @@ class Macroscope(AbstractCapability[AgentDepsT]):
     """Maximum seconds to wait for a review. Reviews call a remote service, so this is
     generous by default."""
 
-    include_instructions: bool = True
-    """Contribute guidance telling the agent to validate each finding before fixing it."""
+    guidance: str | None = None
+    """Custom review guidance for the system prompt.
+
+    Leave as `None` for the default validate-then-fix guidance, or set `''` to
+    contribute no instructions at all."""
 
     def get_toolset(self) -> MacroscopeToolset[AgentDepsT]:
         """Build the toolset that provides the `run_macroscope_review` tool."""
@@ -67,7 +70,11 @@ class Macroscope(AbstractCapability[AgentDepsT]):
         )
 
     def get_instructions(self) -> str | None:
-        """Return validate-then-fix guidance, unless `include_instructions` is False."""
-        if not self.include_instructions:
-            return None
+        """Static validate-then-fix guidance.
+
+        A non-`None` `guidance` replaces the default; `''` disables
+        instructions entirely.
+        """
+        if self.guidance is not None:
+            return self.guidance or None
         return _REVIEW_INSTRUCTIONS

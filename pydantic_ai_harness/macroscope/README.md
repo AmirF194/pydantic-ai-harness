@@ -3,6 +3,8 @@
 Run a [Macroscope](https://docs.macroscope.com/cli) code review from a Pydantic AI
 agent and hand the findings back for validation and fixing.
 
+[Source](https://github.com/pydantic/pydantic-ai-harness/tree/main/pydantic_ai_harness/macroscope/)
+
 ## The problem
 
 Macroscope reviews the current branch's diff and streams findings, but it ships as
@@ -68,7 +70,7 @@ Each finding is a `MacroscopeIssue` with `issue_id`, `sequence`, `path`, `line`,
 | `command` | `'macroscope'` | Binary name or path. Override for a non-default install location. |
 | `cwd` | `'.'` | Repository directory the review runs in. |
 | `timeout` | `600.0` | Maximum seconds to wait for a review. |
-| `include_instructions` | `True` | Contribute guidance telling the agent to validate each finding before fixing it. |
+| `guidance` | `None` | Custom review guidance for the system prompt. `None` contributes the default validate-then-fix guidance; `''` contributes none. |
 
 ## Scope and composition
 

@@ -141,9 +141,17 @@ class TestRunReview:
 
 
 class TestCapability:
-    def test_instructions_toggle(self) -> None:
-        assert Macroscope().get_instructions() is not None
-        assert Macroscope(include_instructions=False).get_instructions() is None
+    def test_default_instructions_mention_validation(self) -> None:
+        instructions = Macroscope().get_instructions()
+        assert instructions is not None
+        assert 'run_macroscope_review' in instructions
+        assert 'untrusted' in instructions
+
+    def test_custom_guidance_replaces_default(self) -> None:
+        assert Macroscope(guidance='Review before merging.').get_instructions() == 'Review before merging.'
+
+    def test_empty_guidance_disables_instructions(self) -> None:
+        assert Macroscope(guidance='').get_instructions() is None
 
     async def test_tool_runs_through_agent(self, tmp_path: Path) -> None:
         command = _fake_cli(tmp_path, ['review_id=rev-9', _ISSUE_LINE, 'issue_status=completed'])
