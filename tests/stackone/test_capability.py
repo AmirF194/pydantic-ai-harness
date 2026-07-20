@@ -42,14 +42,9 @@ class TestStackOne:
         monkeypatch.setenv('STACKONE_API_KEY', 'env-key')
         assert StackOne(account_id='45320').get_toolset() is not None
 
-    def test_search_execute_warns_on_defer_loading(self):
-        with pytest.warns(UserWarning, match='discovery hop'):
-            StackOne(account_id='45320', api_key='key', tool_mode='search_execute', id='stackone', defer_loading=True)
-        with pytest.warns(UserWarning, match='discovery hop'):
-            StackOne(account_id='45320', api_key='key', id='stackone', defer_loading=True)
-
-    def test_individual_mode_does_not_warn(self, recwarn: pytest.WarningsRecorder):
-        StackOne(account_id='45320', api_key='key', actions=['*_list_*'], defer_loading=False)
+    def test_construction_does_not_warn(self, recwarn: pytest.WarningsRecorder):
+        StackOne(account_id='45320', api_key='key', actions=['*_list_*'])
+        StackOne(account_id='45320', api_key='key', id='stackone', defer_loading=True)
         assert not recwarn.list
 
     def test_rejects_actions_in_explicit_search_execute(self):

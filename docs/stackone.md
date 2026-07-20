@@ -68,8 +68,6 @@ Pass `custom_capability_types` so the spec loader knows how to instantiate `Stac
 
 The lower-level `StackOneToolset` is public for use with [`Agent(toolsets=[...])`](/ai/tools-toolsets/toolsets/) and core toolset combinators.
 
-This capability's API may change while it stabilizes; breaking changes ship deprecation warnings where practical.
-
 ## API reference
 
 ::: pydantic_ai_harness.stackone.StackOne

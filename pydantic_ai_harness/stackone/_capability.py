@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import warnings
 from collections.abc import Mapping, Sequence
 from dataclasses import KW_ONLY, dataclass
 from typing import Any
@@ -76,14 +75,6 @@ class StackOne(AbstractCapability[AgentDepsT]):
 
     def __post_init__(self) -> None:
         check_actions_apply(self.tool_mode, self.actions)
-        if resolve_tool_mode(self.tool_mode, self.actions) == 'search_execute' and self.defer_loading:
-            # stacklevel 3: user code -> generated `__init__` -> `__post_init__`.
-            warnings.warn(
-                '`defer_loading` hides the two `search_execute` meta-tools behind `tool_search`, adding '
-                "a discovery hop on top of StackOne's own search. Consider `tool_mode='individual'` with "
-                '`defer_loading`, or `search_execute` without it.',
-                stacklevel=3,
-            )
 
     def get_toolset(self) -> StackOneToolset[AgentDepsT]:
         """Build the StackOne toolset, failing fast if no API key is configured."""
