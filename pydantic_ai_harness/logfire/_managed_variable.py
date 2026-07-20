@@ -1,6 +1,6 @@
 """Shared base for capabilities backed by a Logfire managed variable.
 
-`ManagedPrompt` and `ManagedAgent` both resolve a Logfire
+`ManagedPrompt` and `AgentControl` both resolve a Logfire
 [managed variable](https://logfire.pydantic.dev/docs/reference/advanced/managed-variables/) once per
 run and keep its baggage active for the whole run. This base owns that shared plumbing -- the
 targeting inputs, the per-run resolution context variable, `get_ordering`, and `wrap_run` -- so each

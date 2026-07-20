@@ -7,18 +7,18 @@ from typing import Any, cast
 import logfire
 import pytest
 from logfire.testing import CaptureLogfire
-from logfire.variables import LabeledValue, Rollout, Variable, VariableConfig, VariablesConfig
+from logfire.variables import Rollout, Variable, VariableConfig, VariablesConfig
 from pydantic_ai import Agent, RunContext, Tool
 from pydantic_ai.messages import ModelMessage, ModelRequest, ModelResponse, TextPart, ToolCallPart
 from pydantic_ai.models.function import AgentInfo, FunctionModel
 from pydantic_ai.models.test import TestModel
 from pydantic_ai.tools import ToolDefinition
 
-from pydantic_ai_harness import ManagedAgent as RootManagedAgent
+from pydantic_ai_harness import AgentControl as RootAgentControl
 from pydantic_ai_harness.logfire import (
     AgentConfig,
     AgentConfigSettings,
-    ManagedAgent,
+    AgentControl,
     ToolDefinitionOverride,
     _managed_variable,
 )
@@ -27,7 +27,7 @@ from ._helpers import advertised, capture_tools, get_weather, variables_provider
 
 pytestmark = pytest.mark.anyio
 
-assert RootManagedAgent is ManagedAgent
+assert RootAgentControl is AgentControl
 
 
 def instructions_seen(messages: list[ModelMessage]) -> list[str]:
@@ -35,19 +35,19 @@ def instructions_seen(messages: list[ModelMessage]) -> list[str]:
 
 
 async def test_empty_config_keeps_code_behavior() -> None:
-    result = await Agent(TestModel(), instructions='code', capabilities=[ManagedAgent('empty')]).run('hello')
+    result = await Agent(TestModel(), instructions='code', capabilities=[AgentControl('empty')]).run('hello')
     assert instructions_seen(result.all_messages()) == ['code']
 
 
 async def test_instructions_apply_independently() -> None:
-    capability = ManagedAgent('instructions', default=AgentConfig(instructions='managed'))
+    capability = AgentControl('instructions', default=AgentConfig(instructions='managed'))
     result = await Agent(TestModel(), instructions='code', capabilities=[capability]).run('hello')
     assert instructions_seen(result.all_messages()) == ['code\n\nmanaged']
 
 
 async def test_tool_definition_patches() -> None:
     seen: list[ToolDefinition] = []
-    capability = ManagedAgent(
+    capability = AgentControl(
         'tools',
         default=AgentConfig(
             tool_definitions={
@@ -69,7 +69,7 @@ async def test_settings_schema_and_lowering() -> None:
         seen.append(dict(info.model_settings or {}))
         return ModelResponse(parts=[TextPart('done')])
 
-    capability = ManagedAgent(
+    capability = AgentControl(
         'settings',
         default=AgentConfig(
             settings=AgentConfigSettings.model_validate(
@@ -109,7 +109,7 @@ def test_prebuilt_variable() -> None:
         default=AgentConfig(model='test'),
         logfire_instance=logfire.DEFAULT_LOGFIRE_INSTANCE,
     )
-    assert ManagedAgent(variable).get_model() == 'test'
+    assert AgentControl(variable).get_model() == 'test'
 
 
 async def test_auto_create_uses_request_snapshot(capfire: CaptureLogfire, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -153,7 +153,7 @@ async def test_auto_create_uses_request_snapshot(capfire: CaptureLogfire, monkey
             instructions='Code instructions.',
             model_settings={'temperature': 0.3},
             tools=[lookup, raw_tool, empty_tool],
-            capabilities=[ManagedAgent()],
+            capabilities=[AgentControl()],
         )
         await agent.run('hello')
 
@@ -181,7 +181,7 @@ async def test_applied_sections_baggage() -> None:
         seen.append(logfire.get_baggage().get('logfire.managed.applied_sections'))
         return 'ok'
 
-    capability = ManagedAgent(
+    capability = AgentControl(
         'baggage',
         default=AgentConfig(instructions='managed', settings=AgentConfigSettings(temperature=0.2)),
     )
@@ -196,7 +196,7 @@ async def test_empty_config_has_no_applied_sections_baggage() -> None:
         seen.append(logfire.get_baggage().get('logfire.managed.applied_sections'))
         return 'ok'
 
-    await Agent(TestModel(), tools=[inspect_baggage], capabilities=[ManagedAgent('empty_baggage')]).run('hello')
+    await Agent(TestModel(), tools=[inspect_baggage], capabilities=[AgentControl('empty_baggage')]).run('hello')
     assert seen == [None]
 
 
@@ -216,7 +216,7 @@ async def test_rename_round_trip_preserves_original_context_name() -> None:
         context_names.append(ctx.tool_name)
         return city
 
-    capability = ManagedAgent(
+    capability = AgentControl(
         'rename',
         default=AgentConfig(tool_definitions={'weather': ToolDefinitionOverride(new_name='weather_now')}),
     )
@@ -242,7 +242,7 @@ async def test_rename_collision_warns_and_keeps_other_patches() -> None:
             return ModelResponse(parts=[ToolCallPart('first', {}, tool_call_id='call')])
         return ModelResponse(parts=[TextPart('done')])
 
-    capability = ManagedAgent(
+    capability = AgentControl(
         'collision',
         default=AgentConfig(
             tool_definitions={'first': ToolDefinitionOverride(new_name='second', description='Managed first.')}
@@ -255,7 +255,7 @@ async def test_rename_collision_warns_and_keeps_other_patches() -> None:
 
 async def test_unknown_tool_and_parameter_keys_are_inert() -> None:
     seen: list[ToolDefinition] = []
-    capability = ManagedAgent(
+    capability = AgentControl(
         'unknown_tool',
         default=AgentConfig(
             tool_definitions={
@@ -278,7 +278,7 @@ async def test_schema_without_properties_is_tolerated() -> None:
         return 'ok'
 
     tool = Tool.from_schema(raw_tool, name='raw_tool', description='Original.', json_schema={'type': 'object'})
-    capability = ManagedAgent(
+    capability = AgentControl(
         'raw_schema',
         default=AgentConfig(
             tool_definitions={'raw_tool': ToolDefinitionOverride(parameter_descriptions={'missing': 'ignored'})}
@@ -289,7 +289,7 @@ async def test_schema_without_properties_is_tolerated() -> None:
 
 
 async def test_managed_model_runs_model_less_agent_and_run_model_wins() -> None:
-    managed = ManagedAgent('managed_model', default=AgentConfig(model='test'))
+    managed = AgentControl('managed_model', default=AgentConfig(model='test'))
     assert (await Agent(None, capabilities=[managed]).run('hello')).output.startswith('success')
 
     def call_site(_messages: list[ModelMessage], _info: AgentInfo) -> ModelResponse:
@@ -303,18 +303,18 @@ async def test_nameless_model_selector_resolves_once_per_run(monkeypatch: pytest
     # A nameless capability's selector is evaluated once per request step, but the managed model is a
     # run-stable value, so it memoizes and resolves the variable exactly once even across steps.
     resolves: list[str] = []
-    original = ManagedAgent[Any]._resolve_model_value
+    original = AgentControl[Any]._resolve_model_value
 
-    def counting(self: ManagedAgent[Any], variable: Variable[Any]) -> str | None:
+    def counting(self: AgentControl[Any], variable: Variable[Any]) -> str | None:
         resolves.append(variable.name)
         return original(self, variable)
 
-    monkeypatch.setattr(ManagedAgent, '_resolve_model_value', counting)
+    monkeypatch.setattr(AgentControl, '_resolve_model_value', counting)
 
     def a_tool() -> str:
         return 'ok'
 
-    capability = ManagedAgent(default=AgentConfig(model='test'))
+    capability = AgentControl(default=AgentConfig(model='test'))
     # A model-less agent with one tool: `TestModel` calls the tool (step 1) then answers (step 2).
     await Agent(None, name='multi_step', tools=[a_tool], capabilities=[capability]).run('hello')
     assert resolves == ['agent__multi_step']
@@ -328,34 +328,10 @@ async def test_known_variable_skips_snapshot_build(capfire: CaptureLogfire, monk
 
     monkeypatch.setattr(Variable, 'to_config', fail_to_config)
     with variables_provider(capfire, VariablesConfig(variables={'agent__known': config})):
-        await Agent(TestModel(), capabilities=[ManagedAgent('known')]).run('hello')
+        await Agent(TestModel(), capabilities=[AgentControl('known')]).run('hello')
 
 
 async def test_before_model_request_outside_run_is_inert() -> None:
-    capability = ManagedAgent('outside_run')
+    capability = AgentControl('outside_run')
     request = cast(Any, object())
     assert await capability.before_model_request(cast(Any, None), request) is request
-
-
-async def test_object_value_composition(capfire: CaptureLogfire) -> None:
-    config = VariablesConfig(
-        variables={
-            'agent__composed': VariableConfig(
-                name='agent__composed',
-                labels={
-                    'production': LabeledValue(version=1, serialized_value='{"instructions":"@{prompt__shared}@"}')
-                },
-                rollout=Rollout(labels={'production': 1}),
-                overrides=[],
-            ),
-            'prompt__shared': VariableConfig(
-                name='prompt__shared',
-                labels={'production': LabeledValue(version=1, serialized_value='"Shared instructions."')},
-                rollout=Rollout(labels={'production': 1}),
-                overrides=[],
-            ),
-        }
-    )
-    with variables_provider(capfire, config):
-        result = await Agent(TestModel(), capabilities=[ManagedAgent('composed')]).run('hello')
-    assert instructions_seen(result.all_messages()) == ['Shared instructions.']

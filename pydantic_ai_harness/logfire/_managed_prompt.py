@@ -21,6 +21,11 @@ _PROMPT_VARIABLE_PREFIX = 'prompt__'
 class ManagedPrompt(ManagedVariableCapability[AgentDepsT, str]):
     """Back an agent's instructions with a Logfire-managed prompt.
 
+    > **Legacy.** `ManagedPrompt` predates
+    [`AgentControl`][pydantic_ai_harness.logfire.AgentControl]; a prompt-only `AgentControl` (an
+    `AgentConfig` with just `instructions`) now covers the same use case and is the recommended
+    path. `ManagedPrompt` keeps working for existing setups.
+
     **Prompt-cache trade-off:** the resolved value lands in the system instructions block, so any
     Logfire-side change to the prompt (new version rollout, label flip, A/B targeting) invalidates
     the provider's prompt cache for the affected runs. Pin a `label` (e.g. `'production'`) for the

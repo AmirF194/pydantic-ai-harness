@@ -1,4 +1,4 @@
-"""Back an agent's managed configuration with one Logfire variable."""
+"""Back an agent's Agent Control configuration with one Logfire variable."""
 
 from __future__ import annotations
 
@@ -115,9 +115,8 @@ class AgentConfig(BaseModel):
     instructions: str | None = None
     """Instructions replacing what the model is shown when present.
 
-    Supports Logfire `@{other_variable}@` composition, expanded by the SDK at resolution time, and
-    `{{...}}` runtime placeholders, rendered against `deps` only when `ManagedAgent.render_template`
-    is set.
+    `{{...}}` runtime placeholders are rendered against `deps` only when
+    `AgentControl.render_template` is set.
     """
     model: str | None = None
     """A Pydantic AI model string such as `'openai:gpt-5'`; `None` keeps the code model."""
@@ -228,7 +227,7 @@ class _ToolDefinitionOverridesToolset(WrapperToolset[AgentDepsT]):
 
 
 @dataclass
-class ManagedAgent(ManagedVariableCapability[AgentDepsT, AgentConfig]):
+class AgentControl(ManagedVariableCapability[AgentDepsT, AgentConfig]):
     """Manage an agent's config through one `agent__<name>` Logfire variable.
 
     The variable holds an `AgentConfig`. Each present section -- `instructions`, `model`, `settings`,
@@ -262,14 +261,13 @@ class ManagedAgent(ManagedVariableCapability[AgentDepsT, AgentConfig]):
     import logfire
     from pydantic_ai import Agent
 
-    from pydantic_ai_harness.logfire import ManagedAgent
+    from pydantic_ai_harness.logfire import AgentControl
 
     logfire.configure()
-    agent = Agent('openai:gpt-5', name='checkout_assistant', capabilities=[ManagedAgent(label='production')])
+    agent = Agent('openai:gpt-5', name='checkout_assistant', capabilities=[AgentControl(label='production')])
     result = agent.run_sync('Refund my last order.')
     ```
 
-    Instructions support Logfire `@{other_variable}@` composition at variable resolution time.
     Runtime `{{...}}` placeholders pass through unless `render_template=True`. During a run,
     `logfire.managed.applied_sections` lists the present sections. The `model` section is reported
     when present even if a call-site model outranked it for that run.
@@ -329,7 +327,7 @@ class ManagedAgent(ManagedVariableCapability[AgentDepsT, AgentConfig]):
 
         Both paths read the value with a **bare** `variable.get()` -- they read `.value` and never
         enter the [`ResolvedVariable`][logfire.variables.ResolvedVariable] as a context manager -- so
-        model selection contributes no baggage: [`wrap_run`][pydantic_ai_harness.logfire.ManagedAgent.wrap_run]
+        model selection contributes no baggage: [`wrap_run`][pydantic_ai_harness.logfire.AgentControl.wrap_run]
         stays the sole owner of the run's resolution baggage. Model selection runs before a
         `RunContext` exists, so callable `targeting_key`/`attributes` can't participate (a
         `ModelSelectionContext` is deliberately narrower); only the static `label` and static
@@ -371,7 +369,7 @@ class ManagedAgent(ManagedVariableCapability[AgentDepsT, AgentConfig]):
                     selected.append(ctx.model)
                 else:
                     raise UserError(
-                        'A nameless `ManagedAgent` on a model-less agent has no model to run: the agent '
+                        'A nameless `AgentControl` on a model-less agent has no model to run: the agent '
                         'defines no model and none is published in Logfire yet. Give the agent a model, '
                         'pass one to `run(model=...)`, or publish a `model` in the managed config.'
                     )
@@ -412,7 +410,7 @@ class ManagedAgent(ManagedVariableCapability[AgentDepsT, AgentConfig]):
         """Capture the code-side creation baseline on the first eligible model request.
 
         The managed model itself is sourced at run setup by
-        [`get_model`][pydantic_ai_harness.logfire.ManagedAgent.get_model], so this hook only snapshots
+        [`get_model`][pydantic_ai_harness.logfire.AgentControl.get_model], so this hook only snapshots
         the code-side agent for auto-create and leaves the request untouched.
         """
         self._auto_create_snapshot(request_context)

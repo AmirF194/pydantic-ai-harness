@@ -6,24 +6,24 @@ so you can iterate on it from the Logfire UI -- versioned, labelled, and rolled 
 Two capabilities cover the two managed surfaces:
 
 - [`ManagedPrompt`](#managedprompt) -- one managed prompt (`prompt__<name>`), shareable across agents
-- [`ManagedAgent`](#managedagent) -- the whole agent config (`agent__<name>`): instructions, model,
+- [`AgentControl`](#agentcontrol) -- the whole agent config (`agent__<name>`): instructions, model,
   model settings, and the LLM-facing definitions of the agent's tools, as one variable matching
   Logfire's Managed agents UI
 
 Each capability takes an optional `name` that selects its backing variable. **When you omit it, the
-name defaults to the agent's own `name`** -- so `ManagedAgent()` on an
+name defaults to the agent's own `name`** -- so `AgentControl()` on an
 `Agent(..., name='checkout_assistant')` resolves `agent__checkout_assistant`:
 
 ```python
 from pydantic_ai import Agent
 
-from pydantic_ai_harness.logfire import ManagedAgent
+from pydantic_ai_harness.logfire import AgentControl
 
 agent = Agent(
     'openai:gpt-5',
     name='checkout_assistant',
     tools=[...],
-    capabilities=[ManagedAgent(label='production')],  # -> agent__checkout_assistant
+    capabilities=[AgentControl(label='production')],  # -> agent__checkout_assistant
 )
 ```
 
@@ -47,7 +47,7 @@ from `pydantic_ai_harness.logfire`) to read *why* it resolved the way it did (e.
 
 **Auto-create on first use:** when the backing variable doesn't exist in Logfire yet, it is
 created in the background on first use -- with the payload's JSON schema and description -- so the
-Logfire UI becomes the editing surface without a manual create step. `ManagedAgent` additionally
+Logfire UI becomes the editing surface without a manual create step. `AgentControl` additionally
 writes the variable's `example` as an `AgentConfig`-shaped snapshot of the code-side agent taken
 from the first model request (instructions, model, effective settings, and each tool's description
 and parameter descriptions) -- the baseline the Logfire UI's override editor and optimizer read.
@@ -60,6 +60,8 @@ pip install 'pydantic-ai-harness[logfire]'
 ```
 
 ## `ManagedPrompt`
+
+`ManagedPrompt` is legacy; use a prompt-only [`AgentControl`](#agentcontrol) for new setups.
 
 Back an agent's instructions with a Logfire-managed
 [Prompt](https://logfire.pydantic.dev/docs/reference/advanced/prompt-management/).
@@ -200,7 +202,7 @@ block invalidates the cached prefix for the affected runs.
 
 In short: pinning a `label` keeps the cache hot; using managed values as an A/B platform is opt-in
 cache cost. If you don't need rollouts, `label='production'` is the recommended default. The same
-applies to `ManagedAgent`'s `instructions` section -- and to its `tool_definitions`, which sit even
+applies to `AgentControl`'s `instructions` section -- and to its `tool_definitions`, which sit even
 earlier in the cached prefix.
 
 ### Using your own variable
@@ -254,7 +256,7 @@ Logfire instance instead of the module-level default.
   auto-create its variable through the generic write API -- it warns once; create the prompt via
   the Logfire UI's Prompts flow.
 
-## `ManagedAgent`
+## `AgentControl`
 
 Back a whole agent's configuration -- instructions, model, model settings, and the LLM-facing
 definitions of its tools -- with one `agent__<name>` variable, the same variable Logfire's
@@ -270,7 +272,7 @@ redeploys.
 
 ### The solution
 
-`ManagedAgent` resolves one `AgentConfig` value per run with **presence semantics**: each section
+`AgentControl` resolves one `AgentConfig` value per run with **presence semantics**: each section
 that is present -- `instructions`, `model`, `settings`, `tool_definitions` -- is managed from
 Logfire, and each absent section keeps the code-defined behavior. The whole config versions and
 rolls out as one unit, so a prompt change and the model change it depends on land atomically.
@@ -282,7 +284,7 @@ Removing a section in Logfire is a deliberate revert-to-code.
 import logfire
 from pydantic_ai import Agent
 
-from pydantic_ai_harness.logfire import ManagedAgent
+from pydantic_ai_harness.logfire import AgentControl
 
 logfire.configure()
 
@@ -295,7 +297,7 @@ agent = Agent(
     'openai:gpt-5',
     name='checkout_assistant',
     tools=[get_weather],
-    capabilities=[ManagedAgent(label='production')],  # -> agent__checkout_assistant
+    capabilities=[AgentControl(label='production')],  # -> agent__checkout_assistant
 )
 ```
 
@@ -303,7 +305,7 @@ The variable holds an `AgentConfig`:
 
 ```json
 {
-  "instructions": "You are a concise checkout assistant. @{prompt__support_tone}@",
+  "instructions": "You are a concise checkout assistant. Always confirm the order total.",
   "model": "openai:gpt-5",
   "settings": {
     "temperature": 0.4,
@@ -323,10 +325,8 @@ The variable holds an `AgentConfig`:
 }
 ```
 
-- `instructions` supports Logfire's `@{other_variable}@` composition -- the reference expands at
-  resolution time, so a managed agent can share a `prompt__` variable with other agents. `{{...}}`
-  runtime placeholders pass through verbatim unless `render_template=True` renders them against
-  `deps` (like `ManagedPrompt`).
+- `instructions` supports `{{...}}` runtime placeholders, which pass through verbatim unless
+  `render_template=True` renders them against `deps` (like `ManagedPrompt`).
 - `model` is a pydantic-ai model string. It's a first-class field, not a setting: pydantic-ai keeps
   the model id separate from `ModelSettings` (which has no `model` key), so there's no collision
   putting them side by side.
@@ -364,5 +364,5 @@ The variable holds an `AgentConfig`:
   the sections the capability applied (e.g. `instructions,settings`), which the Logfire UI reads to
   distinguish a wired-up managed agent from one whose config resolves but isn't applied. `model` is
   reported when present even if a call-site `run(model=...)` outranked it that run.
-- `ManagedAgent.resolved` exposes the active run's `ResolvedVariable`, and resolution is isolated
+- `AgentControl.resolved` exposes the active run's `ResolvedVariable`, and resolution is isolated
   per run, exactly like `ManagedPrompt`.

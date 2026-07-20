@@ -6,7 +6,7 @@ if TYPE_CHECKING:
     from .code_mode import CodeMode
     from .filesystem import FileSystem
     from .logfire import (
-        ManagedAgent,
+        AgentControl,
         ManagedPrompt,
     )
     from .shell import LLM_API_KEY_ENV_PATTERNS, Shell
@@ -15,7 +15,7 @@ __all__ = [
     'CodeMode',
     'FileSystem',
     'LLM_API_KEY_ENV_PATTERNS',
-    'ManagedAgent',
+    'AgentControl',
     'ManagedPrompt',
     'Shell',
 ]
@@ -30,10 +30,10 @@ def __getattr__(name: str) -> object:
         from .filesystem import FileSystem
 
         return FileSystem
-    if name == 'ManagedAgent':
-        from .logfire import ManagedAgent
+    if name == 'AgentControl':
+        from .logfire import AgentControl
 
-        return ManagedAgent
+        return AgentControl
     if name == 'ManagedPrompt':
         from .logfire import ManagedPrompt
 
