@@ -7,6 +7,7 @@ import time
 from collections.abc import Sequence
 from pathlib import Path
 
+import anyio
 import pytest
 from pydantic_ai import Agent
 from pydantic_ai.exceptions import ModelRetry
@@ -139,6 +140,17 @@ class TestRunReview:
         await _toolset(command, tmp_path, base=None).run_macroscope_review()
         assert _recorded_args(command) == ['codereview', '--raw']
 
+    async def test_spawn_failure_raises_model_retry(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        # Binary passes the `which` check but fails to exec (lost +x, bad interpreter, TOCTOU).
+        command = _fake_cli(tmp_path, ['review_id=rev-6', 'issue_status=completed'])
+
+        async def _boom(*args: object, **kwargs: object) -> object:
+            raise PermissionError('exec denied')
+
+        monkeypatch.setattr(anyio, 'open_process', _boom)
+        with pytest.raises(ModelRetry, match='Failed to launch'):
+            await _toolset(command, tmp_path).run_macroscope_review()
+
 
 class TestCapability:
     def test_default_instructions_mention_validation(self) -> None:
@@ -152,6 +164,17 @@ class TestCapability:
 
     def test_empty_guidance_disables_instructions(self) -> None:
         assert Macroscope(guidance='').get_instructions() is None
+
+    def test_agent_spec_roundtrip(self) -> None:
+        # The docs promise Macroscope loads from an agent spec via `custom_capability_types`.
+        cap = Macroscope.from_spec(base='release', timeout=900.0)
+        assert isinstance(cap, Macroscope)
+        assert (cap.base, cap.timeout) == ('release', 900.0)
+        agent = Agent.from_spec(
+            {'model': 'test', 'capabilities': [{'Macroscope': {'base': 'main'}}]},
+            custom_capability_types=[Macroscope],
+        )
+        assert isinstance(agent, Agent)
 
     async def test_tool_runs_through_agent(self, tmp_path: Path) -> None:
         command = _fake_cli(tmp_path, ['review_id=rev-9', _ISSUE_LINE, 'issue_status=completed'])

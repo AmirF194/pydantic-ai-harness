@@ -159,13 +159,19 @@ class MacroscopeToolset(FunctionToolset[AgentDepsT]):
         Spawns the CLI in its own session so a hung review can be killed by process
         group when it exceeds `timeout`, rather than leaking a background process.
         """
-        proc = await anyio.open_process(
-            args,
-            cwd=self._cwd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            start_new_session=True,
-        )
+        try:
+            proc = await anyio.open_process(
+                args,
+                cwd=self._cwd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                start_new_session=True,
+            )
+        except OSError as e:
+            # `shutil.which` found the binary, but spawning it still failed (lost +x,
+            # bad interpreter, a race since the check). Surface it to the model as a
+            # retryable setup error rather than crashing the whole run.
+            raise ModelRetry(f'Failed to launch the macroscope CLI ({self._command!r}): {e}') from e
         stdout_chunks: list[bytes] = []
         stderr_chunks: list[bytes] = []
         try:
