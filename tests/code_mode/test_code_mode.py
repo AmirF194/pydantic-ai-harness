@@ -435,6 +435,109 @@ class TestCodeMode:
     # `for_run` / `for_run_step` lifecycle
     # ---------------------------------------------------------------------------
 
+    async def test_enter_cleans_up_monty_if_wrapped_enter_fails(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A later resource acquisition failure must close the already-entered Monty pool."""
+        events: list[str] = []
+
+        class TrackingMonty:
+            def __enter__(self) -> TrackingMonty:
+                events.append('monty enter')
+                return self
+
+            def __exit__(self, *args: Any) -> None:
+                events.append('monty exit')
+
+        class FailingToolset(FunctionToolset[object]):
+            async def __aenter__(self) -> FailingToolset:
+                events.append('wrapped enter')
+                raise RuntimeError('wrapped enter failed')
+
+        monkeypatch.setattr('pydantic_ai_harness.code_mode._toolset.Monty', TrackingMonty)
+        wrapper = CodeMode[object]().get_wrapper_toolset(FailingToolset())
+        assert isinstance(wrapper, CodeModeToolset)
+
+        with pytest.raises(RuntimeError, match='wrapped enter failed'):
+            await wrapper.__aenter__()
+
+        assert events == ['monty enter', 'wrapped enter', 'monty exit']
+
+    async def test_exit_releases_resources_in_reverse_entry_order(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The wrapped toolset exits before the Monty pool it may depend on."""
+        events: list[str] = []
+
+        class TrackingMonty:
+            def __enter__(self) -> TrackingMonty:
+                events.append('monty enter')
+                return self
+
+            def __exit__(self, *args: Any) -> None:
+                events.append('monty exit')
+
+        class TrackingToolset(FunctionToolset[object]):
+            async def __aenter__(self) -> TrackingToolset:
+                events.append('wrapped enter')
+                return self
+
+            async def __aexit__(self, *args: Any) -> bool | None:
+                events.append('wrapped exit')
+                return None
+
+        monkeypatch.setattr('pydantic_ai_harness.code_mode._toolset.Monty', TrackingMonty)
+        wrapper = CodeMode[object]().get_wrapper_toolset(TrackingToolset())
+        assert isinstance(wrapper, CodeModeToolset)
+
+        async with wrapper:
+            assert events == ['monty enter', 'wrapped enter']
+
+        assert events == ['monty enter', 'wrapped enter', 'wrapped exit', 'monty exit']
+
+    async def test_agent_run_reuses_one_pool_with_separate_checkouts(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The agent lifecycle owns one pool while each `run_code` call gets a session."""
+        from pydantic_ai.messages import ModelMessage, ModelResponse, TextPart, ToolCallPart
+        from pydantic_ai.models.function import AgentInfo, FunctionModel
+        from pydantic_monty import Monty as RealMonty
+
+        events: list[str] = []
+
+        class TrackingMonty:
+            def __init__(self, *args: Any, **kwargs: Any) -> None:
+                events.append('pool init')
+                self._pool = RealMonty(*args, **kwargs)
+
+            def __enter__(self) -> TrackingMonty:
+                events.append('pool enter')
+                self._pool.__enter__()
+                return self
+
+            def __exit__(self, *args: Any) -> bool | None:
+                events.append('pool exit')
+                return self._pool.__exit__(*args)
+
+            def checkout(self, *args: Any, **kwargs: Any) -> Any:
+                events.append('checkout')
+                return self._pool.checkout(*args, **kwargs)
+
+        def model_fn(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+            response_count = sum(isinstance(message, ModelResponse) for message in messages)
+            if response_count == 0:
+                return ModelResponse(parts=[ToolCallPart('run_code', {'code': 'x = await add(a=1, b=2)'})])
+            if response_count == 1:
+                return ModelResponse(parts=[ToolCallPart('run_code', {'code': 'x * 10'})])
+            return ModelResponse(parts=[TextPart('done')])
+
+        monkeypatch.setattr('pydantic_ai_harness.code_mode._toolset.Monty', TrackingMonty)
+        agent: Agent[object, str] = Agent(FunctionModel(model_fn), capabilities=[CodeMode[object]()])
+
+        @agent.tool_plain
+        def add(a: int, b: int) -> int:  # pyright: ignore[reportUnusedFunction]
+            """Add two numbers."""
+            return a + b
+
+        result = await agent.run('use code mode twice')
+
+        assert result.output == 'done'
+        assert events == ['pool init', 'pool enter', 'checkout', 'checkout', 'pool exit']
+
     async def test_for_run_returns_fresh_instance_with_cleared_repl(self) -> None:
         """`for_run` must hand back a new toolset instance -- concurrent runs cannot share REPL state."""
         wrapper = CodeMode[object]().get_wrapper_toolset(_build_function_toolset(add))
@@ -1309,14 +1412,13 @@ class TestCodeMode:
         On a fresh REPL, the static type checker catches this before execution.
         """
 
-        # TODO: It is not being caught, why?
         wrapper = CodeMode[object]().get_wrapper_toolset(_build_function_toolset(add))
         assert isinstance(wrapper, CodeModeToolset)
         ctx = await build_ctx(None, wrapper)
         tools = await wrapper.get_tools(ctx)
 
         # Pass a string where int is expected -- type checker catches this.
-        with pytest.raises(ModelRetry, match='error in code'):
+        with pytest.raises(ModelRetry, match='Type error in code'):
             await wrapper.call_tool(
                 'run_code',
                 {'code': "await add(a='not_a_number', b=3)"},

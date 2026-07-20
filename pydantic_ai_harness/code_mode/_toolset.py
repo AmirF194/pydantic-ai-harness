@@ -7,7 +7,7 @@ import keyword
 import re
 import warnings
 from collections.abc import Callable, Generator, Sequence
-from contextlib import contextmanager
+from contextlib import AsyncExitStack, contextmanager
 from dataclasses import dataclass, field, replace
 from typing import Annotated, Any
 
@@ -297,6 +297,10 @@ class CodeModeToolset(WrapperToolset[AgentDepsT]):
     # copy creates its own; `for_run_step` copies borrow the entered instance's pool by reference.
     _monty_pool: Monty | None = field(default=None, init=False, repr=False, compare=False)
 
+    # Owns both the synchronous Monty pool and asynchronous wrapped toolset. It is populated
+    # only after every resource enters successfully, then unwound in reverse entry order.
+    _exit_stack: AsyncExitStack | None = field(default=None, init=False, repr=False, compare=False)
+
     # Catalog string stashed during `get_tools` (when `dynamic_catalog`) and read back by
     # `get_instructions` in the same step. Empty when there's nothing to surface.
     _last_catalog: str = field(default='', init=False, repr=False)
@@ -329,19 +333,20 @@ class CodeModeToolset(WrapperToolset[AgentDepsT]):
         (e.g. inside a durable-execution sandbox that forbids subprocesses) fails fast without
         leaving the wrapped toolset half-entered.
         """
-        self._monty_pool = Monty().__enter__()
-        await self.wrapped.__aenter__()
+        async with AsyncExitStack() as stack:
+            monty_pool = stack.enter_context(Monty())
+            await stack.enter_async_context(self.wrapped)
+            self._monty_pool = monty_pool
+            self._exit_stack = stack.pop_all()
         return self
 
     async def __aexit__(self, *args: Any) -> bool | None:
         """Exit the wrapped toolset, then tear down the worker pool."""
-        assert self._monty_pool is not None
-        monty_pool = self._monty_pool
+        exit_stack = self._exit_stack
+        assert exit_stack is not None
+        self._exit_stack = None
         self._monty_pool = None
-        try:
-            return await self.wrapped.__aexit__(*args)
-        finally:
-            monty_pool.__exit__(*args)
+        return await exit_stack.__aexit__(*args)
 
     @contextmanager
     def _acquire_pool(self) -> Generator[Monty]:
@@ -567,18 +572,11 @@ class CodeModeToolset(WrapperToolset[AgentDepsT]):
             # Serialize to JSON-compatible form so Monty receives only plain data.
             return _TOOL_RETURN_CONTENT_TA.dump_python(result)
 
-        # Static type checking on fresh REPL sessions (first call or after
-        # restart). Monty type-checks each fed snippet before executing it when
-        # the session is checked out with `type_check=True`, so a type error
-        # surfaces as `MontyTypingError` from `feed_start` before any tool runs.
-        # Skipped on subsequent (loaded) sessions: accumulated REPL state
-        # (variables from prior snippets) is invisible to the stateless checker,
-        # and `load` does not restore the checker's accumulated context anyway.
-        # `skip_type_check` is passed to `feed_start` too (not just `type_check`
-        # at checkout) so a loaded session never type-checks even if it lands on
-        # a pooled worker that a prior checkout left in type-check mode. Because
-        # `feed_start` raises before completing, `_repl_state` is left None on a
-        # type error, so the next retry is type-checked again.
+        # Type-check only the first snippet of a fresh REPL. Monty snapshots restore some checker
+        # context, but it can diverge from runtime state across snippets: imports are not available
+        # to the next check, and incrementally constructed dictionaries can be rejected where the
+        # runtime tool validator accepts them as TypedDict inputs. Keep runtime REPL state without
+        # introducing those false positives on later calls.
         type_check = fresh_repl and bool(callable_defs)
         type_check_stubs = self._build_type_check_stubs(callable_defs) if type_check else None
 
