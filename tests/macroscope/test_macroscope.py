@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import shlex
 import time
 from collections.abc import Sequence
@@ -92,6 +93,28 @@ class TestParseStream:
         assert review.review_id is None
         assert review.status == 'unknown'
 
+    def test_marker_text_inside_issue_body_is_not_misparsed(self) -> None:
+        # A finding body can contain the literal marker strings (review findings quote code).
+        # Matching `issue_event=` first keeps them from being read as a status/review_id line;
+        # this guards the branch ordering in `parse_macroscope_stream`.
+        body = 'the code sets issue_status=completed early and logs review_id=leaked'
+        issue = 'issue_event=' + json.dumps(
+            {
+                'issue_id': 'i2',
+                'sequence': 2,
+                'path': 'b.py',
+                'line': 9,
+                'severity': 'high',
+                'category': 'REVIEW_TYPE_CORRECTNESS',
+                'body': body,
+            }
+        )
+        review = parse_macroscope_stream([issue])
+        assert [i.issue_id for i in review.issues] == ['i2']
+        assert review.issues[0].body == body
+        assert review.review_id is None  # not pulled out of the body
+        assert review.status == 'unknown'  # not pulled out of the body
+
 
 class TestRunReview:
     async def test_returns_findings(self, tmp_path: Path) -> None:
@@ -122,6 +145,14 @@ class TestRunReview:
         command = _fake_cli(tmp_path, ['issue_status=failed'])
         with pytest.raises(ModelRetry, match='did not start'):
             await _toolset(command, tmp_path).run_macroscope_review()
+
+    async def test_failed_status_with_review_id_is_returned_not_raised(self, tmp_path: Path) -> None:
+        # A review that started (has a review_id) but ended `failed` is a real outcome the
+        # model should see -- not an error. Only a *missing* review_id is retryable.
+        command = _fake_cli(tmp_path, ['review_id=rev-7', 'issue_status=failed'])
+        review = await _toolset(command, tmp_path).run_macroscope_review()
+        assert review.review_id == 'rev-7'
+        assert review.status == 'failed'
 
     async def test_timeout_kills_process_and_raises(self, tmp_path: Path) -> None:
         # sleep(30) far exceeds the 0.2s timeout: a working kill returns promptly, whereas a
@@ -174,7 +205,9 @@ class TestCapability:
             {'model': 'test', 'capabilities': [{'Macroscope': {'base': 'main'}}]},
             custom_capability_types=[Macroscope],
         )
-        assert isinstance(agent, Agent)
+        loaded = [c for c in agent.root_capability.capabilities if isinstance(c, Macroscope)]
+        assert len(loaded) == 1
+        assert loaded[0].base == 'main'
 
     async def test_tool_runs_through_agent(self, tmp_path: Path) -> None:
         command = _fake_cli(tmp_path, ['review_id=rev-9', _ISSUE_LINE, 'issue_status=completed'])
@@ -187,3 +220,7 @@ class TestCapability:
             if isinstance(part, ToolReturnPart) and part.tool_name == 'run_macroscope_review'
         ]
         assert len(returns) == 1
+        review = returns[0].content
+        assert isinstance(review, MacroscopeReview)
+        assert review.review_id == 'rev-9'
+        assert [i.issue_id for i in review.issues] == ['i1']

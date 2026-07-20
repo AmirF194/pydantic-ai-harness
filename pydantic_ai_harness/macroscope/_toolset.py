@@ -70,7 +70,12 @@ def _token_after(line: str, prefix: str) -> str | None:
 
 
 def _parse_issue(payload: str) -> MacroscopeIssue | None:
-    """Parse one `issue_event` JSON payload, returning `None` if it is malformed."""
+    """Parse one `issue_event` JSON payload, returning `None` if it is malformed.
+
+    The payload is the whole remainder of the line, so a log prefix before
+    `issue_event=` is fine but trailing text after the JSON makes the line
+    unparseable. The CLI emits each `issue_event=` record alone on its line.
+    """
     try:
         return MacroscopeIssue.model_validate_json(payload)
     except ValueError:
@@ -90,6 +95,9 @@ def parse_macroscope_stream(lines: Iterable[str]) -> MacroscopeReview:
     issues: list[MacroscopeIssue] = []
     for raw in lines:
         line = raw.strip()
+        # Check `issue_event=` first: a finding's JSON body can itself contain the text
+        # `issue_status=` or `review_id=`, and matching the event marker first keeps that
+        # body from being misread as a status/review-id line.
         if _ISSUE_EVENT_PREFIX in line:
             issue = _parse_issue(line.split(_ISSUE_EVENT_PREFIX, 1)[1])
             if issue is not None:
