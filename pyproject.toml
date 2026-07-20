@@ -29,7 +29,9 @@ classifiers = [
 ]
 dependencies = [
     "httpx>=0.28.1",
-    "pydantic-ai-slim>=2.1.0",
+    # `ManagedAgent` requires the `AbstractCapability.get_model()` hook (pydantic-ai#6333, first
+    # released in 2.13.0), so the floor is 2.13.0 rather than the historical 2.1.0.
+    "pydantic-ai-slim>=2.13.0",
 ]
 
 [project.optional-dependencies]
@@ -48,7 +50,7 @@ dbos = [
 ]
 logfire = [
     'logfire>=4.31.0',
-    "pydantic-ai-slim[spec]>=2.1.0",
+    "pydantic-ai-slim[spec]>=2.13.0",
 ]
 
 [project.urls]
@@ -70,7 +72,7 @@ dev = [
     'logfire[httpx]>=4.31.0',
     'dirty-equals>=0.9.0',
     'inline-snapshot>=0.32.5',
-    'pydantic-ai-slim[spec]>=2.1.0',
+    'pydantic-ai-slim[spec]>=2.13.0',
     "pytest-examples>=0.0.18",
     "pytest-recording>=0.13.4",
 ]
@@ -78,19 +80,6 @@ lint = [
     'ruff>=0.14',
     'pyright>=1.1.408',
 ]
-
-[tool.uv.sources]
-# TEMPORARY PIN — remove when the pydantic-ai release that includes #6333 lands on PyPI.
-# pydantic-ai#6333 (MERGED to `main`) adds the `AbstractCapability.get_model()` hook that `ManagedAgent`
-# uses to source the agent's model with correct precedence (fixing the model-less-agent and
-# `run(model=...)`-loses-to-managed-model limits). Its selector form — `get_model()` returning a
-# callable that receives `ModelSelectionContext` (with `.agent`/`.deps`) — is what lets a *nameless*
-# `ManagedAgent` source the model too, deriving its variable from the agent at selection time. The
-# current PyPI release (2.12.0) predates the merge, so we pin to the merge commit on `main` until the
-# next release ships the hook, at which point this source drops and we resolve from the `>=` floor above.
-# NOTE: `pydantic-ai-slim` lives in the `pydantic_ai_slim/` subdirectory of the monorepo. Pinned to an
-# explicit rev (not `branch = 'main'`) so the resolution is reproducible and doesn't drift as main moves.
-pydantic-ai-slim = { git = 'https://github.com/pydantic/pydantic-ai.git', rev = '9688a9cca2fcf81451cdac35e701250dbdfec75e', subdirectory = 'pydantic_ai_slim' }
 
 [tool.hatch.version]
 source = 'uv-dynamic-versioning'
