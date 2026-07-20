@@ -49,6 +49,10 @@ authenticate on your behalf, so do this once on the host:
 
    This writes `~/.macroscope/config.yaml`.
 
+The tool invokes `macroscope codereview --raw` for machine-readable streaming
+output, which needs a recent CLI build. The installer fetches the latest and the
+CLI self-updates on use, so a fresh install satisfies this.
+
 If the binary is missing, the tool returns the install command. If a review never
 starts (usually because you are not signed in), the tool tells the agent to run
 `macroscope` to finish setup.

@@ -135,7 +135,11 @@ class MacroscopeToolset(FunctionToolset[AgentDepsT]):
         """
         if shutil.which(self._command) is None:
             raise ModelRetry(_INSTALL_HINT)
-        args = [self._command, 'codereview']
+        # `--raw` forces the machine-readable `issue_event=` stream instead of the interactive
+        # TUI the CLI shows on a terminal, so parsing works regardless of whether the host
+        # attaches a pty to the subprocess. Needs a recent macroscope build (the CLI added the
+        # flag mid-2026 and self-updates on invocation).
+        args = [self._command, 'codereview', '--raw']
         base_ref = base if base is not None else self._base
         if base_ref is not None:
             args += ['--base', base_ref]

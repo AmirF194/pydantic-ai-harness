@@ -100,7 +100,7 @@ class TestRunReview:
         assert review.review_id == 'rev-1'
         assert review.status == 'completed'
         assert len(review.issues) == 1
-        assert _recorded_args(command) == ['codereview', '--base', 'main']
+        assert _recorded_args(command) == ['codereview', '--raw', '--base', 'main']
 
     async def test_clean_review_has_no_issues(self, tmp_path: Path) -> None:
         command = _fake_cli(tmp_path, ['review_id=rev-2', 'issue_status=completed'])
@@ -110,7 +110,7 @@ class TestRunReview:
     async def test_per_call_base_overrides_configured_base(self, tmp_path: Path) -> None:
         command = _fake_cli(tmp_path, ['review_id=rev-3', 'issue_status=completed'])
         await _toolset(command, tmp_path, base='develop').run_macroscope_review(base='release')
-        assert _recorded_args(command) == ['codereview', '--base', 'release']
+        assert _recorded_args(command) == ['codereview', '--raw', '--base', 'release']
 
     async def test_missing_binary_raises_model_retry(self, tmp_path: Path) -> None:
         toolset = _toolset('pai-harness-macroscope-absent', tmp_path)
@@ -137,7 +137,7 @@ class TestRunReview:
         # With no configured or per-call base, `--base` is dropped so the CLI picks the base itself.
         command = _fake_cli(tmp_path, ['review_id=rev-5', 'issue_status=completed'])
         await _toolset(command, tmp_path, base=None).run_macroscope_review()
-        assert _recorded_args(command) == ['codereview']
+        assert _recorded_args(command) == ['codereview', '--raw']
 
 
 class TestCapability:

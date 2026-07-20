@@ -41,6 +41,10 @@ missing, the tool returns the install command; if a review never starts
 (usually because you are not signed in), the tool tells the agent to run
 `macroscope` to finish setup.
 
+The tool invokes `macroscope codereview --raw` for machine-readable streaming
+output, which needs a recent CLI build. The installer fetches the latest and the
+CLI self-updates on use, so a fresh install satisfies this.
+
 ## The tool
 
 | Tool | Purpose |
