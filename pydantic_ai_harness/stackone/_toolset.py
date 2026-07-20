@@ -19,7 +19,6 @@ from __future__ import annotations
 
 import base64
 import os
-import warnings
 from collections.abc import Callable, Mapping, Sequence
 from fnmatch import fnmatch
 from typing import Any, Literal
@@ -94,13 +93,19 @@ def _with_tool_mode(url: str, tool_mode: ToolMode) -> str:
     return f'{url}{separator}{_SEARCH_EXECUTE_QUERY}'
 
 
-def warn_ignored_actions(tool_mode: ToolMode | None, actions: Sequence[str], *, stacklevel: int) -> None:
-    """Warn that `actions` globs cannot apply in explicitly requested `search_execute` mode."""
+def check_actions_apply(tool_mode: ToolMode | None, actions: Sequence[str]) -> None:
+    """Reject `actions` combined with explicitly requested `search_execute` mode.
+
+    The globs cannot apply to the two meta-tools, so the configuration fails
+    closed instead of being ignored.
+
+    Raises:
+        UserError: When both are set.
+    """
     if tool_mode == 'search_execute' and actions:
-        warnings.warn(
-            '`actions` filters are ignored in `search_execute` mode: individual action names '
-            'never reach the agent. Use `individual` mode to filter actions.',
-            stacklevel=stacklevel + 1,
+        raise UserError(
+            '`actions` filters cannot apply in `search_execute` mode: individual action names '
+            'never reach the agent. Use `individual` mode to filter actions.'
         )
 
 
@@ -152,7 +157,7 @@ class StackOneToolset(WrapperToolset[AgentDepsT]):
             base_url: StackOne API host. Point at a regional or staging host if needed.
             actions: `fnmatch` globs over full tool names (case-insensitive), e.g. `['*_list_*']`.
                 Only apply in `individual` mode; explicitly requesting `search_execute`
-                alongside `actions` warns.
+                alongside `actions` raises `UserError`.
             tool_mode: `individual` registers one tool per enabled action; `search_execute`
                 registers two server-side meta-tools that search the catalog and execute
                 actions by id, keeping the prompt footprint constant for large catalogs.
@@ -167,7 +172,7 @@ class StackOneToolset(WrapperToolset[AgentDepsT]):
             id: Stable toolset id. Give each instance a distinct id when an agent uses
                 several StackOne toolsets.
         """
-        warn_ignored_actions(tool_mode, actions, stacklevel=2)
+        check_actions_apply(tool_mode, actions)
         mode = resolve_tool_mode(tool_mode, actions)
         resolved = client if client is not None else f'{base_url.rstrip("/")}{_MCP_PATH}'
         headers: dict[str, str] | None = None

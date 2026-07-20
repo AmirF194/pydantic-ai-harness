@@ -42,7 +42,7 @@ A linked account is one authenticated connection to one provider.
 | `search_execute` | Two server-side meta-tools: search the catalog, execute an action by id | Any catalog size; constant prompt footprint |
 | `individual` | One tool per enabled action, each with its own schema | Filtered or moderate catalogs; per-tool validation, filtering, approval |
 
-The default (`tool_mode=None`) resolves to `search_execute`, or `individual` when `actions` are given. `actions` are case-insensitive `fnmatch` globs over full tool names, which follow `{connector}_{action}_{entity}` (for example `['*_list_*', 'bamboohr_get_employee']`); they only apply to individually registered tools. Provider catalogs can be large enough in `individual` mode to exceed model context windows, so constrain `individual` mode with `actions`. In `search_execute` mode individual action names never reach the agent, so `actions` cannot apply; explicitly requesting `search_execute` alongside `actions` warns.
+The default (`tool_mode=None`) resolves to `search_execute`, or `individual` when `actions` are given. `actions` are case-insensitive `fnmatch` globs over full tool names, which follow `{connector}_{action}_{entity}` (for example `['*_list_*', 'bamboohr_get_employee']`); they only apply to individually registered tools. Provider catalogs can be large enough in `individual` mode to exceed model context windows, so constrain `individual` mode with `actions`. In `search_execute` mode individual action names never reach the agent, so `actions` cannot apply; explicitly requesting `search_execute` alongside `actions` raises an error.
 
 ## Agent spec (YAML/JSON)
 

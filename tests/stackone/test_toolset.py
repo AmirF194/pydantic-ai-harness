@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, NamedTuple
 
 import pytest
 from pydantic_ai.exceptions import UserError
+from pydantic_ai.mcp import MCPToolsetClient
 from pydantic_ai.tools import RunContext
 from pydantic_ai.toolsets import FunctionToolset
 
@@ -18,15 +19,21 @@ if TYPE_CHECKING:
 pytestmark = pytest.mark.anyio
 
 
+class RecordedCall(NamedTuple):
+    client: MCPToolsetClient
+    id: str
+    headers: dict[str, str] | None
+
+
 @dataclass
 class MCPToolsetRecorder:
     """Records `MCPToolset` constructor calls, standing in a no-op toolset for each."""
 
-    calls: list[tuple[Any, dict[str, Any]]] = field(default_factory=list[tuple[Any, dict[str, Any]]])
+    calls: list[RecordedCall] = field(default_factory=list[RecordedCall])
 
-    def __call__(self, client: Any, **kwargs: Any) -> FunctionToolset[None]:
-        self.calls.append((client, kwargs))
-        return FunctionToolset[None](id=kwargs.get('id'))
+    def __call__(self, client: MCPToolsetClient, *, id: str, headers: dict[str, str] | None) -> FunctionToolset[None]:
+        self.calls.append(RecordedCall(client, id, headers))
+        return FunctionToolset[None](id=id)
 
 
 @pytest.fixture
@@ -39,45 +46,46 @@ def mcp_recorder(monkeypatch: pytest.MonkeyPatch) -> MCPToolsetRecorder:
 class TestStackOneToolset:
     def test_default_url_headers_and_id(self, mcp_recorder: MCPToolsetRecorder):
         StackOneToolset(account_id='45320', api_key='key')
-        (client, kwargs) = mcp_recorder.calls[0]
-        assert client == 'https://api.stackone.com/mcp?tool-mode=search_execute'
-        assert kwargs['headers']['Authorization'].startswith('Basic ')
-        assert kwargs['headers']['x-account-id'] == '45320'
-        assert kwargs['id'] == 'stackone'
+        call = mcp_recorder.calls[0]
+        assert call.client == 'https://api.stackone.com/mcp?tool-mode=search_execute'
+        assert call.headers is not None
+        assert call.headers['Authorization'].startswith('Basic ')
+        assert call.headers['x-account-id'] == '45320'
+        assert call.id == 'stackone'
 
     def test_default_mode_resolution(self, mcp_recorder: MCPToolsetRecorder):
         StackOneToolset(account_id='1', api_key='key', actions=['*_list_*'])
-        assert mcp_recorder.calls[0][0] == 'https://api.stackone.com/mcp'
+        assert mcp_recorder.calls[0].client == 'https://api.stackone.com/mcp'
         StackOneToolset(account_id='1', api_key='key', tool_mode='individual')
-        assert mcp_recorder.calls[1][0] == 'https://api.stackone.com/mcp'
+        assert mcp_recorder.calls[1].client == 'https://api.stackone.com/mcp'
 
     def test_custom_id_reaches_the_connection(self, mcp_recorder: MCPToolsetRecorder):
         StackOneToolset(account_id='45320', api_key='key', id='stackone_eu')
-        assert mcp_recorder.calls[0][1]['id'] == 'stackone_eu'
+        assert mcp_recorder.calls[0].id == 'stackone_eu'
 
     def test_custom_base_url(self, mcp_recorder: MCPToolsetRecorder):
         StackOneToolset(
             account_id='45320', api_key='key', base_url='https://api.eu1.stackone.com/', tool_mode='individual'
         )
-        assert mcp_recorder.calls[0][0] == 'https://api.eu1.stackone.com/mcp'
+        assert mcp_recorder.calls[0].client == 'https://api.eu1.stackone.com/mcp'
 
     def test_search_execute_url(self, mcp_recorder: MCPToolsetRecorder):
         StackOneToolset(account_id='45320', api_key='key', tool_mode='search_execute')
-        assert mcp_recorder.calls[0][0] == 'https://api.stackone.com/mcp?tool-mode=search_execute'
+        assert mcp_recorder.calls[0].client == 'https://api.stackone.com/mcp?tool-mode=search_execute'
 
     def test_search_execute_param_appended_to_custom_urls(self, mcp_recorder: MCPToolsetRecorder):
         StackOneToolset(account_id='1', api_key='key', tool_mode='search_execute', client='https://proxy.example/mcp')
-        assert mcp_recorder.calls[0][0] == 'https://proxy.example/mcp?tool-mode=search_execute'
+        assert mcp_recorder.calls[0].client == 'https://proxy.example/mcp?tool-mode=search_execute'
         StackOneToolset(
             account_id='1', api_key='key', tool_mode='search_execute', client='https://proxy.example/mcp?region=eu'
         )
-        assert mcp_recorder.calls[1][0] == 'https://proxy.example/mcp?region=eu&tool-mode=search_execute'
+        assert mcp_recorder.calls[1].client == 'https://proxy.example/mcp?region=eu&tool-mode=search_execute'
 
     def test_no_headers_for_non_url_clients(self, stackone_server: FastMCP, mcp_recorder: MCPToolsetRecorder):
         StackOneToolset(account_id='45320', api_key='key', client=stackone_server)
-        (client, kwargs) = mcp_recorder.calls[0]
-        assert client is stackone_server
-        assert kwargs['headers'] is None
+        call = mcp_recorder.calls[0]
+        assert call.client is stackone_server
+        assert call.headers is None
 
     def test_missing_api_key_fails_at_construction(self, monkeypatch: pytest.MonkeyPatch):
         monkeypatch.delenv('STACKONE_API_KEY', raising=False)
@@ -87,10 +95,12 @@ class TestStackOneToolset:
     def test_api_key_from_environment(self, monkeypatch: pytest.MonkeyPatch, mcp_recorder: MCPToolsetRecorder):
         monkeypatch.setenv('STACKONE_API_KEY', 'env-key')
         StackOneToolset(account_id='45320')
-        assert mcp_recorder.calls[0][1]['headers']['Authorization'].startswith('Basic ')
+        call = mcp_recorder.calls[0]
+        assert call.headers is not None
+        assert call.headers['Authorization'].startswith('Basic ')
 
-    def test_warns_on_actions_in_search_execute(self):
-        with pytest.warns(UserWarning, match='`actions` filters are ignored'):
+    def test_rejects_actions_in_search_execute(self):
+        with pytest.raises(UserError, match='cannot apply in `search_execute` mode'):
             StackOneToolset(account_id='1', api_key='key', tool_mode='search_execute', actions=['*_list_*'])
 
     async def test_actions_filter_is_case_insensitive(self, stackone_server: FastMCP, run_context: RunContext[None]):

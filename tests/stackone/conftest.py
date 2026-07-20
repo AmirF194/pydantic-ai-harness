@@ -13,11 +13,14 @@ from pydantic_ai.usage import RunUsage
 if TYPE_CHECKING:
     from fastmcp import FastMCP
 
-# The MCP client dependency is gated on the `stackone` extra (via `pydantic-ai-slim[mcp]`),
-# so slim CI runs (no extras) can't import these modules. Ignore them at collection.
-# A conditional expression rather than an `if` statement: branch coverage traces statement
-# arcs, and no single environment can take both arms of an install-dependent branch.
-collect_ignore = ['test_capability.py', 'test_toolset.py'] if importlib.util.find_spec('mcp') is None else []
+# `mcp` and `fastmcp` are gated on the `stackone` extra, so slim CI runs (no extras)
+# can't import these modules; ignore them at collection. A conditional expression rather
+# than an `if`: no single environment can take both arms of an install-dependent branch.
+collect_ignore = (
+    ['test_capability.py', 'test_toolset.py']
+    if importlib.util.find_spec('mcp') is None or importlib.util.find_spec('fastmcp') is None
+    else []
+)
 
 
 @pytest.fixture

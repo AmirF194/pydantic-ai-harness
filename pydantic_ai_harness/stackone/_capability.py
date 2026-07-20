@@ -15,6 +15,7 @@ from pydantic_ai_harness.stackone._toolset import (
     MCPToolsetClient,
     StackOneToolset,
     ToolMode,
+    check_actions_apply,
     resolve_tool_mode,
 )
 
@@ -74,6 +75,7 @@ class StackOne(AbstractCapability[AgentDepsT]):
     """Replacement for the default `{base_url}/mcp` connection; see `StackOneToolset`."""
 
     def __post_init__(self) -> None:
+        check_actions_apply(self.tool_mode, self.actions)
         if resolve_tool_mode(self.tool_mode, self.actions) == 'search_execute' and self.defer_loading:
             # stacklevel 3: user code -> generated `__init__` -> `__post_init__`.
             warnings.warn(

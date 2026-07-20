@@ -36,7 +36,7 @@ class TestStackOne:
     def test_missing_api_key_fails_at_agent_construction(self, monkeypatch: pytest.MonkeyPatch):
         monkeypatch.delenv('STACKONE_API_KEY', raising=False)
         with pytest.raises(UserError, match='STACKONE_API_KEY'):
-            StackOne(account_id='45320').get_toolset()
+            Agent(TestModel(), capabilities=[StackOne(account_id='45320')])
 
     def test_api_key_from_environment(self, monkeypatch: pytest.MonkeyPatch):
         monkeypatch.setenv('STACKONE_API_KEY', 'env-key')
@@ -48,8 +48,13 @@ class TestStackOne:
         with pytest.warns(UserWarning, match='discovery hop'):
             StackOne(account_id='45320', api_key='key', id='stackone', defer_loading=True)
 
-    def test_individual_mode_does_not_warn(self):
+    def test_individual_mode_does_not_warn(self, recwarn: pytest.WarningsRecorder):
         StackOne(account_id='45320', api_key='key', actions=['*_list_*'], defer_loading=False)
+        assert not recwarn.list
+
+    def test_rejects_actions_in_explicit_search_execute(self):
+        with pytest.raises(UserError, match='cannot apply in `search_execute` mode'):
+            StackOne(account_id='45320', api_key='key', tool_mode='search_execute', actions=['*_list_*'])
 
     async def test_agent_run_calls_stackone_tools(self, stackone_server: FastMCP):
         capability = StackOne(account_id='45320', api_key='key', client=stackone_server, tool_mode='individual')
