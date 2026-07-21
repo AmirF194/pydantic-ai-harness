@@ -2061,11 +2061,11 @@ class TestPublicPath:
 
         def model_fn(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
             step = sum(isinstance(m, ModelResponse) for m in messages)
-            if step < 2:
+            if step == 0:  # discover the deferred tool
                 args = {'queries': ['hidden']}
-                return ModelResponse(
-                    parts=[ToolCallPart(tool_name='search_tools', args=args, tool_call_id=f'ts{step}')]
-                )
+                return ModelResponse(parts=[ToolCallPart(tool_name='search_tools', args=args, tool_call_id='ts0')])
+            if step == 1:  # call it, forcing the request that re-reads the (cleared) search result
+                return ModelResponse(parts=[ToolCallPart(tool_name='hidden_gem', args={'x': 1}, tool_call_id='hg1')])
             return ModelResponse(parts=[TextPart(content='done')])
 
         agent = Agent(
