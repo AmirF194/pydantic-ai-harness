@@ -7,9 +7,8 @@ Durability is attached via the `DBOSDurability` capability; pydantic-ai 2.14
 deprecated the `DBOSAgent` wrapper in its favor (pydantic/pydantic-ai#4977).
 With the capability, the caller owns the workflow: `agent.run_sync()` is
 called inside an explicit `@DBOS.workflow()` rather than the wrapper starting
-one, and the agent is constructed inside the test because `DBOSDurability`
-must bind after `DBOS.launch()` (same constraint as pydantic-ai's own
-capability tests).
+one. The agent and workflow are defined at module scope so DBOS registers the
+capability's steps and the workflow before `DBOS.launch()`.
 
 DBOS defaults to `parallel_ordered_events` execution mode, which triggers
 the sequential FutureSnapshot resolution path in the execution loop.
@@ -93,6 +92,20 @@ def _code_mode_model(messages: list[ModelRequest | ModelResponse], info: AgentIn
     )
 
 
+code_mode_agent = Agent(
+    FunctionModel(_code_mode_model),
+    name='code_mode_dbos_agent',
+    toolsets=[FunctionToolset(tools=[add], id='math')],
+    capabilities=[CodeMode(), DBOSDurability()],
+)
+
+
+@DBOS.workflow()
+def run_code_mode_agent(prompt: str) -> dict[str, Any]:
+    result = code_mode_agent.run_sync(prompt)
+    return {'output': str(result.output), 'messages': result.all_messages_json().decode()}
+
+
 # ---------------------------------------------------------------------------
 # Tests
 # ---------------------------------------------------------------------------
@@ -108,21 +121,9 @@ def test_code_mode_runs_in_dbos_workflow(dbos_instance: DBOS) -> None:
     a workflow, so a passing run alone would not show durability engaged."""
     _captured_tool_defs.clear()
 
-    agent = Agent(
-        FunctionModel(_code_mode_model),
-        name='code_mode_dbos_agent',
-        toolsets=[FunctionToolset(tools=[add], id='math')],
-        capabilities=[CodeMode(), DBOSDurability()],
-    )
-
-    @DBOS.workflow()
-    def run_agent(prompt: str) -> dict[str, Any]:
-        result = agent.run_sync(prompt)
-        return {'output': str(result.output), 'messages': result.all_messages_json().decode()}
-
     workflow_id = str(uuid.uuid4())
     with SetWorkflowID(workflow_id):
-        payload = run_agent('Calculate 3 + 4')
+        payload = run_code_mode_agent('Calculate 3 + 4')
 
     assert payload['output'] == 'done: 7'
 
@@ -190,4 +191,4 @@ def test_code_mode_runs_in_dbos_workflow(dbos_instance: DBOS) -> None:
     # 6. Durability engaged: model requests were recorded as DBOS steps
     steps = dbos_instance.list_workflow_steps(workflow_id)
     step_names = [step['function_name'] for step in steps]
-    assert 'code_mode_dbos_agent__model.request' in step_names
+    assert step_names.count('code_mode_dbos_agent__model.request') == 2

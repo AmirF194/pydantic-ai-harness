@@ -1217,11 +1217,11 @@ class TestTelemetryAndComposition:
         assert await capability.store.read('main/MEMORY.md', max_chars=1_000) is None
 
     def test_temporal_durability_accepts_static_memory_toolset(self) -> None:
-        # pydantic-ai raises a plain ImportError (not ModuleNotFoundError) with install
-        # instructions when temporalio is missing, so importorskip must be told to accept it.
-        temporal = pytest.importorskip('pydantic_ai.durable_exec.temporal', exc_type=ImportError)
+        pytest.importorskip('temporalio')
+        from pydantic_ai.durable_exec.temporal import TemporalDurability
+
         Agent(
             TestModel(),
             name='memory-agent',
-            capabilities=[Memory[object](inject_memory=False), temporal.TemporalDurability()],
+            capabilities=[Memory[object](inject_memory=False), TemporalDurability()],
         )
