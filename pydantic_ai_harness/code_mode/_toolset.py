@@ -739,6 +739,12 @@ class CodeModeToolset(WrapperToolset[AgentDepsT]):
             raise ModelRetry(f'Type error in code:\n{e.display()}') from e
         except MontySyntaxError as e:
             raise ModelRetry(f'Syntax error in code:\n{e.display()}') from e
+        except MontyRuntimeError as e:
+            # The parser rejects syntax Monty does not implement (e.g. `with`
+            # statements) with a runtime error at construction time. That is a
+            # property of the code, not of the run -- surface it as a retry so
+            # the model can rewrite, matching this method's documented contract.
+            raise ModelRetry(f'Unsupported syntax in code:\n{e}') from e
 
 
 def _get_sigs_and_conflicting(

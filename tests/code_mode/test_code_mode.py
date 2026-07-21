@@ -465,6 +465,25 @@ class TestCodeMode:
         with pytest.raises(ModelRetry, match=r"name 'undefined_var' is not defined"):
             await wrapper.call_tool('run_code', {'code': 'print(undefined_var)'}, ctx, run_code)
 
+    async def test_run_code_unsupported_syntax_becomes_model_retry(self, tmp_path: Path) -> None:
+        """Syntax Monty does not implement (`with` statements) is a `ModelRetry`, not a crash.
+
+        Needs a mount so `open` type-checks (as in real dataset-analysis runs): the
+        code then reaches Monty's parser, whose NotImplementedError surfaces as
+        `MontyRuntimeError` at construction. Before the guard, that escaped
+        `_type_check` and killed the whole agent run.
+        """
+        (tmp_path / 'f.txt').write_text('x')
+        wrapper = CodeMode[object](mount=MountDir('/work', str(tmp_path))).get_wrapper_toolset(
+            _build_function_toolset(add)
+        )
+        assert isinstance(wrapper, CodeModeToolset)
+        ctx = await build_ctx(None, wrapper)
+        tools = await wrapper.get_tools(ctx)
+        code = 'from pathlib import Path\nwith Path("/work/f.txt").open() as f:\n    f.read()'
+        with pytest.raises(ModelRetry, match=r'Unsupported syntax in code'):
+            await wrapper.call_tool('run_code', {'code': code}, ctx, tools['run_code'])
+
     async def test_run_code_typing_error_becomes_model_retry(self) -> None:
         """A `MontyTypingError` from static type checking is translated into `ModelRetry`.
 
