@@ -12,6 +12,7 @@
       { "label": "Compaction", "slug": "compaction" },
       { "label": "Overflowing Tool Output", "slug": "overflowing-tool-output" },
       { "label": "Step Persistence", "slug": "step-persistence" },
+      { "label": "Absurd Durability", "slug": "absurd" },
       { "label": "Media", "slug": "media" },
       { "label": "Subagents", "slug": "subagents" },
       { "label": "Dynamic Workflow", "slug": "dynamic-workflow" },
