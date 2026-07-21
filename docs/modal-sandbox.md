@@ -5,28 +5,20 @@ description: Give a Pydantic AI agent a per-run Modal sandbox with command and f
 
 # Modal Sandbox
 
-Give an agent an isolated Modal container for running commands and managing files
-without using the host filesystem or process space.
+`ModalSandbox` gives an agent an isolated cloud container for running commands
+and working with files. Use it for coding, data processing, and other tasks that
+should not execute model-generated commands on the application host.
 
-> [!NOTE]
-> Import this capability from its submodule. It is not re-exported from
-> `pydantic_ai_harness`:
->
-> ```python
-> from pydantic_ai_harness.modal_sandbox import ModalSandbox
-> ```
+The capability adds shell and file tools backed by a
+[Modal sandbox](https://modal.com/docs/guide/sandbox). By default, every agent
+run gets a fresh sandbox created from a container image. The capability requests
+termination when the run ends. You can also attach an existing sandbox or reuse
+one across several runs.
 
-Modal Sandbox is a released, non-experimental capability. Pydantic AI Harness is
-still on 0.x releases, so the API may change between minor releases. See the
-[version policy](index.md#version-policy).
+## Quick start
 
-[Source](https://github.com/pydantic/pydantic-ai-harness/tree/main/pydantic_ai_harness/modal_sandbox/)
-
-## Usage
-
-Install the optional Modal dependency and configure Modal credentials the way
-the Modal CLI does -- run `modal token new` once, or set the token environment
-variables (which take precedence):
+Install the `modal` extra and authenticate with the Modal CLI. In CI, set
+`MODAL_TOKEN_ID` and `MODAL_TOKEN_SECRET` instead.
 
 ```bash
 uv add "pydantic-ai-harness[modal]"
@@ -36,7 +28,7 @@ export MODAL_TOKEN_ID=...
 export MODAL_TOKEN_SECRET=...
 ```
 
-Pass `ModalSandbox` through the agent's `capabilities` parameter:
+Add `ModalSandbox` to the agent:
 
 ```python
 from pydantic_ai import Agent
@@ -44,12 +36,16 @@ from pydantic_ai_harness.modal_sandbox import ModalSandbox
 
 agent = Agent(
     'anthropic:claude-sonnet-4-6',
-    capabilities=[ModalSandbox()],
+    capabilities=[ModalSandbox(image='python:3.12-slim')],
 )
 
 result = agent.run_sync('Create a Python script and run its tests.')
 print(result.output)
 ```
+
+During the run, the agent can create files, inspect its working directory, run
+commands, and react to command failures. The sandbox is separate from the host
+filesystem and process space.
 
 The capability contributes four tools:
 
@@ -244,6 +240,11 @@ agent = Agent.from_file('agent.yaml', custom_capability_types=[ModalSandbox])
 - [Pydantic AI capabilities](/ai/core-concepts/capabilities/)
 - [Pydantic AI toolsets](/ai/tools-toolsets/toolsets/)
 - [Modal sandboxes](https://modal.com/docs/guide/sandbox)
+- [Modal Sandbox source code](https://github.com/pydantic/pydantic-ai-harness/tree/main/pydantic_ai_harness/modal_sandbox/)
+- [Pydantic AI Harness version policy](index.md#version-policy)
+
+The API may change between releases while Pydantic AI Harness is on 0.x
+versions.
 
 ::: pydantic_ai_harness.modal_sandbox.ModalSandbox
 

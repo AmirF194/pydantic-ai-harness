@@ -1,52 +1,19 @@
 # Modal Sandbox
 
-Give an agent an isolated, ephemeral cloud sandbox, powered by
-[Modal](https://modal.com), to run commands and manage files in without
-touching the host.
+`ModalSandbox` gives an agent an isolated cloud container for running commands
+and working with files. Use it for coding, data processing, and other tasks that
+should not execute model-generated commands on the application host.
 
-> [!NOTE]
-> Import this capability from its submodule. It is not re-exported from `pydantic_ai_harness`:
->
-> ```python
-> from pydantic_ai_harness.modal_sandbox import ModalSandbox
-> ```
+The capability adds shell and file tools backed by a
+[Modal sandbox](https://modal.com/docs/guide/sandbox). By default, every agent
+run gets a fresh sandbox created from a container image. The capability requests
+termination when the run ends. You can also attach an existing sandbox or reuse
+one across several runs.
 
-Modal Sandbox is a released, non-experimental capability. Pydantic AI Harness is
-still on 0.x releases, so the API may change between minor releases. See the
-repository [version policy](https://github.com/pydantic/pydantic-ai-harness#version-policy).
+## Quick start
 
-[View the source](https://github.com/pydantic/pydantic-ai-harness/tree/main/pydantic_ai_harness/modal_sandbox/)
-
-## The problem
-
-Agents that write and run code need somewhere safe to do it. Running
-model-generated commands on the host machine is risky; spinning up and tearing
-down isolated environments by hand is boilerplate. You want the agent to get a
-clean container, use it for a task, and have cleanup requested automatically.
-
-## The solution
-
-`ModalSandbox` gives the agent shell and file tools wired to a
-[Modal sandbox](https://modal.com/docs/guide/sandbox). By default each run gets a
-fresh sandbox created from an image. When the run ends, the capability requests
-termination and waits for a bounded period; `sandbox_timeout` is the server-side
-cleanup backstop. The container is the isolation boundary.
-
-```python
-from pydantic_ai import Agent
-from pydantic_ai_harness.modal_sandbox import ModalSandbox
-
-agent = Agent('anthropic:claude-sonnet-4-6', capabilities=[ModalSandbox()])
-
-result = agent.run_sync('Write a Python script that prints the first 10 primes and run it.')
-print(result.output)
-```
-
-## Setup
-
-Install the `modal` extra and configure Modal credentials the way the Modal CLI
-does -- either run `modal token new` once (it writes `~/.modal.toml`), or set the
-token environment variables (which take precedence):
+Install the `modal` extra and authenticate with the Modal CLI. In CI, set
+`MODAL_TOKEN_ID` and `MODAL_TOKEN_SECRET` instead.
 
 ```bash
 uv add "pydantic-ai-harness[modal]"
@@ -55,6 +22,25 @@ modal token new                # writes ~/.modal.toml
 export MODAL_TOKEN_ID=...
 export MODAL_TOKEN_SECRET=...
 ```
+
+Add `ModalSandbox` to the agent:
+
+```python
+from pydantic_ai import Agent
+from pydantic_ai_harness.modal_sandbox import ModalSandbox
+
+agent = Agent(
+    'anthropic:claude-sonnet-4-6',
+    capabilities=[ModalSandbox(image='python:3.12-slim')],
+)
+
+result = agent.run_sync('Create a Python script and run its tests.')
+print(result.output)
+```
+
+During the run, the agent can create files, inspect its working directory, run
+commands, and react to command failures. The sandbox is separate from the host
+filesystem and process space.
 
 ## Tools
 
@@ -304,3 +290,8 @@ agent = Agent.from_file('agent.yaml', custom_capability_types=[ModalSandbox])
 - [Modal sandboxes](https://modal.com/docs/guide/sandbox)
 - [Pydantic AI capabilities](https://pydantic.dev/docs/ai/core-concepts/capabilities/)
 - [Pydantic AI toolsets](https://pydantic.dev/docs/ai/tools-toolsets/toolsets/)
+- [Modal Sandbox source code](https://github.com/pydantic/pydantic-ai-harness/tree/main/pydantic_ai_harness/modal_sandbox/)
+- [Pydantic AI Harness version policy](https://github.com/pydantic/pydantic-ai-harness#version-policy)
+
+The API may change between releases while Pydantic AI Harness is on 0.x
+versions.
