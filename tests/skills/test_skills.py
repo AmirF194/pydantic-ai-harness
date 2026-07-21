@@ -117,59 +117,29 @@ class TestSkills:
         )
 
         assert 'read_file' in tools[-1]
-        assert 'Use the `read_file` tool to read supporting skill files.' in loaded
+        assert 'Use `read_file` to read supporting skill files.' in loaded
         assert 'Prefix skill-relative paths with `skills/research/`' in loaded
 
-    async def test_resource_skill_directs_reader_through_code_mode(self, tmp_path: Path) -> None:
+    @pytest.mark.parametrize('dynamic_catalog', [False, True])
+    async def test_resource_skill_composes_with_code_mode(self, tmp_path: Path, dynamic_catalog: bool) -> None:
         library = tmp_path / 'skills'
         _write_skill(library, 'research', files={'references/guide.md': 'guide'})
 
         _, tools, loaded = await _activate(
-            [Skills(directories=[library]), FileSystem(root_dir=tmp_path), CodeMode[object](dynamic_catalog=True)],
+            [
+                Skills(directories=[library]),
+                FileSystem(root_dir=tmp_path),
+                CodeMode[object](dynamic_catalog=dynamic_catalog),
+            ],
             'research',
         )
 
         assert 'run_code' in tools[-1]
         assert 'read_file' not in tools[-1]
-        assert 'Use `read_file(...)` inside `run_code` to read supporting skill files.' in loaded
+        assert 'Use `read_file` to read supporting skill files.' in loaded
+        assert 'run_code' not in loaded
 
-    async def test_resource_skill_detects_reader_in_default_code_mode_catalog(self, tmp_path: Path) -> None:
-        library = tmp_path / 'skills'
-        _write_skill(library, 'research', files={'references/guide.md': 'guide'})
-
-        _, _, loaded = await _activate(
-            [Skills(directories=[library]), FileSystem(root_dir=tmp_path), CodeMode[object]()],
-            'research',
-        )
-
-        assert 'Use `read_file(...)` inside `run_code`' in loaded
-
-    async def test_dynamic_code_mode_name_selector_is_detected(self, tmp_path: Path) -> None:
-        library = tmp_path / 'skills'
-        _write_skill(library, 'research', files={'references/guide.md': 'guide'})
-
-        _, _, loaded = await _activate(
-            [
-                Skills(directories=[library]),
-                FileSystem(root_dir=tmp_path),
-                CodeMode[object](tools=['read_file'], dynamic_catalog=True),
-            ],
-            'research',
-        )
-
-        assert 'Use `read_file(...)` inside `run_code`' in loaded
-
-    async def test_dynamic_code_mode_metadata_selector_does_not_invent_reader(self, tmp_path: Path) -> None:
-        library = tmp_path / 'skills'
-        _write_skill(library, 'research', files={'guide.md': 'guide'})
-
-        with pytest.raises(UserError, match="no compatible reader tool 'read_file'"):
-            await _activate(
-                [Skills(directories=[library]), CodeMode[object](tools={'reader': True}, dynamic_catalog=True)],
-                'research',
-            )
-
-    async def test_unrelated_run_code_tool_does_not_count_as_reader(self, tmp_path: Path) -> None:
+    async def test_visible_read_file_does_not_replace_filesystem_authority(self, tmp_path: Path) -> None:
         library = tmp_path / 'skills'
         _write_skill(library, 'research', files={'guide.md': 'guide'})
         skills = Skills[object](directories=[library])
@@ -185,11 +155,10 @@ class TestSkills:
         agent: Agent[object, str] = Agent(FunctionModel(model_fn), capabilities=[skills])
 
         @agent.tool_plain
-        def run_code(code: str) -> str:
-            """Run unrelated code."""
-            return code  # pragma: no cover - only the tool definition is inspected
+        def read_file(path: str) -> str:
+            return path  # pragma: no cover - only the tool definition is inspected
 
-        with pytest.raises(UserError, match="no compatible reader tool 'read_file'"):
+        with pytest.raises(UserError, match='no `FileSystem` capability is configured'):
             await agent.run('go')
 
     async def test_reader_root_can_make_skill_directory_the_tool_root(self, tmp_path: Path) -> None:
@@ -213,12 +182,8 @@ class TestSkills:
 
         agent: Agent[object, str] = Agent(FunctionModel(model_fn), capabilities=[skills])
 
-        @agent.tool_plain
-        def fetch_asset(path: str) -> str:
-            return path  # pragma: no cover - only the tool definition is inspected
-
         await agent.run('go')
-        assert 'Use the `fetch_asset` tool' in observed
+        assert 'Use `fetch_asset`' in observed
         assert 'pass skill-relative paths as written' in observed
 
     async def test_custom_reader_without_root_uses_absolute_paths(self, tmp_path: Path) -> None:
@@ -240,11 +205,7 @@ class TestSkills:
             observed = instructions
             return ModelResponse(parts=[TextPart('done')])
 
-        agent: Agent[object, str] = Agent(FunctionModel(model_fn), capabilities=[skills, FileSystem(root_dir=tmp_path)])
-
-        @agent.tool_plain
-        def fetch_asset(path: str) -> str:
-            return path  # pragma: no cover - only the tool definition is inspected
+        agent: Agent[object, str] = Agent(FunctionModel(model_fn), capabilities=[skills])
 
         await agent.run('go')
         assert f'Pass absolute paths rooted at `{directory.resolve()}`.' in observed
@@ -253,7 +214,7 @@ class TestSkills:
         library = tmp_path / 'skills'
         _write_skill(library, 'research', files={'guide.md': 'guide'})
 
-        with pytest.raises(UserError, match="no compatible reader tool 'read_file'"):
+        with pytest.raises(UserError, match='no `FileSystem` capability is configured'):
             await _activate([Skills(directories=[library])], 'research')
 
     async def test_resource_skill_errors_when_outside_filesystem_root(self, tmp_path: Path) -> None:
@@ -290,7 +251,7 @@ class TestSkills:
             'build',
         )
 
-        assert 'Use the `run_command` tool to run bundled skill scripts.' in loaded
+        assert 'Use `run_command` to run bundled skill scripts.' in loaded
         assert 'Prefix skill-relative paths with `skills/build/`' in loaded
 
     async def test_scripts_remain_optional_without_executor(self, tmp_path: Path) -> None:
@@ -305,20 +266,7 @@ class TestSkills:
         assert 'no script-execution tool is configured' in loaded
         assert 'Do not attempt to run them' in loaded
 
-    async def test_explicit_executor_must_exist(self, tmp_path: Path) -> None:
-        library = tmp_path / 'skills'
-        _write_skill(library, 'build', files={'scripts/check.py': 'print("ok")'})
-
-        with pytest.raises(UserError, match="configured executor tool 'execute_script'"):
-            await _activate(
-                [
-                    Skills(directories=[library], executor_tool='execute_script'),
-                    FileSystem(root_dir=tmp_path),
-                ],
-                'build',
-            )
-
-    async def test_custom_executor_uses_absolute_skill_paths(self, tmp_path: Path) -> None:
+    async def test_custom_executor_is_a_caller_declaration(self, tmp_path: Path) -> None:
         library = tmp_path / 'skills'
         directory = _write_skill(library, 'build', files={'scripts/check.py': 'print("ok")'})
         skills = Skills[object](directories=[library], executor_tool='execute_script')
@@ -336,17 +284,9 @@ class TestSkills:
             observed = instructions
             return ModelResponse(parts=[TextPart('done')])
 
-        agent: Agent[object, str] = Agent(
-            FunctionModel(model_fn),
-            capabilities=[skills, FileSystem(root_dir=tmp_path), Shell(cwd=tmp_path)],
-        )
-
-        @agent.tool_plain
-        def execute_script(path: str) -> str:
-            return path  # pragma: no cover - only the tool definition is inspected
-
+        agent: Agent[object, str] = Agent(FunctionModel(model_fn), capabilities=[skills, FileSystem(root_dir=tmp_path)])
         await agent.run('go')
-        assert 'Use the `execute_script` tool to run bundled skill scripts.' in observed
+        assert 'Use `execute_script` to run bundled skill scripts.' in observed
         assert f'Pass absolute paths rooted at `{directory.resolve()}`.' in observed
 
     async def test_shell_outside_skill_tree_uses_absolute_paths(self, tmp_path: Path) -> None:
@@ -400,6 +340,13 @@ class TestSkills:
 
 
 class TestSkillValidation:
+    def test_reader_root_requires_custom_reader(self, tmp_path: Path) -> None:
+        library = tmp_path / 'skills'
+        _write_skill(library, 'knowledge')
+
+        with pytest.raises(ValueError, match='reader_root requires reader_tool'):
+            Skills(directories=[library], reader_root=tmp_path)
+
     def test_name_can_be_derived_from_directory(self, tmp_path: Path) -> None:
         library = tmp_path / 'skills'
         _write_skill(library, 'derived-name')

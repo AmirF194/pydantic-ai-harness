@@ -7,6 +7,8 @@ The model initially sees each skill's name and description. When it calls the co
 
 [Source](https://github.com/pydantic/pydantic-ai-harness/tree/main/pydantic_ai_harness/skills/)
 
+> The API may change between releases. Where practical, breaking changes ship with a deprecation warning.
+
 ## Installation
 
 Skills uses PyYAML for frontmatter parsing:
@@ -46,9 +48,10 @@ Run `scripts/verify.py` when command execution is available.
 it must match the directory name. `description` is required. Files below a skill
 directory are resources, not nested skills, even if a resource is named `SKILL.md`.
 
-Skills are discovered once when `Skills(...)` is constructed. Adding, removing, or
-editing files does not change that instance's catalog or resource snapshot. Construct
-a new instance to rescan.
+Skills are discovered once when `Skills(...)` is constructed. The skill catalog,
+parsed `SKILL.md` instructions, and supporting-file path inventory are snapshots.
+Contents of existing supporting files are read lazily and remain live. Construct a new
+instance to rescan skill metadata or file paths.
 
 ## Knowledge-only skills
 
@@ -100,18 +103,22 @@ agent = Agent(
 )
 ```
 
-On activation, a resource-bearing skill checks that `read_file` is available, either
-directly or through `CodeMode`, and tells the model the exact path prefix to use. It
-raises `UserError` if no compatible reader exists or the skill is outside the detected
-`FileSystem` root. The resource contents are not loaded eagerly.
+On activation, a resource-bearing skill requires a `FileSystem` capability whose
+`root_dir` contains the skill directory. Skills tells the model to use `read_file` with
+the exact path prefix for that root. It raises `UserError` if `FileSystem` is missing or
+the skill is outside every configured root. Merely registering another tool named
+`read_file` does not establish filesystem authority. Resource contents are not loaded
+eagerly.
 
-Scripts are optional. When `run_command` is available, the activation instructions tell
-the model how to invoke it. Without an executor, the model is told not to run bundled
-scripts and can continue using the rest of the skill. Setting `executor_tool` makes a
-missing executor an activation error.
+Scripts are optional. When a `Shell` capability is present, activation instructions tell
+the model how to use `run_command`. Without `Shell` or a custom executor, the model is
+told not to run bundled scripts and can continue using the rest of the skill. Scripts
+are supporting files, so reading one still requires `FileSystem` or a custom reader.
 
-`CodeMode()` is supported. Skills tells the model to call `read_file(...)` and
-`run_command(...)` inside `run_code` when those tools are sandboxed there.
+`CodeMode()` composes without Skills-specific routing. Skills names the operation and
+path (`read_file` or `run_command`); CodeMode owns whether that operation is presented
+directly or as a function inside `run_code`. This keeps wrapper presentation out of the
+filesystem-authority check.
 
 ## Custom or prefixed tools
 
@@ -127,10 +134,14 @@ Skills(
 )
 ```
 
-`reader_root` is the root expected by the reader tool. Skills calculates the prefix from
-that root to each skill directory. When it is omitted for a custom reader, instructions
-use absolute paths. The configured tool names must be visible to the model, either
-directly or as functions in `run_code`.
+`reader_root` is the root expected by the custom reader. It requires `reader_tool`.
+Skills calculates the prefix from that root to each skill directory. When it is omitted,
+instructions use absolute paths.
+
+Custom tool names are caller declarations. Skills does not inspect the final model tool
+catalog to verify them because wrappers can change how tools are presented. The
+application is responsible for composing a reader or executor that makes the declared
+operation usable; a bad declaration surfaces when the model tries to use it.
 
 ## Claude Code compatibility
 
@@ -189,9 +200,9 @@ Skills(
 ```
 
 - `directories` scans immediate child skill packages under the listed roots.
-- `reader_tool` overrides the default `read_file` resource reader.
-- `reader_root` defines the path root expected by a custom reader.
-- `executor_tool` overrides the optional default `run_command` script executor.
+- `reader_tool` declares a custom resource reader instead of requiring `FileSystem`.
+- `reader_root` defines the path root expected by a custom reader and requires `reader_tool`.
+- `executor_tool` declares a custom script executor instead of using an available `Shell`.
 
 Malformed required metadata, invalid or mismatched names, duplicate skill names,
 missing roots, and non-directory roots fail during construction. Ordinary files and
