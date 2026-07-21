@@ -68,7 +68,7 @@ export MODAL_TOKEN_SECRET=...
 Output is labelled with `[stdout]` / `[stderr]` markers and an `[exit code: N]`
 line on non-zero exit. Each command stream (and each file read) is truncated
 separately by `max_output_bytes` (UTF-8 bytes) and `max_output_lines` (lines),
-whichever is hit first, so a noisy stderr cannot crowd out stdout and the labels
+whichever is hit first, so a large stderr cannot crowd out stdout and the labels
 always survive. Labels, truncation or continuation notes, and command status add
 a small amount beyond those payload limits. For commands the **tail** is kept, so
 errors survive truncation; file reads keep the head and return the next `offset`
@@ -242,11 +242,11 @@ narrowed `run_command` (`ls | head`, `find -maxdepth`) for directories that big.
 - Custom-built images, mounts, or `modal.Secret`: `image` takes a registry tag,
   and `env` takes plain environment variables. For anything richer, create the
   sandbox yourself with the Modal SDK and pass it via `sandbox_id` or `session`.
-- Spilling full output to a file: when command output or a file read is
-  truncated, the model is pointed at a shell slice (`head`, `tail`, `sed -n`,
-  `offset`) rather than the whole output being written to a file in the sandbox
-  for it to open. This is a deliberate choice for now; the shell-slice hint
-  covers the same need without managing temporary files.
+- Spilling full output to a file: truncated file reads end with the next
+  `offset` to page from and oversized files get a shell-slice hint (`head`,
+  `tail`, `sed -n`); truncated command output gets a truncation marker. Nothing
+  is written to a file in the sandbox for the model to open. This is a
+  deliberate choice for now.
 
 Modal's SDK is asyncio-native, so the capability drives its async (`.aio`) API
 directly and requires an asyncio event loop (it does not run under trio).

@@ -63,6 +63,15 @@ class TestOwnedLifecycle:
     async def test_exit_without_enter_is_safe(self) -> None:
         await ModalSandboxSession().__aexit__(None, None, None)
 
+    async def test_detach_failure_does_not_raise(self, fake_modal: FakeModal) -> None:
+        # Detach is best-effort like terminate: a raise from `__aexit__` would replace the
+        # exception unwinding through the body.
+        session = ModalSandboxSession()
+        await session.__aenter__()
+        fake_modal.sandboxes[0].detach_error = RuntimeError('detach boom')
+        await session.__aexit__(None, None, None)
+        assert fake_modal.sandboxes[0].terminated is True
+
     async def test_terminate_failure_does_not_raise_and_still_detaches(self, fake_modal: FakeModal) -> None:
         # Termination is best-effort: a teardown failure must not replace the exception
         # unwinding through the `async with` body (raising from `__aexit__` would mask it),
@@ -442,9 +451,11 @@ class TestExec:
     async def test_process_stream_error_is_wrapped(
         self, fake_modal: FakeModal, failure_point: str, max_output_bytes: int | None
     ) -> None:
+        # A post-start failure says the result could not be read, not that the command did
+        # not run: the command may still be running, and the model must know that.
         setattr(fake_modal, f'{failure_point}_error', fake_modal.error_type(f'{failure_point} failed'))
         async with ModalSandboxSession() as session:
-            with pytest.raises(ModalSandboxError, match=f'Command could not run.*{failure_point} failed'):
+            with pytest.raises(ModalSandboxError, match=f'Could not read the command result.*{failure_point} failed'):
                 await session.exec(['whatever'], max_output_bytes=max_output_bytes)
 
 

@@ -146,7 +146,7 @@ class ModalSandbox(AbstractCapability[AgentDepsT]):
 
     For commands the cap applies to stdout and stderr separately, both client-side (each
     stream retains at most this many bytes after Modal delivers each transport chunk) and
-    in the tool output, so a noisy stderr cannot crowd out stdout. Labels, truncation
+    in the tool output, so a large stderr cannot crowd out stdout. Labels, truncation
     notes, continuation offsets, timeouts, and exit codes add a small amount beyond this
     payload limit. Whichever of `max_output_bytes` and `max_output_lines` is reached
     first wins.
@@ -238,6 +238,12 @@ class ModalSandbox(AbstractCapability[AgentDepsT]):
         ceiling = self.max_command_timeout
         if ceiling is not None and (type(ceiling) is not int or ceiling <= 0):
             raise ValueError(f'max_command_timeout must be a positive integer or None, got {ceiling!r}.')
+
+        # Validated like the numeric fields because the agent-spec path does not type-check
+        # custom-capability dataclass fields; a bad YAML value should fail here, not deep
+        # in the agent build.
+        if self.instructions is not None and type(self.instructions) is not str:
+            raise ValueError(f'instructions must be a string or None, got {self.instructions!r}.')
 
     def _command_ceiling_hint(self, rejected: list[str]) -> str:
         """Redirect a rejected `sandbox_timeout` to the setting that works in reuse modes.

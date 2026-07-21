@@ -592,6 +592,9 @@ class TestCapability:
             ('default_command_timeout', float('nan')),
             ('default_command_timeout', float('inf')),
             ('max_command_timeout', 0),
+            # The agent-spec path does not type-check dataclass fields, so a bad YAML value
+            # must fail at construction, not deep in the agent build.
+            ('instructions', 123),
         ],
     )
     def test_rejects_invalid_limits(self, name: str, value: object) -> None:

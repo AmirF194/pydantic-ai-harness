@@ -191,7 +191,7 @@ class ModalSandboxToolset(FunctionToolset[AgentDepsT]):
         except ModalSandboxError as e:
             raise ModelRetry(str(e))
         # Truncate each stream separately and attach its label afterwards, so the
-        # `[stdout]` / `[stderr]` markers always survive truncation and a noisy stderr
+        # `[stdout]` / `[stderr]` markers always survive truncation and a large stderr
         # cannot crowd stdout out of a shared budget. Tail direction: errors and the
         # exit status live at the end.
         parts: list[str] = []

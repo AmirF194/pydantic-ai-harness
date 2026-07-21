@@ -121,7 +121,7 @@ deadline or the sandbox is terminated.
 
 Each command stream retains the last `max_output_bytes` after every transport
 chunk, and each stream's payload is also truncated separately by
-`max_output_bytes` and `max_output_lines` in the tool output, so a noisy stderr
+`max_output_bytes` and `max_output_lines` in the tool output, so a large stderr
 cannot crowd out stdout and the `[stdout]` / `[stderr]` labels always survive.
 Any cut is marked. Labels, truncation or continuation notes, and command status
 add a small amount beyond those payload limits. One transport chunk can
@@ -215,9 +215,10 @@ instead of being ignored.
 - Custom-built images, mounts, or `modal.Secret`: `image` takes a registry tag,
   and `env` takes plain environment variables. For anything richer, create the
   sandbox yourself with the Modal SDK and pass it via `sandbox_id` or `session`.
-- Spilling full output to a file: truncated output points the model at a shell
-  slice (`head`, `tail`, `sed -n`, `offset`) rather than being written to a file
-  in the sandbox for it to open.
+- Spilling full output to a file: truncated file reads end with the next
+  `offset` to page from and oversized files get a shell-slice hint; truncated
+  command output gets a truncation marker. Nothing is written to a file in the
+  sandbox for the model to open.
 
 ## Agent specs
 

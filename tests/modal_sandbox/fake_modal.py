@@ -124,7 +124,8 @@ class _FakeProcess:
         chunks: list[bytes] | None = None,
     ) -> None:
         self.stdout = _FakeStream(stdout, chunk_size, stdout_error, chunks)
-        self.stderr = _FakeStream(stderr, chunk_size, stderr_error, chunks)
+        # The explicit chunk override drives stdout only, so a test cannot conflate streams.
+        self.stderr = _FakeStream(stderr, chunk_size, stderr_error)
         self._returncode = returncode
         self._wait_error = wait_error
         self.returncode: int | None = None
@@ -228,6 +229,7 @@ class FakeSandbox:
         self.terminated = False
         self.detached = False
         self.terminate_error: Exception | None = None
+        self.detach_error: Exception | None = None
         self.exec = _AioCallable(self._exec)
         self.terminate = _AioCallable(self._terminate)
         self.detach = _AioCallable(self._detach)
@@ -273,6 +275,8 @@ class FakeSandbox:
         return 0 if wait else None
 
     def _detach(self) -> None:
+        if self.detach_error is not None:
+            raise self.detach_error
         self.detached = True
 
     def _poll(self) -> int | None:

@@ -61,7 +61,7 @@ class ModalSandboxAuthError(ModalSandboxTerminalError):
     """
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, kw_only=True)
 class ModalSandboxExecResult:
     """The outcome of running a command in the sandbox."""
 
@@ -322,7 +322,12 @@ class ModalSandboxSession:
                             pass
             finally:
                 with anyio.move_on_after(_TEARDOWN_TIMEOUT):
-                    await sandbox.detach.aio()  # pyright: ignore[reportUnknownMemberType]
+                    try:
+                        await sandbox.detach.aio()  # pyright: ignore[reportUnknownMemberType]
+                    except Exception:
+                        # Best-effort like terminate: a failed local detach must not replace
+                        # the exception unwinding through the body.
+                        pass
 
     def _require_sandbox(self) -> modal.Sandbox:
         sandbox = self._sandbox
@@ -401,7 +406,9 @@ class ModalSandboxSession:
             return ModalSandboxAuthError(_AUTH_MESSAGE)
         except _unavailable_sandbox_exc_types():
             return ModalSandboxUnavailableError(self._unavailable_message())
-        except modal.exception.Error:
+        except Exception:
+            # The classifying poll can itself fail, including with a raw transport error;
+            # fall back to the original error rather than letting the probe abort the run.
             return ModalSandboxError(str(e))
         if returncode is not None:
             return ModalSandboxUnavailableError(self._unavailable_message())
@@ -488,11 +495,12 @@ class ModalSandboxSession:
         try:
             process = await sandbox.exec.aio(*argv, timeout=deadline, text=False)
         except modal.exception.Error as e:
-            raise await self._exec_error(e) from e
+            raise await self._exec_error(e, 'Command could not run in the sandbox') from e
 
         stdout: tuple[str, bool] | None = None
         stderr: tuple[str, bool] | None = None
         returncode: int | None = None
+        exited_after: float | None = None
         command_error: Exception | None = None
 
         # The readers catch Exception, not just modal's Error: stream iteration can surface
@@ -516,9 +524,13 @@ class ModalSandboxSession:
                 task_group.cancel_scope.cancel()
 
         async def wait_for_exit() -> None:
-            nonlocal returncode, command_error
+            nonlocal returncode, exited_after, command_error
             try:
                 returncode = await process.wait.aio()
+                # Clock the exit here, not after the task group: the streams keep draining
+                # concurrently, and drain time must not count toward the deadline window
+                # (a slow drain would otherwise mislabel an early self-kill as a timeout).
+                exited_after = time.monotonic() - started
             except Exception as e:
                 command_error = e
                 task_group.cancel_scope.cancel()
@@ -528,15 +540,19 @@ class ModalSandboxSession:
             task_group.start_soon(read_stderr)
             task_group.start_soon(wait_for_exit)
         if command_error is not None:
-            raise await self._exec_error(command_error) from command_error
-        if stdout is None or stderr is None or returncode is None:  # pragma: no cover - task group completion contract
+            raise await self._exec_error(
+                command_error, 'Could not read the command result (the command may still run until its deadline)'
+            ) from command_error
+        if stdout is None or stderr is None or returncode is None or exited_after is None:  # pragma: no cover
+            # Task-group completion contract: all four are set together on success.
             raise ModalSandboxError('Modal command result was incomplete.')
-        elapsed = time.monotonic() - started
         # Modal's client reports `-1` when its local deadline kills the wait, but the server
         # enforces the same deadline first and its SIGKILL can win the race, surfacing as a
         # plain 137 exit. Read 137 as a timeout only when a deadline was set and the command
         # actually consumed its window, so a command that killed itself early stays a real exit.
-        timed_out = deadline is not None and (returncode == -1 or (returncode == _SIGKILL_EXIT and elapsed >= deadline))
+        timed_out = deadline is not None and (
+            returncode == -1 or (returncode == _SIGKILL_EXIT and exited_after >= deadline)
+        )
         return ModalSandboxExecResult(
             stdout=stdout[0],
             stderr=stderr[0],
@@ -547,20 +563,22 @@ class ModalSandboxSession:
             applied_timeout=deadline,
         )
 
-    async def _exec_error(self, e: Exception) -> ModalSandboxError:
+    async def _exec_error(self, e: Exception, context: str) -> ModalSandboxError:
         """Map an exception from running a command to a ModalSandbox error.
 
         A `ConflictError` is ambiguous (first exec on a dead sandbox, or a transient
         abort), so it is classified by polling; other Modal errors map directly; a
-        non-Modal transport failure becomes a recoverable `ModalSandboxError`.
+        non-Modal transport failure becomes a recoverable `ModalSandboxError`. `context`
+        distinguishes "the command never started" from "the result could not be read",
+        so the model is warned when the command may still be running.
         """
         import modal
 
         if isinstance(e, modal.exception.ConflictError):
             return await self._ambiguous_error(e)
         if isinstance(e, modal.exception.Error):
-            return self._use_error(e, 'Command could not run in the sandbox')
-        return ModalSandboxError(f'Command could not run in the sandbox: {type(e).__name__}: {e}')
+            return self._use_error(e, context)
+        return ModalSandboxError(f'{context}: {type(e).__name__}: {e}')
 
     @staticmethod
     def _decode_stream_chunks(chunks: Iterable[bytes]) -> str:
