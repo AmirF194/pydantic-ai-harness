@@ -122,6 +122,21 @@ agent = Agent('openai:gpt-5', name='calc', toolsets=[tools], capabilities=[Absur
 MCP tools cannot opt out: they perform I/O and so are always checkpointed. Setting
 `metadata={'absurd': False}` on an MCP tool raises a `UserError`.
 
+## CodeMode composition
+
+`AbsurdDurability` composes with the harness `CodeMode` capability, and checkpointing reaches inside
+the sandbox. `CodeMode` dispatches every tool call the generated code makes through its wrapped
+toolset, over a `ToolManager` built on that toolset. Because `AbsurdDurability` registers as the
+innermost capability, its leaf-toolset swap runs first, so the toolset `CodeMode` wraps already holds
+the durable wrappers. A `search(...)` call made from inside `run_code` therefore runs in its own
+`{name}__function_toolset__{id}.call_tool:search` step and is served from the checkpoint on replay,
+the same as a direct tool call.
+
+The `run_code` tool call itself is not a checkpointed step (the code-execution boundary is a wrapper
+toolset, not a durable leaf), so its Python body re-runs on replay. Each checkpointed step that body
+reaches, including the inner tool call, short-circuits to its stored result, so the tool function
+does not run a second time.
+
 ## Checkpoint format compatibility
 
 The step names and the checkpoint payload shapes are byte-compatible with the `pydantic-ai-absurd`
