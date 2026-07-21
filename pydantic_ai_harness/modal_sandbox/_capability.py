@@ -22,7 +22,7 @@ from pydantic_ai_harness.modal_sandbox._session import (
 from pydantic_ai_harness.modal_sandbox._session import (
     ModalSandboxSession,
 )
-from pydantic_ai_harness.modal_sandbox._tool_output import DEFAULT_MAX_LINES
+from pydantic_ai_harness.modal_sandbox._tool_output import DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES
 from pydantic_ai_harness.modal_sandbox._toolset import ModalSandboxToolset
 
 # read_file pulls the whole file into memory before windowing it, so cap how large a file
@@ -141,7 +141,7 @@ class ModalSandbox(AbstractCapability[AgentDepsT]):
     unless you set `max_command_timeout` to the value the sandbox actually allows.
     """
 
-    max_output_bytes: int = 50 * 1024
+    max_output_bytes: int = DEFAULT_MAX_BYTES
     """Maximum payload retained per command stream or file read, measured in UTF-8 bytes.
 
     For commands the cap applies to stdout and stderr separately, both client-side (each

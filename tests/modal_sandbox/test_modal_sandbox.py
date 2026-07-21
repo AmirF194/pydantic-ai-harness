@@ -20,6 +20,7 @@ from pydantic_ai_harness.modal_sandbox import (
     ModalSandbox,
     ModalSandboxError,
     ModalSandboxSession,
+    ModalSandboxTerminalError,
     ModalSandboxUnavailableError,
 )
 
@@ -117,6 +118,14 @@ class TestRunCommand:
             await ts.run_command('echo', timeout_seconds=12.0)
         assert fake_modal.sandboxes[0].exec_calls[-1].timeout == 12
 
+    async def test_omitted_timeout_falls_back_to_default_never_unbounded(self, fake_modal: FakeModal) -> None:
+        # Modal cannot kill a running command, so every command must carry a finite
+        # deadline; an omitted timeout_seconds means default_command_timeout, not None.
+        fake_modal.responder = lambda argv, timeout: ('', '', 0)
+        async with _toolset() as ts:
+            await ts.run_command('echo hi')
+        assert fake_modal.sandboxes[0].exec_calls[-1].timeout == 30
+
     async def test_timeout_clamped_to_sandbox_timeout(self, fake_modal: FakeModal) -> None:
         # Modal cannot kill a running command, so a model-supplied timeout is capped. With no
         # explicit ceiling it falls back to the sandbox lifetime.
@@ -172,21 +181,29 @@ class TestRunCommand:
             with pytest.raises(ModelRetry, match='Command could not run in the sandbox: transient blip'):
                 await ts.run_command('echo hi')
 
-    @pytest.mark.parametrize('exc_property', ['unavailable_type', 'sandbox_terminated_type', 'sandbox_timeout_type'])
-    async def test_terminal_failure_ends_the_run(self, fake_modal: FakeModal, exc_property: str) -> None:
-        # A dead sandbox is terminal: run_command must not turn it into a ModelRetry (which
-        # would loop the model against a sandbox that is never coming back). It propagates.
-        # All three Modal spellings of "the sandbox is gone" must classify the same way;
-        # sandbox expiry (SandboxTimeoutError) is the one an owned run outliving its
-        # lifetime actually produces.
+    @pytest.mark.parametrize(
+        ('exc_property', 'match'),
+        [
+            ('unavailable_type', 'no longer running'),
+            ('sandbox_terminated_type', 'no longer running'),
+            ('sandbox_timeout_type', 'no longer running'),
+            ('auth_type', 'Modal rejected the credentials'),
+        ],
+    )
+    async def test_terminal_failure_ends_the_run(self, fake_modal: FakeModal, exc_property: str, match: str) -> None:
+        # A terminal failure must not become a ModelRetry (which would loop the model
+        # against a sandbox that is never coming back, or against dead credentials). It
+        # propagates. All three Modal spellings of "the sandbox is gone" classify the same
+        # way; sandbox expiry (SandboxTimeoutError) is the one an owned run outliving its
+        # lifetime actually produces, and rejected credentials are the non-sandbox case.
         exc_type: type[Exception] = getattr(fake_modal, exc_property)
 
-        def gone(argv: list[str], timeout: int | None) -> tuple[str, str, int]:
-            raise exc_type('sandbox gone')
+        def fail(argv: list[str], timeout: int | None) -> tuple[str, str, int]:
+            raise exc_type('terminal failure')
 
-        fake_modal.responder = gone
+        fake_modal.responder = fail
         async with _toolset() as ts:
-            with pytest.raises(ModalSandboxUnavailableError, match='no longer running'):
+            with pytest.raises(ModalSandboxTerminalError, match=match):
                 await ts.run_command('echo hi')
 
     async def test_output_is_bounded_end_to_end(self, fake_modal: FakeModal) -> None:
@@ -238,6 +255,19 @@ class TestRunCommand:
             result = await ts.run_command('flood')
         assert 'output truncated to the last 50B' in result
         assert result.endswith('END')
+
+    async def test_client_side_bounding_is_engaged_not_only_presentation(self, fake_modal: FakeModal) -> None:
+        # The session-level ring buffer bounds client memory during the read; the
+        # presentation cap alone cannot substitute for it. With a multi-line flood the two
+        # layers keep different tails: the session keeps a byte suffix of the long line,
+        # the presentation cap alone would keep only whole trailing lines.
+        fake_modal.output_chunk_size = 1
+        fake_modal.responder = lambda argv, timeout: ('X' * 100 + '\nEND', '', 0)
+        async with _toolset(max_output_bytes=50) as ts:
+            result = await ts.run_command('flood')
+        # Last 50 bytes of the stream: a 46-char X suffix, then the END line.
+        assert 'X' * 46 + '\nEND' in result
+        assert 'output truncated' in result
 
     async def test_dead_sandbox_conflict_on_first_exec_is_terminal(self, fake_modal: FakeModal) -> None:
         # A first exec on a dead sandbox surfaces as Modal's ambiguous ConflictError; the
@@ -453,6 +483,20 @@ class TestListDirectory:
             result = await ts.list_directory('/tmp')
         assert result == '[... first line exceeds the 10B limit, output omitted ...]'
 
+    async def test_head_truncation_appends_marker_after_the_listing(self, fake_modal: FakeModal) -> None:
+        # Directory listings truncate head-first: the kept entries come first and the
+        # marker says "first", appended after the body (the opposite arrangement to
+        # command output). coverage's branch metric cannot see these ternary arms, so
+        # this pins them explicitly.
+        async with _toolset(max_output_lines=2) as ts:
+            fake_modal.sandboxes[0].listing = [
+                FileInfo('a', False),
+                FileInfo('b', False),
+                FileInfo('c', False),
+            ]
+            result = await ts.list_directory('/tmp')
+        assert result == 'a\nb\n[... output truncated to the first 2 lines ...]'
+
     async def test_default_path_resolves_to_cwd(self, fake_modal: FakeModal) -> None:
         fake_modal.responder = lambda argv, timeout: ('/work\n', '', 0)
         async with _toolset() as ts:
@@ -524,6 +568,17 @@ class TestToolsetLifecycle:
             await ts.run_command('echo hi')
         assert fake_modal.attach_ids == ['sb-keep']
         assert fake_modal.sandboxes[0].terminated is False
+        assert fake_modal.sandboxes[0].detached is True
+
+    async def test_error_exit_still_terminates_the_sandbox(self, fake_modal: FakeModal) -> None:
+        # The owned sandbox is torn down on the error exit path too, not only on clean
+        # exit: a run that dies mid-task must not leave its sandbox billing until the
+        # server-side backstop.
+        with pytest.raises(RuntimeError, match='body boom'):
+            async with _toolset() as ts:
+                await ts.run_command('echo hi')
+                raise RuntimeError('body boom')
+        assert fake_modal.sandboxes[0].terminated is True
         assert fake_modal.sandboxes[0].detached is True
 
 
@@ -703,6 +758,14 @@ class TestCapability:
         assert instructions is not None
         assert 'up to 900s' in instructions
 
+    def test_instructions_clamp_default_to_the_ceiling(self) -> None:
+        # A default above the enforceable ceiling must not be advertised: the model would
+        # be told a deadline that enforcement then cuts short.
+        instructions = ModalSandbox(default_command_timeout=400.0).get_instructions()
+        assert instructions is not None
+        assert 'times out after 300s' in instructions
+        assert 'up to 300s' in instructions
+
     def test_owned_rejects_ceiling_above_sandbox_timeout(self) -> None:
         # In owned mode a command cannot outlive the sandbox, so a higher ceiling is a
         # dead value; in attach/injected modes it is the documented escape hatch.
@@ -781,3 +844,26 @@ class TestCapability:
 
         assert len(fake_modal.sandboxes) == 2
         assert all(sandbox.terminated for sandbox in fake_modal.sandboxes)
+
+    @pytest.mark.anyio(backends=['asyncio'])
+    async def test_agent_run_failing_terminally_still_tears_down(self, fake_modal: FakeModal) -> None:
+        import sniffio
+
+        if sniffio.current_async_library() != 'asyncio':  # pragma: no cover
+            pytest.skip('Agent.run() requires asyncio')
+
+        # A run that dies on a terminal sandbox error must still request termination on
+        # its way out; the error exit path gets the same teardown as a clean one.
+        def gone(argv: list[str], timeout: int | None) -> tuple[str, str, int]:
+            raise fake_modal.sandbox_terminated_type('sandbox terminated')
+
+        fake_modal.responder = gone
+
+        def call_tool(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+            return ModelResponse(parts=[ToolCallPart('run_command', {'command': 'echo hi'}, tool_call_id='run-1')])
+
+        agent: Agent[None, str] = Agent(FunctionModel(call_tool), capabilities=[ModalSandbox()])
+        with pytest.raises(ModalSandboxUnavailableError):
+            await agent.run('run a command')
+        assert fake_modal.sandboxes[0].terminated is True
+        assert fake_modal.sandboxes[0].detached is True

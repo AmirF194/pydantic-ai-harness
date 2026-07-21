@@ -2,11 +2,10 @@
 
 from __future__ import annotations
 
-import codecs
 import math
 import posixpath
 import time
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
@@ -369,23 +368,6 @@ class ModalSandboxSession:
             )
         return ModalSandboxError(f'Could not start Modal sandbox: {e}')
 
-    def _use_error(self, e: modal.exception.Error, context: str) -> ModalSandboxError:
-        """Map a Modal error raised while *using* the sandbox to a ModalSandbox error.
-
-        A terminated or missing sandbox and rejected credentials are terminal -- retrying cannot
-        help, so the toolset ends the run instead of prompting the model to try again.
-        Everything else (a bad path, a transient sandbox-side failure) stays a recoverable
-        `ModalSandboxError`. `context` prefixes the provider message with the operation
-        that failed.
-        """
-        import modal
-
-        if isinstance(e, modal.exception.AuthError):
-            return ModalSandboxAuthError(_AUTH_MESSAGE)
-        if isinstance(e, _unavailable_sandbox_exc_types()):
-            return ModalSandboxUnavailableError(self._unavailable_message())
-        return ModalSandboxError(f'{context}: {e}')
-
     async def _ambiguous_error(self, e: modal.exception.Error) -> ModalSandboxError:
         """Classify a Modal error that may mask sandbox death by polling the sandbox.
 
@@ -567,25 +549,25 @@ class ModalSandboxSession:
         """Map an exception from running a command to a ModalSandbox error.
 
         A `ConflictError` is ambiguous (first exec on a dead sandbox, or a transient
-        abort), so it is classified by polling; other Modal errors map directly; a
-        non-Modal transport failure becomes a recoverable `ModalSandboxError`. `context`
-        distinguishes "the command never started" from "the result could not be read",
-        so the model is warned when the command may still be running.
+        abort), so it is classified by polling. A terminated or missing sandbox and
+        rejected credentials are terminal -- retrying cannot help, so the toolset ends
+        the run instead of prompting the model to try again. Everything else -- another
+        Modal error or a non-Modal transport failure -- stays a recoverable
+        `ModalSandboxError`. `context` distinguishes "the command never started" from
+        "the result could not be read", so the model is warned when the command may
+        still be running.
         """
         import modal
 
         if isinstance(e, modal.exception.ConflictError):
             return await self._ambiguous_error(e)
+        if isinstance(e, modal.exception.AuthError):
+            return ModalSandboxAuthError(_AUTH_MESSAGE)
+        if isinstance(e, _unavailable_sandbox_exc_types()):
+            return ModalSandboxUnavailableError(self._unavailable_message())
         if isinstance(e, modal.exception.Error):
-            return self._use_error(e, context)
+            return ModalSandboxError(f'{context}: {e}')
         return ModalSandboxError(f'{context}: {type(e).__name__}: {e}')
-
-    @staticmethod
-    def _decode_stream_chunks(chunks: Iterable[bytes]) -> str:
-        decoder = codecs.getincrementaldecoder('utf-8')(errors='replace')
-        parts = [decoder.decode(chunk, final=False) for chunk in chunks]
-        parts.append(decoder.decode(b'', final=True))
-        return ''.join(parts)
 
     @staticmethod
     async def _read_stream(
@@ -601,20 +583,16 @@ class ModalSandboxSession:
         the cut even when the retained text fits its own presentation caps.
         """
         if max_output_bytes is None:
-            return ModalSandboxSession._decode_stream_chunks([await stream.read.aio()]), False
+            return (await stream.read.aio()).decode('utf-8', errors='replace'), False
         retained = bytearray()
         truncated = False
         async for chunk in stream:
-            if len(chunk) >= max_output_bytes:
-                truncated = truncated or len(chunk) > max_output_bytes or bool(retained)
-                retained = bytearray(chunk[-max_output_bytes:])
-                continue
             retained.extend(chunk)
             excess = len(retained) - max_output_bytes
             if excess > 0:
                 truncated = True
                 del retained[:excess]
-        return ModalSandboxSession._decode_stream_chunks([bytes(retained)]), truncated
+        return bytes(retained).decode('utf-8', errors='replace'), truncated
 
     async def file_size(self, path: str) -> int:
         """Return a file's size in bytes via Modal's filesystem API, without reading it.

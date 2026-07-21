@@ -66,10 +66,8 @@ class TestOwnedLifecycle:
     async def test_detach_failure_does_not_raise(self, fake_modal: FakeModal) -> None:
         # Detach is best-effort like terminate: a raise from `__aexit__` would replace the
         # exception unwinding through the body.
-        session = ModalSandboxSession()
-        await session.__aenter__()
-        fake_modal.sandboxes[0].detach_error = RuntimeError('detach boom')
-        await session.__aexit__(None, None, None)
+        async with ModalSandboxSession():
+            fake_modal.sandboxes[0].detach_error = RuntimeError('detach boom')
         assert fake_modal.sandboxes[0].terminated is True
 
     async def test_terminate_failure_does_not_raise_and_still_detaches(self, fake_modal: FakeModal) -> None:
@@ -77,20 +75,24 @@ class TestOwnedLifecycle:
         # unwinding through the `async with` body (raising from `__aexit__` would mask it),
         # and the server-side sandbox_timeout reaps the sandbox regardless. The client is
         # still detached so the attachment is not leaked.
-        session = ModalSandboxSession()
-        await session.__aenter__()
-        fake_modal.sandboxes[0].terminate_error = RuntimeError('terminate boom')
-        await session.__aexit__(None, None, None)
+        async with ModalSandboxSession():
+            fake_modal.sandboxes[0].terminate_error = RuntimeError('terminate boom')
         assert fake_modal.sandboxes[0].detached is True
 
     async def test_terminating_an_already_gone_sandbox_is_not_an_error(self, fake_modal: FakeModal) -> None:
         # An owned run that outlived its sandbox_timeout self-terminates; the teardown terminate
         # then hits "already gone". That is success, not a failure to raise -- a raise here would
         # mask the terminal error the tool already surfaced.
-        session = ModalSandboxSession()
-        await session.__aenter__()
-        fake_modal.sandboxes[0].terminate_error = fake_modal.sandbox_terminated_type('already terminated')
-        await session.__aexit__(None, None, None)
+        async with ModalSandboxSession():
+            fake_modal.sandboxes[0].terminate_error = fake_modal.sandbox_terminated_type('already terminated')
+        assert fake_modal.sandboxes[0].detached is True
+
+    async def test_error_exit_still_terminates(self, fake_modal: FakeModal) -> None:
+        # The owned sandbox is torn down when the body raises, not only on clean exit.
+        with pytest.raises(RuntimeError, match='body boom'):
+            async with ModalSandboxSession():
+                raise RuntimeError('body boom')
+        assert fake_modal.sandboxes[0].terminated is True
         assert fake_modal.sandboxes[0].detached is True
 
     async def test_teardown_bounded_when_terminate_hangs(
@@ -102,11 +104,9 @@ class TestOwnedLifecycle:
         # no-private-imports rule; there is no public seam for it and the hang test is
         # worth the coupling.)
         monkeypatch.setattr('pydantic_ai_harness.modal_sandbox._session._TEARDOWN_TIMEOUT', 0.05)
-        session = ModalSandboxSession()
-        await session.__aenter__()
-        fake_modal.sandboxes[0].terminate = _HangingCall()
         with anyio.fail_after(5):
-            await session.__aexit__(None, None, None)
+            async with ModalSandboxSession():
+                fake_modal.sandboxes[0].terminate = _HangingCall()
         assert fake_modal.sandboxes[0].detached is True
 
     async def test_teardown_bounded_when_detach_hangs(
@@ -115,11 +115,9 @@ class TestOwnedLifecycle:
         # Teardown runs shielded, so a hanging detach would be uncancellable; its own
         # deadline is the only bound between a wedged control plane and a hung process.
         monkeypatch.setattr('pydantic_ai_harness.modal_sandbox._session._TEARDOWN_TIMEOUT', 0.05)
-        session = ModalSandboxSession()
-        await session.__aenter__()
-        fake_modal.sandboxes[0].detach = _HangingCall()
         with anyio.fail_after(5):
-            await session.__aexit__(None, None, None)
+            async with ModalSandboxSession():
+                fake_modal.sandboxes[0].detach = _HangingCall()
         assert fake_modal.sandboxes[0].terminated is True
 
     async def test_entering_an_open_session_raises(self, fake_modal: FakeModal) -> None:
@@ -399,6 +397,16 @@ class TestExec:
         assert result.stdout_truncated is True
         assert result.stderr == 'AB'
         assert result.stderr_truncated is False
+
+    async def test_exact_cap_chunk_is_not_reported_truncated(self, fake_modal: FakeModal) -> None:
+        # One chunk exactly at the cap drops nothing; the flag must stay False so the
+        # caller is not told output was cut when it was not.
+        fake_modal.output_chunks = [b'AAAA']
+        fake_modal.responder = lambda argv, timeout: ('', '', 0)
+        async with ModalSandboxSession() as session:
+            result = await session.exec(['x'], timeout=5, max_output_bytes=4)
+        assert result.stdout == 'AAAA'
+        assert result.stdout_truncated is False
 
     async def test_bounded_output_under_cap_is_whole(self, fake_modal: FakeModal) -> None:
         fake_modal.output_chunk_size = 1
