@@ -81,13 +81,20 @@ _READ_TOOLS = frozenset({'read_file', 'list_directory', 'search_files', 'find_fi
 def build_agent(model: Model | str = DEFAULT_MODEL, workspace: Path | None = None) -> Agent:
     """Build the atlas agent for `workspace` (defaults to the current directory)."""
     workspace = workspace or Path.cwd()
-    (workspace / 'atlas').mkdir(exist_ok=True)
+    atlas_dir = workspace / 'atlas'
+    # A symlinked atlas/ would silently relocate the write root outside the
+    # workspace; require a real directory that resolves beneath it.
+    if atlas_dir.is_symlink():
+        raise ValueError(f'{atlas_dir} is a symlink; the knowledge map requires a real directory.')
+    atlas_dir.mkdir(exist_ok=True)
+    if not atlas_dir.resolve().is_relative_to(workspace.resolve()):
+        raise ValueError(f'{atlas_dir} resolves outside the workspace.')
     # The write boundary holds by construction, not by instruction: surveying
     # the repo uses a toolset filtered to the read-only tools, and the only
     # write-capable toolset is rooted at atlas/ (its tools carry an atlas_
     # prefix, with paths relative to that root).
     survey = FileSystem(root_dir=workspace).get_toolset().filtered(lambda ctx, tool: tool.name in _READ_TOOLS)
-    map_edit = FileSystem(root_dir=workspace / 'atlas').get_toolset().prefixed('atlas')
+    map_edit = FileSystem(root_dir=atlas_dir).get_toolset().prefixed('atlas')
 
     def git_history(subcommand: str, args: list[str]) -> str:
         """Run a read-only git inspection subcommand (log, show, blame, diff, status).
