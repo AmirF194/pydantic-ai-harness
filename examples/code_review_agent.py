@@ -97,8 +97,13 @@ def build_agent(model: Model | str = DEFAULT_MODEL, workspace: Path | None = Non
         """
         if subcommand not in _GIT_READ_SUBCOMMANDS:
             raise ModelRetry(f'git {subcommand!r} is not available; choose from {sorted(_GIT_READ_SUBCOMMANDS)}.')
-        if any(a.startswith('--output') for a in args):
-            raise ModelRetry('--output is not available; read the command output directly.')
+        # Keep git inside the repo and off external commands: no absolute or
+        # home-relative paths, no --no-index (diffs arbitrary host files), no
+        # -O orderfile reads, and no config-driven exec via --ext-diff/--textconv.
+        blocked = ('--output', '--no-index', '--ext-diff', '--textconv', '-O')
+        for a in args:
+            if a.startswith(('/', '~')) or a.startswith(blocked):
+                raise ModelRetry(f'argument {a!r} is not available; use repository-relative paths and plain options.')
         result = subprocess.run(
             ['git', '--no-pager', subcommand, *args], cwd=workspace, capture_output=True, text=True, timeout=30
         )
