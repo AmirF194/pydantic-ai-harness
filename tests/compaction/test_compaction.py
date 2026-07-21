@@ -2045,6 +2045,47 @@ class TestPublicPath:
         result = await agent.run('hello')
         assert result.output is not None
 
+    @pytest.mark.anyio
+    async def test_clear_does_not_break_tool_search_on_next_request(self):
+        # Regression for #380 through the real agent graph. Core re-reads a
+        # `ToolSearchReturnPart`'s structured content on every request via
+        # `parse_discovered_tools`; blanking it to a string used to crash the *next*
+        # request. Drive a multi-request run (search -> clear fires -> another request)
+        # and assert it completes with discovery intact.
+        from pydantic_ai import Agent, Tool
+        from pydantic_ai.capabilities import ToolSearch
+        from pydantic_ai.models.function import AgentInfo, FunctionModel
+
+        def hidden_gem(x: int) -> int:
+            return x + 1
+
+        def model_fn(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+            step = sum(isinstance(m, ModelResponse) for m in messages)
+            if step < 2:
+                args = {'queries': ['hidden']}
+                return ModelResponse(
+                    parts=[ToolCallPart(tool_name='search_tools', args=args, tool_call_id=f'ts{step}')]
+                )
+            return ModelResponse(parts=[TextPart(content='done')])
+
+        agent = Agent(
+            FunctionModel(model_fn),
+            tools=[Tool(hidden_gem, defer_loading=True)],
+            capabilities=[ToolSearch(), ClearToolResults(max_messages=1, keep_pairs=0)],
+        )
+        result = await agent.run('go')
+
+        assert result.output == 'done'
+        messages = result.all_messages()
+        search_returns = [
+            p for m in messages if isinstance(m, ModelRequest) for p in m.parts if isinstance(p, ToolSearchReturnPart)
+        ]
+        # The typed search return kept its concrete type and structured (dict) content.
+        assert search_returns
+        assert all(isinstance(p.content, dict) for p in search_returns)
+        # Core still recovers the discovered tool -- the read that crashed in #380.
+        assert parse_discovered_tools(messages) == {'hidden_gem'}
+
 
 # ---------------------------------------------------------------------------
 # Remaining branch coverage — defensive paths in shared helpers
