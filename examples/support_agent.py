@@ -24,11 +24,18 @@ from pydantic_ai_harness.memory import FileStore, Memory
 DEFAULT_MODEL = os.environ.get('PYDANTIC_AI_MODEL', 'anthropic:claude-opus-4-7')
 
 
-# Phrases that read as attempts to override the agent's instructions.
+# Phrases that read as attempts to override the agent's instructions. A regex
+# is a demo seam, not a security control: a real deployment would put a
+# classifier or moderation-API call here instead (guards may be async).
 _INJECTION_PATTERNS = re.compile(
-    r'ignore (all|your|previous) instructions|reveal your (system )?prompt|you are now', re.IGNORECASE
+    r'(ignore|disregard|forget) (all|your|previous|prior) (instructions|directions|rules)'
+    r'|reveal .{0,30}(system )?prompt'
+    r'|you are now',
+    re.IGNORECASE,
 )
-# The agent must never promise money on its own authority.
+# The agent must never promise money on its own authority. Deliberately coarse:
+# it also bounces refusals like "I cannot issue a refund", which costs one
+# retry and still converges on an escalation without the loaded word.
 _FORBIDDEN_PROMISES = re.compile(r'refund|chargeback|compensat|free month', re.IGNORECASE)
 
 

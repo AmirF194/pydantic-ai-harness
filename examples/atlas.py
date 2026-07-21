@@ -68,10 +68,15 @@ Boundary: create and edit files under `atlas/` only -- never any other path.
 def build_agent(model: Model | str = DEFAULT_MODEL, workspace: Path | None = None) -> Agent:
     """Build the atlas agent for `workspace` (defaults to the current directory)."""
     workspace = workspace or Path.cwd()
+    # Enforce the atlas/-only write boundary rather than relying on the
+    # instructions: every existing top-level entry except atlas/ is marked
+    # read-only, computed here because glob patterns can't express "everything
+    # but this directory".
+    read_only = [f'{p.name}/**' if p.is_dir() else p.name for p in workspace.iterdir() if p.name != 'atlas']
     return Agent(
         model,
         capabilities=[
-            FileSystem(root_dir=workspace),
+            FileSystem(root_dir=workspace, protected_patterns=read_only),
             # Git history explains *why* code exists; rg keeps discovery targeted.
             Shell(cwd=workspace, denied_commands=[], allowed_commands=['git', 'rg', 'ls'], default_timeout=60.0),
             Planning(),
