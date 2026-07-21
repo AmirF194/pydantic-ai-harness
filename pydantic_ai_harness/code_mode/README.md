@@ -184,7 +184,7 @@ from pydantic_monty import MountDir
 from pydantic_ai_harness import CodeMode
 
 # The agent can read /work/data.csv and write /work/summary.md back to the host:
-CodeMode(mount=MountDir('/work', '/tmp/agent-workspace', mode='read-write'))
+CodeMode(mount=MountDir(virtual_path='/work', host_path='/tmp/agent-workspace', mode='read-write'))
 ```
 
 **`os_access` -- answer the sandbox's OS calls yourself.** Reach for this when the agent needs

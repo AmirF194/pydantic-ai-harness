@@ -65,7 +65,7 @@ class CodeMode(AbstractCapability[AgentDepsT]):
     ```python
     from pydantic_monty import MountDir
 
-    agent = Agent('openai:gpt-5', capabilities=[CodeMode(mount=MountDir('/work', '/tmp/agent-work'))])
+    agent = Agent('openai:gpt-5', capabilities=[CodeMode(mount=MountDir(virtual_path='/work', host_path='/tmp/agent-work'))])
     ```
     """
 

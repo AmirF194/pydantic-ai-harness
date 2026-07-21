@@ -34,11 +34,11 @@ dependencies = [
 
 [project.optional-dependencies]
 code-mode = [
-    'pydantic-monty>=0.0.19b2',
+    'pydantic-monty>=0.0.19b5',
 ]
 # Extras metadata has no native redirect syntax, so aliases are represented as duplicate extras.
 codemode = [
-    'pydantic-monty>=0.0.19b2',
+    'pydantic-monty>=0.0.19b5',
 ]
 temporal = [
     'pydantic-ai-slim[temporal]',
@@ -51,7 +51,7 @@ logfire = [
     "pydantic-ai-slim[spec]>=2.1.0",
 ]
 dynamic-workflow = [
-    "pydantic-monty>=0.0.19b2",
+    "pydantic-monty>=0.0.19b5",
 ]
 acp = [
     # The SDK breaks across minors, so cap per minor.
@@ -100,21 +100,10 @@ bump = true
 # below lives in the same table -- uv reads `constraint-dependencies` from
 # `[tool.uv]`, not from an adjacent `uv.toml`.
 exclude-newer-package = { pydantic-ai = false, pydantic-ai-slim = false, pydantic-evals = false, pydantic-graph = false }
-# pydantic-monty and pydantic-monty-runtime are a matched pair: a given monty
-# build only works with the runtime of the same version. But monty 0.0.19b2
-# declares its runtime dependency loosely as `pydantic-monty-runtime>=0.0.18`,
-# so an unlocked resolution (notably the `test-floor` job's
-# `--resolution lowest-direct`) floats the runtime up to the newest pre-release
-# (e.g. 0.0.19b3) while monty stays pinned at 0.0.19b2. That mismatched pair
-# fails and hangs the code_mode / dynamic_workflow suites. Pin the runtime to
-# the exact version that matches the monty we depend on so every resolution
-# mode installs the matched pair; the `==` pre-release specifier also opts the
-# runtime into pre-release resolution without enabling pre-releases globally.
-# Keep this in lockstep with the `pydantic-monty` version above, and drop it
-# once monty pins its runtime tightly (or ships a stable release).
-# `tests/test_monty_runtime_pairing.py` enforces the lockstep: if this pin ever
-# drifts from the monty version, that test fails fast instead of hanging CI.
-constraint-dependencies = ['pydantic-monty-runtime==0.0.19b2']
+# monty pins its runtime exactly, but uv only honors pre-release specifiers on
+# direct requirements/constraints, so opt the runtime into pre-release
+# resolution here. Drop once monty ships a stable release.
+constraint-dependencies = ['pydantic-monty-runtime>=0.0.19b4']
 
 
 [tool.hatch.build.targets.wheel]

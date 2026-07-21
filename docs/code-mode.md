@@ -221,7 +221,7 @@ from pydantic_ai_harness import CodeMode
 # The agent can read /work/data.csv and write /work/summary.md back to the host:
 agent = Agent(
     'anthropic:claude-sonnet-4-6',
-    capabilities=[CodeMode(mount=MountDir('/work', '/tmp/agent-workspace', mode='read-write'))],
+    capabilities=[CodeMode(mount=MountDir(virtual_path='/work', host_path='/tmp/agent-workspace', mode='read-write'))],
 )
 ```
 

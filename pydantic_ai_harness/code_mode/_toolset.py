@@ -586,7 +586,7 @@ class CodeModeToolset(WrapperToolset[AgentDepsT]):
             with self._acquire_pool() as monty_pool:
                 with monty_pool.checkout(type_check=type_check, type_check_stubs=type_check_stubs) as session:
                     if self._repl_state is not None:
-                        session.load(self._repl_state)
+                        session.load_session(self._repl_state)
                     monty_state = session.feed_start(
                         code,
                         print_callback=capture,
@@ -599,7 +599,6 @@ class CodeModeToolset(WrapperToolset[AgentDepsT]):
                         valid_names=callable_defs,
                         sequential_names=sequential_tools,
                         global_sequential=global_sequential,
-                        os_access=self.os_access,
                     ).run(monty_state)
                     self._repl_state = session.dump()
         except MontySyntaxError as e:

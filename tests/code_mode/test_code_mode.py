@@ -2570,7 +2570,7 @@ class TestCodeModeOSAccess:
     async def test_description_mount_only_advertises_filesystem_not_env_or_clock(self, tmp_path: Path) -> None:
         """A `mount` without `os` advertises filesystem access only -- it must not tell the model
         that env/clock are host-backed, since a mount cannot route `os.getenv`/`datetime.now()`."""
-        wrapper = CodeMode[object](mount=MountDir('/work', str(tmp_path))).get_wrapper_toolset(
+        wrapper = CodeMode[object](mount=MountDir(virtual_path='/work', host_path=str(tmp_path))).get_wrapper_toolset(
             _build_function_toolset(add)
         )
         assert isinstance(wrapper, CodeModeToolset)
@@ -2703,7 +2703,7 @@ class TestCodeModeOSAccess:
         and resumes.
         """
         (tmp_path / 'data.txt').write_text('hello-from-host')
-        wrapper = CodeMode[object](mount=MountDir('/work', str(tmp_path))).get_wrapper_toolset(
+        wrapper = CodeMode[object](mount=MountDir(virtual_path='/work', host_path=str(tmp_path))).get_wrapper_toolset(
             _build_function_toolset(add)
         )
         assert isinstance(wrapper, CodeModeToolset)
@@ -2719,7 +2719,10 @@ class TestCodeModeOSAccess:
         (tmp_path / 'b').mkdir()
         (tmp_path / 'a' / 'f.txt').write_text('AA')
         (tmp_path / 'b' / 'f.txt').write_text('BB')
-        mounts = [MountDir('/a', str(tmp_path / 'a')), MountDir('/b', str(tmp_path / 'b'))]
+        mounts = [
+            MountDir(virtual_path='/a', host_path=str(tmp_path / 'a')),
+            MountDir(virtual_path='/b', host_path=str(tmp_path / 'b')),
+        ]
         wrapper = CodeMode[object](mount=mounts).get_wrapper_toolset(_build_function_toolset(add))
         assert isinstance(wrapper, CodeModeToolset)
         ctx = await build_ctx(None, wrapper)
@@ -2730,7 +2733,7 @@ class TestCodeModeOSAccess:
 
     def test_capability_forwards_os_and_mount_to_toolset(self, tmp_path: Path) -> None:
         """`CodeMode` forwards `os_access`/`mount` onto the `CodeModeToolset` it builds."""
-        mount = MountDir('/work', str(tmp_path))
+        mount = MountDir(virtual_path='/work', host_path=str(tmp_path))
         wrapper = CodeMode[object](os_access=_unused_os_callback, mount=mount).get_wrapper_toolset(
             _build_function_toolset(add)
         )
