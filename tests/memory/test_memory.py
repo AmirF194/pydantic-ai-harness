@@ -1216,8 +1216,10 @@ class TestTelemetryAndComposition:
         assert [approval.tool_name for approval in result.output.approvals] == ['write_memory']
         assert await capability.store.read('main/MEMORY.md', max_chars=1_000) is None
 
-    def test_temporal_wrapper_accepts_static_memory_toolset(self) -> None:
+    def test_temporal_durability_accepts_static_memory_toolset(self) -> None:
         temporal = pytest.importorskip('pydantic_ai.durable_exec.temporal')
-        temporal.TemporalAgent(
-            Agent(TestModel(), name='memory-agent', capabilities=[Memory[object](inject_memory=False)])
+        Agent(
+            TestModel(),
+            name='memory-agent',
+            capabilities=[Memory[object](inject_memory=False), temporal.TemporalDurability()],
         )
