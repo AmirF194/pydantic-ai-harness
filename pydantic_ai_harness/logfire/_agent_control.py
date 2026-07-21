@@ -101,7 +101,7 @@ class ToolDefinitionOverride(BaseModel):
 
 
 class AgentConfig(BaseModel):
-    """The schema contract shared with the Logfire Managed agents UI.
+    """The schema contract shared with the Logfire Agent Control UI.
 
     Every managed value is a patch on the code-defined agent. A key present in the value is managed
     from Logfire; an absent key keeps code-defined behavior. Removing a key in Logfire is therefore

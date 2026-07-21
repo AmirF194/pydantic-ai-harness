@@ -5,10 +5,11 @@ so you can iterate on it from the Logfire UI -- versioned, labelled, and rolled 
 
 Two capabilities cover the two managed surfaces:
 
-- [`ManagedPrompt`](#managedprompt) -- one managed prompt (`prompt__<name>`), shareable across agents
 - [`AgentControl`](#agentcontrol) -- the whole agent config (`agent__<name>`): instructions, model,
   model settings, and the LLM-facing definitions of the agent's tools, as one variable matching
-  Logfire's Managed agents UI
+  Logfire's Agent Control UI
+- [`ManagedPrompt`](#managedprompt) -- one managed prompt (`prompt__<name>`), shareable across agents
+  (legacy: a prompt-only `AgentControl` now covers this)
 
 Each capability takes an optional `name` that selects its backing variable. **When you omit it, the
 name defaults to the agent's own `name`** -- so `AgentControl()` on an
@@ -260,7 +261,7 @@ Logfire instance instead of the module-level default.
 
 Back a whole agent's configuration -- instructions, model, model settings, and the LLM-facing
 definitions of its tools -- with one `agent__<name>` variable, the same variable Logfire's
-Managed agents UI edits.
+Agent Control UI edits.
 
 ### The problem
 
