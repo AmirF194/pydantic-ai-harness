@@ -124,16 +124,28 @@ def truncate_output(
     max_lines: int = DEFAULT_MAX_LINES,
     max_bytes: int = DEFAULT_MAX_BYTES,
     direction: Literal['head', 'tail'] = 'tail',
+    already_truncated: bool = False,
 ) -> str:
     """Cap free-form tool output (e.g. shell) and mark it when anything was dropped.
 
     Unlike `render_file_window`, this output is not line-addressable, so the model gets a
     marker rather than a continuation offset. Defaults to `tail`: command errors and exit
-    status live at the end.
+    status live at the end. `already_truncated` says an upstream reader dropped bytes at
+    the same byte cap before `text` got here, so the cut is marked even when what remains
+    fits the caps.
     """
-    result = truncate(text.split('\n'), max_lines=max_lines, max_bytes=max_bytes, direction=direction)
+    lines = text.split('\n')
+    # A trailing newline yields a final '' element; drop it so the caps count real lines
+    # (with a one-line cap, newline-terminated output would otherwise keep only the '').
+    if len(lines) > 1 and lines[-1] == '':
+        lines = lines[:-1]
+    result = truncate(lines, max_lines=max_lines, max_bytes=max_bytes, direction=direction)
+    if result.first_line_exceeded:
+        # Head direction with an oversized first line: nothing was kept, so a normal
+        # "truncated to the first ..." marker would imply content that is not there.
+        return f'[... first line exceeds the {format_size(max_bytes)} limit, output omitted ...]'
     body = '\n'.join(result.truncated_lines)
-    if not result.truncated:
+    if not result.truncated and not already_truncated:
         return body
     kept = 'last' if direction == 'tail' else 'first'
     # Name the cap that actually fired so "50KB" is not reported when the line cap stopped us.

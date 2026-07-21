@@ -134,11 +134,21 @@ class ModalSandboxToolset(FunctionToolset[AgentDepsT]):
             await session.__aexit__(*args)
 
     def _require_session(self) -> ModalSandboxSession:
-        if self._session is None:  # pragma: no cover - tools only run inside the toolset context
-            # ModalSandboxError (not a bare RuntimeError) so that, were this ever reached, the
-            # tool wrappers turn it into a ModelRetry like every other session failure.
+        if self._session is None:
+            # Reachable by calling a tool on an instance that was never entered (e.g. the
+            # base toolset outside an agent run). That is a caller error, not a model
+            # mistake, so the typed error propagates rather than becoming a ModelRetry.
             raise ModalSandboxError('The Modal sandbox session is not open.')
         return self._session
+
+    def _truncate_stream(self, text: str, already_truncated: bool) -> str:
+        return truncate_output(
+            text,
+            max_lines=self._max_output_lines,
+            max_bytes=self._max_output_bytes,
+            direction='tail',
+            already_truncated=already_truncated,
+        )
 
     def _command_timeout(self, timeout_seconds: float | None) -> int:
         if timeout_seconds is not None and (not math.isfinite(timeout_seconds) or timeout_seconds <= 0):
@@ -180,16 +190,16 @@ class ModalSandboxToolset(FunctionToolset[AgentDepsT]):
             raise
         except ModalSandboxError as e:
             raise ModelRetry(str(e))
+        # Truncate each stream separately and attach its label afterwards, so the
+        # `[stdout]` / `[stderr]` markers always survive truncation and a noisy stderr
+        # cannot crowd stdout out of a shared budget. Tail direction: errors and the
+        # exit status live at the end.
         parts: list[str] = []
         if result.stdout:
-            parts.append(f'[stdout]\n{result.stdout}')
+            parts.append(f'[stdout]\n{self._truncate_stream(result.stdout, result.stdout_truncated)}')
         if result.stderr:
-            parts.append(f'[stderr]\n{result.stderr}')
-        body = '\n'.join(parts) if parts else '(no output)'
-        # Command output: keep the tail, where errors and the exit status live.
-        output = truncate_output(
-            body, max_lines=self._max_output_lines, max_bytes=self._max_output_bytes, direction='tail'
-        )
+            parts.append(f'[stderr]\n{self._truncate_stream(result.stderr, result.stderr_truncated)}')
+        output = '\n'.join(parts) if parts else '(no output)'
         if result.timed_out:
             return f'{output}\n[timed out after {result.applied_timeout}s]'
         if result.returncode:
@@ -242,7 +252,12 @@ class ModalSandboxToolset(FunctionToolset[AgentDepsT]):
             content: The text to write.
         """
         session = self._require_session()
-        data = content.encode('utf-8')
+        try:
+            data = content.encode('utf-8')
+        except UnicodeEncodeError:
+            # Reachable when a provider's pre-parsed tool arguments carry an unpaired
+            # surrogate; a model mistake, so retry rather than abort the run.
+            raise ModelRetry('content contains characters that cannot be encoded as UTF-8 (unpaired surrogates).')
         try:
             await session.write_bytes(path, data)
         except ModalSandboxTerminalError:
@@ -267,7 +282,9 @@ class ModalSandboxToolset(FunctionToolset[AgentDepsT]):
             raise ModelRetry(f'Could not list {path!r}: {e}')
         if not entries:
             return '(empty)'
-        names = sorted(f'{name}/' if is_dir else name for name, is_dir in entries)
+        # Sort by name before adding the `/` suffix so directories keep plain name order
+        # ('/' sorts after '-' and '.', which would misplace suffixed names).
+        names = [f'{name}/' if is_dir else name for name, is_dir in sorted(entries)]
         # Directory listing is sorted, so keep the head if it overflows the cap.
         return truncate_output(
             '\n'.join(names), max_lines=self._max_output_lines, max_bytes=self._max_output_bytes, direction='head'

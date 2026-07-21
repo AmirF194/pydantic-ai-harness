@@ -10,31 +10,41 @@ from pydantic_ai.capabilities import AbstractCapability
 from pydantic_ai.tools import AgentDepsT
 from pydantic_ai.toolsets import AgentToolset
 
-from pydantic_ai_harness.modal_sandbox._session import ModalSandboxSession
+from pydantic_ai_harness.modal_sandbox._session import (
+    DEFAULT_APP_NAME as _DEFAULT_APP_NAME,
+)
+from pydantic_ai_harness.modal_sandbox._session import (
+    DEFAULT_IMAGE as _DEFAULT_IMAGE,
+)
+from pydantic_ai_harness.modal_sandbox._session import (
+    DEFAULT_SANDBOX_TIMEOUT as _DEFAULT_SANDBOX_TIMEOUT,
+)
+from pydantic_ai_harness.modal_sandbox._session import (
+    ModalSandboxSession,
+)
 from pydantic_ai_harness.modal_sandbox._tool_output import DEFAULT_MAX_LINES
 from pydantic_ai_harness.modal_sandbox._toolset import ModalSandboxToolset
 
-# Defaults shared by the field declarations and the validation below, so the two cannot
-# drift: a setting is "left at its default" iff it equals the constant here.
-_DEFAULT_IMAGE = 'python:3.12-slim'
-_DEFAULT_APP_NAME = 'pydantic-ai-harness'
-_DEFAULT_SANDBOX_TIMEOUT = 300
 # read_file pulls the whole file into memory before windowing it, so cap how large a file
 # it will read; bigger files should be sliced with a shell command instead.
 _DEFAULT_MAX_READ_BYTES = 5 * 1024 * 1024
 
+# Default instruction templates; `get_instructions` fills in the per-instance timeout
+# numbers so the model learns the real deadline and ceiling, not a placeholder.
 _OWNED_INSTRUCTIONS = (
     'You have a Modal sandbox: an isolated, ephemeral cloud container. Use `run_command` to run '
     'shell commands in it, and `read_file` / `write_file` / `list_directory` to manage files. '
-    'Commands run through `sh`, so pipes and redirection work. The sandbox is reset between '
-    'sessions, so persist anything important outside it.'
+    'Commands run through `sh`, so pipes and redirection work. A command times out after '
+    '{default_timeout}s unless you pass `timeout_seconds` (up to {max_timeout}s). The sandbox '
+    'is reset between runs, so persist anything important outside it.'
 )
 
 _ATTACHED_INSTRUCTIONS = (
     'You have a Modal sandbox: an isolated cloud container. Use `run_command` to run shell '
     'commands in it, and `read_file` / `write_file` / `list_directory` to manage files. '
-    'Commands run through `sh`, so pipes and redirection work. This sandbox persists across '
-    'sessions, so files from earlier runs can still be present.'
+    'Commands run through `sh`, so pipes and redirection work. A command times out after '
+    '{default_timeout}s unless you pass `timeout_seconds` (up to {max_timeout}s). This sandbox '
+    'persists across runs, so files from earlier runs can still be present.'
 )
 
 
@@ -52,8 +62,9 @@ class ModalSandbox(AbstractCapability[AgentDepsT]):
     `ModalSandboxSession`) so you control its lifetime and can read its `sandbox_id`.
     The capability never opens or terminates a `session` you pass.
 
-    Requires the `modal` extra (`uv add "pydantic-ai-harness[modal]"`) and
-    Modal credentials in the environment (`MODAL_TOKEN_ID` / `MODAL_TOKEN_SECRET`).
+    Requires the `modal` extra (`uv add "pydantic-ai-harness[modal]"`) and Modal
+    credentials, configured as for the Modal CLI: run `modal token new` once, or set
+    `MODAL_TOKEN_ID` / `MODAL_TOKEN_SECRET` in the environment.
 
     ```python
     from pydantic_ai import Agent
@@ -112,6 +123,8 @@ class ModalSandbox(AbstractCapability[AgentDepsT]):
     """Default timeout in seconds for one `run_command`, used when the model omits one.
 
     This bounds a single command; `sandbox_timeout` bounds the whole sandbox's lifetime.
+    Modal enforces whole-second deadlines, so fractional values are rounded up (0.5
+    behaves as 1).
     """
 
     max_command_timeout: int | None = None
@@ -129,16 +142,18 @@ class ModalSandbox(AbstractCapability[AgentDepsT]):
     """
 
     max_output_bytes: int = 50 * 1024
-    """Maximum command or file payload retained before annotations, measured in UTF-8 bytes.
+    """Maximum payload retained per command stream or file read, measured in UTF-8 bytes.
 
-    Labels, truncation notes, continuation offsets, timeouts, and exit codes add a small
-    amount beyond this payload limit. For commands, each client-side stream retains at most
-    this many bytes after Modal delivers each transport chunk. Whichever of
-    `max_output_bytes` and `max_output_lines` is reached first wins.
+    For commands the cap applies to stdout and stderr separately, both client-side (each
+    stream retains at most this many bytes after Modal delivers each transport chunk) and
+    in the tool output, so a noisy stderr cannot crowd out stdout. Labels, truncation
+    notes, continuation offsets, timeouts, and exit codes add a small amount beyond this
+    payload limit. Whichever of `max_output_bytes` and `max_output_lines` is reached
+    first wins.
     """
 
     max_output_lines: int = DEFAULT_MAX_LINES
-    """Maximum payload lines retained before annotations, alongside `max_output_bytes`.
+    """Maximum payload lines retained per command stream or file read, alongside `max_output_bytes`.
 
     A second cap so many short lines cannot pile up under the byte budget. Whichever cap is
     reached first wins. Labels and truncation or status notes can add lines beyond this
@@ -153,8 +168,14 @@ class ModalSandbox(AbstractCapability[AgentDepsT]):
     briefly exceed this value in client memory before it is rejected.
     """
 
-    include_instructions: bool = True
-    """If True, add instructions telling the model how to use the sandbox."""
+    instructions: str | None = None
+    """Instructions telling the model how to use the sandbox, added to the system prompt.
+
+    Leave as `None` for a default that matches the mode (fresh sandbox per run, or a
+    reused one that can carry files from earlier runs) and states the command timeout
+    and its ceiling. Set `''` to add no instructions, or pass your own text -- e.g. when
+    wrapping with `PrefixTools`, so the tool names in the text match the prefixed ones.
+    """
 
     def __post_init__(self) -> None:
         """Reject settings that the chosen mode would ignore, so a dead value can't mislead.
@@ -179,6 +200,17 @@ class ModalSandbox(AbstractCapability[AgentDepsT]):
                 )
             return
         if self.sandbox_id is None:
+            # Owned mode: a command cannot outlive the sandbox, so a ceiling above the
+            # sandbox lifetime is a dead value -- reject it like the other mode conflicts.
+            # In attach/injected modes a higher ceiling is the documented escape hatch for
+            # sandboxes whose real lifetime exceeds the pinned default, so no check there.
+            ceiling = self.max_command_timeout
+            if ceiling is not None and ceiling > self.sandbox_timeout:
+                raise ValueError(
+                    f'max_command_timeout ({ceiling}) cannot exceed sandbox_timeout '
+                    f'({self.sandbox_timeout}) for an owned sandbox: the sandbox is reaped '
+                    'before such a command could finish. Raise sandbox_timeout instead.'
+                )
             return
         ignored = self._non_default_owned_settings()
         if ignored:
@@ -234,13 +266,18 @@ class ModalSandbox(AbstractCapability[AgentDepsT]):
         ]
 
     def get_instructions(self) -> str | None:
-        """Explain the sandbox to the model, unless disabled."""
-        if not self.include_instructions:
-            return None
+        """Explain the sandbox to the model, unless overridden or disabled via `instructions`."""
+        if self.instructions is not None:
+            return self.instructions or None
         # A reused sandbox (attach or injected session) can carry files from earlier runs;
         # only a per-run owned sandbox starts clean each time.
         reused = self.sandbox_id is not None or self.session is not None
-        return _ATTACHED_INSTRUCTIONS if reused else _OWNED_INSTRUCTIONS
+        template = _ATTACHED_INSTRUCTIONS if reused else _OWNED_INSTRUCTIONS
+        # Report the deadline the toolset will actually apply (quantized and clamped, see
+        # `ModalSandboxToolset._command_timeout`), so the numbers cannot contradict behavior.
+        ceiling = self.max_command_timeout if self.max_command_timeout is not None else self.sandbox_timeout
+        default_timeout = min(max(1, math.ceil(self.default_command_timeout)), ceiling)
+        return template.format(default_timeout=default_timeout, max_timeout=ceiling)
 
     def get_toolset(self) -> AgentToolset[AgentDepsT]:
         """Build and return the Modal sandbox toolset."""

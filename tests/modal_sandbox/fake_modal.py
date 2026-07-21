@@ -65,13 +65,22 @@ class _FakeStream:
 
     The session reads unbounded output with `.read.aio()` and bounded output by iterating
     chunks. `chunk_size` controls how the iterable path splits the data, so a test can drive
-    the bounded reader's drop logic with more than one chunk. `None` yields the data as a
-    single chunk (the realistic "one message" case, and what most tests want).
+    the bounded reader's drop logic with more than one chunk. `chunks` overrides the split
+    with an explicit, possibly non-uniform sequence (real transport chunks are arbitrary
+    sizes). `None` for both yields the data as a single chunk (the realistic "one message"
+    case, and what most tests want).
     """
 
-    def __init__(self, data: bytes, chunk_size: int | None, error: Exception | None = None) -> None:
+    def __init__(
+        self,
+        data: bytes,
+        chunk_size: int | None,
+        error: Exception | None = None,
+        chunks: list[bytes] | None = None,
+    ) -> None:
         self._data = data
         self._chunk_size = chunk_size
+        self._chunks = chunks
         self._error = error
         self.read = _AioCallable(self._read)
         self._pending: list[bytes] = []
@@ -83,7 +92,9 @@ class _FakeStream:
         return self._data
 
     def __aiter__(self) -> _FakeStream:
-        if self._chunk_size is None:
+        if self._chunks is not None:
+            self._pending = list(self._chunks)
+        elif self._chunk_size is None:
             self._pending = [self._data] if self._data else []
         else:
             self._pending = [self._data[i : i + self._chunk_size] for i in range(0, len(self._data), self._chunk_size)]
@@ -110,9 +121,10 @@ class _FakeProcess:
         stdout_error: Exception | None,
         stderr_error: Exception | None,
         wait_error: Exception | None,
+        chunks: list[bytes] | None = None,
     ) -> None:
-        self.stdout = _FakeStream(stdout, chunk_size, stdout_error)
-        self.stderr = _FakeStream(stderr, chunk_size, stderr_error)
+        self.stdout = _FakeStream(stdout, chunk_size, stdout_error, chunks)
+        self.stderr = _FakeStream(stderr, chunk_size, stderr_error, chunks)
         self._returncode = returncode
         self._wait_error = wait_error
         self.returncode: int | None = None
@@ -145,16 +157,16 @@ class FakeSandboxTimeoutError(FakeModalError):
     """Stand-in for `modal.exception.SandboxTimeoutError`."""
 
 
+class FakeConflictError(FakeModalError):
+    """Stand-in for `modal.exception.ConflictError` (first exec on a dead sandbox, or a transient abort)."""
+
+
 class FakeSandboxFilesystemError(FakeModalError):
     """Stand-in for `modal.exception.SandboxFilesystemError`."""
 
 
 class FakeSandboxFilesystemNotFoundError(FakeSandboxFilesystemError):
     """Stand-in for `modal.exception.SandboxFilesystemNotFoundError` (a missing file, recoverable)."""
-
-
-class FakeSandboxFilesystemPathAlreadyExistsError(FakeSandboxFilesystemError):
-    """Stand-in for `modal.exception.SandboxFilesystemPathAlreadyExistsError`."""
 
 
 @dataclass
@@ -176,7 +188,6 @@ class _FakeFilesystem:
         self._sandbox = sandbox
         self.read_bytes = _AioCallable(self._read_bytes)
         self.write_bytes = _AioCallable(self._write_bytes)
-        self.make_directory = _AioCallable(self._make_directory)
         self.list_files = _AioCallable(self._list_files)
         self.stat = _AioCallable(self._stat)
 
@@ -188,17 +199,12 @@ class _FakeFilesystem:
         self._check(remote_path)
         # Size comes from the stored bytes, or an override the test set for this path.
         size = self._sandbox.stat_sizes.get(remote_path, len(self._sandbox.files.get(remote_path, b'')))
-        return FileInfo(remote_path, False, size=size)
+        # Real Modal reports the entry's basename, not the full path.
+        return FileInfo(posixpath.basename(remote_path), False, size=size)
 
     def _write_bytes(self, data: bytes, remote_path: str) -> None:
         self._check(remote_path)
         self._sandbox.files[remote_path] = data
-
-    def _make_directory(self, remote_path: str, *, create_parents: bool = True) -> None:
-        self._check(remote_path)
-        if self._sandbox.make_directory_error is not None:
-            raise self._sandbox.make_directory_error
-        self._sandbox.made_dirs.append(remote_path)
 
     def _list_files(self, remote_path: str) -> list[FileInfo]:
         self._check(remote_path)
@@ -230,11 +236,9 @@ class FakeSandbox:
         self.files: dict[str, bytes] = {}
         # Lets a test report a large size for a path without allocating the bytes.
         self.stat_sizes: dict[str, int] = {}
-        self.made_dirs: list[str] = []
         self.list_paths: list[str] = []
         self.listing: list[FileInfo] = []
         self.fs_error: Exception | None = None
-        self.make_directory_error: Exception | None = None
         self.poll_result: int | None = None
         self.poll_error: Exception | None = None
         self._filesystem = _FakeFilesystem(self)
@@ -243,9 +247,13 @@ class FakeSandbox:
     def filesystem(self) -> _FakeFilesystem:
         return self._filesystem
 
-    def _exec(self, *args: str, timeout: int | None = None, text: bool = True, **kwargs: object) -> _FakeProcess:
+    def _exec(self, *args: str, timeout: int | None = None, text: bool = True) -> _FakeProcess:
+        # Closed keyword signature on purpose: real `Sandbox.exec` rejects unknown kwargs,
+        # so the fake must too, or a bad kwarg in the session would only fail in production.
         argv = list(args)
         self.exec_calls.append(ExecCall(argv=argv, timeout=timeout, text=text))
+        if self._control.exec_error is not None:
+            raise self._control.exec_error
         stdout, stderr, code = self._control.responder(argv, timeout)
         return _FakeProcess(
             _stream_bytes(stdout),
@@ -255,6 +263,7 @@ class FakeSandbox:
             self._control.stdout_error,
             self._control.stderr_error,
             self._control.wait_error,
+            self._control.output_chunks,
         )
 
     def _terminate(self, *, wait: bool = False) -> int | None:
@@ -284,17 +293,23 @@ class FakeModal:
         self.sandboxes: list[FakeSandbox] = []
         self.create_kwargs: list[dict[str, object]] = []
         self.app_lookups: list[dict[str, object]] = []
+        # The marker objects `App.lookup` returned, so a test can assert the looked-up app
+        # is the one passed to `Sandbox.create`.
+        self.apps: list[object] = []
         self.image_tags: list[str] = []
         self.attach_ids: list[str] = []
         self.create_error: Exception | None = None
         self.attach_error: Exception | None = None
         self.attach_poll_result: int | None = None
+        self.exec_error: Exception | None = None
         self.stdout_error: Exception | None = None
         self.stderr_error: Exception | None = None
         self.wait_error: Exception | None = None
         # How the fake splits exec output when the bounded reader iterates it; None yields the
         # whole output as one chunk. A test bounding output sets a small size to force drops.
         self.output_chunk_size: int | None = None
+        # Explicit, possibly non-uniform chunk sequence; overrides `output_chunk_size`.
+        self.output_chunks: list[bytes] | None = None
         self.module = self._build_module()
 
     @property
@@ -319,13 +334,19 @@ class FakeModal:
         return FakeSandboxTerminatedError
 
     @property
+    def sandbox_timeout_type(self) -> type[Exception]:
+        """Modal `SandboxTimeoutError`: the sandbox expired at its `sandbox_timeout` -- terminal."""
+        return FakeSandboxTimeoutError
+
+    @property
     def file_not_found_type(self) -> type[Exception]:
         """A missing *file* (Modal `SandboxFilesystemNotFoundError`) -- recoverable, retried."""
         return FakeSandboxFilesystemNotFoundError
 
     @property
-    def path_already_exists_type(self) -> type[Exception]:
-        return FakeSandboxFilesystemPathAlreadyExistsError
+    def conflict_type(self) -> type[Exception]:
+        """Modal `ConflictError`: ambiguous (dead sandbox on first exec, or a transient abort)."""
+        return FakeConflictError
 
     def _build_module(self) -> types.ModuleType:
         control = self
@@ -333,16 +354,29 @@ class FakeModal:
 
         def app_lookup(name: str, *, create_if_missing: bool = False) -> object:
             control.app_lookups.append({'name': name, 'create_if_missing': create_if_missing})
-            return object()
+            app = object()
+            control.apps.append(app)
+            return app
 
-        def image_from_registry(tag: str, **kwargs: object) -> object:
+        def image_from_registry(tag: str) -> object:
+            # Closed signature on purpose, like `sandbox_create` below: signature drift in
+            # the session should fail here, not only in production.
             control.image_tags.append(tag)
             return object()
 
-        def sandbox_create(*args: object, **kwargs: object) -> FakeSandbox:
+        def sandbox_create(
+            *,
+            app: object,
+            image: object,
+            timeout: int | None = None,
+            workdir: str | None = None,
+            env: dict[str, str | None] | None = None,
+        ) -> FakeSandbox:
             if control.create_error is not None:
                 raise control.create_error
-            control.create_kwargs.append(kwargs)
+            control.create_kwargs.append(
+                {'app': app, 'image': image, 'timeout': timeout, 'workdir': workdir, 'env': env}
+            )
             sandbox = FakeSandbox(control, 'sb-owned')
             control.sandboxes.append(sandbox)
             return sandbox
@@ -373,10 +407,10 @@ class FakeModal:
             Error=FakeModalError,
             NotFoundError=FakeNotFoundError,
             AuthError=FakeAuthError,
+            ConflictError=FakeConflictError,
             SandboxTerminatedError=FakeSandboxTerminatedError,
             SandboxTimeoutError=FakeSandboxTimeoutError,
             SandboxFilesystemError=FakeSandboxFilesystemError,
             SandboxFilesystemNotFoundError=FakeSandboxFilesystemNotFoundError,
-            SandboxFilesystemPathAlreadyExistsError=FakeSandboxFilesystemPathAlreadyExistsError,
         )
         return module

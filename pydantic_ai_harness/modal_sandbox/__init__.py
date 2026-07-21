@@ -8,6 +8,7 @@ toolset remains an implementation detail of the capability.
 
 from pydantic_ai_harness.modal_sandbox._capability import ModalSandbox
 from pydantic_ai_harness.modal_sandbox._session import (
+    ModalSandboxAuthError,
     ModalSandboxError,
     ModalSandboxExecResult,
     ModalSandboxSession,
@@ -17,6 +18,7 @@ from pydantic_ai_harness.modal_sandbox._session import (
 
 __all__ = [
     'ModalSandbox',
+    'ModalSandboxAuthError',
     'ModalSandboxError',
     'ModalSandboxExecResult',
     'ModalSandboxSession',

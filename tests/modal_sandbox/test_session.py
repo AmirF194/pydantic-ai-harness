@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import builtins
 import sys
+import time
 
 import anyio
 import pytest
@@ -62,13 +63,15 @@ class TestOwnedLifecycle:
     async def test_exit_without_enter_is_safe(self) -> None:
         await ModalSandboxSession().__aexit__(None, None, None)
 
-    async def test_detaches_even_when_terminate_fails(self, fake_modal: FakeModal) -> None:
+    async def test_terminate_failure_does_not_raise_and_still_detaches(self, fake_modal: FakeModal) -> None:
+        # Termination is best-effort: a teardown failure must not replace the exception
+        # unwinding through the `async with` body (raising from `__aexit__` would mask it),
+        # and the server-side sandbox_timeout reaps the sandbox regardless. The client is
+        # still detached so the attachment is not leaked.
         session = ModalSandboxSession()
         await session.__aenter__()
         fake_modal.sandboxes[0].terminate_error = RuntimeError('terminate boom')
-        with pytest.raises(RuntimeError, match='terminate boom'):
-            await session.__aexit__(None, None, None)
-        # The client is detached even though terminate raised, so the attachment is not leaked.
+        await session.__aexit__(None, None, None)
         assert fake_modal.sandboxes[0].detached is True
 
     async def test_terminating_an_already_gone_sandbox_is_not_an_error(self, fake_modal: FakeModal) -> None:
@@ -86,6 +89,9 @@ class TestOwnedLifecycle:
     ) -> None:
         # If Modal's control plane stalls, terminate must not hang the caller forever: the
         # shielded teardown gives each RPC a deadline, and detach still runs after it fires.
+        # (Dotted-path setattr on the private deadline is a knowing exception to the
+        # no-private-imports rule; there is no public seam for it and the hang test is
+        # worth the coupling.)
         monkeypatch.setattr('pydantic_ai_harness.modal_sandbox._session._TEARDOWN_TIMEOUT', 0.05)
         session = ModalSandboxSession()
         await session.__aenter__()
@@ -93,6 +99,27 @@ class TestOwnedLifecycle:
         with anyio.fail_after(5):
             await session.__aexit__(None, None, None)
         assert fake_modal.sandboxes[0].detached is True
+
+    async def test_teardown_bounded_when_detach_hangs(
+        self, fake_modal: FakeModal, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Teardown runs shielded, so a hanging detach would be uncancellable; its own
+        # deadline is the only bound between a wedged control plane and a hung process.
+        monkeypatch.setattr('pydantic_ai_harness.modal_sandbox._session._TEARDOWN_TIMEOUT', 0.05)
+        session = ModalSandboxSession()
+        await session.__aenter__()
+        fake_modal.sandboxes[0].detach = _HangingCall()
+        with anyio.fail_after(5):
+            await session.__aexit__(None, None, None)
+        assert fake_modal.sandboxes[0].terminated is True
+
+    async def test_entering_an_open_session_raises(self, fake_modal: FakeModal) -> None:
+        # A second enter would overwrite the handle and orphan the first owned sandbox
+        # (billed until sandbox_timeout) with no error.
+        async with ModalSandboxSession() as session:
+            with pytest.raises(ModalSandboxError, match='already open'):
+                await session.__aenter__()
+        assert len(fake_modal.sandboxes) == 1
 
     async def test_cancel_during_enter_terminates_created_sandbox(self, fake_modal: FakeModal) -> None:
         # A run cancelled while the sandbox is being created must not orphan it: creation is
@@ -117,6 +144,16 @@ class TestAttachLifecycle:
         # An attached sandbox keeps running (no terminate) but the client is detached.
         assert fake_modal.sandboxes[0].terminated is False
         assert fake_modal.sandboxes[0].detached is True
+
+    async def test_unavailable_message_names_the_attached_sandbox(self, fake_modal: FakeModal) -> None:
+        # Attach mode cannot know the real lifetime, so the message must not quote this
+        # session's pinned sandbox_timeout or advise raising it (attach mode rejects that).
+        async with ModalSandboxSession(sandbox_id='sb-existing') as session:
+            fake_modal.sandboxes[0].fs_error = fake_modal.unavailable_type('gone')
+            fake_modal.sandboxes[0].poll_result = 0
+            with pytest.raises(ModalSandboxUnavailableError, match="attached Modal sandbox 'sb-existing'") as exc:
+                await session.read_bytes('/x')
+            assert 'sandbox_timeout' not in str(exc.value)
 
     async def test_attach_to_terminated_sandbox_fails_at_enter(self, fake_modal: FakeModal) -> None:
         fake_modal.attach_poll_result = 0
@@ -280,6 +317,43 @@ class TestExec:
             assert result.returncode == -1
             assert result.timed_out is False
 
+    async def test_server_side_deadline_kill_reports_timed_out(self, fake_modal: FakeModal) -> None:
+        # The server enforces the deadline before the client's own clock fires, so its
+        # SIGKILL (exit 137) can beat Modal's -1 sentinel; a 137 exit that consumed the
+        # whole deadline window is a timeout, not a mysterious ordinary exit.
+        def slow_kill(argv: list[str], timeout: int | None) -> tuple[str, str, int]:
+            time.sleep(1.05)  # exceed the 1s deadline; the fake responder runs inline
+            return ('', '', 137)
+
+        fake_modal.responder = slow_kill
+        async with ModalSandboxSession() as session:
+            result = await session.exec(['sleep', '99'], timeout=1)
+        assert result.returncode == 137
+        assert result.timed_out is True
+
+    async def test_early_sigkill_is_not_a_timeout(self, fake_modal: FakeModal) -> None:
+        # A command that dies by SIGKILL well before the deadline is a real exit.
+        fake_modal.responder = lambda argv, timeout: ('', '', 137)
+        async with ModalSandboxSession() as session:
+            result = await session.exec(['kill-self'], timeout=15)
+        assert result.timed_out is False
+
+    async def test_string_argv_rejected(self, fake_modal: FakeModal) -> None:
+        # A str is a Sequence[str] of characters; 'ls -la' would splat into one-character
+        # arguments, so the mistake is caught up front.
+        async with ModalSandboxSession() as session:
+            with pytest.raises(TypeError, match='argv must be a sequence of arguments'):
+                await session.exec('ls -la')
+
+    async def test_non_modal_stream_error_becomes_sandbox_error(self, fake_modal: FakeModal) -> None:
+        # Transport failures during stream iteration are not modal.exception.Error; they
+        # must still surface as a typed, recoverable sandbox error.
+        fake_modal.stdout_error = ValueError('Received empty message')
+        async with ModalSandboxSession() as session:
+            with pytest.raises(ModalSandboxError, match='ValueError: Received empty message') as exc:
+                await session.exec(['x'], timeout=5)
+            assert not isinstance(exc.value, ModalSandboxTerminalError)
+
     async def test_bounded_output_keeps_the_tail(self, fake_modal: FakeModal) -> None:
         # A flood of output must not balloon client memory: with a cap only the last bytes are
         # retained. One-char chunks make the drop loop run per character.
@@ -297,6 +371,25 @@ class TestExec:
             result = await session.exec(['big'], timeout=5, max_output_bytes=4)
         assert result.stdout == '6789'
         assert result.stderr == 'GHIJ'
+
+    async def test_bounded_output_with_large_then_small_chunks(self, fake_modal: FakeModal) -> None:
+        # Real transport chunks are arbitrary sizes. After an oversized chunk replaces the
+        # retained tail, later smaller chunks must keep appending to it.
+        fake_modal.output_chunks = [b'0123456789', b'AB']
+        async with ModalSandboxSession() as session:
+            result = await session.exec(['big'], timeout=5, max_output_bytes=4)
+        assert result.stdout == '89AB'
+
+    async def test_result_reports_stream_truncation(self, fake_modal: FakeModal) -> None:
+        # The caller needs to know bytes were dropped even when the retained tail fits its
+        # own presentation caps, so the cut is carried on the result per stream.
+        fake_modal.output_chunk_size = 1
+        fake_modal.responder = lambda argv, timeout: ('0123456789', 'AB', 0)
+        async with ModalSandboxSession() as session:
+            result = await session.exec(['big'], timeout=5, max_output_bytes=4)
+        assert result.stdout_truncated is True
+        assert result.stderr == 'AB'
+        assert result.stderr_truncated is False
 
     async def test_bounded_output_under_cap_is_whole(self, fake_modal: FakeModal) -> None:
         fake_modal.output_chunk_size = 1
@@ -357,24 +450,15 @@ class TestExec:
 
 class TestFilesystem:
     async def test_write_then_read_round_trips(self, fake_modal: FakeModal) -> None:
+        # Modal's `write_bytes` creates missing parent directories itself, so a nested
+        # path needs no separate mkdir round trip.
         async with ModalSandboxSession() as session:
             await session.write_bytes('/work/app/main.py', b'print(1)\n')
             assert await session.read_bytes('/work/app/main.py') == b'print(1)\n'
-        sandbox = fake_modal.sandboxes[0]
-        # Parent directories are created before the write.
-        assert sandbox.made_dirs == ['/work/app']
 
-    async def test_existing_parent_directory_is_write_success(self, fake_modal: FakeModal) -> None:
-        async with ModalSandboxSession() as session:
-            fake_modal.sandboxes[0].make_directory_error = fake_modal.path_already_exists_type('already exists')
-            await session.write_bytes('/work/app/main.py', b'print(1)\n')
-            assert await session.read_bytes('/work/app/main.py') == b'print(1)\n'
-
-    async def test_write_at_root_skips_make_directory(self, fake_modal: FakeModal) -> None:
+    async def test_write_at_root(self, fake_modal: FakeModal) -> None:
         async with ModalSandboxSession() as session:
             await session.write_bytes('/file.txt', b'data')
-        # The parent is the filesystem root, so no directory is created.
-        assert fake_modal.sandboxes[0].made_dirs == []
         assert '/file.txt' in fake_modal.sandboxes[0].files
 
     async def test_list_files_normalizes_to_name_is_dir(self, fake_modal: FakeModal) -> None:
@@ -475,9 +559,7 @@ class TestPathResolution:
         fake_modal.responder = lambda argv, timeout: ('/work\n', '', 0)
         async with ModalSandboxSession() as session:
             await session.write_bytes('pkg/main.py', b'x')
-        sandbox = fake_modal.sandboxes[0]
-        assert '/work/pkg/main.py' in sandbox.files
-        assert sandbox.made_dirs == ['/work/pkg']
+        assert '/work/pkg/main.py' in fake_modal.sandboxes[0].files
 
     async def test_absolute_path_skips_pwd(self, fake_modal: FakeModal) -> None:
         async with ModalSandboxSession() as session:
@@ -508,14 +590,12 @@ class TestPathResolution:
         async with ModalSandboxSession() as session:
             await session.write_bytes('/work/../data/f.txt', b'x')
         assert '/work/../data/f.txt' in fake_modal.sandboxes[0].files
-        assert fake_modal.sandboxes[0].made_dirs == ['/work/../data']
 
-    async def test_double_slash_absolute_parent_skips_make_directory(self, fake_modal: FakeModal) -> None:
-        # POSIX normpath preserves a leading '//', so its parent is '//' (still root). The
-        # guard must skip make_directory for it rather than try to create a root alias.
+    async def test_double_slash_absolute_path_passed_through(self, fake_modal: FakeModal) -> None:
+        # POSIX treats a leading '//' as a distinct root spelling; the path reaches Modal
+        # unnormalized.
         async with ModalSandboxSession() as session:
             await session.write_bytes('//file.txt', b'x')
-        assert fake_modal.sandboxes[0].made_dirs == []
         assert '//file.txt' in fake_modal.sandboxes[0].files
 
     async def test_failed_pwd_probe_not_cached(self, fake_modal: FakeModal) -> None:

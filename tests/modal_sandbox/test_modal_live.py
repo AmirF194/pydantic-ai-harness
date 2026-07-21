@@ -119,10 +119,11 @@ class TestRealExecution:
         result = await session.exec(['sh', '-c', 'echo STDERR-DIAGNOSTIC 1>&2; sleep 30'], timeout=2)
 
         assert 'STDERR-DIAGNOSTIC' in result.stderr
-        # Modal currently reports this deadline kill as 137 rather than its -1 timeout
-        # sentinel. The integration promises to preserve the diagnostic, not normalize
-        # provider exit codes that are indistinguishable from a process killing itself.
+        # Modal reports this deadline kill either as its client-side -1 sentinel or, when
+        # the server's SIGKILL wins the race, as a plain 137 exit. The session recognizes
+        # both (137 counts once the command consumed its whole deadline window).
         assert result.returncode != 0
+        assert result.timed_out is True
 
     async def test_large_stderr_does_not_block_stdout(self, session: ModalSandboxSession) -> None:
         """Validates the fake-encoded assumption that Modal buffers streams without stderr deadlock."""
@@ -223,6 +224,16 @@ class TestRealFilesystem:
             await session.read_bytes(f'/tmp/{_unique("missing")}')
 
         assert not isinstance(exc_info.value, ModalSandboxTerminalError)
+
+    async def test_list_files_reports_basenames_and_dir_flags(self, session: ModalSandboxSession) -> None:
+        """Validates the fake-encoded assumption that Modal lists entries by basename with a real dir flag."""
+        root = f'/tmp/{_unique("ls")}'
+        await session.write_bytes(f'{root}/file.txt', b'x')
+        await session.write_bytes(f'{root}/sub/nested.txt', b'y')
+
+        entries = await session.list_files(root)
+
+        assert sorted(entries) == [('file.txt', False), ('sub', True)]
 
     async def test_workdir_and_relative_file_resolution_share_one_view(self) -> None:
         """Validates the fake-encoded assumption that relative file API paths share the process cwd view.
