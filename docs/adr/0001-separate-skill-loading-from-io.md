@@ -1,0 +1,3 @@
+# Separate skill loading from I/O
+
+The Skills capability discovers Agent Skills and reveals their instructions and filesystem location through Pydantic AI's deferred-capability mechanism. It does not provide file-reading or script-execution tools: applications grant those permissions explicitly by composing Skills with filesystem, shell, or execution-environment capabilities. A resource-bearing skill validates that a compatible reader is available when the skill is activated; script execution remains optional and is described accurately to the model. This avoids making skill discovery an implicit code-execution boundary and reuses the existing I/O controls in Harness.
