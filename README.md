@@ -15,7 +15,7 @@ Pydantic AI's [capabilities](https://ai.pydantic.dev/capabilities/) and [hooks](
 
 The [capability matrix](#capability-matrix) tracks where we are. [Tell us what to prioritize.](#help-us-prioritize)
 
-**Contents:** [Installation](#installation) · [Quick start](#quick-start) · [DynamicWorkflow](#orchestrating-sub-agents-dynamicworkflow) · [Capability matrix](#capability-matrix) · [An ecosystem agent](#an-ecosystem-agent) · [Help us prioritize](#help-us-prioritize) · [Build your own](#build-your-own) · [Contributing](#contributing) · [Version policy](#version-policy) · [Pydantic AI references](#pydantic-ai-references) · [License](#license)
+**Contents:** [Installation](#installation) · [Quick start](#quick-start) · [Examples](#examples) · [DynamicWorkflow](#orchestrating-sub-agents-dynamicworkflow) · [Capability matrix](#capability-matrix) · [An ecosystem agent](#an-ecosystem-agent) · [Help us prioritize](#help-us-prioritize) · [Build your own](#build-your-own) · [Contributing](#contributing) · [Version policy](#version-policy) · [Pydantic AI references](#pydantic-ai-references) · [License](#license)
 
 ## Installation
 
@@ -98,6 +98,13 @@ practices and warning of a "normalization of deviance" as engineers stop reviewi
 [![Logfire trace from the Quick start run](docs/images/quick-start-trace.png)](https://logfire-us.pydantic.dev/public-trace/84bcf123-2106-49da-9f6f-5c26395339bb?spanId=7650806a0785b946)
 
 **[See this run as a public Logfire trace ->](https://logfire-us.pydantic.dev/public-trace/84bcf123-2106-49da-9f6f-5c26395339bb?spanId=7650806a0785b946)** Each `run_code` span fans out into the tool calls the model issued from inside the sandbox -- it's the easiest way to understand what code mode actually did.
+
+## Examples
+
+The [`examples/`](examples/) directory contains six complete agents -- a coding agent, a code
+review agent, a repo knowledge-map builder, a research agent, a data analyst, and a support
+triage bot -- each a single runnable file composing the capabilities below into something you
+can use as-is or fork. Start with [`examples/README.md`](examples/README.md).
 
 ## Orchestrating sub-agents: DynamicWorkflow
 

@@ -3,6 +3,7 @@
     "label": "Pydantic AI Harness",
     "items": [
       { "label": "Overview", "slug": "index" },
+      { "label": "Examples", "slug": "examples" },
       { "label": "Code Mode", "slug": "code-mode" },
       { "label": "FileSystem", "slug": "filesystem" },
       { "label": "Shell", "slug": "shell" },

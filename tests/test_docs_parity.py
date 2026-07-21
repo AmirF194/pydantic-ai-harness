@@ -87,7 +87,7 @@ def test_capability_linked_from_top_readme(package: Path) -> None:
 # ACP is the one page that stays experimental.
 
 _DOCS_DIR = _ROOT / 'docs'
-_NON_CAPABILITY_PAGES = {'index.md', 'mutation-testing.md'}
+_NON_CAPABILITY_PAGES = {'index.md', 'mutation-testing.md', 'examples.md'}
 _ACP_PAGE = 'acp.md'
 
 _SOURCE_LINK = 'github.com/pydantic/pydantic-ai-harness/tree/main/pydantic_ai_harness/'
