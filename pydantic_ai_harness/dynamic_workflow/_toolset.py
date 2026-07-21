@@ -29,7 +29,14 @@ from pydantic_core import to_jsonable_python
 from typing_extensions import Self, TypedDict
 
 try:
-    from pydantic_monty import Monty, MontyRuntimeError, MontySyntaxError, MontyTypingError, ResourceLimits
+    from pydantic_monty import (
+        Monty,
+        MontyCrashedError,
+        MontyRuntimeError,
+        MontySyntaxError,
+        MontyTypingError,
+        ResourceLimits,
+    )
 except ImportError as _import_error:  # pragma: no cover
     raise ImportError(
         'pydantic-monty is required for DynamicWorkflow. '
@@ -670,9 +677,6 @@ class DynamicWorkflowToolset(AbstractToolset[AgentDepsT]):
 
         limits = _resolve_resource_limits(self.resource_limits)
         capture = PrintCapture()
-        # Type-check the script against the sub-agent stubs as part of `feed_start`: a type error
-        # surfaces as `MontyTypingError` before any sub-agent runs, so it costs a retry but no
-        # sub-agent budget.
         type_check_stubs = self._build_type_check_stubs()
         in_workflow_token = _in_workflow.set(True)
         try:
@@ -690,10 +694,10 @@ class DynamicWorkflowToolset(AbstractToolset[AgentDepsT]):
             raise ModelRetry(f'Syntax error in workflow:\n{capture.prepend_to(e.display())}') from e
         except MontyRuntimeError as e:
             if budget_exhausted:
-                # On this capability's deferred-future path, host-raised exceptions cannot be
-                # caught inside the sandbox (Monty's inline resume path can catch them). The
-                # flag proves this script hit the budget; under gather, the displayed error may
-                # be another independently surfaced failure from the same batch.
+                # The script may catch the budget error and fail later on something else, so
+                # the flag -- not the displayed error -- proves this script hit the budget;
+                # under gather, the displayed error may also be an independently surfaced
+                # failure from the same batch.
                 return _budget_terminal_result(
                     max_agent_calls=self.max_agent_calls,
                     last_error=capture.prepend_to(e.display()),
@@ -703,8 +707,16 @@ class DynamicWorkflowToolset(AbstractToolset[AgentDepsT]):
                 f'Runtime error in workflow:\n{capture.prepend_to(e.display())}'
                 f'{_completed_retry_section(completed_dispatches)}'
             ) from e
+        except MontyCrashedError as e:
+            # The worker died mid-script (e.g. resource exhaustion or request timeout);
+            # the pool replaces it transparently. Completed sub-agent results are listed
+            # so the retry can reuse them as plain values.
+            raise ModelRetry(
+                'The workflow script crashed the sandbox worker. Revise the script and try again.'
+                f'{_completed_retry_section(completed_dispatches)}'
+            ) from e
         except BaseException as e:
-            # Convert a model-provokable sandbox panic to a retry (see `is_sandbox_panic`);
+            # Convert a sandbox panic to a retry (see `is_sandbox_panic`);
             # anything else (CancelledError, ...) re-raises unchanged.
             if not is_sandbox_panic(e):
                 raise

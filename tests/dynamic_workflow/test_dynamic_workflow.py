@@ -965,6 +965,24 @@ async def test_completed_sub_agent_results_are_truncated_and_capped() -> None:
     assert ' ... [truncated]' in msg
 
 
+async def test_worker_crash_becomes_model_retry(monkeypatch: pytest.MonkeyPatch) -> None:
+    # A worker death (`MontyCrashedError`) must surface as a retry carrying the completed
+    # sub-agent results, not tear down the agent run. A tiny `request_timeout` plus an
+    # infinite loop crashes the worker for real; `MontyCrashedError` cannot be constructed
+    # or subclassed from Python, so injection is not an option.
+    import functools
+
+    from pydantic_monty import Monty
+
+    monkeypatch.setattr(
+        'pydantic_ai_harness.dynamic_workflow._toolset.Monty', functools.partial(Monty, request_timeout=0.5)
+    )
+    ts = DynamicWorkflowToolset[object](agents=[_wf_agent()])
+    with pytest.raises(ModelRetry, match='crashed the sandbox worker') as exc_info:
+        await _run_script(ts, "await sub(task='x')\nwhile True:\n    pass")
+    assert 'sub(task="x") -> "ok"' in str(exc_info.value)
+
+
 async def test_sandbox_panic_is_retryable(monkeypatch: pytest.MonkeyPatch) -> None:
     # A Rust-side sandbox panic (pyo3 PanicException) must surface as a retry that carries the
     # already-completed sub-agent results, not tear down the whole agent run. It is injected via

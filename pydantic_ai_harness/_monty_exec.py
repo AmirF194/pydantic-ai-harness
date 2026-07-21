@@ -8,7 +8,7 @@ Two capabilities build on this:
 - `code_mode`: the dispatch callback runs the agent's own tools.
 - `dynamic_workflow`: the dispatch callback runs sub-agents.
 
-The synchronous snapshot API (rather than `feed_run_async`) is used deliberately:
+The synchronous snapshot API (rather than `AsyncMonty`) is used deliberately:
 it avoids background threads and `call_soon_threadsafe`, so the loop is safe inside
 restricted event loops such as Temporal's workflow sandbox.
 """
@@ -51,8 +51,8 @@ def is_sandbox_panic(exc: BaseException) -> bool:
 
     pyo3 raises `pyo3_runtime.PanicException`, a `BaseException` (not `Exception`) subclass
     from a module that cannot be imported, so it is matched by name. A panic can surface from
-    inside the sandbox (e.g. a Rust-side memory error), so callers should convert it to a retry
-    rather than let it tear down the whole agent run.
+    monty's host-side bindings, so callers should convert it to a retry rather than let it
+    tear down the whole agent run.
     """
     return type(exc).__name__ == 'PanicException'
 

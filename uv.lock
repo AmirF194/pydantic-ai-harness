@@ -16,7 +16,7 @@ pydantic-ai = false
 pydantic-evals = false
 
 [manifest]
-constraints = [{ name = "pydantic-monty-runtime", specifier = ">=0.0.19b4" }]
+constraints = [{ name = "pydantic-monty-runtime", specifier = ">=0.0.19b5" }]
 
 [[package]]
 name = "agent-client-protocol"

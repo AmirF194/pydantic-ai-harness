@@ -103,7 +103,7 @@ exclude-newer-package = { pydantic-ai = false, pydantic-ai-slim = false, pydanti
 # monty pins its runtime exactly, but uv only honors pre-release specifiers on
 # direct requirements/constraints, so opt the runtime into pre-release
 # resolution here. Drop once monty ships a stable release.
-constraint-dependencies = ['pydantic-monty-runtime>=0.0.19b4']
+constraint-dependencies = ['pydantic-monty-runtime>=0.0.19b5']
 
 
 [tool.hatch.build.targets.wheel]

@@ -219,8 +219,8 @@ The script runs in Monty, a subset of Python. Knowing the edges matters:
 
 Before a script runs it is statically type-checked against the sub-agent signatures. A misspelled function, a positional `task`, or a wrong-typed argument costs one retry, but no sub-agent budget and no sandbox execution.
 
-!!! warning "Errors abort the whole script"
-    A sub-agent that raises cannot be caught inside the script -- one failure aborts the whole script and the model retries it. Write scripts where sub-agents do not depend on catching each other's errors. If a script fails after some sub-agents already finished, the retry prompt lists those completed results, so the model can reuse them as plain values instead of paying for the same calls again.
+!!! warning "An uncaught error aborts the whole script"
+    A sub-agent that raises propagates as a normal exception. The script can catch it with `try`/`except`; an uncaught failure aborts the whole script and the model retries it. If a script fails after some sub-agents already finished, the retry prompt lists those completed results, so the model can reuse them as plain values instead of paying for the same calls again.
 
 ## Observability
 

@@ -8,6 +8,7 @@ loaded by the project (no extra dev dependency needed).
 
 from __future__ import annotations
 
+import functools
 from pathlib import Path
 from typing import Any, TypeVar
 
@@ -27,7 +28,7 @@ from pydantic_ai.toolsets.abstract import ToolsetTool
 from pydantic_ai.toolsets.function import FunctionToolset
 from pydantic_ai.usage import RunUsage
 from pydantic_core import SchemaValidator, core_schema
-from pydantic_monty import NOT_HANDLED, MountDir, OSAccess, OsFunction
+from pydantic_monty import NOT_HANDLED, Monty, MountDir, OSAccess, OsFunction
 from typing_extensions import TypedDict
 
 from pydantic_ai_harness import CodeMode
@@ -365,6 +366,21 @@ class TestCodeMode:
         second = await wrapper.call_tool('run_code', {'code': 'print(x * 10)'}, ctx, run_code)
         assert second.return_value == {'output': '30\n'}
 
+    async def test_repl_state_survives_runtime_error(self) -> None:
+        """Assignments made before a failing line survive into the retry (REPL-style)."""
+        wrapper = CodeMode[object]().get_wrapper_toolset(_build_function_toolset(add))
+        assert isinstance(wrapper, CodeModeToolset)
+        ctx = await build_ctx(None, wrapper)
+        tools = await wrapper.get_tools(ctx)
+        run_code = tools['run_code']
+
+        await wrapper.call_tool('run_code', {'code': 'x = await add(a=20, b=21)'}, ctx, run_code)
+        with pytest.raises(ModelRetry, match='Runtime error'):
+            await wrapper.call_tool('run_code', {'code': "y = x + 1\nraise ValueError('boom')"}, ctx, run_code)
+        # `x` from the first call and `y` assigned before the raise both survive.
+        result = await wrapper.call_tool('run_code', {'code': 'y'}, ctx, run_code)
+        assert result.return_value == 42
+
     async def test_run_code_restart_resets_repl_state(self) -> None:
         """Passing `restart=True` clears any previously-set names in the sandbox."""
         wrapper = CodeMode[object]().get_wrapper_toolset(_build_function_toolset(add))
@@ -399,7 +415,7 @@ class TestCodeMode:
         run_code = tools['run_code']
         # Fresh REPL: the type checker parses the snippet first, so a syntax
         # error surfaces through it as a `Type error in code` retry.
-        with pytest.raises(ModelRetry, match=r'error in code'):
+        with pytest.raises(ModelRetry, match=r'Type error in code'):
             await wrapper.call_tool('run_code', {'code': 'def ('}, ctx, run_code)
 
         # Non-fresh REPL: type checking is skipped, so feed_start raises
@@ -416,7 +432,7 @@ class TestCodeMode:
         """A `MontyTypingError` from static type checking is translated into `ModelRetry`.
 
         On a fresh REPL (first call or after restart), the code is type-checked
-        before execution using Monty's stateless type checker.
+        at `feed_start` against the tool stubs before execution.
         """
         wrapper = CodeMode[object]().get_wrapper_toolset(_build_function_toolset(add))
         assert isinstance(wrapper, CodeModeToolset)
@@ -1709,6 +1725,30 @@ class TestCodeMode:
         with pytest.raises(_Boom):
             await wrapper.call_tool('run_code', {'code': 'await add(a=1, b=2)'}, ctx, tools['run_code'])
 
+    async def test_worker_crash_becomes_model_retry_and_resets_state(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A `MontyCrashedError` (worker death) becomes a retry with the session reset.
+
+        A tiny `request_timeout` plus an infinite loop kills the worker for real, so the
+        crash surfaces from the live execution path rather than an injected stub.
+        `MontyCrashedError` cannot be constructed or subclassed from Python.
+        """
+        monkeypatch.setattr(
+            'pydantic_ai_harness.code_mode._toolset.Monty', functools.partial(Monty, request_timeout=0.5)
+        )
+        wrapper = CodeMode[None]().get_wrapper_toolset(_build_function_toolset(add))
+        assert isinstance(wrapper, CodeModeToolset)
+        ctx = await build_ctx(None, wrapper)
+        tools = await wrapper.get_tools(ctx)
+        run_code = tools['run_code']
+
+        await wrapper.call_tool('run_code', {'code': 'x = 1'}, ctx, run_code)
+        with pytest.raises(ModelRetry, match='crashed the sandbox worker'):
+            await wrapper.call_tool('run_code', {'code': 'while True:\n    pass'}, ctx, run_code)
+        # The reset is observable: the next call is a fresh REPL, so the type checker
+        # rejects the name assigned before the crash.
+        with pytest.raises(ModelRetry, match='Type error in code'):
+            await wrapper.call_tool('run_code', {'code': 'x'}, ctx, run_code)
+
     # ---------------------------------------------------------------------------
     # Sequential tool resolution
     # ---------------------------------------------------------------------------
@@ -2592,8 +2632,8 @@ class TestCodeModeOSAccess:
         assert 'Host-backed OS access' in description
 
     async def test_os_callback_dispatches_inside_run_code(self) -> None:
-        """An `os` callback is threaded through `feed_start` and every `resume`, so OS calls
-        keep dispatching even after a tool call suspends and resumes the sandbox."""
+        """The `os` captured at `feed_start` answers OS-call snapshots via `resume_auto()`,
+        so OS calls still dispatch after a tool-call suspend/resume round-trip."""
 
         def os_cb(fn: OsFunction, args: tuple[Any, ...], kwargs: dict[str, Any]) -> Any:
             if fn == 'os.getenv':
@@ -2605,7 +2645,7 @@ class TestCodeModeOSAccess:
         ctx = await build_ctx(None, wrapper)
         tools = await wrapper.get_tools(ctx)
         # The tool call forces a FunctionSnapshot -> FutureSnapshot round-trip; the os.getenv
-        # afterwards only resolves if `os` survived those resumes.
+        # afterwards only resolves if the captured `os` is still consulted after them.
         code = "import os\nx = await add(a=2, b=3)\nhome = os.getenv('THING')\n{'sum': x, 'home': home}"
         result = await wrapper.call_tool('run_code', {'code': code}, ctx, tools['run_code'])
         assert result.return_value == {'sum': 5, 'home': 'envval'}

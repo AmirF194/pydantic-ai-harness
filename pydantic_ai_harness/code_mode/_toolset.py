@@ -36,6 +36,7 @@ try:
     from pydantic_monty import (
         AbstractOS,
         Monty,
+        MontyCrashedError,
         MontyRuntimeError,
         MontySyntaxError,
         MontyTypingError,
@@ -285,9 +286,9 @@ class CodeModeToolset(WrapperToolset[AgentDepsT]):
     """
 
     # init=False so `replace()` in `for_run` produces a fresh instance with `_repl_state=None`,
-    # giving each agent run isolated REPL state. A Monty session cannot outlive its worker pool's
-    # `with` block, so REPL state is carried between calls as the dumped bytes of the session
-    # (`session.dump()`), reloaded into a fresh session on the next call.
+    # giving each agent run isolated REPL state. Each call checks out its own session (from a
+    # per-call pool when the toolset was not entered), so REPL state is carried between calls
+    # as `session.dump()` bytes reloaded via `load_session` on the next call.
     _repl_state: bytes | None = field(default=None, init=False, repr=False)
 
     # The Monty worker pool, created in `__aenter__` and reused by every `run_code` call for
@@ -572,8 +573,8 @@ class CodeModeToolset(WrapperToolset[AgentDepsT]):
             # Serialize to JSON-compatible form so Monty receives only plain data.
             return _TOOL_RETURN_CONTENT_TA.dump_python(result)
 
-        # Type-check only the first snippet of a fresh REPL. Monty snapshots restore some checker
-        # context, but it can diverge from runtime state across snippets: imports are not available
+        # Type-check only the first snippet of a fresh REPL. Session dumps restore some checker
+        # state, but it can diverge from runtime state across snippets: imports are not available
         # to the next check, and incrementally constructed dictionaries can be rejected where the
         # runtime tool validator accepts them as TypedDict inputs. Keep runtime REPL state without
         # introducing those false positives on later calls.
@@ -587,19 +588,27 @@ class CodeModeToolset(WrapperToolset[AgentDepsT]):
                 with monty_pool.checkout(type_check=type_check, type_check_stubs=type_check_stubs) as session:
                     if self._repl_state is not None:
                         session.load_session(self._repl_state)
-                    monty_state = session.feed_start(
-                        code,
-                        print_callback=capture,
-                        os=self.os_access,
-                        mount=self.mount,
-                        skip_type_check=not type_check,
-                    )
-                    completed = await MontyExecutor(
-                        dispatch=dispatch_tool_call,
-                        valid_names=callable_defs,
-                        sequential_names=sequential_tools,
-                        global_sequential=global_sequential,
-                    ).run(monty_state)
+                    try:
+                        monty_state = session.feed_start(
+                            code,
+                            print_callback=capture,
+                            os=self.os_access,
+                            mount=self.mount,
+                            skip_type_check=not type_check,
+                        )
+                        completed = await MontyExecutor(
+                            dispatch=dispatch_tool_call,
+                            valid_names=callable_defs,
+                            sequential_names=sequential_tools,
+                            global_sequential=global_sequential,
+                        ).run(monty_state)
+                    except MontyRuntimeError:
+                        # A runtime error ends the feed with the session idle again, and
+                        # assignments made before the failing line survive in the worker.
+                        # Dump them so the retry keeps REPL state, as the tool description
+                        # promises.
+                        self._repl_state = session.dump()
+                        raise
                     self._repl_state = session.dump()
         except MontySyntaxError as e:
             raise ModelRetry(f'Syntax error in code:\n{capture.prepend_to(e.display())}') from e
@@ -616,8 +625,17 @@ class CodeModeToolset(WrapperToolset[AgentDepsT]):
             # (ModelRetry → MontyRuntimeError → ModelRetry), but the retry
             # semantics are the same -- the model gets another chance.
             raise ModelRetry(f'Runtime error:\n{capture.prepend_to(e.display())}') from e
+        except MontyCrashedError as e:
+            # The worker died mid-feed (e.g. the code exhausted its memory or hit the
+            # request timeout) and the REPL state died with it; the pool replaces the
+            # worker transparently. Reset so the retry starts from a fresh,
+            # type-checked session.
+            self._repl_state = None
+            raise ModelRetry(
+                'The code crashed the sandbox worker and the session was reset. Revise the code and try again.'
+            ) from e
         except BaseException as e:
-            # Convert a model-provokable sandbox panic to a retry (see `is_sandbox_panic`);
+            # Convert a sandbox panic to a retry (see `is_sandbox_panic`);
             # anything else (CancelledError, ...) re-raises unchanged.
             if not is_sandbox_panic(e):
                 raise
