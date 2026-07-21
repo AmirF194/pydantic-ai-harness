@@ -13,8 +13,8 @@ behind every capability choice is a comment next to it.
 | Example | What it does | Built with |
 |---|---|---|
 | `coding_agent.py` | Drives an interactive coding session in the current repo | `FileSystem`, `Shell`, `RepoContext`, `Planning`, `SlidingWindow`, `LimitWarner` |
-| `code_review_agent.py` | Reviews a git diff with specialist sub-reviewers and returns a typed report | `SubAgents` with `shared_capabilities`, read-only `FileSystem`, `Shell` |
-| `atlas.py` | Builds and maintains a knowledge map of a repo, refreshing only what changed | `FileSystem`, `Shell`, `Planning`, `SlidingWindow`, plus a no-op gate in plain code |
+| `code_review_agent.py` | Reviews a git diff with specialist sub-reviewers and returns a typed report | `SubAgents`, a `filtered` read-only `FileSystem` toolset, a read-only `git_history` tool |
+| `atlas.py` | Builds and maintains a knowledge map of a repo, refreshing only what changed | `FileSystem` toolsets split by scope (`filtered` read, `prefixed` write), `Planning`, `SlidingWindow`, a read-only `git_history` tool |
 | `research_agent.py` | Researches a question on the web and cites every claim | `CodeMode`, `WebSearch`, `OverflowingToolOutput` |
 | `data_analysis_agent.py` | Analyzes a dataset by computing in a sandbox instead of guessing numbers | `CodeMode` with a read-only dataset mount, `OverflowingToolOutput` |
 | `support_agent.py` | Triages support messages with guardrails and per-customer memory | `InputGuard`, `OutputGuard`, `Memory` with `FileStore` |

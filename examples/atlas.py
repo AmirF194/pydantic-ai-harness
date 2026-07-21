@@ -11,7 +11,8 @@ The design splits work between deterministic code and model judgment:
   state file recording the last-documented commit, exits without spending tokens
   when nothing changed, and assembles the git change evidence itself.
 - **The model decides *what the changes mean* for the map.** `Planning` structures
-  the survey; `FileSystem` and `Shell` ground every page in real files and history.
+  the survey; `FileSystem` and a read-only `git_history` tool ground every page
+  in real files and history.
 
 Build or refresh the map for the current repository:
 
@@ -23,10 +24,10 @@ import os
 import subprocess
 from pathlib import Path
 
-from pydantic_ai import Agent
+from pydantic_ai import Agent, ModelRetry
 from pydantic_ai.models import Model
 
-from pydantic_ai_harness import FileSystem, Shell
+from pydantic_ai_harness import FileSystem
 from pydantic_ai_harness.compaction import SlidingWindow
 from pydantic_ai_harness.planning import Planning
 
@@ -52,8 +53,8 @@ Structure:
 Accuracy:
 - Every statement must trace to something you actually opened: a source file,
   an existing doc, or git history. If you can't verify it, leave it out.
-- Use `git log` and `git blame` on load-bearing files to recover design
-  rationale, not just current shape.
+- Use the `git_history` tool (log, blame, show) on load-bearing files to
+  recover design rationale, not just current shape.
 
 Refresh runs (the prompt will include a summary of recent changes):
 - Read the current map first, decide which pages the changes invalidate, edit
@@ -61,27 +62,59 @@ Refresh runs (the prompt will include a summary of recent changes):
   wording that is still accurate.
 - A refresh that finds nothing to update is a success: report that and stop.
 
-Boundary: create and edit files under `atlas/` only -- never any other path.
+Tools: survey the repo with the read-only file tools and `git_history`. Write
+map pages with the `atlas_`-prefixed tools, whose paths are relative to
+`atlas/` itself -- write `overview.md`, not `atlas/overview.md`. Those are the
+only tools that write, and they can only reach the map.
 """
+
+
+# Inspection-only git subcommands. A whole-command allowlist ('git') would also
+# admit mutating subcommands like `git checkout` or `git apply`, quietly
+# bypassing the write boundary below.
+_GIT_READ_SUBCOMMANDS = frozenset({'log', 'show', 'blame', 'diff', 'status', 'shortlog', 'rev-parse'})
+
+# The filesystem tools that only read.
+_READ_TOOLS = frozenset({'read_file', 'list_directory', 'search_files', 'find_files', 'file_info'})
 
 
 def build_agent(model: Model | str = DEFAULT_MODEL, workspace: Path | None = None) -> Agent:
     """Build the atlas agent for `workspace` (defaults to the current directory)."""
     workspace = workspace or Path.cwd()
-    # Enforce the atlas/-only write boundary rather than relying on the
-    # instructions: every existing top-level entry except atlas/ is marked
-    # read-only, computed here because glob patterns can't express "everything
-    # but this directory".
-    read_only = [f'{p.name}/**' if p.is_dir() else p.name for p in workspace.iterdir() if p.name != 'atlas']
+    (workspace / 'atlas').mkdir(exist_ok=True)
+    # The write boundary holds by construction, not by instruction: surveying
+    # the repo uses a toolset filtered to the read-only tools, and the only
+    # write-capable toolset is rooted at atlas/ (its tools carry an atlas_
+    # prefix, with paths relative to that root).
+    survey = FileSystem(root_dir=workspace).get_toolset().filtered(lambda ctx, tool: tool.name in _READ_TOOLS)
+    map_edit = FileSystem(root_dir=workspace / 'atlas').get_toolset().prefixed('atlas')
+
+    def git_history(subcommand: str, args: list[str]) -> str:
+        """Run a read-only git inspection subcommand (log, show, blame, diff, status).
+
+        Args:
+            subcommand: One of log, show, blame, diff, status, shortlog, rev-parse.
+            args: Arguments after the subcommand, e.g. `['-L', '10,20:src/x.py']`.
+        """
+        if subcommand not in _GIT_READ_SUBCOMMANDS:
+            raise ModelRetry(f'git {subcommand!r} is not available; choose from {sorted(_GIT_READ_SUBCOMMANDS)}.')
+        if any(a.startswith('--output') for a in args):
+            raise ModelRetry('--output is not available; read the command output directly.')
+        result = subprocess.run(
+            ['git', '--no-pager', subcommand, *args], cwd=workspace, capture_output=True, text=True, timeout=30
+        )
+        if result.returncode != 0:
+            raise ModelRetry(f'git {subcommand} failed: {result.stderr.strip()[:500]}')
+        return result.stdout
+
     return Agent(
         model,
         capabilities=[
-            FileSystem(root_dir=workspace, protected_patterns=read_only),
-            # Git history explains *why* code exists; rg keeps discovery targeted.
-            Shell(cwd=workspace, denied_commands=[], allowed_commands=['git', 'rg', 'ls'], default_timeout=60.0),
             Planning(),
             SlidingWindow(max_tokens=150_000, keep_messages=40),
         ],
+        toolsets=[survey, map_edit],
+        tools=[git_history],
         instructions=INSTRUCTIONS,
     )
 

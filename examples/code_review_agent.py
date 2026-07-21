@@ -1,7 +1,7 @@
 """A code review agent that reviews a git diff with specialist sub-reviewers.
 
-A lead reviewer delegates to correctness and security specialists (all provably
-read-only) and synthesizes their reports into a validated `ReviewReport` -- a
+A lead reviewer delegates to correctness and security specialists (all confined
+to read-only tools) and synthesizes their reports into a validated `ReviewReport` -- a
 typed result that can go straight into CI annotations or a bot comment.
 
 Review the working tree against a base ref:
@@ -16,10 +16,10 @@ from pathlib import Path
 from typing import Literal
 
 from pydantic import BaseModel, Field
-from pydantic_ai import Agent
+from pydantic_ai import Agent, ModelRetry
 from pydantic_ai.models import Model
 
-from pydantic_ai_harness import FileSystem, Shell
+from pydantic_ai_harness import FileSystem
 from pydantic_ai_harness.subagents import SubAgent, SubAgents
 
 DEFAULT_MODEL = os.environ.get('PYDANTIC_AI_MODEL', 'anthropic:claude-opus-4-7')
@@ -45,9 +45,9 @@ class ReviewReport(BaseModel):
 LEAD_INSTRUCTIONS = """\
 You are the lead reviewer for a code change.
 
-1. Get the diff (`git diff <base>...` or as instructed) and read enough surrounding
-   code to understand each change in context. Judge the diff, not the whole repo.
-   The shell allows only `git` and `rg`; use the filesystem tools to read files.
+1. Get the diff (`git_history` with `diff`) and read enough surrounding code to
+   understand each change in context. Judge the diff, not the whole repo. Use
+   the filesystem tools to read and search files.
 2. Delegate one pass to the `correctness` reviewer and one to the `security`
    reviewer, giving each the base ref and the list of changed files.
 3. Verify their findings against the code before including them: drop anything you
@@ -71,33 +71,60 @@ risk with file, line, and how it could be exploited. Do not comment on style.
 """
 
 
+# Inspection-only git subcommands: a whole-command allowlist would also admit
+# mutating subcommands (`git checkout`, `git apply`) that can rewrite the very
+# working tree under review.
+_GIT_READ_SUBCOMMANDS = frozenset({'diff', 'log', 'show', 'blame', 'status', 'rev-parse'})
+
+
+# The filesystem tools that only read. Filtering to these (rather than marking
+# paths read-only) removes the write tools from the reviewers entirely.
+_READ_TOOLS = frozenset({'read_file', 'list_directory', 'search_files', 'find_files', 'file_info'})
+
+
 def build_agent(model: Model | str = DEFAULT_MODEL, workspace: Path | None = None) -> Agent[None, ReviewReport]:
     """Build the review agent for `workspace` (defaults to the current directory)."""
     workspace = workspace or Path.cwd()
-    # Every path is readable, no path is writable: reviewers can't "fix" the code.
-    read_only_fs = FileSystem(root_dir=workspace, protected_patterns=['**'])
-    git_and_grep = Shell(cwd=workspace, denied_commands=[], allowed_commands=['git', 'rg'], default_timeout=60.0)
+    # Reviewers can't "fix" the code they review: the write tools don't exist.
+    read_only_files = FileSystem(root_dir=workspace).get_toolset().filtered(lambda ctx, tool: tool.name in _READ_TOOLS)
+
+    def git_history(subcommand: str, args: list[str]) -> str:
+        """Run a read-only git inspection subcommand (diff, log, show, blame, status).
+
+        Args:
+            subcommand: One of diff, log, show, blame, status, rev-parse.
+            args: Arguments after the subcommand, e.g. `['HEAD~1...', '--stat']`.
+        """
+        if subcommand not in _GIT_READ_SUBCOMMANDS:
+            raise ModelRetry(f'git {subcommand!r} is not available; choose from {sorted(_GIT_READ_SUBCOMMANDS)}.')
+        if any(a.startswith('--output') for a in args):
+            raise ModelRetry('--output is not available; read the command output directly.')
+        result = subprocess.run(
+            ['git', '--no-pager', subcommand, *args], cwd=workspace, capture_output=True, text=True, timeout=30
+        )
+        if result.returncode != 0:
+            raise ModelRetry(f'git {subcommand} failed: {result.stderr.strip()[:500]}')
+        return result.stdout
 
     def specialist(name: str, brief: str) -> SubAgent:
+        # Each specialist gets the same read-only file tools and git access as the lead.
         return SubAgent(
-            Agent(model, name=name, instructions=brief),
+            Agent(model, name=name, instructions=brief, toolsets=[read_only_files], tools=[git_history]),
             max_calls=1,
         )
 
     return Agent(
         model,
         capabilities=[
-            read_only_fs,
-            git_and_grep,
             SubAgents(
                 agents=[
                     specialist('correctness', CORRECTNESS_BRIEF),
                     specialist('security', SECURITY_BRIEF),
                 ],
-                # The specialists get the same read-only filesystem and shell as the lead.
-                shared_capabilities=[read_only_fs, git_and_grep],
             ),
         ],
+        toolsets=[read_only_files],
+        tools=[git_history],
         instructions=LEAD_INSTRUCTIONS,
         output_type=ReviewReport,
     )
@@ -107,7 +134,7 @@ def main() -> None:
     """Review the working tree against the base ref given on the command line."""
     base = sys.argv[1] if len(sys.argv) > 1 else 'HEAD~1'
     # Refuse anything that isn't a resolvable ref before it reaches the agent's
-    # prompt (and, through it, the shell's `git` invocations).
+    # prompt (and, through it, the git_history tool's invocations).
     check = subprocess.run(['git', 'rev-parse', '--verify', '--quiet', f'{base}^{{commit}}'], capture_output=True)
     if check.returncode != 0:
         raise SystemExit(f'{base!r} is not a resolvable git ref in this repository.')
