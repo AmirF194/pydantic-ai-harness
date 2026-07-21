@@ -37,7 +37,19 @@ A linked account is one authenticated connection to one provider.
 | `search_execute` | Two server-side meta-tools: search the catalog, execute an action by id | Any catalog size; constant prompt footprint |
 | `individual` | One tool per enabled action, each with its own schema | Filtered or moderate catalogs; per-tool validation, filtering, approval |
 
-The default (`tool_mode=None`) resolves to `search_execute`, or `individual` when `actions` are given. `actions` are case-insensitive `fnmatch` globs over full tool names, which follow `{connector}_{action}_{entity}` (for example `['*_list_*', 'bamboohr_get_employee']`); they only apply to individually registered tools. Provider catalogs can be large enough in `individual` mode to exceed model context windows, so constrain `individual` mode with `actions`. In `search_execute` mode individual action names never reach the agent, so `actions` cannot apply; explicitly requesting `search_execute` alongside `actions` raises an error.
+In `search_execute` mode the model first calls a search tool with a natural-language query, then executes a matching action by id; nothing from the catalog sits in the prompt upfront, so the footprint stays constant at any catalog size. In `individual` mode every enabled action is registered as its own tool with its own schema; provider catalogs can be large enough for this to exceed model context windows, so constrain it with `actions`. The default (`tool_mode=None`) is `search_execute`, or `individual` when `actions` are given.
+
+`actions` selects which actions are registered as individual tools, matched as case-insensitive `fnmatch` globs over full tool names (`{connector}_{action}_{entity}`). For a Workday account:
+
+```python {test="skip"}
+from pydantic_ai_harness.stackone import StackOne
+
+StackOne(account_id='45320')                                  # default: the search/execute pair
+StackOne(account_id='45320', actions=['*_list_*'])            # individual tools, list actions only
+StackOne(account_id='45320', actions=['workday_get_worker'])  # exactly one tool
+```
+
+Explicitly requesting `search_execute` alongside `actions` raises an error, since the globs cannot apply to the meta-tools.
 
 ## Agent spec (YAML/JSON)
 
