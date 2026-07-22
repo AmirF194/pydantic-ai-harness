@@ -712,13 +712,23 @@ class SqliteStepStore:
         # the gated design only ever wrote provider-valid snapshots.
         # Attempt-and-catch rather than a `PRAGMA table_info` pre-check: two
         # store instances migrating the same old file concurrently would both
-        # pass the pre-check and the loser's `ALTER` would raise.
+        # pass the pre-check and the loser's `ALTER` would raise. Only a
+        # already-there column is benign, so confirm that is what happened --
+        # a locked or readonly database raises the same `OperationalError`,
+        # and swallowing it would pin a schema-less store for its lifetime
+        # (`_schema_ready` never retries) with every later read failing on
+        # `no such column: state`.
         try:
             conn.execute("ALTER TABLE snapshots ADD COLUMN state TEXT NOT NULL DEFAULT 'complete'")
         except sqlite3.OperationalError:
-            pass  # duplicate column: created by the schema above or a concurrent migration
+            if 'state' not in self._snapshot_columns(conn):
+                raise
         conn.commit()
         self._schema_ready = True
+
+    @staticmethod
+    def _snapshot_columns(conn: sqlite3.Connection) -> set[str]:
+        return {row[1] for row in conn.execute('PRAGMA table_info(snapshots)')}
 
     async def register_run(self, record: RunRecord) -> None:
         await anyio.to_thread.run_sync(self._sync_register_run, record)

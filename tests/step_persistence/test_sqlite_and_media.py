@@ -209,6 +209,37 @@ class TestSqliteStepStoreProtocol:
         assert opted is not None
         assert opted.step_index == 4
 
+    async def test_failed_state_migration_surfaces_instead_of_pinning_a_broken_schema(self, tmp_path: Path) -> None:
+        """A migration that fails for a reason other than "column is already there" must raise.
+
+        Swallowing it would mark the schema ready and leave every later read
+        failing on the missing column, with no retry. A readonly database
+        reproduces that class of failure: the `CREATE TABLE IF NOT EXISTS`
+        pass is a no-op on the existing tables, then `ALTER TABLE` raises.
+        """
+        db = tmp_path / 'runs.db'
+        await SqliteStepStore(database=db, media_store=None).register_run(RunRecord(run_id='r1'))
+
+        rollback = sqlite3.connect(db)
+        rollback.executescript(
+            'DROP TABLE snapshots;'
+            'CREATE TABLE snapshots ('
+            'seq INTEGER PRIMARY KEY AUTOINCREMENT, run_id TEXT NOT NULL, step_index INTEGER NOT NULL, '
+            'conversation_id TEXT, parent_run_id TEXT, agent_name TEXT, timestamp TEXT NOT NULL, '
+            'messages TEXT NOT NULL);'
+            'CREATE INDEX idx_snapshots_run ON snapshots(run_id, seq);'
+        )
+        rollback.commit()
+        rollback.close()
+
+        readonly = sqlite3.connect(f'file:{db}?mode=ro', uri=True, check_same_thread=False)
+        try:
+            store = SqliteStepStore(connection=readonly, media_store=None)
+            with pytest.raises(sqlite3.OperationalError, match='readonly database'):
+                await store.latest_snapshot(run_id='r1')
+        finally:
+            readonly.close()
+
     async def test_snapshot_seq_monotonic_across_reset_step(self, tmp_path: Path) -> None:
         """A reused `run_id` with `step_index` reset to 0 must not clobber the prior snapshot.
 
