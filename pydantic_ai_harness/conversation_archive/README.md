@@ -42,7 +42,9 @@ agent = Agent(
 
 ## Composition with compaction
 
-List `ConversationArchive` **before** any compaction capability. Its `get_ordering()` places it in the outermost tier so its `before_model_request` runs first and archives the pre-compaction history; user list order breaks ties within a tier. If a compaction capability runs before the archive, the archive would only ever see the already-summarized history and the originals would be lost.
+Ordering is handled automatically. `ConversationArchive.get_ordering()` places it in the outermost tier, and the built-in compaction capabilities (`SlidingWindow`, `SummarizingCompaction`, ...) are non-outermost, so the capability chain's topological sort runs the archive's `before_model_request` before theirs regardless of the order you list them. It captures the pre-compaction history whether you write `capabilities=[ConversationArchive(...), SlidingWindow(...)]` or the reverse.
+
+The only caveat is a custom compaction capability that also declares itself `outermost`: within a tier, user list order breaks the tie, so list `ConversationArchive` first in that case.
 
 Dedup keys off a content hash of each serialized message, not object identity. Durable executors (Temporal, DBOS) serialize state between steps, so the same message arrives as a fresh object each turn; a content hash stays stable across re-instantiation and replay, and the archive re-seeds from disk per run.
 

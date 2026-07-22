@@ -150,6 +150,11 @@ def _format_message(message: ModelMessage, *, truncate: bool) -> str:
                 if truncate and len(content) > 500:
                     content = content[:500] + '...'
                 lines.append(f'Tool [{part.tool_name}]: {content}')
+            else:
+                # The only remaining `ModelRequestPart` is `RetryPromptPart`
+                # (`ToolSearchReturnPart`/`LoadCapabilityReturnPart` subclass `ToolReturnPart`).
+                # A retry or validation-error prompt is worth recalling, so index it in full.
+                lines.append(f'Retry [{part.tool_name}]: {part.content}')
     else:
         for part in message.parts:
             if isinstance(part, TextPart):

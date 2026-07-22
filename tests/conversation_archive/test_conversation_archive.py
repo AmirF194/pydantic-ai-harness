@@ -145,6 +145,30 @@ class TestConversationArchive:
                 for part in message.parts:
                     assert not (isinstance(part, SystemPromptPart) and part.content.startswith('Summary'))
 
+    async def test_summary_skip_stays_in_sync_with_compaction(self, tmp_path: Path) -> None:
+        # Drift guard: the archive hand-copies the prefix `SummarizingCompaction` emits. If that
+        # prefix ever changes, an artifact built with the real (current) prefix would no longer be
+        # recognized and would be archived. Building the artifact from the compaction module's own
+        # constant makes this test fail the moment the two drift apart. The cross-capability import
+        # is deliberately test-only; the source keeps a local literal to avoid runtime coupling.
+        from pydantic_ai_harness.compaction._summarizing_compaction import _SUMMARY_PREFIX
+
+        path = tmp_path / 'messages.json'
+        capability: ConversationArchive[None] = ConversationArchive(path=str(path))
+        summary = ModelRequest(parts=[SystemPromptPart(content=f'{_SUMMARY_PREFIX}older summarized context')])
+        original = ModelRequest(parts=[UserPromptPart(content='KEEPME original detail')])
+        request_context = ModelRequestContext(
+            model=TestModel(),
+            messages=[summary, original],
+            model_settings=None,
+            model_request_parameters=ModelRequestParameters(),
+        )
+        await capability.before_model_request(_run_context(), request_context)
+
+        text = path.read_text()
+        assert 'KEEPME' in text
+        assert _SUMMARY_PREFIX not in text
+
     def test_ordering_is_outermost(self) -> None:
         assert ConversationArchive().get_ordering().position == 'outermost'
 
@@ -283,6 +307,7 @@ class TestConversationArchive:
         assert '[Compaction summary]' in rendered
         assert 'Tool Call [search]' in rendered
         assert 'Tool [readfile]' in rendered
+        assert 'Retry [readfile]: please retry' in rendered  # RetryPromptPart is searchable
         assert '...' in rendered  # truncation applied to the long tool return / args
 
     async def test_max_matches_and_context_lines_honored(self, tmp_path: Path) -> None:

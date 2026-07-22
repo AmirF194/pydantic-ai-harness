@@ -50,9 +50,10 @@ class ConversationArchive(AbstractCapability[AgentDepsT]):
     )
     ```
 
-    List `ConversationArchive` before any compaction capability. Its `get_ordering`
-    places it in the outermost tier so its `before_model_request` observes the
-    pre-compaction history, but user order breaks ties within a tier.
+    Ordering is automatic: `get_ordering` places this in the outermost tier, and the
+    built-in compaction capabilities are non-outermost, so the chain runs this
+    capability's `before_model_request` before theirs whatever order you list them in.
+    Only a custom compaction that also declares itself outermost needs this listed first.
     """
 
     path: str | os.PathLike[str] = '.pydantic-ai/messages.json'
