@@ -8,10 +8,12 @@ loaded by the project (no extra dev dependency needed).
 
 from __future__ import annotations
 
+import asyncio
 import functools
 from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any, TypeVar
+from unittest.mock import MagicMock
 
 import pytest
 from pydantic_ai import (
@@ -24,7 +26,7 @@ from pydantic_ai import (
 from pydantic_ai.exceptions import ModelRetry
 from pydantic_ai.messages import ToolCallPart
 from pydantic_ai.models.test import TestModel
-from pydantic_ai.tool_manager import ParallelExecutionMode
+from pydantic_ai.tool_manager import ParallelExecutionMode, ToolManager
 from pydantic_ai.toolsets.abstract import ToolsetTool
 from pydantic_ai.toolsets.function import FunctionToolset
 from pydantic_ai.usage import RunUsage
@@ -51,8 +53,8 @@ async def _close_direct_toolsets(anyio_backend: str) -> AsyncIterator[None]:
     yield
     while _entered_toolsets:
         toolset = _entered_toolsets.pop()
-        if toolset._exit_stack is not None:  # pyright: ignore[reportPrivateUsage]
-            await toolset.__aexit__(None, None, None)
+        assert toolset._exit_stack is not None  # pyright: ignore[reportPrivateUsage]
+        await toolset.__aexit__(None, None, None)
 
 
 pytestmark = pytest.mark.anyio
@@ -85,7 +87,7 @@ def build_run_context(deps: T, run_step: int = 0) -> RunContext[T]:
 
 async def build_ctx(
     deps: T,
-    toolset: AbstractToolset[T],
+    toolset: CodeModeToolset[T],
     run_step: int = 0,
     *,
     root_capability: Any = None,
@@ -97,9 +99,8 @@ async def build_ctx(
     """
     from pydantic_ai.tool_manager import ToolManager
 
-    if isinstance(toolset, CodeModeToolset) and toolset._run_state is None:  # pyright: ignore[reportPrivateUsage]
-        await toolset.__aenter__()
-        _entered_toolsets.append(toolset)
+    await toolset.__aenter__()
+    _entered_toolsets.append(toolset)
 
     ctx = build_run_context(deps, run_step=run_step)
     tm = ToolManager(toolset=toolset, root_capability=root_capability)
@@ -501,13 +502,30 @@ class TestCodeMode:
         with pytest.raises(ModelRetry, match=r"name 'undefined_var' is not defined"):
             await wrapper.call_tool('run_code', {'code': 'print(undefined_var)'}, ctx, run_code)
 
+        # With no callable stubs there is no typing pass, so a first-feed parse failure
+        # reaches MontySyntaxError and must also discard the fresh session.
+        empty_wrapper = CodeMode[object]().get_wrapper_toolset(FunctionToolset())
+        assert isinstance(empty_wrapper, CodeModeToolset)
+        empty_ctx = await build_ctx(None, empty_wrapper)
+        empty_tools = await empty_wrapper.get_tools(empty_ctx)
+        with pytest.raises(ModelRetry, match=r'Syntax error in code'):
+            await empty_wrapper.call_tool('run_code', {'code': 'def ('}, empty_ctx, empty_tools['run_code'])
+        assert empty_wrapper._run_state is not None  # pyright: ignore[reportPrivateUsage]
+        assert empty_wrapper._run_state.session is None  # pyright: ignore[reportPrivateUsage]
+
     async def test_run_code_typing_error_becomes_model_retry(self) -> None:
         """A `MontyTypingError` from static type checking is translated into `ModelRetry`.
 
         On a fresh REPL (first call or after restart), the code is type-checked
         at `feed_start` against the tool stubs before execution.
         """
-        wrapper = CodeMode[object]().get_wrapper_toolset(_build_function_toolset(add))
+
+        def later(x: int) -> str:
+            """A tool added after the failed feed."""
+            return str(x)
+
+        base = _build_function_toolset(add)
+        wrapper = CodeMode[object]().get_wrapper_toolset(base)
         assert isinstance(wrapper, CodeModeToolset)
         ctx = await build_ctx(None, wrapper)
         tools = await wrapper.get_tools(ctx)
@@ -520,35 +538,39 @@ class TestCodeMode:
                 tools['run_code'],
             )
 
+        # A failed first feed must not pin its checkout-time stubs. Tool Search and
+        # per-step toolsets can change the catalog before the model retries.
+        assert wrapper._run_state is not None  # pyright: ignore[reportPrivateUsage]
+        assert wrapper._run_state.session is None  # pyright: ignore[reportPrivateUsage]
+        base.add_function(later)
+        ctx.tool_manager = await ToolManager(toolset=wrapper).for_run_step(ctx)
+        tools = await wrapper.get_tools(ctx)
+        result = await wrapper.call_tool('run_code', {'code': 'await later(x=1)'}, ctx, tools['run_code'])
+        assert result.return_value == '1'
+
     # ---------------------------------------------------------------------------
     # `for_run` / `for_run_step` lifecycle
     # ---------------------------------------------------------------------------
 
-    async def test_enter_cleans_up_monty_if_wrapped_enter_fails(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """A later resource acquisition failure must close the already-entered Monty pool."""
+    async def test_enter_does_not_start_monty_if_wrapped_enter_fails(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A wrapped-toolset failure must not start an unused Monty worker."""
         events: list[str] = []
-
-        class TrackingMonty:
-            def __enter__(self) -> TrackingMonty:
-                events.append('monty enter')
-                return self
-
-            def __exit__(self, *args: Any) -> None:
-                events.append('monty exit')
 
         class FailingToolset(FunctionToolset[object]):
             async def __aenter__(self) -> FailingToolset:
                 events.append('wrapped enter')
                 raise RuntimeError('wrapped enter failed')
 
-        monkeypatch.setattr('pydantic_ai_harness.code_mode._toolset.Monty', TrackingMonty)
+        monty = MagicMock()
+        monkeypatch.setattr('pydantic_ai_harness.code_mode._toolset.Monty', monty)
         wrapper = CodeMode[object]().get_wrapper_toolset(FailingToolset())
         assert isinstance(wrapper, CodeModeToolset)
 
         with pytest.raises(RuntimeError, match='wrapped enter failed'):
             await wrapper.__aenter__()
 
-        assert events == ['monty enter', 'wrapped enter', 'monty exit']
+        assert events == ['wrapped enter']
+        monty.assert_not_called()
 
     async def test_exit_releases_resources_in_reverse_entry_order(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """The wrapped toolset exits before the Monty pool it may depend on."""
@@ -561,6 +583,17 @@ class TestCodeMode:
 
             def __exit__(self, *args: Any) -> None:
                 events.append('monty exit')
+
+            def checkout(self, *args: Any, **kwargs: Any) -> Any:
+                class TrackingSession:
+                    def __enter__(self) -> TrackingSession:
+                        events.append('session enter')
+                        return self
+
+                    def __exit__(self, *args: Any) -> None:
+                        events.append('session exit')
+
+                return TrackingSession()
 
         class TrackingToolset(FunctionToolset[object]):
             async def __aenter__(self) -> TrackingToolset:
@@ -576,9 +609,21 @@ class TestCodeMode:
         assert isinstance(wrapper, CodeModeToolset)
 
         async with wrapper:
-            assert events == ['monty enter', 'wrapped enter']
+            assert events == ['wrapped enter']
+            assert wrapper._run_state is not None  # pyright: ignore[reportPrivateUsage]
+            wrapper._run_state.get_session(  # pyright: ignore[reportPrivateUsage]
+                type_check=False, type_check_stubs=None
+            )
+            assert events == ['wrapped enter', 'monty enter', 'session enter']
 
-        assert events == ['monty enter', 'wrapped enter', 'wrapped exit', 'monty exit']
+        assert events == [
+            'wrapped enter',
+            'monty enter',
+            'session enter',
+            'wrapped exit',
+            'session exit',
+            'monty exit',
+        ]
 
     async def test_agent_run_reuses_one_pool_and_session(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """The agent lifecycle owns one pool and one REPL session across `run_code` calls."""
@@ -1785,21 +1830,23 @@ class TestCodeMode:
         assert wrapper._run_state is not None  # pyright: ignore[reportPrivateUsage]
         assert wrapper._run_state.session is None  # pyright: ignore[reportPrivateUsage]
 
-    async def test_non_panic_base_exception_propagates(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        # The panic guard catches BaseException but must re-raise anything that is not a VM panic.
-        class _Boom(BaseException):
-            pass
+    async def test_cancellation_propagates_and_resets_session(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Cancellation drops the suspended session before propagating to the caller."""
 
         async def _boom(self: Any, state: Any) -> Any:
-            raise _Boom('boom')
+            raise asyncio.CancelledError
 
-        monkeypatch.setattr('pydantic_ai_harness._monty_exec.MontyExecutor.run', _boom)
         wrapper = CodeMode[None]().get_wrapper_toolset(_build_function_toolset(add))
         assert isinstance(wrapper, CodeModeToolset)
         ctx = await build_ctx(None, wrapper)
         tools = await wrapper.get_tools(ctx)
-        with pytest.raises(_Boom):
+        await wrapper.call_tool('run_code', {'code': 'x = 1'}, ctx, tools['run_code'])
+
+        monkeypatch.setattr('pydantic_ai_harness._monty_exec.MontyExecutor.run', _boom)
+        with pytest.raises(asyncio.CancelledError):
             await wrapper.call_tool('run_code', {'code': 'await add(a=1, b=2)'}, ctx, tools['run_code'])
+        assert wrapper._run_state is not None  # pyright: ignore[reportPrivateUsage]
+        assert wrapper._run_state.session is None  # pyright: ignore[reportPrivateUsage]
 
     async def test_worker_crash_becomes_model_retry_and_resets_state(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """A `MontyCrashedError` (worker death) becomes a retry with the session reset.
@@ -2695,6 +2742,7 @@ class TestCodeModeOSAccess:
         # The regression guard: a mount must select the filesystem note, not the OS note that would
         # (wrongly) advertise env/clock as host-routed -- this assert fails if the OS note is picked.
         assert 'Mounted filesystem access' in description
+        assert "writes through a `mode='overlay'` mount last only for the current `run_code` call" in description
 
     async def test_description_host_access_note_shows_with_no_sandboxed_tools(self) -> None:
         """The host-access note appears even when no tools are sandboxed (base description)."""
@@ -2828,6 +2876,25 @@ class TestCodeModeOSAccess:
         code = "from pathlib import Path\nawait add(a=1, b=1)\nPath('/work/data.txt').read_text()"
         result = await wrapper.call_tool('run_code', {'code': code}, ctx, tools['run_code'])
         assert result.return_value == 'hello-from-host'
+
+    async def test_overlay_writes_are_discarded_between_calls(self, tmp_path: Path) -> None:
+        """Monty scopes copy-on-write storage to one feed, even while REPL variables persist."""
+        wrapper = CodeMode[object](mount=MountDir(virtual_path='/work', host_path=str(tmp_path))).get_wrapper_toolset(
+            _build_function_toolset(add)
+        )
+        assert isinstance(wrapper, CodeModeToolset)
+        ctx = await build_ctx(None, wrapper)
+        tools = await wrapper.get_tools(ctx)
+
+        await wrapper.call_tool(
+            'run_code',
+            {'code': "from pathlib import Path\np = Path('/work/generated.txt')\np.write_text('temporary')"},
+            ctx,
+            tools['run_code'],
+        )
+        assert not (tmp_path / 'generated.txt').exists()
+        with pytest.raises(ModelRetry, match='FileNotFoundError'):
+            await wrapper.call_tool('run_code', {'code': 'p.read_text()'}, ctx, tools['run_code'])
 
     async def test_mount_accepts_list_of_directories(self, tmp_path: Path) -> None:
         """`mount` accepts a `list[MountDir]`; each directory is exposed at its virtual path."""

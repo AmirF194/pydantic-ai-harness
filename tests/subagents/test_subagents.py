@@ -8,7 +8,6 @@ from dataclasses import dataclass, field
 from typing import Any
 
 import pytest
-from anyio import ClosedResourceError
 from pydantic_ai import Agent
 from pydantic_ai.capabilities import AbstractCapability
 from pydantic_ai.exceptions import ModelAPIError, UnexpectedModelBehavior, UsageLimitExceeded, UserError
@@ -562,42 +561,6 @@ class TestRunControls:
         returns = _delegate_returns(result)
         assert len(returns) == 1
         assert "Sub-agent 'worker' exceeded its 0.01s time budget" in returns[0]
-
-    async def test_timeout_teardown_closed_resource_is_reported_as_timeout(self) -> None:
-        # A timeout cancels the child mid-run; with a tight budget the cancellation can surface
-        # from pydantic-graph's stream teardown as ClosedResourceError instead of TimeoutError
-        # (observed on Python 3.11 under load). Injecting the error directly asserts that a
-        # configured timeout maps it to the soft time-budget message rather than crashing.
-        def teardown_race(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
-            raise ClosedResourceError
-
-        worker = Agent(FunctionModel(teardown_race), name='worker')
-        parent: Agent[object, str] = Agent(
-            _delegate_then_finish('worker'),
-            capabilities=[SubAgents(agents=[SubAgent(worker, timeout_seconds=5.0)])],
-        )
-        result = await parent.run('go')
-        assert result.output == 'all done'
-        returns = _delegate_returns(result)
-        assert len(returns) == 1
-        assert "Sub-agent 'worker' exceeded its 5.0s time budget" in returns[0]
-
-    async def test_closed_resource_without_timeout_is_a_crash_not_a_timeout(self) -> None:
-        # Without a configured timeout nothing cancels the run, so a closed stream is a genuine
-        # failure and must fall through to crash handling rather than being misreported as a
-        # timeout. With containment on it surfaces as a crash retry naming the real exception.
-        def boom(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
-            raise ClosedResourceError
-
-        boomer = Agent(FunctionModel(boom), name='boomer')
-        worker = Agent(TestModel(custom_output_text='OK'), name='worker')
-        parent: Agent[object, str] = Agent(
-            _delegate_two_then_finish('boomer', 'worker'),
-            capabilities=[SubAgents(agents=[SubAgent(boomer, contain_errors=True), SubAgent(worker)])],
-        )
-        result = await parent.run('go')
-        assert result.output == 'all done'
-        assert any('crashed: ClosedResourceError' in r for r in _delegate_retries(result))
 
     async def test_max_calls_exhausted_returns_soft_and_skips_child(self) -> None:
         runs = {'n': 0}

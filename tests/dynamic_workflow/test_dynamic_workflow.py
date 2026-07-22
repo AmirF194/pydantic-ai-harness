@@ -1124,6 +1124,17 @@ async def test_budget_guard_terminates_even_when_error_caught_in_sandbox() -> No
     assert out['completed'] == ['counted(task="a") -> "ok"']
 
 
+async def test_budget_guard_terminates_when_caught_script_completes_normally() -> None:
+    counted: Agent[object, str] = Agent(TestModel(custom_output_text='ok'), name='counted')
+    ts = DynamicWorkflowToolset[object](agents=[WorkflowAgent(agent=counted)], max_agent_calls=1)
+    code = "await counted(task='a')\ntry:\n    await counted(task='b')\nexcept RuntimeError:\n    pass\n'done'"
+    out = await _run_script(ts, code)
+    assert isinstance(out, dict)
+    assert 'budget' in out['error']
+    assert 'completed after exhausting' in out['last_error']
+    assert out['completed'] == ['counted(task="a") -> "ok"']
+
+
 async def test_cancellation_awaits_inflight_sub_agents() -> None:
     # Cancelling the workflow tool call must not return until in-flight sub-agent runs have
     # fully unwound -- `task.cancel()` only schedules the CancelledError; the executor awaits

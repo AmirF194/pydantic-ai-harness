@@ -8,7 +8,6 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, Generic
 
-from anyio import ClosedResourceError
 from pydantic_ai.agent import AbstractAgent, EventStreamHandler
 from pydantic_ai.capabilities import AgentCapability
 from pydantic_ai.exceptions import (
@@ -256,18 +255,7 @@ class SubAgentToolset(FunctionToolset[AgentDepsT]):
         )
         timeout = sub_agent.timeout_seconds
         try:
-            try:
-                result = await (asyncio.wait_for(run, timeout) if timeout is not None else run)
-            except ClosedResourceError as exc:
-                # A timeout cancels the child mid-run. With a tight budget the cancellation can
-                # surface from pydantic-graph's stream teardown as `ClosedResourceError` instead
-                # of `TimeoutError` (observed on Python 3.11 under load). A stream only closes
-                # here because the timeout cancelled the run, so report it as the timeout it is.
-                # Without a configured timeout nothing cancels the run, so a closed stream is a
-                # genuine failure -- re-raise it for the crash containment below.
-                if timeout is None:
-                    raise
-                raise asyncio.TimeoutError from exc
+            result = await (asyncio.wait_for(run, timeout) if timeout is not None else run)
         except asyncio.TimeoutError:
             return self._steer(
                 sub_agent.on_failure,

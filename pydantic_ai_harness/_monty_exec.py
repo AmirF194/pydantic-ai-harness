@@ -8,9 +8,10 @@ Two capabilities build on this:
 - `code_mode`: the dispatch callback runs the agent's own tools.
 - `dynamic_workflow`: the dispatch callback runs sub-agents.
 
-The synchronous snapshot API (rather than `AsyncMonty`) is used deliberately:
-it avoids background threads and `call_soon_threadsafe`, so the loop is safe inside
-restricted event loops such as Temporal's workflow sandbox.
+The synchronous snapshot API (rather than `AsyncMonty`) is used deliberately: it exposes
+each suspension to this host-controlled loop without a background async adapter. Durable
+backends execute the surrounding tool call at their activity boundary; Monty's subprocess
+worker does not run inside a restricted workflow sandbox.
 """
 
 from __future__ import annotations

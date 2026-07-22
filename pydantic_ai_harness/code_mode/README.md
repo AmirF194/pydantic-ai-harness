@@ -239,8 +239,9 @@ Your callback's return value decides the call's fate, and the two outcomes are e
 Both expose the real host to model-written code, so grant only what the task needs. Access is fixed
 when the capability is built, so construct `CodeMode` per request to scope it.
 
-A `MountDir` defaults to copy-on-write `mode='overlay'`: the sandbox reads host files and sees its
-own writes, but those writes do **not** reach the host. Pass `mode='read-write'` to persist them, or
+A `MountDir` defaults to copy-on-write `mode='overlay'`: the sandbox reads host files and sees writes
+made during the current `run_code` call, but Monty discards those writes before the next call and they
+do **not** reach the host. Pass `mode='read-write'` when later calls need to read the writes, or
 `mode='read-only'` to forbid writes.
 
 > Monty-specific: these hooks use Monty's `AbstractOS`/`MountDir` types.

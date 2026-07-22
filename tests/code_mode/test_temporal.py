@@ -121,16 +121,22 @@ _captured_tool_defs: list[list[ToolDefinition]] = []
 
 # FunctionModel that emits a run_code tool call for the given code snippet.
 def _code_mode_model(messages: list[ModelRequest | ModelResponse], info: AgentInfo) -> ModelResponse:
-    """Model that generates a run_code call on the first request, then returns the result as text."""
+    """Model that uses two REPL feeds, then returns the second result as text."""
     _captured_tool_defs.append(info.function_tools)
 
-    # Check if we already got a tool result back.
-    for msg in messages:
-        if isinstance(msg, ModelResponse):
-            continue
-        for part in msg.parts:
-            if isinstance(part, ToolReturnPart) and part.tool_name == 'run_code':
-                return ModelResponse(parts=[TextPart(content=f'done: {part.content}')])
+    returns = [
+        part
+        for msg in messages
+        if isinstance(msg, ModelRequest)
+        for part in msg.parts
+        if isinstance(part, ToolReturnPart) and part.tool_name == 'run_code'
+    ]
+    if len(returns) == 1:
+        return ModelResponse(
+            parts=[ToolCallPart(tool_name='run_code', args={'code': 'result * 10'}, tool_call_id='test_tc_2')]
+        )
+    if len(returns) == 2:
+        return ModelResponse(parts=[TextPart(content=f'done: {returns[-1].content}')])
 
     # First call -- emit run_code.
     return ModelResponse(
@@ -182,13 +188,7 @@ class SandboxRestrictionWorkflow:
 
 
 async def test_code_mode_runs_in_temporal_workflow(client: Client) -> None:
-    """CodeMode's snapshot-based execution loop works inside a Temporal workflow.
-
-    This is the core regression test for the `call_soon_threadsafe` issue:
-    the old `feed_run_async` approach hung because Temporal's sandboxed
-    event loop doesn't implement `call_soon_threadsafe`. The snapshot
-    approach (`feed_start`/`resume`) avoids threads entirely.
-    """
+    """CodeMode runs at Temporal's tool-activity boundary and its result replays."""
     _captured_tool_defs.clear()
     workflow_id = 'test_code_mode_temporal_1'
     async with Worker(
@@ -210,11 +210,11 @@ async def test_code_mode_runs_in_temporal_workflow(client: Client) -> None:
             task_queue=TASK_QUEUE,
         )
 
-    assert result['output'] == 'done: 7'
+    assert result['output'] == 'done: 70'
     assert sandbox_result == 'subprocess.run.__call__'
 
     messages = json.loads(result['messages'])
-    assert len(messages) == 4
+    assert len(messages) == 6
 
     # 1. User prompt
     assert messages[0]['kind'] == 'request'
@@ -255,13 +255,23 @@ async def test_code_mode_runs_in_temporal_workflow(client: Client) -> None:
     assert nested_return['content'] == 7
     assert nested_return['tool_call_id'] == nested_call['tool_call_id']
 
-    # 4. Final text response
+    # 4-5. A second feed consumes the variable assigned by the first feed.
     assert messages[3]['kind'] == 'response'
-    assert messages[3]['parts'][0]['part_kind'] == 'text'
-    assert messages[3]['parts'][0]['content'] == 'done: 7'
+    second_call = messages[3]['parts'][0]
+    assert second_call['part_kind'] == 'tool-call'
+    assert second_call['args'] == {'code': 'result * 10'}
+    assert messages[4]['kind'] == 'request'
+    second_return = messages[4]['parts'][0]
+    assert second_return['part_kind'] == 'tool-return'
+    assert second_return['content'] == 70
+
+    # 6. Final text response
+    assert messages[5]['kind'] == 'response'
+    assert messages[5]['parts'][0]['part_kind'] == 'text'
+    assert messages[5]['parts'][0]['content'] == 'done: 70'
 
     # 5. Verify tool definitions sent to the model
-    assert len(_captured_tool_defs) == 2
+    assert len(_captured_tool_defs) == 3
     for tool_defs in _captured_tool_defs:
         tool_names = [td.name for td in tool_defs]
         # CodeMode wraps `add` into `run_code` -- the model should only see `run_code`

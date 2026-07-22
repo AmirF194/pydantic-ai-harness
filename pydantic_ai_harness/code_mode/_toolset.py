@@ -65,13 +65,16 @@ CodeModeMount = MountDir | list[MountDir]
 class _MontyRunState:
     """Monty resources shared by every toolset view created during one agent run."""
 
-    pool: Monty
+    pool: Monty | None = None
     session: MontySession | None = None
     has_executed_feed: bool = False
+    _pool_stack: ExitStack = field(default_factory=ExitStack, repr=False)
     _session_stack: ExitStack = field(default_factory=ExitStack, repr=False)
 
     def get_session(self, *, type_check: bool, type_check_stubs: str | None) -> MontySession:
-        """Return the run's live REPL session, creating it on first use."""
+        """Return the run's live REPL session, creating its pool on first use."""
+        if self.pool is None:
+            self.pool = self._pool_stack.enter_context(Monty())
         if self.session is None:
             self.session = self._session_stack.enter_context(
                 self.pool.checkout(type_check=type_check, type_check_stubs=type_check_stubs)
@@ -86,8 +89,11 @@ class _MontyRunState:
         self.has_executed_feed = False
 
     def close(self) -> None:
-        """Return the checked-out worker before the owning pool closes."""
+        """Return the checked-out worker and close the owning pool."""
         self.reset()
+        self._pool_stack.close()
+        self._pool_stack = ExitStack()
+        self.pool = None
 
 
 class _RunCodeArguments(TypedDict):
@@ -140,6 +146,10 @@ _OS_ENABLED_NOTE = (
     'configured for this agent (availability depends on that configuration). `asyncio.sleep` and '
     'the `time` module remain unavailable.'
 )
+_MOUNT_LIFETIME_NOTE = (
+    "- **Mount write lifetime**: writes through a `mode='overlay'` mount last only for the current "
+    "`run_code` call. Use `mode='read-write'` when later calls need to read those writes."
+)
 
 _RUN_CODE_DESCRIPTION_TAIL = """\
 - **No `import *`**: wildcard imports are not supported
@@ -180,6 +190,8 @@ def _base_description(*, has_os: bool, has_mount: bool) -> str:
         restriction = _MOUNT_ONLY_NOTE
     else:
         restriction = _NO_OS_RESTRICTION
+    if has_mount:
+        restriction = f'{restriction}\n{_MOUNT_LIFETIME_NOTE}'
     return f'{_RUN_CODE_DESCRIPTION_HEAD}\n{restriction}\n{_RUN_CODE_DESCRIPTION_TAIL}'
 
 
@@ -360,15 +372,9 @@ class CodeModeToolset(WrapperToolset[AgentDepsT]):
         return new_self
 
     async def __aenter__(self) -> Self:
-        """Create the Monty worker pool for this toolset's lifetime, then enter the wrapped toolset.
-
-        The pool is created before entering the wrapped toolset so that a failure to spawn workers
-        (e.g. inside a durable-execution sandbox that forbids subprocesses) fails fast without
-        leaving the wrapped toolset half-entered.
-        """
+        """Enter the wrapped toolset and prepare lazy Monty resources for this run."""
         async with AsyncExitStack() as stack:
-            monty_pool = stack.enter_context(Monty())
-            run_state = _MontyRunState(monty_pool)
+            run_state = _MontyRunState()
             stack.callback(run_state.close)
             await stack.enter_async_context(self.wrapped)
             self._run_state = run_state
@@ -628,8 +634,14 @@ class CodeModeToolset(WrapperToolset[AgentDepsT]):
                 raise
             run_state.has_executed_feed = True
         except MontySyntaxError as e:
+            if fresh_repl:
+                # No code ran, so discard the checkout-time type stubs. A later step may expose
+                # a different tool catalog (for example after Tool Search discovers a tool).
+                run_state.reset()
             raise ModelRetry(f'Syntax error in code:\n{capture.prepend_to(e.display())}') from e
         except MontyTypingError as e:
+            # Typing errors can only come from the fresh-feed check above.
+            run_state.reset()
             raise ModelRetry(f'Type error in code:\n{capture.prepend_to(e.display())}') from e
         except MontyRuntimeError as e:
             # Exceptions raised inside dispatch_tool_call (e.g. UserError from
@@ -653,8 +665,9 @@ class CodeModeToolset(WrapperToolset[AgentDepsT]):
             ) from e
         except BaseException as e:
             # Convert a sandbox panic to a retry (see `is_sandbox_panic`);
-            # anything else (CancelledError, ...) re-raises unchanged.
+            # interruptions re-raise unchanged after dropping the suspended session.
             if not is_sandbox_panic(e):
+                run_state.reset()
                 raise
             # The panic aborts the VM mid-execution, so the REPL's accumulated state cannot
             # be trusted; drop it so the retry starts from a fresh, type-checked session.

@@ -336,6 +336,24 @@ def _budget_terminal_result(
     }
 
 
+def _completed_workflow_result(
+    *,
+    completed_output: object,
+    printed: str,
+    budget_exhausted: bool,
+    max_agent_calls: int,
+    completed_dispatches: list[_CompletedDispatch],
+) -> object:
+    """Return a normal result unless the script caught a terminal budget error."""
+    if budget_exhausted:
+        return _budget_terminal_result(
+            max_agent_calls=max_agent_calls,
+            last_error='The workflow caught the budget error and completed after exhausting the sub-agent budget.',
+            completed_dispatches=completed_dispatches,
+        )
+    return _workflow_result(completed_output, printed)
+
+
 @dataclass(frozen=True)
 class WorkflowAgent(Generic[AgentDepsT]):
     """One sub-agent exposed to the orchestration script as an async function.
@@ -733,4 +751,12 @@ class DynamicWorkflowToolset(AbstractToolset[AgentDepsT]):
         finally:
             _in_workflow.reset(in_workflow_token)
 
-        return _workflow_result(completed.output, capture.joined)
+        # Monty lets workflow code catch host exceptions. Exhausting the budget remains
+        # terminal even if the script catches that error and otherwise finishes normally.
+        return _completed_workflow_result(
+            completed_output=completed.output,
+            printed=capture.joined,
+            budget_exhausted=budget_exhausted,
+            max_agent_calls=self.max_agent_calls,
+            completed_dispatches=completed_dispatches,
+        )

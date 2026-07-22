@@ -235,7 +235,7 @@ agent = Agent(
 )
 ```
 
-A `MountDir` defaults to copy-on-write `mode='overlay'`: the sandbox reads host files and sees its own writes, but those writes do **not** reach the host. Pass `mode='read-write'` to persist them, or `mode='read-only'` to forbid writes. `mount` also accepts a list of `MountDir` for multiple mount points.
+A `MountDir` defaults to copy-on-write `mode='overlay'`: the sandbox reads host files and sees writes made during the current `run_code` call, but Monty discards those writes before the next call and they do **not** reach the host. Pass `mode='read-write'` when later calls need to read the writes, or `mode='read-only'` to forbid writes. `mount` also accepts a list of `MountDir` for multiple mount points.
 
 ### `os_access` -- answer the sandbox's OS calls yourself
 
