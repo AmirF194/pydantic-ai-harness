@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from typing import Any
 
 import pytest
@@ -283,7 +284,7 @@ class TestNesting:
         agent.tool_plain(act)
         ctx = FakeDurableContext()
 
-        with pytest.raises(UserError, match='while another step is still running'):
+        with pytest.raises(UserError, match='from inside another AWS Lambda durable step'):
             run_durable(lambda: agent.run('go'), context=ctx)
 
     def test_run_durable_inside_a_running_loop_is_rejected(self) -> None:
@@ -410,3 +411,91 @@ class TestCoverageOfRemainingPaths:
 
         assert len(cancelled) == 1
         assert 'a__model.cancel_suspended_response' in ctx.step_names
+
+
+class TestBridgeFailureModes:
+    """Regressions for ways the bridge could strand the handler thread or swallow SDK control flow."""
+
+    def test_a_cancelled_step_operation_does_not_hang_the_handler(self) -> None:
+        # `Task.exception()` raises for a cancelled task, so a naive done-callback would strand the
+        # handler thread inside `context.step(...)` until the function timed out.
+        import asyncio
+
+        def act() -> str:
+            raise asyncio.CancelledError('inner cancel')
+
+        agent = build_agent(act)
+        ctx = FakeDurableContext()
+
+        # The point of the assertion is that the call returns at all rather than wedging the thread.
+        with pytest.raises(BaseException):
+            run_durable(lambda: agent.run('go'), context=ctx)
+
+    def test_sdk_control_flow_propagates_out_of_the_handler(self) -> None:
+        """`SuspendExecution` and friends are `BaseException`s the SDK raises so user code cannot
+        catch them. Routing one into the agent loop would turn a suspension into a failure."""
+
+        class Suspend(BaseException):
+            pass
+
+        class SuspendingContext(FakeDurableContext):
+            def step(self, func, name=None, config=None):  # type: ignore[no-untyped-def]
+                if name is not None and 'call_tool' in name:
+                    raise Suspend('retry scheduled')
+                return super().step(func, name=name, config=config)
+
+        agent = build_agent(act)
+        ctx = SuspendingContext()
+
+        with pytest.raises(Suspend):
+            run_durable(lambda: agent.run('go'), context=ctx)
+
+
+class TestRuntimeToolsets:
+    @pytest.mark.parametrize('kind', ['function', 'mcp', 'dynamic'])
+    def test_executing_toolsets_added_per_run_are_rejected(self, kind: str) -> None:
+        from pydantic_ai.toolsets._dynamic import DynamicToolset
+
+        toolset: object
+        if kind == 'function':
+            toolset = FunctionToolset[object](id='late')
+        elif kind == 'dynamic':
+            toolset = DynamicToolset[object](lambda ctx: FunctionToolset[object](), id='late')
+        else:
+            pytest.importorskip('pydantic_ai.mcp')
+            from .test_aws_lambda_mcp import FakeMCPToolset
+
+            toolset = FakeMCPToolset(id='late')
+
+        agent = build_agent(act)
+        ctx = FakeDurableContext()
+
+        with pytest.raises(UserError, match=re.escape('cannot be passed to `run(toolsets=...)` at runtime')):
+            run_durable(lambda: agent.run('go', toolsets=[toolset]), context=ctx)
+
+    def test_non_executing_runtime_toolsets_pass_through(self) -> None:
+        from pydantic_ai.toolsets.external import ExternalToolset
+
+        agent = build_agent(act)
+        ctx = FakeDurableContext()
+
+        result = run_durable(
+            lambda: agent.run('go', toolsets=[ExternalToolset[object]([ToolDefinition(name='remote')], id='ext')]),
+            context=ctx,
+        )
+
+        assert result.output == 'done'
+
+
+class TestEnqueueGuard:
+    def test_enqueue_inside_a_checkpointed_tool_raises(self) -> None:
+        def act(ctx: RunContext[object]) -> str:
+            ctx.enqueue('later')
+            return 'sunny'
+
+        agent = Agent(tool_then_text(), name='a', capabilities=[LambdaDurability()])
+        agent.tool(act)
+        ctx = FakeDurableContext()
+
+        with pytest.raises(UserError, match='enqueue'):
+            run_durable(lambda: agent.run('go'), context=ctx)

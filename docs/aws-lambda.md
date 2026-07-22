@@ -54,8 +54,9 @@ def handler(event: dict[str, Any], context: DurableContext) -> str:
     return result.output
 ```
 
-Attach the capability at construction, not per invocation: binding is when the agent's toolsets are
-wrapped, so a capability added per run cannot checkpoint tool calls.
+Attach the capability at construction rather than per run. Per-run attachment does work (the
+capability binds and wraps toolsets either way), but attaching once keeps the wrapping and the
+deployed step shape stable across invocations, and it matches the other durability integrations.
 
 Deploy with a durable configuration and invoke a published version, since in-flight executions are
 pinned to the version that started them:
@@ -72,6 +73,20 @@ aws lambda create-function \
 
 aws lambda publish-version --function-name support-agent
 ```
+
+!!! warning "A run is durable only inside `run_durable`"
+    Attaching `LambdaDurability` does not by itself make a run durable. Only a run entered through
+    `run_durable` is checkpointed. Calling `agent.run_sync(...)`, or awaiting the agent from your
+    own `asyncio.run(...)`, produces a fully working but **non-durable** run, with no warning.
+
+## Requirements
+
+The agent needs a `name` (or `LambdaDurability(name=...)`), and every leaf toolset needs a unique
+`id`. Both are part of every step name, so both are checked when the agent is constructed: an agent
+without a name raises a `UserError` from `Agent(...)`, as does a toolset that has no `id` or shares
+one with another toolset. Tools registered directly on the agent live in a toolset whose id renders
+as `<agent>`, so `@agent.tool_plain def get_weather` is checkpointed as
+`{name}__function_toolset__<agent>.call_tool:get_weather`.
 
 ## How the sync handler and the async agent connect
 
@@ -105,29 +120,46 @@ Step names are built from the agent's `name` and each toolset's `id`:
 | `{name}__dynamic_toolset__{id}.call_tool:{tool}` | a dynamic toolset's tool call |
 | `{name}__event_stream_handler` | one event delivered to an `event_stream_handler` |
 
-When a run uses more than one model, the model ID is appended to the model step names
-(`{name}__model.request.{model_id}`) so a resumed execution maps each checkpoint back to the model
-it was recorded for.
+A request that does not use the agent's default model records its model id in the step name
+(`{name}__model.request.{model_id}`), so a resumed execution maps each checkpoint back to the model
+it was recorded for. The default model keeps the plain, suffix-less name.
 
 ## Constraints
 
-- **Steps are at least once.** A step is checkpointed after it runs, so an interruption between a
-  tool's side effect and its checkpoint re-runs the tool when the execution resumes. Keep tool side
-  effects idempotent, or set `step_semantics` to `AT_MOST_ONCE_PER_RETRY` for the tools that cannot
-  tolerate a repeat.
+- **Steps are at least once, and retried by default.** A step is checkpointed after it runs, so an
+  interruption between a tool's side effect and its checkpoint re-runs the tool when the execution
+  resumes. On top of that, the SDK's default retry policy is six attempts with exponential backoff
+  (5s to 60s), applied to every model request and every tool call. Keep tool side effects
+  idempotent. `AT_MOST_ONCE_PER_RETRY` alone is not enough to make a tool run once: it prevents
+  re-execution after an interruption *within* an attempt, but the retry policy still starts further
+  attempts that do execute the body. For a tool that must not repeat, set both:
+
+    ```python {test="skip" lint="skip"}
+    metadata={'aws_lambda': {'step_semantics': StepSemantics.AT_MOST_ONCE_PER_RETRY,
+                             'retry_strategy': RetryPresets.none()}}
+    ```
+
+- **Retries stack.** Pydantic AI and provider clients have their own retry logic. Leaving those
+  enabled alongside the step retry policy multiplies the attempts and mishandles `Retry-After`;
+  disable one side.
 - **Tool calls run one at a time.** A step's identity comes from the order steps are reached, so
   concurrently scheduled tool calls could claim each other's checkpoints when the execution
   resumes. Inside a durable handler the run is switched to sequential tool execution. Outside one
   the agent keeps its configured parallelism.
-- **Renaming breaks in-flight executions.** The agent's `name` and each toolset's `id` are part of
-  every step name, so they should not change once the agent is deployed: a rename orphans the
-  checkpoints of in-flight executions, which resume under the old names and re-run their steps.
+- **Changing the shape of the run breaks in-flight executions.** A resumed execution matches
+  checkpoints by the order operations are reached, so anything that changes the number or order of
+  steps breaks executions started under the old code: adding or removing a tool or MCP server,
+  flipping a `metadata={'aws_lambda': False}` opt-out, adding an `event_stream_handler` (which
+  switches the model step to `model.request_stream` and adds handler steps), or changing the model
+  so the step-name suffix changes. Renaming the agent or a toolset `id` changes the recorded names
+  too. Deploy under a new published version and let in-flight executions drain on the old one.
 - **Step results must survive the SDK serializer.** Results are checkpointed through the Lambda
   SDK's serializer. Tool results are encoded by Pydantic first, so structured returns such as
   `ToolReturn` and `BinaryContent` round-trip; a value Pydantic cannot serialize does not.
-- **Streaming a run out of a durable execution is not supported.** There is no channel out of a
-  running durable execution, so `run_stream` and `iter` are not available inside the handler. An
-  `event_stream_handler` still works: model events are handled live inside the model step and each
+- **Events cannot leave a running durable execution.** `run_stream` and `iter` do work inside the
+  handler and are checkpointed normally, but a durable execution returns a single value when it
+  completes, so there is no channel to stream tokens to a caller while it runs. An
+  `event_stream_handler` works: model events are handled live inside the model step and each
   agent-level event is checkpointed in its own step.
 - **`ctx.enqueue()` is not available inside a checkpointed tool**, because a resumed execution
   serves the recorded step output and would drop the enqueued messages. Enqueue from handler-level
@@ -166,19 +198,11 @@ metadata replaces.
 `LambdaDurability` orders itself innermost, so any other capability's contribution to a model
 request is already applied inside the durable step. Attach it alongside other capabilities as usual.
 
-## Relation to the AWS example
-
-The AWS Durable Execution SDK repository carries a
-[Pydantic AI example](https://github.com/aws/aws-durable-execution-sdk-python) showing the
-sync-to-async bridge. This capability builds on the same idea and adds the pieces a production
-integration needs: control-flow signals crossing a step as values, tool-result serialization, MCP
-and dynamic toolsets, transparency outside a durable handler, and per-tool step configuration.
-
 ## Further reading
 
 - [AWS Lambda durable functions](https://docs.aws.amazon.com/lambda/latest/dg/durable-functions.html)
 - [AWS Durable Execution SDK for Python](https://github.com/aws/aws-durable-execution-sdk-python)
-- [Pydantic AI durable execution](https://pydantic.dev/docs/ai/durable_execution/temporal/)
+- [Pydantic AI durable execution](https://pydantic.dev/docs/ai/durable_execution/overview/)
 - [AWS Lambda Durability source code](https://github.com/pydantic/pydantic-ai-harness/tree/main/pydantic_ai_harness/aws_lambda/)
 
 ## API reference

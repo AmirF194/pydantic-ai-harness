@@ -53,8 +53,10 @@ class FakeMCPToolset(MCPToolset[object]):
         instructions: str | None = None,
         include_instructions: bool = True,
         tool_metadata: dict[str, object] | None = None,
+        tool_name: str = 'add',
     ) -> None:
         self._id = id
+        self._tool_name = tool_name
         self.max_retries = None
         self.cache_tools = True
         self.include_instructions = include_instructions
@@ -85,12 +87,12 @@ class FakeMCPToolset(MCPToolset[object]):
     async def get_tools(self, ctx: RunContext[object]) -> dict[str, ToolsetTool[object]]:
         await self._require_session()
         tool_def = ToolDefinition(
-            name='add',
+            name=self._tool_name,
             description='Add two integers.',
             parameters_json_schema=_ADD_SCHEMA,
             metadata=self._tool_metadata,
         )
-        return {'add': self.tool_for_tool_def(tool_def)}
+        return {self._tool_name: self.tool_for_tool_def(tool_def)}
 
     async def get_instructions(self, ctx: RunContext[object]) -> InstructionPart | None:
         if not self.include_instructions or self._instructions_text is None:
@@ -185,3 +187,40 @@ class TestMcpCheckpointing:
 
         assert result.output == 'summed'
         assert server.tool_calls == [('add', {'a': 2, 'b': 3})]
+
+
+class TestMultipleServers:
+    """`CombinedToolset` lists toolsets concurrently, so two servers issue sibling step requests.
+
+    Sibling steps must queue and run one at a time, not be rejected as if they were nested.
+    """
+
+    def test_two_mcp_servers_are_listed_and_called(self) -> None:
+        first = FakeMCPToolset(id='s1', instructions='One.')
+        second = FakeMCPToolset(id='s2', instructions='Two.', tool_name='add2')
+        agent = Agent(add_then_done(), name='calc', toolsets=[first, second], capabilities=[LambdaDurability()])
+        ctx = FakeDurableContext()
+
+        result = run_durable(lambda: agent.run('add 2 and 3'), context=ctx)
+
+        assert result.output == 'summed'
+        assert 'calc__mcp_server__s1.get_tools' in ctx.step_names
+        assert 'calc__mcp_server__s2.get_tools' in ctx.step_names
+
+    def test_two_servers_replay_from_checkpoints(self) -> None:
+        def build_two() -> tuple[FakeMCPToolset, FakeMCPToolset, Agent[Any, Any]]:
+            a = FakeMCPToolset(id='s1', instructions='One.')
+            b = FakeMCPToolset(id='s2', instructions='Two.', tool_name='add2')
+            return a, b, Agent(add_then_done(), name='calc', toolsets=[a, b], capabilities=[LambdaDurability()])
+
+        _, _, agent = build_two()
+        first = FakeDurableContext()
+        run_durable(lambda: agent.run('add 2 and 3'), context=first)
+
+        # A replay must line up with the recorded operations, which only holds if sibling steps
+        # were queued in a stable order.
+        resumed = FakeDurableContext(journal=first.operations)
+        result = run_durable(lambda: agent.run('add 2 and 3'), context=resumed)
+
+        assert result.output == 'summed'
+        assert resumed.invoked == []

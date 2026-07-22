@@ -44,7 +44,8 @@ def double_then_done() -> FunctionModel:
 class Resolver:
     """Records how often the dynamic toolset factory runs."""
 
-    def __init__(self) -> None:
+    def __init__(self, tool_name: str = 'double') -> None:
+        self.tool_name = tool_name
         self.resolutions = 0
         self.calls: list[int] = []
 
@@ -52,11 +53,11 @@ class Resolver:
         self.resolutions += 1
         toolset = FunctionToolset[object]()
 
-        @toolset.tool_plain
         def double(value: int) -> int:
             self.calls.append(value)
             return value * 2
 
+        toolset.add_function(double, name=self.tool_name)
         return toolset
 
 
@@ -110,3 +111,23 @@ class TestDynamicToolset:
         dynamic = DynamicToolset[object](Resolver())
         with pytest.raises(UserError, match='unique `id`'):
             Agent(double_then_done(), name='d', toolsets=[dynamic], capabilities=[LambdaDurability()])
+
+
+class TestMultipleDynamicToolsets:
+    def test_two_dynamic_toolsets_resolve_concurrently(self) -> None:
+        """Two dynamic toolsets are resolved by `CombinedToolset` concurrently, so they issue
+        sibling step requests that must queue rather than be rejected as nested."""
+        first, second = Resolver(), Resolver(tool_name='double2')
+        agent = Agent(
+            double_then_done(),
+            name='d',
+            toolsets=[DynamicToolset[object](first, id='ta'), DynamicToolset[object](second, id='tb')],
+            capabilities=[LambdaDurability()],
+        )
+        ctx = FakeDurableContext()
+
+        result = run_durable(lambda: agent.run('double 21'), context=ctx)
+
+        assert result.output == 'doubled'
+        assert 'd__dynamic_toolset__ta.get_tools' in ctx.step_names
+        assert 'd__dynamic_toolset__tb.get_tools' in ctx.step_names

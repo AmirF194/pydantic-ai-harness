@@ -13,9 +13,12 @@ threads and a queue:
 A step body dispatched on the handler thread schedules its async operation back onto the agent
 loop and blocks on the result, so the loop stays free while the handler thread waits.
 
-The active bridge is published in a `ContextVar` rather than passed around, which is what lets
-`LambdaDurability` be attached at agent construction (the point at which it can wrap toolsets)
-instead of per invocation.
+The active bridge is published in a `ContextVar` rather than passed around, so the capability
+does not have to be handed a `DurableContext` per invocation.
+
+The invariant the bridge holds: **every queued step request is resolved exactly once**. The
+handler thread blocks on the result of the step it is servicing, so a request that is never
+resolved wedges the invocation until the function times out.
 """
 
 from __future__ import annotations
@@ -36,7 +39,7 @@ if TYPE_CHECKING:
 
 T = TypeVar('T')
 
-_ENGINE_NAME = 'AWS Lambda'
+ENGINE_NAME = 'AWS Lambda'
 
 
 class DurableStepContext(Protocol):
@@ -58,7 +61,9 @@ class _AgentLoop:
     """A background event loop reused across invocations of a warm execution environment.
 
     Reusing it keeps loop-bound async resources (a provider's cached HTTP client, for example)
-    valid between invocations, which a fresh loop per invocation would invalidate.
+    valid between invocations, which a fresh loop per invocation would invalidate. The tradeoff is
+    that a run abandoned mid-flight would otherwise survive into the next invocation, so
+    `run_durable` cancels the run it started before returning.
     """
 
     def __init__(self) -> None:
@@ -76,6 +81,16 @@ class _AgentLoop:
 
 
 _agent_loop = _AgentLoop()
+
+_in_step_body: contextvars.ContextVar[bool] = contextvars.ContextVar(
+    'pydantic_ai_harness_aws_lambda_in_step_body', default=False
+)
+"""Set in the context a step's operation runs under, so a nested step can be detected.
+
+A step body blocks the handler thread inside `context.step(...)`, so a step requested from within
+another step's operation could never be serviced. Concurrent *sibling* steps are fine: they queue,
+and the handler thread runs them one at a time.
+"""
 
 
 @dataclass
@@ -99,8 +114,10 @@ class StepBridge:
     def __init__(self, context: DurableStepContext) -> None:
         self._context = context
         self._queue: Queue[_StepRequest | _Finished[Any]] = Queue()
-        self._lock = threading.Lock()
-        self._step_in_flight = False
+        # Serialises step requests so their queue order -- and so the order Lambda assigns
+        # checkpoint identity in -- is first-come, rather than depending on how the event loop
+        # interleaves concurrent callers (two MCP servers being listed in parallel, say).
+        self._order = asyncio.Lock()
 
     async def run_step(
         self,
@@ -109,37 +126,29 @@ class StepBridge:
         config: StepConfig | None = None,
     ) -> T:
         """Checkpoint `operation` as a durable step. Runs on the agent loop."""
-        with self._lock:
-            if self._step_in_flight:
-                raise UserError(
-                    f'A {_ENGINE_NAME} durable step was requested while another step is still running. '
-                    'Lambda durable steps cannot be nested, and the handler thread is blocked until the '
-                    'outer step returns, so this would deadlock. This usually means a tool starts a '
-                    'nested agent run that also has `LambdaDurability` attached; drop the capability '
-                    'from the nested agent, or opt the tool out of checkpointing with '
-                    "`metadata={'aws_lambda': False}`."
-                )
-            self._step_in_flight = True
+        if _in_step_body.get():
+            raise UserError(
+                f'A durable step was requested from inside another {ENGINE_NAME} durable step. Lambda '
+                'durable steps cannot be nested, and the handler thread is blocked servicing the outer '
+                'step, so the inner one could never run. This usually means a tool starts a nested agent '
+                'run that also has `LambdaDurability` attached; drop the capability from the nested '
+                "agent, or opt the tool out of checkpointing with `metadata={'aws_lambda': False}`."
+            )
 
         loop = asyncio.get_running_loop()
-        future: asyncio.Future[T] = loop.create_future()
-
-        def reply(succeeded: bool, value: Any) -> None:
-            if succeeded:
-                loop.call_soon_threadsafe(_set_result_if_pending, future, value)
-            else:
-                loop.call_soon_threadsafe(_set_exception_if_pending, future, value)
 
         def body(_step_context: Any) -> T:
             # Runs on the handler thread, inside `context.step(...)`. Hand the real work back to
             # the agent loop and block until it finishes.
             result: Future[T] = Future()
             step_context = contextvars.copy_context()
+            step_context.run(_in_step_body.set, True)
 
             def schedule() -> None:
                 try:
-                    # Creating the task inside `step_context` makes it the task's context, which
-                    # `create_task(context=...)` would do directly on 3.11+.
+                    # Creating the task inside `step_context` makes it the task's context, which is
+                    # what `create_task(context=...)` does on 3.11+, spelled so it also type-checks
+                    # against the repo's 3.10 target.
                     task: asyncio.Task[T] = step_context.run(lambda: loop.create_task(operation()))
                 except BaseException as exc:  # pragma: no cover - task creation failing is not reproducible
                     result.set_exception(exc)
@@ -149,20 +158,31 @@ class StepBridge:
             loop.call_soon_threadsafe(schedule)
             return result.result()
 
-        self._queue.put(
-            _StepRequest(name=name, body=body, config=config, reply=reply, context=contextvars.copy_context())
-        )
-        try:
+        async with self._order:
+            future: asyncio.Future[T] = loop.create_future()
+
+            def reply(succeeded: bool, value: Any) -> None:
+                if succeeded:
+                    loop.call_soon_threadsafe(_set_result_if_pending, future, value)
+                else:
+                    loop.call_soon_threadsafe(_set_exception_if_pending, future, value)
+
+            self._queue.put(
+                _StepRequest(name=name, body=body, config=config, reply=reply, context=contextvars.copy_context())
+            )
             return await future
-        finally:
-            with self._lock:
-                self._step_in_flight = False
 
     def finish(self, result: Any = None, error: BaseException | None = None) -> None:
         self._queue.put(_Finished(result=result, error=error))
 
     def consume(self) -> Any:
-        """Run queued steps on the handler thread until the agent run finishes."""
+        """Run queued steps on the handler thread until the agent run finishes.
+
+        A `BaseException` that is not an `Exception` is the SDK's own control flow, most importantly
+        `SuspendExecution`, which is how a step retry ends the invocation so Lambda can re-invoke it
+        later. Those have to reach the SDK's handler wrapper unchanged, so they propagate out of here
+        rather than being routed into the agent, and the queue stops being serviced.
+        """
         while True:
             item = self._queue.get()
             if isinstance(item, _Finished):
@@ -171,20 +191,36 @@ class StepBridge:
                 return item.result
             try:
                 value = item.context.run(self._context.step, item.body, name=item.name, config=item.config)
-            except BaseException as exc:
-                # The step failed even after Lambda applied its retry policy. Hand the error to
-                # the agent so the run can surface it, rather than aborting the handler here.
+            except Exception as exc:
+                # An ordinary step failure, already past the SDK's retry policy. Hand it to the agent
+                # so the run can surface or handle it.
                 item.reply(False, exc)
+            except BaseException as exc:
+                # SDK control flow (suspension, interruption). Resolve the waiting step so the agent
+                # task is not left on a future, then let it out of the handler untouched.
+                item.reply(False, exc)
+                raise
             else:
                 item.reply(True, value)
 
 
 def _forward(task: asyncio.Task[T], target: Future[T]) -> None:
-    exc = task.exception()
-    if exc is not None:
+    """Resolve `target` from a finished task, without ever leaving it unresolved.
+
+    `Task.exception()` *raises* `CancelledError` for a cancelled task, so the naive spelling lets an
+    exception escape this done-callback and strands `target`, wedging the handler thread.
+    """
+    try:
+        if task.cancelled():
+            target.set_exception(asyncio.CancelledError())
+            return
+        exc = task.exception()
+        if exc is not None:
+            target.set_exception(exc)
+        else:
+            target.set_result(task.result())
+    except BaseException as exc:  # pragma: no cover - defensive: the resolve-exactly-once invariant
         target.set_exception(exc)
-    else:
-        target.set_result(task.result())
 
 
 def _set_result_if_pending(future: asyncio.Future[T], value: T) -> None:
@@ -237,32 +273,41 @@ def run_durable(agent_run: Callable[[], Coroutine[Any, Any, T]], *, context: Dur
     else:
         raise UserError(
             '`run_durable()` blocks the calling thread until the agent run finishes, so it cannot be '
-            f'called from a running event loop. An {_ENGINE_NAME} durable handler is synchronous, so '
+            f'called from a running event loop. An {ENGINE_NAME} durable handler is synchronous, so '
             'call it directly from the handler; if you already have an event loop, await the agent '
             'run instead.'
         )
     if _active_bridge.get() is not None:
         raise UserError(
-            f'`run_durable()` is already active on this thread. An {_ENGINE_NAME} durable handler runs '
+            f'`run_durable()` is already active on this thread. An {ENGINE_NAME} durable handler runs '
             'one agent run at a time; call `run_durable()` once per handler invocation.'
         )
 
     bridge = StepBridge(context)
     token = _active_bridge.set(bridge)
+    loop = _agent_loop.get()
+    run_context = contextvars.copy_context()
+    tasks: list[asyncio.Task[None]] = []
+    started = threading.Event()
+
+    async def run() -> None:
+        try:
+            bridge.finish(result=await agent_run())
+        except BaseException as exc:
+            bridge.finish(error=exc)
+
+    def schedule_run() -> None:
+        tasks.append(run_context.run(lambda: loop.create_task(run())))
+        started.set()
+
     try:
-        loop = _agent_loop.get()
-        run_context = contextvars.copy_context()
-
-        async def run() -> None:
-            try:
-                bridge.finish(result=await agent_run())
-            except BaseException as exc:
-                bridge.finish(error=exc)
-
-        def schedule_run() -> None:
-            run_context.run(lambda: loop.create_task(run()))
-
         loop.call_soon_threadsafe(schedule_run)
         return bridge.consume()
     finally:
+        # The loop outlives the invocation, so a run abandoned by a suspension or an error escaping
+        # the handler would otherwise keep running into the next warm invocation.
+        started.wait()
+        task = tasks[0]
+        if not task.done():
+            loop.call_soon_threadsafe(task.cancel)
         _active_bridge.reset(token)

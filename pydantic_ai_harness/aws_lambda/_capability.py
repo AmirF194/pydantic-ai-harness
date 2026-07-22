@@ -21,7 +21,7 @@ except ImportError as _import_error:  # pragma: no cover
     ) from _import_error
 
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, fields, replace
 from typing import TYPE_CHECKING, Any, ClassVar
 
 from aws_durable_execution_sdk_python.config import StepConfig
@@ -56,16 +56,17 @@ from pydantic_ai.tools import AgentDepsT, RunContext, ToolDefinition
 from pydantic_ai.toolsets import AbstractToolset, WrapperToolset
 from pydantic_ai.toolsets._dynamic import DynamicToolset  # pyright: ignore[reportPrivateUsage]
 
-from ._bridge import current_bridge, in_durable_context
+from ._bridge import ENGINE_NAME as _ENGINE_NAME
+from ._bridge import StepBridge, current_bridge, in_durable_context
 
 if TYPE_CHECKING:
     from pydantic_ai.mcp import MCPToolset
 
-_ENGINE_NAME = 'AWS Lambda'
 _TOOL_CONFIG_KEY = 'aws_lambda'
 _TOOL_CONFIG_LABEL = 'AWS Lambda step config'
 _NO_FALLBACK_CONFIG: Mapping[str, ToolConfig] = {}
-_STEP_CONFIG_FIELDS = frozenset({'retry_strategy', 'step_semantics', 'serdes'})
+# Derived rather than listed so a new SDK `StepConfig` field is accepted, not rejected as unknown.
+_STEP_CONFIG_FIELDS = frozenset(f.name for f in fields(StepConfig))
 
 _Instructions = str | InstructionPart | Sequence[str | InstructionPart] | None
 _JsonValue = Any
@@ -78,7 +79,7 @@ _dynamic_tools_adapter: TypeAdapter[DynamicToolsResult] = TypeAdapter(DynamicToo
 _instructions_adapter: TypeAdapter[_Instructions] = TypeAdapter(_Instructions)
 
 
-def _require_bridge() -> Any:
+def _require_bridge() -> StepBridge:
     bridge = current_bridge()
     assert bridge is not None  # pragma: no cover - callers gate on `in_durable_context`
     return bridge
