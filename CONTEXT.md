@@ -12,9 +12,6 @@ _Avoid_: Programmatic skill
 A reusable unit of agent behavior defined through the Pydantic AI capabilities API. Code-defined instructions and tools are capabilities, not Agent Skills.
 _Avoid_: Programmatic skill
 
-**Skill Resource**:
-A file bundled with an Agent Skill and referenced by its instructions. Loading the skill identifies its resources but does not grant permission to read or execute them.
-
 **Skill Library**:
 A collection of validated Agent Skills made available to an agent as a unit.
 _Avoid_: Skill registry

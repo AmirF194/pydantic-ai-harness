@@ -56,14 +56,12 @@ class _SkillFrontmatter(BaseModel):
 
 @dataclass(frozen=True)
 class SkillDefinition:
-    """Validated skill metadata and its construction-time filesystem snapshot."""
+    """Validated skill metadata and rendered body from a single `SKILL.md`."""
 
     name: str
     description: str
     body: str
     directory: Path
-    supporting_files: tuple[Path, ...]
-    script_files: tuple[Path, ...]
     ignored_behavioral_fields: tuple[str, ...]
 
 
@@ -108,16 +106,6 @@ def _validate_name(name: str, source: Path) -> None:
         )
 
 
-def _snapshot_supporting_files(directory: Path) -> tuple[Path, ...]:
-    skill_file = directory / 'SKILL.md'
-    return tuple(
-        sorted(
-            (path.relative_to(directory) for path in directory.rglob('*') if path.is_file() and path != skill_file),
-            key=lambda path: path.as_posix(),
-        )
-    )
-
-
 def load_skill(skill_file: Path) -> SkillDefinition:
     """Load one `SKILL.md` into a validated construction-time definition."""
     frontmatter_text, body = _extract_frontmatter(skill_file.read_text(encoding='utf-8'), skill_file)
@@ -133,16 +121,12 @@ def load_skill(skill_file: Path) -> SkillDefinition:
     if frontmatter.name is not None and name != directory_name:
         raise ValueError(f'Skill name {name!r} in {skill_file} must match its parent directory {directory_name!r}.')
 
-    supporting_files = _snapshot_supporting_files(skill_file.parent)
-    script_files = tuple(path for path in supporting_files if path.parts and path.parts[0] == 'scripts')
     ignored_fields = tuple(sorted(BEHAVIORAL_FRONTMATTER_FIELDS.intersection(raw_frontmatter)))
     return SkillDefinition(
         name=name,
         description=frontmatter.description,
         body=body,
         directory=skill_file.parent.resolve(),
-        supporting_files=supporting_files,
-        script_files=script_files,
         ignored_behavioral_fields=ignored_fields,
     )
 

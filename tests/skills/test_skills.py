@@ -7,13 +7,9 @@ from pathlib import Path
 import pytest
 from pydantic_ai import Agent
 from pydantic_ai.capabilities import AbstractCapability
-from pydantic_ai.exceptions import UserError
 from pydantic_ai.messages import LoadCapabilityReturnPart, ModelMessage, ModelResponse, TextPart, ToolCallPart
 from pydantic_ai.models.function import AgentInfo, FunctionModel
 
-from pydantic_ai_harness.code_mode import CodeMode
-from pydantic_ai_harness.filesystem import FileSystem
-from pydantic_ai_harness.shell import Shell
 from pydantic_ai_harness.skills import Skills
 
 pytestmark = pytest.mark.anyio
@@ -84,7 +80,7 @@ class TestSkills:
         assert 'Follow these directions.' in loaded
         assert 'description: Beta help.' not in loaded
 
-    async def test_knowledge_only_skill_needs_no_filesystem(self, tmp_path: Path) -> None:
+    async def test_skill_body_is_exposed_with_its_directory(self, tmp_path: Path) -> None:
         library = tmp_path / 'skills'
         directory = _write_skill(library, 'knowledge', body='Answer from this embedded guidance.')
 
@@ -93,214 +89,14 @@ class TestSkills:
         assert f'Skill directory: `{directory.resolve()}`.' in loaded
         assert 'Answer from this embedded guidance.' in loaded
 
-    async def test_empty_skill_body_still_loads_path_directions(self, tmp_path: Path) -> None:
+    async def test_empty_skill_body_still_loads_the_directory_line(self, tmp_path: Path) -> None:
         library = tmp_path / 'skills'
-        _write_skill(library, 'empty', body='')
+        directory = _write_skill(library, 'empty', body='')
 
         _, _, loaded = await _activate([Skills(directories=[library])], 'empty')
 
         assert '# Skill: empty' in loaded
-        assert loaded.endswith('Resolve relative paths in this skill against that directory.')
-
-    async def test_resource_skill_directs_first_party_filesystem(self, tmp_path: Path) -> None:
-        library = tmp_path / 'skills'
-        _write_skill(
-            library,
-            'research',
-            body='Read references/guide.md.',
-            files={'references/guide.md': 'guide'},
-        )
-
-        _, tools, loaded = await _activate(
-            [Skills(directories=[library]), FileSystem(root_dir=tmp_path)],
-            'research',
-        )
-
-        assert 'read_file' in tools[-1]
-        assert 'Use `read_file` to read supporting skill files.' in loaded
-        assert 'Prefix skill-relative paths with `skills/research/`' in loaded
-
-    @pytest.mark.parametrize('dynamic_catalog', [False, True])
-    async def test_resource_skill_composes_with_code_mode(self, tmp_path: Path, dynamic_catalog: bool) -> None:
-        library = tmp_path / 'skills'
-        _write_skill(library, 'research', files={'references/guide.md': 'guide'})
-
-        _, tools, loaded = await _activate(
-            [
-                Skills(directories=[library]),
-                FileSystem(root_dir=tmp_path),
-                CodeMode[object](dynamic_catalog=dynamic_catalog),
-            ],
-            'research',
-        )
-
-        assert 'run_code' in tools[-1]
-        assert 'read_file' not in tools[-1]
-        assert 'Use `read_file` to read supporting skill files.' in loaded
-        assert 'run_code' not in loaded
-
-    async def test_visible_read_file_does_not_replace_filesystem_authority(self, tmp_path: Path) -> None:
-        library = tmp_path / 'skills'
-        _write_skill(library, 'research', files={'guide.md': 'guide'})
-        skills = Skills[object](directories=[library])
-        calls = 0
-
-        def model_fn(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
-            nonlocal calls
-            calls += 1
-            if calls == 1:
-                return ModelResponse(parts=[ToolCallPart(tool_name='load_capability', args={'id': 'research'})])
-            return ModelResponse(parts=[TextPart('done')])  # pragma: no cover - activation fails first
-
-        agent: Agent[object, str] = Agent(FunctionModel(model_fn), capabilities=[skills])
-
-        @agent.tool_plain
-        def read_file(path: str) -> str:
-            return path  # pragma: no cover - only the tool definition is inspected
-
-        with pytest.raises(UserError, match='no `FileSystem` capability is configured'):
-            await agent.run('go')
-
-    async def test_reader_root_can_make_skill_directory_the_tool_root(self, tmp_path: Path) -> None:
-        library = tmp_path / 'skills'
-        directory = _write_skill(library, 'research', files={'guide.md': 'guide'})
-        skills = Skills(directories=[library], reader_tool='fetch_asset', reader_root=directory)
-
-        observed = ''
-
-        def model_fn(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
-            nonlocal observed
-            returns = [
-                part for message in messages for part in message.parts if isinstance(part, LoadCapabilityReturnPart)
-            ]
-            if not returns:
-                return ModelResponse(parts=[ToolCallPart(tool_name='load_capability', args={'id': 'research'})])
-            instructions = returns[-1].content.get('instructions')
-            assert instructions is not None
-            observed = instructions
-            return ModelResponse(parts=[TextPart('done')])
-
-        agent: Agent[object, str] = Agent(FunctionModel(model_fn), capabilities=[skills])
-
-        await agent.run('go')
-        assert 'Use `fetch_asset`' in observed
-        assert 'pass skill-relative paths as written' in observed
-
-    async def test_custom_reader_without_root_uses_absolute_paths(self, tmp_path: Path) -> None:
-        library = tmp_path / 'skills'
-        directory = _write_skill(library, 'research', files={'guide.md': 'guide'})
-        skills = Skills(directories=[library], reader_tool='fetch_asset')
-
-        observed = ''
-
-        def model_fn(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
-            nonlocal observed
-            returns = [
-                part for message in messages for part in message.parts if isinstance(part, LoadCapabilityReturnPart)
-            ]
-            if not returns:
-                return ModelResponse(parts=[ToolCallPart(tool_name='load_capability', args={'id': 'research'})])
-            instructions = returns[-1].content.get('instructions')
-            assert instructions is not None
-            observed = instructions
-            return ModelResponse(parts=[TextPart('done')])
-
-        agent: Agent[object, str] = Agent(FunctionModel(model_fn), capabilities=[skills])
-
-        await agent.run('go')
-        assert f'Pass absolute paths rooted at `{directory.resolve()}`.' in observed
-
-    async def test_resource_skill_errors_when_reader_is_missing(self, tmp_path: Path) -> None:
-        library = tmp_path / 'skills'
-        _write_skill(library, 'research', files={'guide.md': 'guide'})
-
-        with pytest.raises(UserError, match='no `FileSystem` capability is configured'):
-            await _activate([Skills(directories=[library])], 'research')
-
-    async def test_resource_skill_errors_when_outside_filesystem_root(self, tmp_path: Path) -> None:
-        library = tmp_path / 'skills'
-        _write_skill(library, 'research', files={'guide.md': 'guide'})
-        other_root = tmp_path / 'other'
-        other_root.mkdir()
-
-        with pytest.raises(UserError, match='outside every configured `FileSystem` root'):
-            await _activate(
-                [Skills(directories=[library]), FileSystem(root_dir=other_root)],
-                'research',
-            )
-
-    async def test_reader_root_must_contain_skill(self, tmp_path: Path) -> None:
-        library = tmp_path / 'skills'
-        _write_skill(library, 'research', files={'guide.md': 'guide'})
-
-        with pytest.raises(UserError, match='outside configured reader_root'):
-            await _activate(
-                [
-                    Skills(directories=[library], reader_tool='read_file', reader_root=tmp_path / 'other'),
-                    FileSystem(root_dir=tmp_path),
-                ],
-                'research',
-            )
-
-    async def test_scripts_are_directed_to_shell(self, tmp_path: Path) -> None:
-        library = tmp_path / 'skills'
-        _write_skill(library, 'build', files={'scripts/check.py': 'print("ok")'})
-
-        _, _, loaded = await _activate(
-            [Skills(directories=[library]), FileSystem(root_dir=tmp_path), Shell(cwd=tmp_path)],
-            'build',
-        )
-
-        assert 'Use `run_command` to run bundled skill scripts.' in loaded
-        assert 'Prefix skill-relative paths with `skills/build/`' in loaded
-
-    async def test_scripts_remain_optional_without_executor(self, tmp_path: Path) -> None:
-        library = tmp_path / 'skills'
-        _write_skill(library, 'build', files={'scripts/check.py': 'print("ok")'})
-
-        _, _, loaded = await _activate(
-            [Skills(directories=[library]), FileSystem(root_dir=tmp_path)],
-            'build',
-        )
-
-        assert 'no script-execution tool is configured' in loaded
-        assert 'Do not attempt to run them' in loaded
-
-    async def test_custom_executor_is_a_caller_declaration(self, tmp_path: Path) -> None:
-        library = tmp_path / 'skills'
-        directory = _write_skill(library, 'build', files={'scripts/check.py': 'print("ok")'})
-        skills = Skills[object](directories=[library], executor_tool='execute_script')
-        observed = ''
-
-        def model_fn(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
-            nonlocal observed
-            returns = [
-                part for message in messages for part in message.parts if isinstance(part, LoadCapabilityReturnPart)
-            ]
-            if not returns:
-                return ModelResponse(parts=[ToolCallPart(tool_name='load_capability', args={'id': 'build'})])
-            instructions = returns[-1].content.get('instructions')
-            assert instructions is not None
-            observed = instructions
-            return ModelResponse(parts=[TextPart('done')])
-
-        agent: Agent[object, str] = Agent(FunctionModel(model_fn), capabilities=[skills, FileSystem(root_dir=tmp_path)])
-        await agent.run('go')
-        assert 'Use `execute_script` to run bundled skill scripts.' in observed
-        assert f'Pass absolute paths rooted at `{directory.resolve()}`.' in observed
-
-    async def test_shell_outside_skill_tree_uses_absolute_paths(self, tmp_path: Path) -> None:
-        library = tmp_path / 'skills'
-        directory = _write_skill(library, 'build', files={'scripts/check.py': 'print("ok")'})
-        shell_root = tmp_path / 'shell'
-        shell_root.mkdir()
-
-        _, _, loaded = await _activate(
-            [Skills(directories=[library]), FileSystem(root_dir=tmp_path), Shell(cwd=shell_root)],
-            'build',
-        )
-
-        assert f'Pass absolute paths rooted at `{directory.resolve()}`.' in loaded
+        assert loaded.endswith(f'Skill directory: `{directory.resolve()}`.')
 
     async def test_claude_skill_dir_is_expanded(self, tmp_path: Path) -> None:
         library = tmp_path / 'skills'
@@ -340,13 +136,6 @@ class TestSkills:
 
 
 class TestSkillValidation:
-    def test_reader_root_requires_custom_reader(self, tmp_path: Path) -> None:
-        library = tmp_path / 'skills'
-        _write_skill(library, 'knowledge')
-
-        with pytest.raises(ValueError, match='reader_root requires reader_tool'):
-            Skills(directories=[library], reader_root=tmp_path)
-
     def test_name_can_be_derived_from_directory(self, tmp_path: Path) -> None:
         library = tmp_path / 'skills'
         _write_skill(library, 'derived-name')
@@ -441,12 +230,15 @@ class TestSkillValidation:
         (library / 'not-a-skill').mkdir()
         Skills(directories=[library])
 
-    async def test_nested_skill_md_is_a_supporting_file(self, tmp_path: Path) -> None:
+    async def test_nested_skill_md_is_not_a_skill(self, tmp_path: Path) -> None:
         library = tmp_path / 'skills'
         _write_skill(library, 'outer', files={'references/SKILL.md': 'reference'})
 
-        with pytest.raises(UserError, match='contains supporting files'):
-            await _activate([Skills(directories=[library])], 'outer')
+        initial, _, loaded = await _activate([Skills(directories=[library])], 'outer')
+
+        assert '- outer:' in initial
+        assert '# Skill: outer' in loaded
+        assert '- references:' not in initial
 
     def test_behavioral_fields_are_ignored_with_one_warning(self, tmp_path: Path) -> None:
         library = tmp_path / 'skills'
