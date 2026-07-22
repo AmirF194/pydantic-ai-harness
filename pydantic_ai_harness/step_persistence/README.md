@@ -152,9 +152,12 @@ By default `continue_run` returns the messages of the latest `complete`
 snapshot for that `run_id` -- a point whose tool work was fully settled
 when captured. Snapshots are written at these boundaries:
 
-- after a `CallToolsNode` completes with no open tool calls (in practice
-  the terminal one, where the tool returns are already part of history),
-- at `after_run`, as a fallback if the run reached no such boundary, and
+- after every `CallToolsNode` whose tool calls all returned -- the pending
+  tool-return request is folded in, so the point is durable the moment the
+  tool completes, before the next model request is even sent,
+- at `after_run`, when the run ended past that boundary (a run that reached
+  no boundary at all, or an `Agent.run_stream` whose closing response lands
+  after the last one), and
 - when a run *fails*: the live history at failure time is saved, whatever
   its shape -- a model request that raises after a clean tool cycle
   produces a `complete` snapshot; a crash mid-tool-cycle produces an

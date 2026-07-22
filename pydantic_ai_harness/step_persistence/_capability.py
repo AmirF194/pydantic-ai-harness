@@ -7,7 +7,7 @@ from datetime import datetime, timezone
 from typing import Any
 from uuid import uuid4
 
-from pydantic_ai import CallToolsNode
+from pydantic_ai import CallToolsNode, ModelRequestNode
 from pydantic_ai.capabilities import AbstractCapability
 from pydantic_ai.capabilities.abstract import AgentNode, NodeResult, WrapRunHandler
 from pydantic_ai.messages import ModelMessage, ModelResponse, ToolCallPart
@@ -49,10 +49,12 @@ class StepPersistence(AbstractCapability[AgentDepsT]):
     (run/model-request/tool-call start, completion, failure), records a
     `ToolEffectRecord` per tool call so the orchestrator can decide whether
     replay is safe, and saves a `ContinuableSnapshot` at every settled
-    `CallToolsNode` boundary, plus a fallback save at `after_run` if the run
-    reached no such boundary. A run that *fails* saves the live at-failure
-    history (see `on_run_error`), classified by its tool-work state:
-    `complete` when every tool call is resolved, `interrupted` otherwise.
+    `CallToolsNode` boundary -- folding in the pending tool-return request, so
+    the point is durable the moment the tool completes -- plus a fallback save
+    at `after_run` when the run ends past that boundary. A run that *fails*
+    saves the live at-failure history (see `on_run_error`), classified by its
+    tool-work state: `complete` when every tool call is resolved,
+    `interrupted` otherwise.
 
     A run that crashes between `before_tool_execute` and `after_tool_execute`
     leaves a visible event trail, a `started` tool-effect record (the
@@ -211,7 +213,7 @@ class StepPersistence(AbstractCapability[AgentDepsT]):
     ) -> AgentRunResult[Any]:
         """Push this run's id onto the contextvar so nested delegates can read it."""
         token = current_run_id.set(self._effective_run_id(ctx))
-        saved_token = snapshot_saved.set(False)
+        saved_token = snapshot_saved.set(0)
         history_token = live_run_history.set(None)
         try:
             return await handler()
@@ -256,15 +258,19 @@ class StepPersistence(AbstractCapability[AgentDepsT]):
     ) -> AgentRunResult[Any]:
         """Emit `run_completed`, saving a final snapshot only as a fallback.
 
-        The terminal `CallToolsNode` already saved the final provider-valid
-        snapshot via `after_node_run`, carrying the correct `step_index`. By
-        `after_run`, `ctx.run_step` is reset to 0, so re-saving here would both
-        duplicate the tail and stamp a misleading `step_index`. We only save
-        when the run produced no snapshot at all (no provider-valid node
-        boundary was reached), as a last-resort capture of the final state.
+        When a terminal `CallToolsNode` already saved the final history via
+        `after_node_run` it carries the correct `step_index`, whereas by
+        `after_run` `ctx.run_step` is reset to 0 -- so re-saving would both
+        duplicate the tail and stamp a misleading `step_index`. We save only
+        when the run ended past the newest boundary snapshot.
+
+        That covers a run which reached no provider-valid boundary at all, and
+        `Agent.run_stream`, which ends through `SetFinalResult` rather than a
+        terminal `CallToolsNode` and appends its closing response after the last
+        boundary -- leaving `after_run` the only hook that sees the full run.
         """
-        if not snapshot_saved.get():
-            messages = result.all_messages()
+        messages = result.all_messages()
+        if len(messages) > snapshot_saved.get():
             if is_provider_valid(messages):
                 await self.store.save_snapshot(
                     ContinuableSnapshot(
@@ -493,19 +499,34 @@ class StepPersistence(AbstractCapability[AgentDepsT]):
     ) -> NodeResult[AgentDepsT]:
         """Save a continuable snapshot after a settled `CallToolsNode`, and refresh the live-history stash.
 
-        The `CallToolsNode` save fires when the history has no open tool
-        calls -- in practice the terminal node, where `_handle_final_result`
-        has appended the tool returns (mid-run, the returns still sit in the
-        next `ModelRequestNode`). The `is_provider_valid` check doubles as a
-        defense in case a custom node reshapes history.
+        At that boundary every tool call from the preceding `ModelRequestNode`
+        has a matching tool return, so the history is provider-valid. The
+        returned `ModelRequestNode` carries those returns and is not yet in
+        `ctx.messages`, so its request is folded in before validation --
+        without it a worker killed right after a completed tool call would
+        leave no resume point at all (#373). `is_provider_valid` doubles as a
+        defense in case a custom node reshapes history, and the saved count
+        goes to `snapshot_saved` so `after_run` can tell whether the run ended
+        past this boundary.
+
+        This save is the durable one: it lands in the store while the run is
+        still healthy, so it survives a hard kill that fires no hook. The
+        error path (`on_run_error`) only rescues histories that a raise unwinds
+        through.
 
         Every node boundary also re-stashes the live message list so that
         `on_run_error` can persist the at-failure history when a later node
-        raises before its own `after_node_run` fires.
+        raises before its own `after_node_run` fires. The stash holds that list
+        by reference, so the snapshot candidate rebinds to a new list rather
+        than appending to it -- an append would leak `result.request` into the
+        history the error path later reads, duplicating it once the graph
+        appends the request itself.
         """
         self._stash_live_history(ctx)
         messages = list(ctx.messages)
         if isinstance(node, CallToolsNode):
+            if isinstance(result, ModelRequestNode):
+                messages = [*messages, result.request]
             if is_provider_valid(messages):
                 await self.store.save_snapshot(
                     ContinuableSnapshot(
@@ -517,5 +538,5 @@ class StepPersistence(AbstractCapability[AgentDepsT]):
                         agent_name=self.agent_name,
                     )
                 )
-                snapshot_saved.set(True)
+                snapshot_saved.set(len(messages))
         return result
