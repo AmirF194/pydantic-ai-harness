@@ -1555,12 +1555,14 @@ def _interrupted_snapshot(run_id: str, step_index: int, marker: str) -> Continua
 
 
 def _first_text(messages: list[ModelMessage]) -> str:
-    for msg in messages:
-        if isinstance(msg, ModelResponse):
-            for part in msg.parts:
-                if isinstance(part, TextPart):
-                    return part.content
-    raise AssertionError('no text part in messages')
+    texts = [
+        part.content
+        for msg in messages
+        if isinstance(msg, ModelResponse)
+        for part in msg.parts
+        if isinstance(part, TextPart)
+    ]
+    return texts[0]
 
 
 class TestSnapshotStateReadPath:
