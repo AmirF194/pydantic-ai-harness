@@ -3,8 +3,9 @@
 Verifies that the snapshot-based execution loop (`feed_start`/`resume`)
 works with Temporal's workflow sandbox and history replay.
 
-Monty executes snippets in subprocess workers. Each agent run owns one worker
-pool and one checked-out REPL session, reused by every `run_code` call.
+Monty executes snippets in subprocess workers. The first `run_code` call lazily creates
+the run's worker pool and initial checked-out REPL session. That session is reused across
+calls until it is reset or invalidated.
 
 Durability is attached via the `TemporalDurability` capability; pydantic-ai
 2.14 deprecated the `TemporalAgent` wrapper in its favor
@@ -188,7 +189,7 @@ class SandboxRestrictionWorkflow:
 
 
 async def test_code_mode_runs_in_temporal_workflow(client: Client) -> None:
-    """CodeMode runs at Temporal's tool-activity boundary and its result replays."""
+    """CodeMode runs workflow-side, nested tools use activities, and the history replays."""
     _captured_tool_defs.clear()
     workflow_id = 'test_code_mode_temporal_1'
     async with Worker(

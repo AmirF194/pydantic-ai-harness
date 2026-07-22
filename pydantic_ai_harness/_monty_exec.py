@@ -9,9 +9,10 @@ Two capabilities build on this:
 - `dynamic_workflow`: the dispatch callback runs sub-agents.
 
 The synchronous snapshot API (rather than `AsyncMonty`) is used deliberately: it exposes
-each suspension to this host-controlled loop without a background async adapter. Durable
-backends execute the surrounding tool call at their activity boundary; Monty's subprocess
-worker does not run inside a restricted workflow sandbox.
+each suspension to this host-controlled loop without a background async adapter. Under
+Temporal, this loop runs workflow-side and replays. Monty's passed-through native module
+owns its worker subprocess outside the restricted Python module sandbox, while nested
+durable-wrapped tools cross their configured activity boundaries.
 """
 
 from __future__ import annotations
