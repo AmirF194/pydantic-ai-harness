@@ -253,7 +253,7 @@ class TestCommandValidation:
         )
         ts._check_command('echo hello')
 
-    async def test_unparsable_command_allowed(self, toolset: ShellToolset[None]) -> None:
+    async def test_unparseable_command_allowed(self, toolset: ShellToolset[None]) -> None:
         toolset._check_command("echo 'unterminated")
 
     async def test_empty_command_allowed(self, toolset: ShellToolset[None]) -> None:
