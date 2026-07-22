@@ -53,9 +53,20 @@ if TYPE_CHECKING:
     from pydantic_ai.mcp import MCPToolset
 
 AbsurdParallelExecutionMode = Literal['sequential', 'parallel_ordered_events']
-"""Tool-call execution modes usable with Absurd. A subset of `ParallelExecutionMode`: `'parallel'`
-is excluded because Absurd disambiguates repeated step names with an encounter-order counter, so
-checkpoints only line up with a replay when the steps are reached in a deterministic order."""
+"""Tool-call execution modes usable with Absurd. A subset of `ParallelExecutionMode`.
+
+Absurd disambiguates repeated step names by encounter order (the second `ctx.step(name, ...)` for a
+given `name` records under `name#2`, the third under `name#3`, ...). A replay lines up with its
+checkpoints only if each repeated step name claims the same slot it did on the first run.
+
+The slot is claimed synchronously when `ctx.step(...)` is entered, before the step body runs. Tool
+calls are scheduled in the model's tool-call order under both parallel modes, so their step names are
+assigned in that order regardless of which call finishes first -- completion order does not move a
+tool call's slot. `'parallel'` is nonetheless excluded because it emits tool-result events (and so
+the per-event `event_stream_handler` steps) in completion order, which races and could assign one of
+those repeated step names a different slot on replay. `'parallel_ordered_events'` emits those events
+in the model's tool-call order once the whole batch completes, so every repeated step name -- tool
+calls and event-handler steps alike -- lines up on replay."""
 
 _ENGINE_NAME = 'Absurd'
 _TOOL_CONFIG_KEY = 'absurd'
@@ -109,10 +120,47 @@ def _deserialize_call_tool_result(payload: JsonValue) -> CallToolResult:
     return _call_tool_result_adapter.validate_python(payload)
 
 
+def _reject_model_id_hash(model_id: str) -> None:
+    """Reject a model id containing `#`.
+
+    A request's model id is folded into the model step name as a `.{model_id}` suffix, and Absurd
+    disambiguates repeated step names by appending `#2`, `#3`, ... So a model id containing `#`
+    would collide with that counter suffix (e.g. id `cheap#2` resolves to the `#2` checkpoint of
+    model `cheap`). Byte-compatibility with `pydantic-ai-absurd` forbids escaping the id (it would
+    change the step name for every such id, and the reference package has the same collision), so
+    the id is rejected instead.
+    """
+    if '#' in model_id:
+        raise UserError(
+            f'Model id {model_id!r} contains {"#"!r}, which Absurd uses to disambiguate repeated '
+            'step names. Folded into the model step name it would collide with that suffix. Choose '
+            'a model id without `#`.'
+        )
+
+
+def _reject_step_options(config: ToolConfig, tool_name: str) -> None:
+    """Reject a non-empty `absurd` config mapping.
+
+    `ctx.step(...)` takes no per-call options, so a mapping under the `absurd` metadata key has
+    nothing to apply. Only `False` (inline opt-out) is meaningful, so a populated mapping is a
+    mistake rather than something quietly dropped -- Temporal takes the same stance for metadata it
+    cannot use.
+    """
+    if config is not False and config:
+        raise UserError(
+            f'Tool {tool_name!r} sets a non-empty {_TOOL_CONFIG_KEY!r} step config, but Absurd steps '
+            f'take no per-tool options, so the config would have no effect. Only '
+            f'metadata={{{_TOOL_CONFIG_KEY!r}: False}} (run the tool inline, uncheckpointed) is '
+            'supported; remove the config.'
+        )
+
+
 def _resolve_function_tool_config(tool: ToolsetTool[Any] | None, tool_name: str) -> ToolConfig:
-    return resolve_tool_durable_config(
+    config = resolve_tool_durable_config(
         tool, tool_name, _NO_FALLBACK_CONFIG, metadata_key=_TOOL_CONFIG_KEY, config_type_label=_TOOL_CONFIG_LABEL
     )
+    _reject_step_options(config, tool_name)
+    return config
 
 
 def _resolve_mcp_tool_config(tool: ToolsetTool[Any] | None, tool_name: str) -> ToolConfig:
@@ -125,6 +173,7 @@ def _resolve_mcp_tool_config(tool: ToolsetTool[Any] | None, tool_name: str) -> T
             f'metadata={{{_TOOL_CONFIG_KEY!r}: False}}, but MCP tools perform I/O and so cannot run '
             'outside a step. Remove the metadata so the call stays checkpointed.'
         )
+    _reject_step_options(config, tool_name)
     return config
 
 
@@ -208,7 +257,13 @@ def _build_mcp_toolset(toolset: MCPToolset[AgentDepsT], *, step_name_prefix: str
         get_instructions_operation=get_instructions_operation,
         call_tool_operation=call_tool_operation,
         resolve_tool_config=_resolve_mcp_tool_config,
-        lifecycle='enter-never',
+        # Enter the wrapped server for the run's duration (the analog for a gated in-process engine,
+        # as in Prefect). With `'enter-never'` the wrapper's `__aenter__` is a no-op, so outside a
+        # task every `get_tools`/`call_tool` opens its own implicit session, and inside a task each
+        # call pays a fresh `initialize`. Entering here keeps one session for a stateful server. The
+        # checkpointed operations and their step names are unchanged, so this does not affect the
+        # persistence format.
+        lifecycle='enter-always',
     )
 
 
@@ -219,8 +274,11 @@ class AbsurdDurability(BaseDurabilityCapability[AgentDepsT]):
     Attach it via `capabilities=[AbsurdDurability()]` and call `agent.run()` inside an Absurd
     task handler: every model request, MCP call, and function tool call is wrapped in
     `ctx.step(...)`, so a worker crash mid-run resumes from the last completed step instead of
-    restarting -- no tokens are re-spent, and a tool side effect runs once. Outside a task the
-    capability is transparent and the run is a normal, non-durable agent run.
+    restarting. A completed step is served from its checkpoint on replay instead of being
+    recomputed, so tokens are not re-spent on work that already finished. A step is checkpointed
+    after it runs, so a crash between a tool's side effect and its checkpoint re-runs the tool on
+    recovery: keep tool side effects idempotent. Outside a task the capability is transparent and
+    the run is a normal, non-durable agent run.
 
     The capability discovers the agent's model, name, and toolsets automatically when it is bound
     to the agent. Step results are stored in Postgres as JSON, so a checkpointed tool's return
@@ -231,14 +289,17 @@ class AbsurdDurability(BaseDurabilityCapability[AgentDepsT]):
 
     Example:
         ```python {test="skip"}
+        from absurd_sdk import AsyncAbsurd, AsyncTaskContext, JsonValue
         from pydantic_ai import Agent
         from pydantic_ai_harness.absurd import AbsurdDurability
 
+        absurd = AsyncAbsurd('postgresql://localhost/absurd', queue_name='agents')
         agent = Agent('openai:gpt-5', name='analyst', capabilities=[AbsurdDurability()])
 
 
         @absurd.register_task(name='analyse')
-        async def analyse(params, ctx):
+        async def analyse(params: JsonValue, ctx: AsyncTaskContext) -> JsonValue:
+            assert isinstance(params, dict)
             result = await agent.run(params['prompt'])
             return {'output': result.output}
         ```
@@ -274,12 +335,15 @@ class AbsurdDurability(BaseDurabilityCapability[AgentDepsT]):
                 step.
             name: Unique agent name used as the prefix for every checkpoint step. Defaults to the
                 agent's `name` when the capability is bound.
-            parallel_execution_mode: Tool-call execution mode applied for the duration of every
-                run. Defaults to `'sequential'`. `'parallel'` is excluded by type: Absurd
-                disambiguates repeated step names with an encounter-order counter, so steps must
-                be reached in a deterministic order for a replay to line up with its checkpoints.
+            parallel_execution_mode: Tool-call execution mode applied for a run inside a task.
+                Defaults to `'sequential'`. `'parallel'` is excluded by type because it emits
+                tool-result and event-handler steps in completion order, which races with Absurd's
+                encounter-order step naming; see `AbsurdParallelExecutionMode` for the full
+                invariant. Outside a task the agent's configured mode is left untouched.
         """
         super().__init__(models=models, event_stream_handler=event_stream_handler, name=name)
+        for model_id in models or {}:
+            _reject_model_id_hash(model_id)
         self._parallel_execution_mode: ParallelExecutionMode = parallel_execution_mode
         self._default_model_id: str | None = None
 
@@ -319,9 +383,15 @@ class AbsurdDurability(BaseDurabilityCapability[AgentDepsT]):
         await task_ctx.step(f'{self.name}__event_stream_handler', _inner)
 
     async def wrap_run(self, ctx: RunContext[AgentDepsT], *, handler: WrapRunHandler) -> AgentRunResult[Any]:
-        """Apply the configured parallel-execution mode for every entry point."""
+        """Apply the configured parallel-execution mode for a run inside a task.
+
+        The mode only matters for checkpoint-name determinism inside a task, so outside one the
+        capability stays transparent and leaves the agent's configured mode untouched. (Unlike an
+        out-of-process engine, whose override is harmless off the durable path, forcing a mode here
+        would change ordinary non-durable runs.)
+        """
         agent = self._agent
-        if agent is None:  # pragma: no cover - `for_agent` always binds the agent before a run
+        if agent is None or not self.in_durable_context:
             return await handler()
         with agent.parallel_tool_call_execution_mode(self._parallel_execution_mode):
             return await handler()

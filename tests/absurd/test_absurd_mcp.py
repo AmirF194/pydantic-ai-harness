@@ -66,15 +66,27 @@ class FakeMCPToolset(MCPToolset[object]):
         self._tool_metadata = tool_metadata
         self.tool_calls: list[tuple[str, dict[str, Any]]] = []
         self.enter_count = 0
+        self._session_depth = 0
+        self.implicit_sessions = 0
 
     async def __aenter__(self) -> FakeMCPToolset:
         self.enter_count += 1
+        self._session_depth += 1
         return self
 
     async def __aexit__(self, *args: object) -> None:
-        return None
+        self._session_depth -= 1
+
+    async def _require_session(self) -> None:
+        """Model a real MCP server: I/O needs an active session. If the wrapper did not enter one,
+        the call opens its own implicit session for the duration of the call, as `MCPToolset` does."""
+        if self._session_depth == 0:
+            self.implicit_sessions += 1
+            await self.__aenter__()
+            await self.__aexit__(None, None, None)
 
     async def get_tools(self, ctx: RunContext[object]) -> dict[str, ToolsetTool[object]]:
+        await self._require_session()
         tool_def = ToolDefinition(
             name='add',
             description='Add two integers.',
@@ -91,6 +103,7 @@ class FakeMCPToolset(MCPToolset[object]):
     async def call_tool(
         self, name: str, tool_args: dict[str, Any], ctx: RunContext[object], tool: ToolsetTool[object]
     ) -> int:
+        await self._require_session()
         self.tool_calls.append((name, dict(tool_args)))
         return int(tool_args['a']) + int(tool_args['b'])
 
@@ -137,6 +150,33 @@ class TestMcpCheckpointing:
         assert replay.invoked == []
 
 
+class TestMcpSessionLifecycle:
+    async def test_wrapper_holds_one_session_no_implicit_per_call(self) -> None:
+        # `enter-always`: the durable wrapper enters the server for the run, so `get_tools` and
+        # `call_tool` ride one session instead of each opening its own implicit session.
+        server = FakeMCPToolset(id='calc', instructions='Use the calculator.', include_instructions=True)
+        agent = Agent(_add_then_done_model(), name='calc', toolsets=[server], capabilities=[AbsurdDurability()])
+
+        ctx = FakeAsyncTaskContext()
+        with absurd_task_context(ctx):
+            result = await agent.run('add 2 and 3')
+
+        assert result.output == 'summed'
+        assert server.implicit_sessions == 0
+        assert server.enter_count >= 1
+
+    async def test_transparent_run_also_reuses_one_session(self) -> None:
+        # Outside a task the capability is transparent, but the wrapper still enters the server, so
+        # ordinary non-durable runs also avoid a fresh implicit session per call.
+        server = FakeMCPToolset(id='calc', instructions='Use the calculator.', include_instructions=True)
+        agent = Agent(_add_then_done_model(), name='calc', toolsets=[server], capabilities=[AbsurdDurability()])
+
+        result = await agent.run('add 2 and 3')
+
+        assert result.output == 'summed'
+        assert server.implicit_sessions == 0
+
+
 class TestMcpInlineOptOutForbidden:
     async def test_metadata_false_on_mcp_tool_raises(self) -> None:
         server = FakeMCPToolset(id='calc', tool_metadata={'absurd': False})
@@ -145,4 +185,13 @@ class TestMcpInlineOptOutForbidden:
         ctx = FakeAsyncTaskContext()
         with absurd_task_context(ctx):
             with pytest.raises(UserError, match='MCP tool .* cannot run outside a step'):
+                await agent.run('add 2 and 3')
+
+    async def test_non_empty_dict_config_on_mcp_tool_raises(self) -> None:
+        server = FakeMCPToolset(id='calc', tool_metadata={'absurd': {'retries': 3}})
+        agent = Agent(_add_then_done_model(), name='calc', toolsets=[server], capabilities=[AbsurdDurability()])
+
+        ctx = FakeAsyncTaskContext()
+        with absurd_task_context(ctx):
+            with pytest.raises(UserError, match='take no per-tool options'):
                 await agent.run('add 2 and 3')
