@@ -273,10 +273,10 @@ def _build_dynamic_toolset(
 
 
 @dataclass(init=False)
-class LambdaDurability(BaseDurabilityCapability[AgentDepsT]):
+class AWSLambdaDurability(BaseDurabilityCapability[AgentDepsT]):
     """Capability that checkpoints an agent's I/O into AWS Lambda durable steps.
 
-    Attach it with `capabilities=[LambdaDurability()]` and enter the run from a durable handler
+    Attach it with `capabilities=[AWSLambdaDurability()]` and enter the run from a durable handler
     with `run_durable`: every model request, function tool call, MCP call, and dynamic-toolset
     resolution is wrapped in `DurableContext.step(...)`. A completed step is served from its
     checkpoint when the execution resumes, so finished work is not repeated and tokens are not
@@ -297,9 +297,9 @@ class LambdaDurability(BaseDurabilityCapability[AgentDepsT]):
         ```python {test="skip"}
         from aws_durable_execution_sdk_python import DurableContext, durable_execution
         from pydantic_ai import Agent
-        from pydantic_ai_harness.aws_lambda import LambdaDurability, run_durable
+        from pydantic_ai_harness.aws_lambda import AWSLambdaDurability, run_durable
 
-        agent = Agent('bedrock:us.amazon.nova-pro-v1:0', name='support', capabilities=[LambdaDurability()])
+        agent = Agent('bedrock:us.amazon.nova-pro-v1:0', name='support', capabilities=[AWSLambdaDurability()])
 
 
         @agent.tool_plain
@@ -330,7 +330,7 @@ class LambdaDurability(BaseDurabilityCapability[AgentDepsT]):
         name: str | None = None,
         step_config: Mapping[str, Any] | None = None,
     ) -> None:
-        """Create a `LambdaDurability` capability.
+        """Create an `AWSLambdaDurability` capability.
 
         The agent's model, name, and toolsets are discovered when the capability is bound.
 

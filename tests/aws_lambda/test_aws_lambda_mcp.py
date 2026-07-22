@@ -1,4 +1,4 @@
-"""MCP durable-wrapping tests for `LambdaDurability`.
+"""MCP durable-wrapping tests for `AWSLambdaDurability`.
 
 A lightweight `FakeMCPToolset` stands in for a real server: it is a genuine `MCPToolset`
 subclass, so the capability's `isinstance` wrapping and `tool_for_tool_def` rebuild apply, but
@@ -28,7 +28,7 @@ from pydantic_ai.messages import (
 from pydantic_ai.models.function import AgentInfo, FunctionModel
 from pydantic_ai.tools import RunContext, ToolDefinition
 
-from pydantic_ai_harness.aws_lambda import LambdaDurability, run_durable
+from pydantic_ai_harness.aws_lambda import AWSLambdaDurability, run_durable
 
 from .conftest import FakeDurableContext
 
@@ -118,7 +118,7 @@ def add_then_done() -> FunctionModel:
 
 
 def build(server: FakeMCPToolset) -> Agent[Any, Any]:
-    return Agent(add_then_done(), name='calc', toolsets=[server], capabilities=[LambdaDurability()])
+    return Agent(add_then_done(), name='calc', toolsets=[server], capabilities=[AWSLambdaDurability()])
 
 
 class TestMcpCheckpointing:
@@ -198,7 +198,7 @@ class TestMultipleServers:
     def test_two_mcp_servers_are_listed_and_called(self) -> None:
         first = FakeMCPToolset(id='s1', instructions='One.')
         second = FakeMCPToolset(id='s2', instructions='Two.', tool_name='add2')
-        agent = Agent(add_then_done(), name='calc', toolsets=[first, second], capabilities=[LambdaDurability()])
+        agent = Agent(add_then_done(), name='calc', toolsets=[first, second], capabilities=[AWSLambdaDurability()])
         ctx = FakeDurableContext()
 
         result = run_durable(lambda: agent.run('add 2 and 3'), context=ctx)
@@ -211,7 +211,7 @@ class TestMultipleServers:
         def build_two() -> tuple[FakeMCPToolset, FakeMCPToolset, Agent[Any, Any]]:
             a = FakeMCPToolset(id='s1', instructions='One.')
             b = FakeMCPToolset(id='s2', instructions='Two.', tool_name='add2')
-            return a, b, Agent(add_then_done(), name='calc', toolsets=[a, b], capabilities=[LambdaDurability()])
+            return a, b, Agent(add_then_done(), name='calc', toolsets=[a, b], capabilities=[AWSLambdaDurability()])
 
         _, _, agent = build_two()
         first = FakeDurableContext()

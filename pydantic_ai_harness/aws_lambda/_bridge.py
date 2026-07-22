@@ -138,7 +138,7 @@ class StepBridge:
                 f'A durable step was requested from inside another {ENGINE_NAME} durable step. Lambda '
                 'durable steps cannot be nested, and the handler thread is blocked servicing the outer '
                 'step, so the inner one could never run. This usually means a tool starts a nested agent '
-                'run that also has `LambdaDurability` attached; drop the capability from the nested '
+                'run that also has `AWSLambdaDurability` attached; drop the capability from the nested '
                 "agent, or opt the tool out of checkpointing with `metadata={'aws_lambda': False}`."
             )
 

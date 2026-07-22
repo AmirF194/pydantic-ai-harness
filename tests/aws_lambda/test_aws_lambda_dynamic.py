@@ -1,4 +1,4 @@
-"""Dynamic-toolset durable-wrapping tests for `LambdaDurability`.
+"""Dynamic-toolset durable-wrapping tests for `AWSLambdaDurability`.
 
 A `DynamicToolset` resolves its inner toolset through a user factory that may do I/O. Left
 unwrapped it would resolve inline and re-run when the execution resumes, so both the resolution
@@ -26,7 +26,7 @@ from pydantic_ai.tools import RunContext
 from pydantic_ai.toolsets import FunctionToolset
 from pydantic_ai.toolsets._dynamic import DynamicToolset  # pyright: ignore[reportPrivateUsage]
 
-from pydantic_ai_harness.aws_lambda import LambdaDurability, run_durable
+from pydantic_ai_harness.aws_lambda import AWSLambdaDurability, run_durable
 
 from .conftest import FakeDurableContext
 
@@ -63,7 +63,7 @@ class Resolver:
 
 def build(resolver: Resolver) -> Agent[Any, Any]:
     dynamic = DynamicToolset[object](resolver, id='tools')
-    return Agent(double_then_done(), name='d', toolsets=[dynamic], capabilities=[LambdaDurability()])
+    return Agent(double_then_done(), name='d', toolsets=[dynamic], capabilities=[AWSLambdaDurability()])
 
 
 class TestDynamicToolset:
@@ -110,7 +110,7 @@ class TestDynamicToolset:
 
         dynamic = DynamicToolset[object](Resolver())
         with pytest.raises(UserError, match='unique `id`'):
-            Agent(double_then_done(), name='d', toolsets=[dynamic], capabilities=[LambdaDurability()])
+            Agent(double_then_done(), name='d', toolsets=[dynamic], capabilities=[AWSLambdaDurability()])
 
 
 class TestMultipleDynamicToolsets:
@@ -122,7 +122,7 @@ class TestMultipleDynamicToolsets:
             double_then_done(),
             name='d',
             toolsets=[DynamicToolset[object](first, id='ta'), DynamicToolset[object](second, id='tb')],
-            capabilities=[LambdaDurability()],
+            capabilities=[AWSLambdaDurability()],
         )
         ctx = FakeDurableContext()
 

@@ -5,7 +5,7 @@ description: Checkpoint a Pydantic AI agent's model requests and tool calls into
 
 # AWS Lambda Durability
 
-`LambdaDurability` makes an agent resumable on [AWS Lambda durable
+`AWSLambdaDurability` makes an agent resumable on [AWS Lambda durable
 functions](https://docs.aws.amazon.com/lambda/latest/dg/durable-functions.html). Every model
 request, function tool call, MCP call, and dynamic-toolset resolution is checkpointed as a durable
 step, so an invocation that times out, fails, or is retried continues from the last completed step
@@ -34,12 +34,12 @@ from typing import Any
 from aws_durable_execution_sdk_python import DurableContext, durable_execution
 from pydantic_ai import Agent
 
-from pydantic_ai_harness.aws_lambda import LambdaDurability, run_durable
+from pydantic_ai_harness.aws_lambda import AWSLambdaDurability, run_durable
 
 agent = Agent(
     'bedrock:us.amazon.nova-pro-v1:0',
     name='support',
-    capabilities=[LambdaDurability()],
+    capabilities=[AWSLambdaDurability()],
 )
 
 
@@ -75,13 +75,13 @@ aws lambda publish-version --function-name support-agent
 ```
 
 !!! warning "A run is durable only inside `run_durable`"
-    Attaching `LambdaDurability` does not by itself make a run durable. Only a run entered through
+    Attaching `AWSLambdaDurability` does not by itself make a run durable. Only a run entered through
     `run_durable` is checkpointed. Calling `agent.run_sync(...)`, or awaiting the agent from your
     own `asyncio.run(...)`, produces a fully working but **non-durable** run, with no warning.
 
 ## Requirements
 
-The agent needs a `name` (or `LambdaDurability(name=...)`), and every leaf toolset needs a unique
+The agent needs a `name` (or `AWSLambdaDurability(name=...)`), and every leaf toolset needs a unique
 `id`. Both are part of every step name, so both are checked when the agent is constructed: an agent
 without a name raises a `UserError` from `Agent(...)`, as does a toolset that has no `id` or shares
 one with another toolset. Tools registered directly on the agent live in a toolset whose id renders
@@ -190,12 +190,12 @@ def charge_card(amount: int) -> str:
 every attempt. Use it for cheap, side-effect-free tools whose result is not worth a checkpoint. MCP
 tools cannot opt out, because they perform I/O that must not re-run when the execution resumes.
 
-`LambdaDurability(step_config=...)` sets the base configuration for every step. Per-tool metadata
+`AWSLambdaDurability(step_config=...)` sets the base configuration for every step. Per-tool metadata
 overrides it key by key, so a tool that sets only `step_semantics` keeps the base `retry_strategy`.
 
 ## Composition with other capabilities
 
-`LambdaDurability` orders itself innermost, so any other capability's contribution to a model
+`AWSLambdaDurability` orders itself innermost, so any other capability's contribution to a model
 request is already applied inside the durable step. Attach it alongside other capabilities as usual.
 
 ## Further reading
@@ -207,6 +207,6 @@ request is already applied inside the durable step. Attach it alongside other ca
 
 ## API reference
 
-::: pydantic_ai_harness.aws_lambda.LambdaDurability
+::: pydantic_ai_harness.aws_lambda.AWSLambdaDurability
 
 ::: pydantic_ai_harness.aws_lambda.run_durable

@@ -22,7 +22,7 @@ from pydantic_ai.models.test import TestModel
 from pydantic_ai.tools import DeferredToolRequests, ToolDefinition
 from pydantic_ai.toolsets import FunctionToolset
 
-from pydantic_ai_harness.aws_lambda import LambdaDurability, run_durable
+from pydantic_ai_harness.aws_lambda import AWSLambdaDurability, run_durable
 
 from .conftest import FakeDurableContext
 
@@ -40,7 +40,7 @@ def tool_then_text(tool_name: str = 'act', args: dict[str, Any] | None = None) -
 
 def build_agent(tool: Any, *, output_type: Any = None, **kwargs: Any) -> Agent[Any, Any]:
     extra = {'output_type': output_type} if output_type is not None else {}
-    agent = Agent(tool_then_text(), name='a', capabilities=[LambdaDurability(**kwargs)], **extra)
+    agent = Agent(tool_then_text(), name='a', capabilities=[AWSLambdaDurability(**kwargs)], **extra)
     tool.__name__ = 'act'
     agent.tool_plain(tool)
     return agent
@@ -228,7 +228,7 @@ class TestStepConfig:
         def act() -> str:
             return 'sunny'
 
-        agent = Agent(tool_then_text(), name='a', toolsets=[toolset], capabilities=[LambdaDurability()])
+        agent = Agent(tool_then_text(), name='a', toolsets=[toolset], capabilities=[AWSLambdaDurability()])
         ctx = FakeDurableContext()
 
         run_durable(lambda: agent.run('go'), context=ctx)
@@ -244,7 +244,7 @@ class TestStepConfig:
         def act() -> str:
             return 'sunny'
 
-        agent = Agent(tool_then_text(), name='a', toolsets=[toolset], capabilities=[LambdaDurability()])
+        agent = Agent(tool_then_text(), name='a', toolsets=[toolset], capabilities=[AWSLambdaDurability()])
         ctx = FakeDurableContext()
 
         run_durable(lambda: agent.run('go'), context=ctx)
@@ -253,13 +253,13 @@ class TestStepConfig:
 
     def test_unknown_config_key_is_rejected_at_construction(self) -> None:
         with pytest.raises(UserError, match="Unknown 'aws_lambda' step config key 'retries'"):
-            LambdaDurability(step_config={'retries': 3})
+            AWSLambdaDurability(step_config={'retries': 3})
 
     def test_unknown_per_tool_config_key_is_rejected(self) -> None:
         toolset = FunctionToolset[object](id='tools')
         toolset.add_function(act, metadata={'aws_lambda': {'retries': 3}})
 
-        agent = Agent(tool_then_text(), name='a', toolsets=[toolset], capabilities=[LambdaDurability()])
+        agent = Agent(tool_then_text(), name='a', toolsets=[toolset], capabilities=[AWSLambdaDurability()])
         ctx = FakeDurableContext()
 
         with pytest.raises(UserError, match="Unknown 'aws_lambda' step config key 'retries'"):
@@ -272,12 +272,12 @@ class TestNesting:
     """
 
     def test_nested_agent_run_is_rejected_instead_of_deadlocking(self) -> None:
-        inner = Agent(TestModel(), name='inner', capabilities=[LambdaDurability()])
+        inner = Agent(TestModel(), name='inner', capabilities=[AWSLambdaDurability()])
 
         async def act() -> str:
             return str((await inner.run('nested')).output)
 
-        agent = Agent(tool_then_text(), name='a', capabilities=[LambdaDurability()])
+        agent = Agent(tool_then_text(), name='a', capabilities=[AWSLambdaDurability()])
         agent.tool_plain(act)
         ctx = FakeDurableContext()
 
@@ -285,13 +285,13 @@ class TestNesting:
             run_durable(lambda: agent.run('go'), context=ctx)
 
     def test_run_durable_inside_a_running_loop_is_rejected(self) -> None:
-        inner = Agent(TestModel(), name='inner', capabilities=[LambdaDurability()])
+        inner = Agent(TestModel(), name='inner', capabilities=[AWSLambdaDurability()])
         ctx = FakeDurableContext()
 
         async def act() -> str:
             return str(run_durable(lambda: inner.run('nested'), context=ctx).output)
 
-        agent = Agent(tool_then_text(), name='a', capabilities=[LambdaDurability()])
+        agent = Agent(tool_then_text(), name='a', capabilities=[AWSLambdaDurability()])
         agent.tool_plain(act)
 
         with pytest.raises(UserError, match='cannot be called from a running event loop'):
@@ -305,10 +305,10 @@ def act() -> str:
 class TestBinding:
     def test_agent_without_a_name_is_rejected(self) -> None:
         with pytest.raises(UserError, match='unique `name`'):
-            Agent(TestModel(), capabilities=[LambdaDurability()])
+            Agent(TestModel(), capabilities=[AWSLambdaDurability()])
 
     def test_capability_name_overrides_the_agent_name(self) -> None:
-        agent = Agent(tool_then_text(), name='a', capabilities=[LambdaDurability(name='custom')])
+        agent = Agent(tool_then_text(), name='a', capabilities=[AWSLambdaDurability(name='custom')])
         agent.tool_plain(act)
         ctx = FakeDurableContext()
 
@@ -318,7 +318,7 @@ class TestBinding:
 
     def test_model_id_is_folded_into_the_step_name(self) -> None:
         extra = TestModel(custom_output_text='from extra')
-        agent = Agent(tool_then_text(), name='a', capabilities=[LambdaDurability(models={'extra': extra})])
+        agent = Agent(tool_then_text(), name='a', capabilities=[AWSLambdaDurability(models={'extra': extra})])
         agent.tool_plain(act)
         ctx = FakeDurableContext()
 
@@ -336,7 +336,7 @@ class TestEventStreamHandler:
                 seen.append(event)
 
         # An event stream handler makes the run stream, so use a model that supports streaming.
-        agent = Agent(TestModel(), name='a', capabilities=[LambdaDurability(event_stream_handler=handler)])
+        agent = Agent(TestModel(), name='a', capabilities=[AWSLambdaDurability(event_stream_handler=handler)])
         agent.tool_plain(act)
         ctx = FakeDurableContext()
 
@@ -351,13 +351,13 @@ class TestCoverageOfRemainingPaths:
     def test_sync_tool_calling_run_durable_is_rejected(self) -> None:
         """A sync tool runs on a worker thread with the handler's context copied, so there is no
         running loop but the bridge is still active."""
-        inner = Agent(TestModel(), name='inner', capabilities=[LambdaDurability()])
+        inner = Agent(TestModel(), name='inner', capabilities=[AWSLambdaDurability()])
         ctx = FakeDurableContext()
 
         def act() -> str:
             return str(run_durable(lambda: inner.run('nested'), context=ctx).output)
 
-        agent = Agent(tool_then_text(), name='a', capabilities=[LambdaDurability()])
+        agent = Agent(tool_then_text(), name='a', capabilities=[AWSLambdaDurability()])
         agent.tool_plain(act)
 
         with pytest.raises(UserError, match='already active on this thread'):
@@ -367,7 +367,7 @@ class TestCoverageOfRemainingPaths:
         from pydantic_ai.toolsets.external import ExternalToolset
 
         external = ExternalToolset[object]([ToolDefinition(name='remote')], id='ext')
-        agent = Agent(tool_then_text(), name='a', toolsets=[external], capabilities=[LambdaDurability()])
+        agent = Agent(tool_then_text(), name='a', toolsets=[external], capabilities=[AWSLambdaDurability()])
         agent.tool_plain(act)
         ctx = FakeDurableContext()
 
@@ -378,7 +378,7 @@ class TestCoverageOfRemainingPaths:
     def test_a_string_model_default_keeps_one_step_name(self) -> None:
         """The default model carries its own name as provenance; the suffix is suppressed so the
         default keeps a single step name."""
-        agent = Agent('test', name='a', capabilities=[LambdaDurability()])
+        agent = Agent('test', name='a', capabilities=[AWSLambdaDurability()])
         ctx = FakeDurableContext()
 
         run_durable(lambda: agent.run('go'), context=ctx)
@@ -400,7 +400,7 @@ class TestCoverageOfRemainingPaths:
                 return ModelResponse(parts=[TextPart(content='partial')], state='suspended')
             raise RuntimeError('continuation failed')
 
-        agent = Agent(CancellableModel(fn, model_name='fn'), name='a', capabilities=[LambdaDurability()])
+        agent = Agent(CancellableModel(fn, model_name='fn'), name='a', capabilities=[AWSLambdaDurability()])
         ctx = FakeDurableContext()
 
         with pytest.raises(RuntimeError, match='continuation failed'):
@@ -489,7 +489,7 @@ class TestEnqueueGuard:
         def act(ctx: RunContext[object]) -> None:
             ctx.enqueue('later')
 
-        agent = Agent(tool_then_text(), name='a', capabilities=[LambdaDurability()])
+        agent = Agent(tool_then_text(), name='a', capabilities=[AWSLambdaDurability()])
         agent.tool(act)
         ctx = FakeDurableContext()
 
@@ -506,7 +506,7 @@ class TestReplayFidelity:
         run_durable(lambda: agent.run('go'), context=first)
 
         # Resume an execution whose recorded operations belong to a different agent shape.
-        other = Agent(tool_then_text(), name='b', capabilities=[LambdaDurability()])
+        other = Agent(tool_then_text(), name='b', capabilities=[AWSLambdaDurability()])
         other.tool_plain(act)
         resumed = FakeDurableContext(journal=first.operations)
 
