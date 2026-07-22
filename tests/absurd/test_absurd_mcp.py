@@ -150,6 +150,19 @@ class TestMcpCheckpointing:
         assert replay.invoked == []
 
 
+class TestFakeServerModelsImplicitSessions:
+    async def test_io_without_an_open_session_opens_an_implicit_one(self) -> None:
+        # Proves the fake server models a real `MCPToolset`: I/O with no session open opens a
+        # transient implicit one, so the `implicit_sessions == 0` assertions below are meaningful.
+        server = FakeMCPToolset(id='calc')
+        await server._require_session()
+        assert server.implicit_sessions == 1
+
+        async with server:
+            await server._require_session()
+        assert server.implicit_sessions == 1
+
+
 class TestMcpSessionLifecycle:
     async def test_wrapper_holds_one_session_no_implicit_per_call(self) -> None:
         # `enter-always`: the durable wrapper enters the server for the run, so `get_tools` and

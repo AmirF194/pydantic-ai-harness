@@ -485,8 +485,14 @@ class TestParallelExecutionMode:
 
         monkeypatch.setattr(agent, 'parallel_tool_call_execution_mode', spy)
 
-        await agent.run('hi')
+        # Inside a task the override applies; outside one it must not touch the configured mode.
+        ctx = FakeAsyncTaskContext()
+        with absurd_task_context(ctx):
+            await agent.run('hi')
+        assert recorded == ['parallel_ordered_events']
 
+        recorded.clear()
+        await agent.run('hi')
         assert recorded == []
 
 
