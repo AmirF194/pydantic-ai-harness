@@ -9,13 +9,17 @@ from unittest.mock import AsyncMock, patch
 import pytest
 from opentelemetry.trace import NoOpTracer, Tracer
 from pydantic_ai.messages import (
+    LoadCapabilityCallPart,
     ModelMessage,
+    ModelMessagesTypeAdapter,
     ModelRequest,
     ModelResponse,
     SystemPromptPart,
     TextPart,
     ToolCallPart,
     ToolReturnPart,
+    ToolSearchArgs,
+    ToolSearchCallPart,
     ToolSearchReturnContent,
     ToolSearchReturnPart,
     UserPromptPart,
@@ -1957,6 +1961,44 @@ class TestClampOversizedMessages:
         assert _CLAMP_ARGS_KEY in part.args
         assert '[clamped: removed' in part.args[_CLAMP_ARGS_KEY]
         assert part.tool_call_id == 'c1'
+
+    @pytest.mark.anyio
+    async def test_preserves_typed_tool_call_subclasses(self):
+        # `ToolSearchCallPart` and `LoadCapabilityCallPart` subclass `ToolCallPart` but narrow
+        # `args` to a typed shape that `ModelMessagesTypeAdapter` validates when persisted
+        # history is restored (e.g. `StepPersistence` resume). Replacing that shape with the
+        # `_clamped` object made the round-trip fail; clamping must skip typed subclasses and
+        # touch only plain tool calls.
+        search_args: ToolSearchArgs = {'queries': ['find tools for ' + 'x' * 5_000]}
+        load_args = '{"id": "' + 'c' * 5_000 + '"}'
+        messages: list[ModelMessage] = [
+            ModelResponse(
+                parts=[
+                    ToolSearchCallPart(args=search_args, tool_call_id='ts1'),
+                    LoadCapabilityCallPart(args=load_args, tool_call_id='lc1'),
+                    ToolCallPart(tool_name='write_plan', args='p' * 5_000, tool_call_id='c1'),
+                ]
+            ),
+        ]
+        cap = ClampOversizedMessages(max_part_chars=1_000, keep_head_chars=50, keep_tail_chars=50)
+        result = await cap.compact(messages, _make_ctx())
+
+        response = result[0]
+        assert isinstance(response, ModelResponse)
+        search, load, plain = response.parts
+        # Typed subclasses are left untouched (same objects, structured args intact).
+        assert search is messages[0].parts[0]
+        assert load is messages[0].parts[1]
+        # The plain oversized call is still clamped.
+        assert isinstance(plain, ToolCallPart)
+        assert isinstance(plain.args, dict)
+        assert _CLAMP_ARGS_KEY in plain.args
+        # The real regression: the compacted history still round-trips through the type
+        # adapter, which is how `StepPersistence` restores it.
+        restored = ModelMessagesTypeAdapter.validate_json(ModelMessagesTypeAdapter.dump_json(result))
+        restored_search = restored[0].parts[0]
+        assert type(restored_search) is ToolSearchCallPart
+        assert restored_search.args == search_args
 
     @pytest.mark.anyio
     async def test_small_tool_call_args_untouched(self):
