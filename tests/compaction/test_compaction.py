@@ -18,7 +18,6 @@ from pydantic_ai.messages import (
     TextPart,
     ToolCallPart,
     ToolReturnPart,
-    ToolSearchArgs,
     ToolSearchCallPart,
     ToolSearchReturnContent,
     ToolSearchReturnPart,
@@ -1969,36 +1968,23 @@ class TestClampOversizedMessages:
         # history is restored (e.g. `StepPersistence` resume). Replacing that shape with the
         # `_clamped` object made the round-trip fail; clamping must skip typed subclasses and
         # touch only plain tool calls.
-        search_args: ToolSearchArgs = {'queries': ['find tools for ' + 'x' * 5_000]}
-        load_args = '{"id": "' + 'c' * 5_000 + '"}'
-        messages: list[ModelMessage] = [
-            ModelResponse(
-                parts=[
-                    ToolSearchCallPart(args=search_args, tool_call_id='ts1'),
-                    LoadCapabilityCallPart(args=load_args, tool_call_id='lc1'),
-                    ToolCallPart(tool_name='write_plan', args='p' * 5_000, tool_call_id='c1'),
-                ]
-            ),
-        ]
+        search_call = ToolSearchCallPart(args={'queries': ['find tools for ' + 'x' * 5_000]}, tool_call_id='ts1')
+        load_call = LoadCapabilityCallPart(args='{"id": "' + 'c' * 5_000 + '"}', tool_call_id='lc1')
+        plain_call = ToolCallPart(tool_name='write_plan', args='p' * 5_000, tool_call_id='c1')
+        messages: list[ModelMessage] = [ModelResponse(parts=[search_call, load_call, plain_call])]
         cap = ClampOversizedMessages(max_part_chars=1_000, keep_head_chars=50, keep_tail_chars=50)
         result = await cap.compact(messages, _make_ctx())
 
-        response = result[0]
-        assert isinstance(response, ModelResponse)
-        search, load, plain = response.parts
-        # Typed subclasses are left untouched (same objects, structured args intact).
-        assert search is messages[0].parts[0]
-        assert load is messages[0].parts[1]
-        # The plain oversized call is still clamped.
+        search, load, plain = result[0].parts
+        # Typed subclasses pass through as the same objects; the plain call is still clamped.
+        assert search is search_call
+        assert load is load_call
         assert isinstance(plain, ToolCallPart)
-        assert isinstance(plain.args, dict)
-        assert _CLAMP_ARGS_KEY in plain.args
-        # The real regression: the compacted history still round-trips through the type
-        # adapter, which is how `StepPersistence` restores it.
-        restored = ModelMessagesTypeAdapter.validate_json(ModelMessagesTypeAdapter.dump_json(result))
-        restored_search = restored[0].parts[0]
-        assert type(restored_search) is ToolSearchCallPart
-        assert restored_search.args == search_args
+        assert plain.args_as_dict().keys() == {_CLAMP_ARGS_KEY}
+        # The real regression: the compacted history survives the round-trip `StepPersistence`
+        # restores through. Equality covers the concrete part classes too, so this also pins
+        # that the typed parts come back typed with their structured args intact.
+        assert ModelMessagesTypeAdapter.validate_json(ModelMessagesTypeAdapter.dump_json(result)) == result
 
     @pytest.mark.anyio
     async def test_small_tool_call_args_untouched(self):
