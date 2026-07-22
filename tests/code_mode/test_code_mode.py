@@ -9,6 +9,7 @@ loaded by the project (no extra dev dependency needed).
 from __future__ import annotations
 
 import functools
+from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any, TypeVar
 
@@ -29,7 +30,7 @@ from pydantic_ai.toolsets.function import FunctionToolset
 from pydantic_ai.usage import RunUsage
 from pydantic_core import SchemaValidator, core_schema
 from pydantic_monty import NOT_HANDLED, Monty, MountDir, OSAccess, OsFunction
-from typing_extensions import TypedDict
+from typing_extensions import Never, TypedDict
 
 from pydantic_ai_harness import CodeMode
 from pydantic_ai_harness._monty_exec import PrintCapture
@@ -40,6 +41,19 @@ from pydantic_ai_harness.code_mode._toolset import (  # pyright: ignore[reportPr
     _global_mode_is_sequential,
     _sanitize_tool_name,
 )
+
+_entered_toolsets: list[CodeModeToolset[Never]] = []
+
+
+@pytest.fixture(autouse=True)
+async def _close_direct_toolsets(anyio_backend: str) -> AsyncIterator[None]:
+    """Close toolsets entered by the lower-level `call_tool` tests."""
+    yield
+    while _entered_toolsets:
+        toolset = _entered_toolsets.pop()
+        if toolset._exit_stack is not None:  # pyright: ignore[reportPrivateUsage]
+            await toolset.__aexit__(None, None, None)
+
 
 pytestmark = pytest.mark.anyio
 
@@ -82,6 +96,10 @@ async def build_ctx(
     `ctx.tool_manager` to be set.
     """
     from pydantic_ai.tool_manager import ToolManager
+
+    if isinstance(toolset, CodeModeToolset) and toolset._run_state is None:  # pyright: ignore[reportPrivateUsage]
+        await toolset.__aenter__()
+        _entered_toolsets.append(toolset)
 
     ctx = build_run_context(deps, run_step=run_step)
     tm = ToolManager(toolset=toolset, root_capability=root_capability)
@@ -236,6 +254,48 @@ class TestCodeMode:
         assert '"""Add two numbers."""' in description
         # The base description must tell the model to await tool calls.
         assert 'await' in description
+
+    async def test_run_code_description_explains_final_expression_return(self) -> None:
+        """The model is told how to return a value after assigning it."""
+        wrapper = CodeMode[object]().get_wrapper_toolset(_build_function_toolset(add))
+        assert isinstance(wrapper, CodeModeToolset)
+
+        tools = await wrapper.get_tools(build_run_context(None))
+        description = tools['run_code'].tool_def.description
+
+        assert description is not None
+        assert 'End the snippet with the value to return as a bare expression.' in description
+        assert 'result = some_expression\nresult' in description
+        assert 'Without a non-`None` final expression or print output, `run_code` returns `{}`.' in description
+        assert 'A final expression that evaluates to `None` is treated as no result.' in description
+        assert 'results = await asyncio.gather' not in description
+        assert 'With `print()` output and no non-`None` final expression' in description
+        assert 'With `print()` output and a plain, non-`None` final expression' in description
+        assert 'With `print()` output and a multimodal final expression' in description
+
+    async def test_run_code_function_examples_are_expressions(self) -> None:
+        """Async, sync, and mixed function examples do not end on assignments."""
+        cases: list[tuple[FunctionToolset[object], tuple[str, ...]]] = [
+            (_build_function_toolset(add), ('e.g. `await tool_name(arg=value)`.',)),
+            (
+                FunctionToolset[object](tools=[Tool(add, sequential=True)]),
+                ('e.g. `tool_name(arg=value)`.',),
+            ),
+            (
+                FunctionToolset[object](tools=[Tool(add, sequential=True), Tool(greet)]),
+                ('e.g. `await tool_name(arg=value)`.', 'e.g. `tool_name(arg=value)`.'),
+            ),
+        ]
+
+        for toolset, expected_examples in cases:
+            wrapper = CodeMode[object]().get_wrapper_toolset(toolset)
+            assert isinstance(wrapper, CodeModeToolset)
+
+            description = (await wrapper.get_tools(build_run_context(None)))['run_code'].tool_def.description
+
+            assert description is not None
+            assert all(example in description for example in expected_examples)
+            assert 'e.g. `result =' not in description
 
     async def test_run_code_executes_call_through_monty(self) -> None:
         """End-to-end: `run_code` runs Python in Monty and dispatches to a sync wrapped tool."""
@@ -406,6 +466,19 @@ class TestCodeMode:
         # No print output → result returned directly (not wrapped in a dict).
         assert result.return_value == 3
 
+    async def test_run_code_treats_none_as_no_expression_result(self) -> None:
+        """A final `None` uses the same return shapes as no final expression."""
+        wrapper = CodeMode[object]().get_wrapper_toolset(_build_function_toolset(add))
+        assert isinstance(wrapper, CodeModeToolset)
+        ctx = await build_ctx(None, wrapper)
+        tools = await wrapper.get_tools(ctx)
+
+        result = await wrapper.call_tool('run_code', {'code': 'None'}, ctx, tools['run_code'])
+        assert result.return_value == {}
+
+        printed = await wrapper.call_tool('run_code', {'code': 'print("done")\nNone'}, ctx, tools['run_code'])
+        assert printed.return_value == {'output': 'done\n'}
+
     async def test_run_code_syntax_error_becomes_model_retry(self) -> None:
         """A Python syntax error is surfaced as `ModelRetry` so the model can fix it."""
         wrapper = CodeMode[object]().get_wrapper_toolset(_build_function_toolset(add))
@@ -507,8 +580,8 @@ class TestCodeMode:
 
         assert events == ['monty enter', 'wrapped enter', 'wrapped exit', 'monty exit']
 
-    async def test_agent_run_reuses_one_pool_with_separate_checkouts(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """The agent lifecycle owns one pool while each `run_code` call gets a session."""
+    async def test_agent_run_reuses_one_pool_and_session(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The agent lifecycle owns one pool and one REPL session across `run_code` calls."""
         from pydantic_ai.messages import ModelMessage, ModelResponse, TextPart, ToolCallPart
         from pydantic_ai.models.function import AgentInfo, FunctionModel
         from pydantic_monty import Monty as RealMonty
@@ -552,7 +625,7 @@ class TestCodeMode:
         result = await agent.run('use code mode twice')
 
         assert result.output == 'done'
-        assert events == ['pool init', 'pool enter', 'checkout', 'checkout', 'pool exit']
+        assert events == ['pool init', 'pool enter', 'checkout', 'pool exit']
 
     async def test_for_run_returns_fresh_instance_with_cleared_repl(self) -> None:
         """`for_run` must hand back a new toolset instance -- concurrent runs cannot share REPL state."""
@@ -563,12 +636,13 @@ class TestCodeMode:
         # Force lazy REPL creation on the *original* instance.
         tools = await wrapper.get_tools(ctx)
         await wrapper.call_tool('run_code', {'code': 'x = 1'}, ctx, tools['run_code'])
-        assert wrapper._repl_state is not None  # pyright: ignore[reportPrivateUsage]
+        assert wrapper._run_state is not None  # pyright: ignore[reportPrivateUsage]
+        assert wrapper._run_state.session is not None  # pyright: ignore[reportPrivateUsage]
 
         fresh = await wrapper.for_run(ctx)
         assert isinstance(fresh, CodeModeToolset)
         assert fresh is not wrapper
-        assert fresh._repl_state is None  # pyright: ignore[reportPrivateUsage]
+        assert fresh._run_state is None  # pyright: ignore[reportPrivateUsage]
 
     async def test_for_run_step_short_circuits_when_wrapped_unchanged(self) -> None:
         """If the inner toolset doesn't change between steps, `for_run_step` returns `self` unchanged."""
@@ -619,14 +693,14 @@ class TestCodeMode:
         # Lazily create the REPL on the original instance.
         tools = await wrapper.get_tools(ctx)
         await wrapper.call_tool('run_code', {'code': 'x = 7'}, ctx, tools['run_code'])
-        original_repl = wrapper._repl_state  # pyright: ignore[reportPrivateUsage]
+        original_repl = wrapper._run_state  # pyright: ignore[reportPrivateUsage]
         assert original_repl is not None
 
         next_step = await wrapper.for_run_step(ctx)
         assert isinstance(next_step, CodeModeToolset)
         assert next_step is not wrapper
         # State carries over so the LLM doesn't lose its variables between steps.
-        assert next_step._repl_state is original_repl  # pyright: ignore[reportPrivateUsage]
+        assert next_step._run_state is original_repl  # pyright: ignore[reportPrivateUsage]
 
     # ---------------------------------------------------------------------------
     # Filter behaviour
@@ -1702,12 +1776,14 @@ class TestCodeMode:
 
         # Establish REPL state so the guard's reset to None is observable.
         await wrapper.call_tool('run_code', {'code': 'x = 1'}, ctx, run_code)
-        assert wrapper._repl_state is not None  # pyright: ignore[reportPrivateUsage]
+        assert wrapper._run_state is not None  # pyright: ignore[reportPrivateUsage]
+        assert wrapper._run_state.session is not None  # pyright: ignore[reportPrivateUsage]
 
         monkeypatch.setattr('pydantic_ai_harness._monty_exec.MontyExecutor.run', _panic)
         with pytest.raises(ModelRetry, match='aborted inside the sandbox'):
             await wrapper.call_tool('run_code', {'code': 'x'}, ctx, run_code)
-        assert wrapper._repl_state is None  # pyright: ignore[reportPrivateUsage]
+        assert wrapper._run_state is not None  # pyright: ignore[reportPrivateUsage]
+        assert wrapper._run_state.session is None  # pyright: ignore[reportPrivateUsage]
 
     async def test_non_panic_base_exception_propagates(self, monkeypatch: pytest.MonkeyPatch) -> None:
         # The panic guard catches BaseException but must re-raise anything that is not a VM panic.

@@ -6,8 +6,8 @@ import inspect
 import keyword
 import re
 import warnings
-from collections.abc import Callable, Generator, Sequence
-from contextlib import AsyncExitStack, contextmanager
+from collections.abc import Callable, Sequence
+from contextlib import AsyncExitStack, ExitStack
 from dataclasses import dataclass, field, replace
 from typing import Annotated, Any
 
@@ -38,6 +38,7 @@ try:
         Monty,
         MontyCrashedError,
         MontyRuntimeError,
+        MontySession,
         MontySyntaxError,
         MontyTypingError,
         MountDir,
@@ -58,6 +59,35 @@ CodeModeOSCallback = Callable[[OsFunction, tuple[object, ...], dict[str, object]
 CodeModeOS = AbstractOS | CodeModeOSCallback
 # Accepted by `CodeMode.mount`: one or more host-directory mounts.
 CodeModeMount = MountDir | list[MountDir]
+
+
+@dataclass
+class _MontyRunState:
+    """Monty resources shared by every toolset view created during one agent run."""
+
+    pool: Monty
+    session: MontySession | None = None
+    has_executed_feed: bool = False
+    _session_stack: ExitStack = field(default_factory=ExitStack, repr=False)
+
+    def get_session(self, *, type_check: bool, type_check_stubs: str | None) -> MontySession:
+        """Return the run's live REPL session, creating it on first use."""
+        if self.session is None:
+            self.session = self._session_stack.enter_context(
+                self.pool.checkout(type_check=type_check, type_check_stubs=type_check_stubs)
+            )
+        return self.session
+
+    def reset(self) -> None:
+        """Return the current worker and make the next call start a fresh REPL."""
+        self._session_stack.close()
+        self._session_stack = ExitStack()
+        self.session = None
+        self.has_executed_feed = False
+
+    def close(self) -> None:
+        """Return the checked-out worker before the owning pool closes."""
+        self.reset()
 
 
 class _RunCodeArguments(TypedDict):
@@ -86,7 +116,7 @@ Write and run Python code in a sandboxed environment.
 The sandbox uses Monty, a subset of Python. Key restrictions:
 - **No classes**: class definitions are not supported
 - **No third-party libraries**: only the standard library modules listed below can be used
-- **Importable standard library modules**: `sys`, `typing`, `asyncio`, `math`, `json`, `re`, `datetime`, `os`, `pathlib`. These must be imported before use, just like in regular Python. For example: `import asyncio` then `results = await asyncio.gather(tool_one(...), tool_two(...))`."""
+- **Importable standard library modules**: `sys`, `typing`, `asyncio`, `math`, `json`, `re`, `datetime`, `os`, `pathlib`. These must be imported before use, just like in regular Python. For example: `import asyncio` then `await asyncio.gather(tool_one(...), tool_two(...))`."""
 
 # Timing/OS restriction line, swapped depending on what host access the agent
 # configured. Three states, because `mount` and `os` enable different things:
@@ -117,11 +147,23 @@ _RUN_CODE_DESCRIPTION_TAIL = """\
 State is preserved between calls (REPL-style). Set `restart: true` to reset state.
 
 The last expression's value is automatically captured as the return value -- you do **not** need to \
-`print()` it. Avoid `print()` for return values as it produces Python string representations, not \
-structured data. Use `print()` only for supplementary logging or debug output.
+`print()` it. End the snippet with the value to return as a bare expression. A final assignment stores \
+the value but does not return it. A final expression that evaluates to `None` is treated as no result. \
+Without a non-`None` final expression or print output, `run_code` returns `{}`. For example:
 
-Returns the last expression's value directly. If `print()` was also called, returns \
-`{"output": "<printed text>", "result": <last expression>}`.\
+```python
+result = some_expression
+result
+```
+
+Avoid `print()` for return values as it produces Python string representations, not structured data. \
+Use `print()` only for supplementary logging or debug output.
+
+Returns a non-`None` last expression's value directly when nothing is printed. With `print()` output \
+and no non-`None` final expression, returns `{"output": "<printed text>"}`. With `print()` output and a \
+plain, non-`None` final expression, returns \
+`{"output": "<printed text>", "result": <last expression>}`. With `print()` output and a multimodal \
+final expression, returns a list with the printed text followed by the native content.\
 """
 
 
@@ -150,15 +192,15 @@ def _functions_header(*, has_sync: bool, has_async: bool) -> str:
     if has_async and not has_sync:
         return base + (
             ' All tool functions are async: invoke them with `await`,'
-            ' e.g. `result = await tool_name(arg=value)`.'
+            ' e.g. `await tool_name(arg=value)`.'
             ' Calling without `await` returns an unresolved future, not the value.'
         )
     if has_sync and not has_async:
-        return base + (' All tool functions are synchronous: call them directly, e.g. `result = tool_name(arg=value)`.')
+        return base + (' All tool functions are synchronous: call them directly, e.g. `tool_name(arg=value)`.')
     return base + (
         ' Async functions (`async def`) must be invoked with `await`,'
-        ' e.g. `result = await tool_name(arg=value)`.'
-        ' Sync functions (`def`) are called directly, e.g. `result = tool_name(arg=value)`.'
+        ' e.g. `await tool_name(arg=value)`.'
+        ' Sync functions (`def`) are called directly, e.g. `tool_name(arg=value)`.'
     )
 
 
@@ -285,18 +327,9 @@ class CodeModeToolset(WrapperToolset[AgentDepsT]):
     so Tool Search discoveries don't bust the tool-definitions cache prefix.
     """
 
-    # init=False so `replace()` in `for_run` produces a fresh instance with `_repl_state=None`,
-    # giving each agent run isolated REPL state. Each call checks out its own session (from a
-    # per-call pool when the toolset was not entered), so REPL state is carried between calls
-    # as `session.dump()` bytes reloaded via `load_session` on the next call.
-    _repl_state: bytes | None = field(default=None, init=False, repr=False)
-
-    # The Monty worker pool, created in `__aenter__` and reused by every `run_code` call for
-    # the lifetime of the entered toolset (one pool per agent run, rather than one per call).
-    # `None` when the toolset was not entered through its lifecycle -- `call_tool` then falls
-    # back to a per-call pool. init=False so `for_run` copies start poolless and each entered
-    # copy creates its own; `for_run_step` copies borrow the entered instance's pool by reference.
-    _monty_pool: Monty | None = field(default=None, init=False, repr=False, compare=False)
+    # Shared by `for_run_step` copies so they use the same REPL session and the original entered
+    # instance can close it. `for_run` leaves this unset, giving concurrent runs isolated state.
+    _run_state: _MontyRunState | None = field(default=None, init=False, repr=False, compare=False)
 
     # Owns both the synchronous Monty pool and asynchronous wrapped toolset. It is populated
     # only after every resource enters successfully, then unwound in reverse entry order.
@@ -321,8 +354,7 @@ class CodeModeToolset(WrapperToolset[AgentDepsT]):
         if new_wrapped is self.wrapped:
             return self
         new_self = replace(self, wrapped=new_wrapped)
-        new_self._repl_state = self._repl_state
-        new_self._monty_pool = self._monty_pool
+        new_self._run_state = self._run_state
         new_self._warned_deferred = self._warned_deferred
         new_self._last_catalog = self._last_catalog
         return new_self
@@ -336,8 +368,10 @@ class CodeModeToolset(WrapperToolset[AgentDepsT]):
         """
         async with AsyncExitStack() as stack:
             monty_pool = stack.enter_context(Monty())
+            run_state = _MontyRunState(monty_pool)
+            stack.callback(run_state.close)
             await stack.enter_async_context(self.wrapped)
-            self._monty_pool = monty_pool
+            self._run_state = run_state
             self._exit_stack = stack.pop_all()
         return self
 
@@ -346,17 +380,8 @@ class CodeModeToolset(WrapperToolset[AgentDepsT]):
         exit_stack = self._exit_stack
         assert exit_stack is not None
         self._exit_stack = None
-        self._monty_pool = None
+        self._run_state = None
         return await exit_stack.__aexit__(*args)
-
-    @contextmanager
-    def _acquire_pool(self) -> Generator[Monty]:
-        """Yield the pool created in `__aenter__`; if the toolset was not entered, spin up a per-call pool."""
-        if self._monty_pool is not None:
-            yield self._monty_pool
-        else:
-            with Monty() as pool:
-                yield pool
 
     async def get_instructions(
         self, ctx: RunContext[AgentDepsT]
@@ -474,12 +499,13 @@ class CodeModeToolset(WrapperToolset[AgentDepsT]):
         code = tool_args['code']
         restart = tool_args.get('restart', False)
 
-        # Clear the REPL on restart so that if type checking fails, the
-        # next retry still gets fresh_repl=True and is type-checked again.
-        if restart:
-            self._repl_state = None
+        run_state = self._run_state
+        assert run_state is not None, '`CodeModeToolset` must be entered before calling `run_code`'
 
-        fresh_repl = self._repl_state is None
+        if restart:
+            run_state.reset()
+
+        fresh_repl = not run_state.has_executed_feed
 
         callable_defs = tool.callable_defs
         sanitized_to_original = tool.sanitized_to_original
@@ -573,43 +599,34 @@ class CodeModeToolset(WrapperToolset[AgentDepsT]):
             # Serialize to JSON-compatible form so Monty receives only plain data.
             return _TOOL_RETURN_CONTENT_TA.dump_python(result)
 
-        # Type-check only the first snippet of a fresh REPL. Session dumps restore some checker
-        # state, but it can diverge from runtime state across snippets: imports are not available
-        # to the next check, and incrementally constructed dictionaries can be rejected where the
-        # runtime tool validator accepts them as TypedDict inputs. Keep runtime REPL state without
-        # introducing those false positives on later calls.
+        # Type-check only the first executed snippet. Monty's checker can reject valid later
+        # snippets that reuse imports or pass a runtime-validated dict to a TypedDict parameter.
         type_check = fresh_repl and bool(callable_defs)
         type_check_stubs = self._build_type_check_stubs(callable_defs) if type_check else None
 
         capture = PrintCapture()
 
         try:
-            with self._acquire_pool() as monty_pool:
-                with monty_pool.checkout(type_check=type_check, type_check_stubs=type_check_stubs) as session:
-                    if self._repl_state is not None:
-                        session.load_session(self._repl_state)
-                    try:
-                        monty_state = session.feed_start(
-                            code,
-                            print_callback=capture,
-                            os=self.os_access,
-                            mount=self.mount,
-                            skip_type_check=not type_check,
-                        )
-                        completed = await MontyExecutor(
-                            dispatch=dispatch_tool_call,
-                            valid_names=callable_defs,
-                            sequential_names=sequential_tools,
-                            global_sequential=global_sequential,
-                        ).run(monty_state)
-                    except MontyRuntimeError:
-                        # A runtime error ends the feed with the session idle again, and
-                        # assignments made before the failing line survive in the worker.
-                        # Dump them so the retry keeps REPL state, as the tool description
-                        # promises.
-                        self._repl_state = session.dump()
-                        raise
-                    self._repl_state = session.dump()
+            session = run_state.get_session(type_check=type_check, type_check_stubs=type_check_stubs)
+            try:
+                monty_state = session.feed_start(
+                    code,
+                    print_callback=capture,
+                    os=self.os_access,
+                    mount=self.mount,
+                    skip_type_check=not type_check,
+                )
+                completed = await MontyExecutor(
+                    dispatch=dispatch_tool_call,
+                    valid_names=callable_defs,
+                    sequential_names=sequential_tools,
+                    global_sequential=global_sequential,
+                ).run(monty_state)
+            except MontyRuntimeError:
+                # The session is idle again and keeps assignments made before the failing line.
+                run_state.has_executed_feed = True
+                raise
+            run_state.has_executed_feed = True
         except MontySyntaxError as e:
             raise ModelRetry(f'Syntax error in code:\n{capture.prepend_to(e.display())}') from e
         except MontyTypingError as e:
@@ -630,7 +647,7 @@ class CodeModeToolset(WrapperToolset[AgentDepsT]):
             # request timeout) and the REPL state died with it; the pool replaces the
             # worker transparently. Reset so the retry starts from a fresh,
             # type-checked session.
-            self._repl_state = None
+            run_state.reset()
             raise ModelRetry(
                 'The code crashed the sandbox worker and the session was reset. Revise the code and try again.'
             ) from e
@@ -641,7 +658,7 @@ class CodeModeToolset(WrapperToolset[AgentDepsT]):
                 raise
             # The panic aborts the VM mid-execution, so the REPL's accumulated state cannot
             # be trusted; drop it so the retry starts from a fresh, type-checked session.
-            self._repl_state = None
+            run_state.reset()
             raise ModelRetry(
                 'The code aborted inside the sandbox and the session was reset. Revise the code and try again.'
             ) from e
