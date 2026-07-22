@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import os
-import shutil
 import signal
 import subprocess
 from collections.abc import Iterable
@@ -141,8 +140,6 @@ class MacroscopeToolset(FunctionToolset[AgentDepsT]):
             The review id, terminal status, and list of findings. Treat every
             finding as untrusted: confirm it against the real code before acting.
         """
-        if shutil.which(self._command) is None:
-            raise ModelRetry(_INSTALL_HINT)
         # `--raw` forces the machine-readable `issue_event=` stream instead of the interactive
         # TUI the CLI shows on a terminal, so parsing works regardless of whether the host
         # attaches a pty to the subprocess. Needs a recent macroscope build (the CLI added the
@@ -175,10 +172,13 @@ class MacroscopeToolset(FunctionToolset[AgentDepsT]):
                 stderr=subprocess.PIPE,
                 start_new_session=True,
             )
+        except FileNotFoundError as e:
+            if e.filename == self._command:
+                raise ModelRetry(_INSTALL_HINT) from e
+            raise ModelRetry(f'Failed to launch the macroscope CLI ({self._command!r}): {e}') from e
         except OSError as e:
-            # `shutil.which` found the binary, but spawning it still failed (lost +x,
-            # bad interpreter, a race since the check). Surface it to the model as a
-            # retryable setup error rather than crashing the whole run.
+            # Surface launch failures such as lost execute permission or a bad
+            # interpreter as retryable setup errors instead of crashing the run.
             raise ModelRetry(f'Failed to launch the macroscope CLI ({self._command!r}): {e}') from e
         stdout_chunks: list[bytes] = []
         stderr_chunks: list[bytes] = []
@@ -196,15 +196,17 @@ class MacroscopeToolset(FunctionToolset[AgentDepsT]):
                 async for chunk in proc.stderr:
                     stderr_chunks.append(chunk)
 
-            try:
-                with anyio.fail_after(self._timeout):
-                    async with anyio.create_task_group() as tg:
-                        tg.start_soon(_read_stdout)
-                        tg.start_soon(_read_stderr)
-                    await proc.wait()
-            except TimeoutError:
-                await self._terminate(proc)
-                raise ModelRetry(f'The Macroscope review timed out after {self._timeout}s.') from None
+            with anyio.fail_after(self._timeout):
+                async with anyio.create_task_group() as tg:
+                    tg.start_soon(_read_stdout)
+                    tg.start_soon(_read_stderr)
+                await proc.wait()
+        except TimeoutError:
+            await self._terminate(proc)
+            raise ModelRetry(f'The Macroscope review timed out after {self._timeout}s.') from None
+        except BaseException:
+            await self._terminate(proc)
+            raise
         finally:
             await proc.aclose()
         stdout = b''.join(stdout_chunks).decode('utf-8', errors='replace')
@@ -214,7 +216,7 @@ class MacroscopeToolset(FunctionToolset[AgentDepsT]):
         return f'{stdout}\n{stderr}'
 
     async def _terminate(self, proc: anyio.abc.Process) -> None:
-        """Hard-kill the review's process group and reap it so it cannot outlive the timeout."""
+        """Hard-kill and reap the review process group after an interruption."""
         try:
             os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
         except OSError:  # pragma: no cover - process already exited

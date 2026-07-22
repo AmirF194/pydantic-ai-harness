@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import shlex
 import time
@@ -9,6 +10,7 @@ from collections.abc import Sequence
 from pathlib import Path
 
 import anyio
+import anyio.abc
 import pytest
 from pydantic_ai import Agent
 from pydantic_ai.exceptions import ModelRetry
@@ -141,6 +143,14 @@ class TestRunReview:
         with pytest.raises(ModelRetry, match='not found'):
             await toolset.run_macroscope_review()
 
+    async def test_relative_command_resolves_from_configured_cwd(self, tmp_path: Path) -> None:
+        bin_dir = tmp_path / 'bin'
+        bin_dir.mkdir()
+        command = _fake_cli(bin_dir, ['review_id=rev-relative', 'issue_status=completed'])
+        review = await _toolset('./bin/macroscope', tmp_path).run_macroscope_review()
+        assert review.review_id == 'rev-relative'
+        assert _recorded_args(command) == ['codereview', '--raw', '--base', 'main']
+
     async def test_no_review_id_raises_model_retry(self, tmp_path: Path) -> None:
         command = _fake_cli(tmp_path, ['issue_status=failed'])
         with pytest.raises(ModelRetry, match='did not start'):
@@ -165,6 +175,29 @@ class TestRunReview:
         elapsed = time.monotonic() - started
         assert elapsed < 5, f'review took {elapsed:.1f}s -- the process was waited out, not killed'
 
+    async def test_cancellation_terminates_process_group(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        command = _fake_cli(tmp_path, ['review_id=rev-cancelled', 'issue_status=completed'], sleep=1)
+        toolset = _toolset(command, tmp_path)
+        original_terminate = toolset._terminate
+        terminated = False
+
+        async def tracked_terminate(proc: anyio.abc.Process) -> None:
+            nonlocal terminated
+            terminated = True
+            await original_terminate(proc)
+
+        monkeypatch.setattr(toolset, '_terminate', tracked_terminate)
+        task = asyncio.create_task(toolset.run_macroscope_review())
+        with anyio.fail_after(5):
+            args_file = Path(f'{command}.args')
+            while not args_file.exists():
+                await anyio.sleep(0.01)
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+
+        assert terminated
+
     async def test_base_omitted_lets_cli_autodetect(self, tmp_path: Path) -> None:
         # With no configured or per-call base, `--base` is dropped so the CLI picks the base itself.
         command = _fake_cli(tmp_path, ['review_id=rev-5', 'issue_status=completed'])
@@ -172,7 +205,7 @@ class TestRunReview:
         assert _recorded_args(command) == ['codereview', '--raw']
 
     async def test_spawn_failure_raises_model_retry(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-        # Binary passes the `which` check but fails to exec (lost +x, bad interpreter, TOCTOU).
+        # The executable exists but spawning still fails, for example after losing execute permission.
         command = _fake_cli(tmp_path, ['review_id=rev-6', 'issue_status=completed'])
 
         async def _boom(*args: object, **kwargs: object) -> object:
@@ -181,6 +214,11 @@ class TestRunReview:
         monkeypatch.setattr(anyio, 'open_process', _boom)
         with pytest.raises(ModelRetry, match='Failed to launch'):
             await _toolset(command, tmp_path).run_macroscope_review()
+
+    async def test_missing_cwd_raises_launch_error(self, tmp_path: Path) -> None:
+        command = _fake_cli(tmp_path, ['review_id=rev-missing-cwd', 'issue_status=completed'])
+        with pytest.raises(ModelRetry, match='Failed to launch'):
+            await _toolset(command, tmp_path / 'missing').run_macroscope_review()
 
 
 class TestCapability:
