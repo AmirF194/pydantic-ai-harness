@@ -8,6 +8,9 @@ the `playwright` Python package installed (no browser binary).
 
 from __future__ import annotations
 
+import asyncio
+import sys
+
 import pytest
 from pydantic_ai import Agent
 from pydantic_ai.messages import BinaryContent, ToolReturn
@@ -130,8 +133,9 @@ class _FakePage:
 
 
 class _FakeBrowser:
-    def __init__(self, page: _FakePage) -> None:
+    def __init__(self, page: _FakePage, *, close_error: Exception | None = None) -> None:
         self._page = page
+        self._close_error = close_error
         self.closed = False
 
     async def new_page(self) -> _FakePage:
@@ -139,20 +143,37 @@ class _FakeBrowser:
 
     async def close(self) -> None:
         self.closed = True
+        if self._close_error is not None:
+            raise self._close_error
 
 
 class _FakeChromium:
-    def __init__(self, page: _FakePage, *, launch_error: bool = False) -> None:
+    def __init__(
+        self,
+        page: _FakePage,
+        *,
+        executable_missing: bool = False,
+        launch_error: Exception | None = None,
+        close_error: Exception | None = None,
+    ) -> None:
         self._page = page
+        # An existing path so the real `os.path.exists` pre-check takes the launch
+        # branch; a bogus path models a missing Chromium binary.
+        self._executable_path = '/nonexistent/chromium-binary' if executable_missing else sys.executable
         self._launch_error = launch_error
+        self._close_error = close_error
         self.launched: list[bool] = []
         self.browser: _FakeBrowser | None = None
 
+    @property
+    def executable_path(self) -> str:
+        return self._executable_path
+
     async def launch(self, *, headless: bool) -> _FakeBrowser:
         self.launched.append(headless)
-        if self._launch_error:
-            raise RuntimeError('chromium binary missing')
-        self.browser = _FakeBrowser(self._page)
+        if self._launch_error is not None:
+            raise self._launch_error
+        self.browser = _FakeBrowser(self._page, close_error=self._close_error)
         return self.browser
 
 
@@ -199,10 +220,17 @@ def _ctx() -> RunContext[None]:
 
 
 def _install_fake_driver(
-    monkeypatch: pytest.MonkeyPatch, page: _FakePage, *, launch_error: bool = False
+    monkeypatch: pytest.MonkeyPatch,
+    page: _FakePage,
+    *,
+    executable_missing: bool = False,
+    launch_error: Exception | None = None,
+    close_error: Exception | None = None,
 ) -> _FakeDriverCM:
     """Point the capability's `async_playwright` at a fake driver chain."""
-    chromium = _FakeChromium(page, launch_error=launch_error)
+    chromium = _FakeChromium(
+        page, executable_missing=executable_missing, launch_error=launch_error, close_error=close_error
+    )
     cm = _FakeDriverCM(_FakeDriver(chromium))
     monkeypatch.setattr(capability_module, 'async_playwright', lambda: cm)
     return cm
@@ -231,6 +259,22 @@ class TestBrowserTools:
             result = await toolset.navigate(url)
             assert isinstance(result, str) and result.startswith('URL:')
             assert page.goto_calls == [url]
+
+    async def test_navigate_allows_ipv6_host_in_allowlist(self) -> None:
+        # A bracketed IPv6 literal must match its allowlist entry (regression: the
+        # old netloc.split(':') turned '[::1]' into '[').
+        page = _FakePage(url='http://[::1]:8080/')
+        toolset = _toolset(page, allowed_domains=['::1'])
+        result = await toolset.navigate('http://[::1]:8080/')
+        assert isinstance(result, str) and result.startswith('URL:')
+        assert page.goto_calls == ['http://[::1]:8080/']
+
+    async def test_navigate_rejects_url_without_host(self) -> None:
+        page = _FakePage()
+        toolset = _toolset(page, allowed_domains=['example.com'])
+        result = await toolset.navigate('mailto:a@b.com')
+        assert result == 'Error: domain not in allowed_domains: mailto:a@b.com'
+        assert page.goto_calls == []
 
     async def test_navigate_attaches_screenshot_when_configured(self) -> None:
         toolset = _toolset(_FakePage(), screenshot_on_navigate=True)
@@ -400,6 +444,35 @@ class TestBrowserState:
         with pytest.raises(RuntimeError, match='Chromium is not installed'):
             await toolset.screenshot()
 
+    async def test_concurrent_ensure_page_launches_once(self) -> None:
+        # Two tool calls that race before the page exists must launch Chromium once.
+        state = BrowserState()
+        launches: list[int] = []
+
+        async def _launch() -> None:
+            launches.append(1)
+            await asyncio.sleep(0)  # yield so the second caller blocks on the lock
+            state.page = _FakePage()
+
+        state.lazy_launcher = _launch
+        first, second = await asyncio.gather(state.ensure_page(), state.ensure_page())
+        assert launches == [1]
+        assert first is second
+
+    async def test_concurrent_ensure_page_failed_launch_raises_once(self) -> None:
+        state = BrowserState()
+        launches: list[int] = []
+
+        async def _launch() -> None:
+            launches.append(1)
+            await asyncio.sleep(0)
+            state.launch_error = 'Chromium is not installed.'
+
+        state.lazy_launcher = _launch
+        results = await asyncio.gather(state.ensure_page(), state.ensure_page(), return_exceptions=True)
+        assert launches == [1]  # second caller sees the error, does not relaunch
+        assert all(isinstance(r, RuntimeError) for r in results)
+
 
 # --- Capability hooks -------------------------------------------------------
 
@@ -415,6 +488,13 @@ class TestBrowserHooks:
         text = instructions(_ctx())
         assert text is not None and 'Allowed domains: all' in text
 
+    def test_get_instructions_reports_empty_allowlist_as_none(self) -> None:
+        # An empty allowlist blocks every domain, so the model must be told 'none',
+        # not 'all' (which list-truthiness would collapse it to).
+        instructions = Browser[None](allowed_domains=[]).get_instructions()
+        text = instructions(_ctx())
+        assert text is not None and 'Allowed domains: none' in text
+
     def test_get_instructions_suppressed_on_launch_error(self) -> None:
         browser = Browser[None]()
         browser._state.launch_error = 'boom'
@@ -423,8 +503,10 @@ class TestBrowserHooks:
     async def test_prepare_tools_reset_unapproved(self) -> None:
         browser = Browser[None]()
         defs = [
-            ToolDefinition(name='navigate', parameters_json_schema={'type': 'object'}, kind='unapproved'),
-            ToolDefinition(name='other', parameters_json_schema={'type': 'object'}, kind='function'),
+            ToolDefinition(
+                name='navigate', parameters_json_schema={'type': 'object'}, kind='unapproved', toolset_id='browser'
+            ),
+            ToolDefinition(name='other', parameters_json_schema={'type': 'object'}, kind='function', toolset_id='misc'),
         ]
         result = await browser.prepare_tools(_ctx(), defs)
         by_name = {td.name: td for td in result}
@@ -435,11 +517,24 @@ class TestBrowserHooks:
         browser = Browser[None]()
         browser._state.launch_error = 'boom'
         defs = [
-            ToolDefinition(name='navigate', parameters_json_schema={'type': 'object'}, kind='function'),
-            ToolDefinition(name='other', parameters_json_schema={'type': 'object'}, kind='function'),
+            ToolDefinition(
+                name='navigate', parameters_json_schema={'type': 'object'}, kind='function', toolset_id='browser'
+            ),
+            ToolDefinition(name='other', parameters_json_schema={'type': 'object'}, kind='function', toolset_id='misc'),
         ]
         result = await browser.prepare_tools(_ctx(), defs)
         assert [td.name for td in result] == ['other']
+
+    async def test_prepare_tools_ignores_same_named_foreign_tool(self) -> None:
+        # A `navigate` from another toolset must be left untouched (not re-approved,
+        # not hidden), since matching is by `toolset_id`, not tool name.
+        foreign = ToolDefinition(
+            name='navigate', parameters_json_schema={'type': 'object'}, kind='unapproved', toolset_id='other_toolset'
+        )
+        browser = Browser[None]()
+        assert (await browser.prepare_tools(_ctx(), [foreign]))[0].kind == 'unapproved'
+        browser._state.launch_error = 'boom'
+        assert [td.name for td in await browser.prepare_tools(_ctx(), [foreign])] == ['navigate']
 
     async def test_for_run_isolates_state(self) -> None:
         browser = Browser[None]()
@@ -503,15 +598,33 @@ class TestBrowserLifecycle:
 
     async def test_missing_binary_raises_install_hint(self, monkeypatch: pytest.MonkeyPatch) -> None:
         page = _FakePage()
-        cm = _install_fake_driver(monkeypatch, page, launch_error=True)
+        cm = _install_fake_driver(monkeypatch, page, executable_missing=True)
         agent = Agent(TestModel(call_tools=['screenshot']), capabilities=[Browser()])
         with pytest.raises(RuntimeError, match='playwright install chromium'):
             await agent.run('screenshot the page')
+        assert cm._driver.chromium.launched == []  # never attempted launch on a missing binary
         assert cm.exited is True  # Playwright driver still cleaned up
+
+    async def test_launch_failure_with_binary_present_surfaces_own_error(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        installs: list[bool] = []
+
+        async def _spy_install() -> bool:  # pragma: no cover -- asserted never called
+            installs.append(True)
+            return False
+
+        monkeypatch.setattr(capability_module, '_auto_install_chromium', _spy_install)
+        page = _FakePage()
+        cm = _install_fake_driver(monkeypatch, page, launch_error=RuntimeError('sandbox denied'))
+        # auto_install=True proves a real launch failure does not trigger a download.
+        agent = Agent(TestModel(call_tools=['screenshot']), capabilities=[Browser(auto_install=True)])
+        with pytest.raises(RuntimeError, match='sandbox denied'):
+            await agent.run('screenshot the page')
+        assert installs == []  # binary present -> no install attempt
+        assert cm.exited is True  # driver still cleaned up
 
     async def test_auto_install_retry_when_install_fails(self, monkeypatch: pytest.MonkeyPatch) -> None:
         page = _FakePage()
-        _install_fake_driver(monkeypatch, page, launch_error=True)
+        _install_fake_driver(monkeypatch, page, executable_missing=True)
 
         async def _fake_install() -> bool:
             return False
@@ -520,6 +633,30 @@ class TestBrowserLifecycle:
         agent = Agent(TestModel(call_tools=['screenshot']), capabilities=[Browser(auto_install=True)])
         with pytest.raises(RuntimeError, match='Chromium is not installed'):
             await agent.run('screenshot the page')
+
+    async def test_close_error_still_exits_driver(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        page = _FakePage()
+        cm = _install_fake_driver(monkeypatch, page, close_error=RuntimeError('close failed'))
+        agent = Agent(TestModel(call_tools=['screenshot']), capabilities=[Browser()])
+        with pytest.raises(RuntimeError, match='close failed'):
+            await agent.run('screenshot the page')
+        assert cm.exited is True  # driver exited despite the close error
+
+    async def test_pending_popup_tasks_cancelled_on_run_end(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        page = _FakePage()
+        _install_fake_driver(monkeypatch, page)
+        browser = Browser()
+
+        async def _same_instance(self: Browser[None], ctx: RunContext[None]) -> Browser[None]:
+            return self
+
+        monkeypatch.setattr(Browser, 'for_run', _same_instance)
+        pending = asyncio.ensure_future(asyncio.sleep(3600))
+        browser._popup_tasks.add(pending)
+        agent = Agent(TestModel(call_tools=['screenshot']), capabilities=[browser])
+        await agent.run('screenshot the page')
+        assert pending.cancelled()
+        assert browser._popup_tasks == set()
 
 
 # --- Package surface --------------------------------------------------------

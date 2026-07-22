@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import functools
+import os
 import sys
 from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING
@@ -142,10 +143,6 @@ class Browser(AbstractCapability[AgentDepsT]):
     clear install hint. Set `True` to opt into the automatic download instead.
     """
 
-    _BROWSER_TOOL_NAMES = frozenset(
-        {'navigate', 'click', 'type_text', 'screenshot', 'get_text', 'scroll', 'go_back', 'go_forward', 'execute_js'}
-    )
-
     _state: BrowserState = field(default_factory=BrowserState, init=False, repr=False)
     _toolset: BrowserToolset[AgentDepsT] = field(init=False, repr=False)
     _browser: PlaywrightBrowser | None = field(default=None, init=False, repr=False)
@@ -174,19 +171,27 @@ class Browser(AbstractCapability[AgentDepsT]):
         def _instructions(ctx: RunContext[AgentDepsT]) -> str | None:
             if self._state.launch_error is not None:
                 return None
-            return _INSTRUCTIONS.format(
-                max_content_tokens=self.max_content_tokens,
-                allowed_domains=', '.join(self.allowed_domains) if self.allowed_domains else 'all',
-            )
+            if self.allowed_domains is None:
+                domains = 'all'
+            elif self.allowed_domains:
+                domains = ', '.join(self.allowed_domains)
+            else:
+                domains = 'none'
+            return _INSTRUCTIONS.format(max_content_tokens=self.max_content_tokens, allowed_domains=domains)
 
         return _instructions
 
     async def prepare_tools(self, ctx: RunContext[AgentDepsT], tool_defs: list[ToolDefinition]) -> list[ToolDefinition]:
-        """Hide the browser tools when Chromium is unavailable; keep them approval-free otherwise."""
+        """Hide the browser tools when Chromium is unavailable; keep them approval-free otherwise.
+
+        Tools are matched by `toolset_id` so a same-named tool from another toolset
+        (e.g. a different `navigate`) is left untouched.
+        """
+        toolset_id = self._toolset.id
         if self._state.launch_error is not None:
-            return [td for td in tool_defs if td.name not in self._BROWSER_TOOL_NAMES]
+            return [td for td in tool_defs if td.toolset_id != toolset_id]
         return [
-            replace(td, kind='function') if td.name in self._BROWSER_TOOL_NAMES and td.kind == 'unapproved' else td
+            replace(td, kind='function') if td.toolset_id == toolset_id and td.kind == 'unapproved' else td
             for td in tool_defs
         ]
 
@@ -244,20 +249,22 @@ class Browser(AbstractCapability[AgentDepsT]):
             nonlocal entered
             pw = await pw_cm.__aenter__()
             entered = True
-            try:
-                browser = await pw.chromium.launch(headless=self.headless)
-            except Exception:
-                # A non-None browser here means auto_install fetched Chromium and
-                # the retry succeeded -- reachable only with a real install.
+            if not os.path.exists(pw.chromium.executable_path):
+                # Binary genuinely absent: raise a clear install hint, or fetch it
+                # when opted in. A launch failure with the binary present (sandbox,
+                # missing system libs, no display) is left to surface as its own
+                # error rather than being masked as "Chromium is not installed".
                 browser = await self._install_and_retry(pw) if self.auto_install else None
                 if browser is None:  # pragma: no branch
                     self._state.launch_error = _CHROMIUM_MISSING_MESSAGE
                     return
+            else:
+                browser = await pw.chromium.launch(headless=self.headless)
+            self._browser = browser
             page = await browser.new_page()
             if self.allowed_domains is not None:
                 await page.route('**/*', functools.partial(self._route_guard, page))
             page.on('popup', functools.partial(self._on_popup, page))
-            self._browser = browser
             self._state.page = page
 
         self._state.lazy_launcher = _launch
@@ -265,12 +272,20 @@ class Browser(AbstractCapability[AgentDepsT]):
             return await handler()
         finally:
             self._state.lazy_launcher = None
-            if self._browser is not None:
-                browser = self._browser
+            if self._popup_tasks:
+                for task in self._popup_tasks:
+                    task.cancel()
+                await asyncio.gather(*self._popup_tasks, return_exceptions=True)
+                self._popup_tasks.clear()
+            browser = self._browser
+            if browser is not None:
                 self._state.page = None
                 self._browser = None
-                await browser.close()
-            if entered:
+                try:
+                    await browser.close()
+                finally:
+                    await pw_cm.__aexit__(None, None, None)
+            elif entered:
                 await pw_cm.__aexit__(None, None, None)
 
     @classmethod

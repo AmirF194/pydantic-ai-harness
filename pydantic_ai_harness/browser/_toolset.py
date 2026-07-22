@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Literal, Protocol
@@ -71,16 +72,16 @@ def check_allowed_domain(url: str, allowed_domains: list[str] | None) -> bool:
     """Return whether `url`'s host is permitted by the allowlist.
 
     `allowed_domains=None` means every domain is allowed (open egress). A host
-    matches when it equals an allowed entry or is a subdomain of one. The port
-    is stripped before comparison. A URL that does not parse is rejected.
+    matches when it equals an allowed entry or is a subdomain of one. `hostname`
+    strips the port and brackets, so bracketed IPv6 literals compare correctly. A
+    URL without a host (e.g. `about:blank`, `mailto:`) is rejected.
     """
     if allowed_domains is None:
         return True
-    try:
-        domain = urlparse(url).netloc.lower().split(':')[0]
-    except ValueError:  # pragma: no cover
+    host = urlparse(url).hostname
+    if host is None:
         return False
-    return any(domain == entry.lower() or domain.endswith('.' + entry.lower()) for entry in allowed_domains)
+    return any(host == entry.lower() or host.endswith('.' + entry.lower()) for entry in allowed_domains)
 
 
 def _truncate(text: str, max_chars: int) -> str:
@@ -109,16 +110,31 @@ class BrowserState:
     lazy_launcher: Callable[[], Awaitable[None]] | None = field(default=None, init=False, repr=False)
     """Async launcher installed by `Browser.wrap_run`; populates `page` on first use."""
 
+    _launch_lock: asyncio.Lock = field(default_factory=asyncio.Lock, init=False, repr=False)
+    """Serializes the lazy launch so concurrent first tool calls launch Chromium once."""
+
     async def ensure_page(self) -> _Page:
-        """Return the active page, launching Chromium lazily on the first call."""
+        """Return the active page, launching Chromium lazily on the first call.
+
+        Tool calls in one model response run concurrently, so the launch is
+        serialized: the first caller runs `lazy_launcher` under the lock and the
+        rest observe the populated `page` (or the launch error) instead of
+        launching a second Chromium.
+        """
         if self.launch_error is not None:
             raise RuntimeError(self.launch_error)
         if self.page is None:
-            if self.lazy_launcher is None:
-                raise RuntimeError('Browser is not running: Browser.wrap_run must be active before any browser tool.')
-            await self.lazy_launcher()
+            async with self._launch_lock:
+                if self.page is None and self.launch_error is None:
+                    if self.lazy_launcher is None:
+                        raise RuntimeError(
+                            'Browser is not running: Browser.wrap_run must be active before any browser tool.'
+                        )
+                    await self.lazy_launcher()
+            if self.launch_error is not None:
+                raise RuntimeError(self.launch_error)
             if self.page is None:
-                raise RuntimeError(self.launch_error or 'Browser failed to launch.')  # pragma: no branch
+                raise RuntimeError('Browser failed to launch.')  # pragma: no cover
         return self.page
 
 
