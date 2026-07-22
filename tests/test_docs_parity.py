@@ -128,6 +128,7 @@ _CAPABILITY_PAGE_META = {
     'subagents.md': ('subagents', 'Subagents'),
     'dynamic-workflow.md': ('dynamic_workflow', 'Dynamic Workflow'),
     'planning.md': ('planning', 'Planning'),
+    'system-reminders.md': ('system_reminders', 'System Reminders'),
     'runtime-authoring.md': ('runtime_authoring', 'Runtime Authoring'),
     'guardrails.md': ('guardrails', 'Input & Output Guardrails'),
     'acp.md': ('experimental/acp', 'ACP (Agent Client Protocol)'),

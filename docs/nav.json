@@ -17,6 +17,7 @@
       { "label": "Subagents", "slug": "subagents" },
       { "label": "Dynamic Workflow", "slug": "dynamic-workflow" },
       { "label": "Planning", "slug": "planning" },
+      { "label": "System Reminders", "slug": "system-reminders" },
       { "label": "Memory", "slug": "memory" },
       { "label": "Modal Sandbox", "slug": "modal-sandbox" },
       { "label": "Runtime Authoring", "slug": "runtime-authoring" },
