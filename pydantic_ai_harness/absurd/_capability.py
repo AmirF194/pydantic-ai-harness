@@ -20,7 +20,8 @@ except ImportError as _import_error:  # pragma: no cover
         'you can use the `absurd` optional group -- `pip install "pydantic-ai-harness[absurd]"`'
     ) from _import_error
 
-from collections.abc import Mapping, Sequence
+import copy
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, ClassVar, Literal
 
@@ -48,6 +49,8 @@ from pydantic_ai.models import Model, ModelRequestContext
 from pydantic_ai.run import AgentRunResult
 from pydantic_ai.tools import AgentDepsT, RunContext, ToolDefinition
 from pydantic_ai.toolsets import AbstractToolset, WrapperToolset
+from pydantic_ai.toolsets._dynamic import DynamicToolset
+from pydantic_ai.toolsets.external import TOOL_SCHEMA_VALIDATOR
 
 if TYPE_CHECKING:
     from pydantic_ai.mcp import MCPToolset
@@ -79,6 +82,7 @@ _response_adapter: TypeAdapter[ModelResponse] = TypeAdapter(ModelResponse)
 _events_adapter: TypeAdapter[list[ModelResponseStreamEvent]] = TypeAdapter(list[ModelResponseStreamEvent])
 _call_tool_result_adapter: TypeAdapter[CallToolResult] = TypeAdapter(CallToolResult)
 _tool_defs_adapter: TypeAdapter[dict[str, ToolDefinition]] = TypeAdapter(dict[str, ToolDefinition])
+_tool_def_adapter: TypeAdapter[ToolDefinition] = TypeAdapter(ToolDefinition)
 _instructions_adapter: TypeAdapter[_Instructions] = TypeAdapter(_Instructions)
 
 
@@ -267,13 +271,160 @@ def _build_mcp_toolset(toolset: MCPToolset[AgentDepsT], *, step_name_prefix: str
     )
 
 
+class _AbsurdDynamicToolset(WrapperToolset[AgentDepsT]):
+    """Durable wrapper for a construction-time `DynamicToolset`.
+
+    A `DynamicToolset` resolves its inner toolset lazily per run (or per run step) by calling a
+    user factory, which may do I/O. Left unwrapped, that resolution and the inner tool calls run
+    inline in task code and re-run on recovery. This wrapper moves them into Absurd steps, mirroring
+    the shape of `pydantic_ai.durable_exec.temporal._dynamic_toolset.TemporalDynamicToolset` (there
+    is no shared core primitive for durable dynamic toolsets, so, as Temporal does, the wrapper is
+    engine-local): `get_tools` resolves the toolset inside one step and checkpoints its tool
+    definitions and instructions; `call_tool` re-resolves inside its own step and checkpoints the
+    result. On replay each step is served from its checkpoint, so the factory and the tool are not
+    re-invoked.
+
+    Outside a task the wrapper is transparent and delegates to the wrapped `DynamicToolset`.
+    """
+
+    def __init__(
+        self,
+        wrapped: DynamicToolset[AgentDepsT],
+        *,
+        step_name_prefix: str,
+        in_durable_context: Callable[[], bool],
+    ) -> None:
+        super().__init__(wrapped)
+        # `wrapped.id` may be `None` here: the base capability calls `_wrap_leaf_toolset` before it
+        # rejects an id-less leaf, and the name is never used in that case (binding raises first).
+        self._name = f'{step_name_prefix}__dynamic_toolset__{wrapped.id}'
+        self._in_durable_context = in_durable_context
+        # Set by `get_tools`, read by `get_instructions` in the same run step. Lives on the per-run
+        # copy so concurrent runs of the shared bound wrapper do not clobber each other.
+        self._run_instructions: _Instructions = None
+
+    @property
+    def id(self) -> str:
+        assert self.wrapped.id is not None
+        return self.wrapped.id
+
+    def visit_and_replace(
+        self, visitor: Callable[[AbstractToolset[AgentDepsT]], AbstractToolset[AgentDepsT]]
+    ) -> AbstractToolset[AgentDepsT]:
+        # A durable wrapper is a barrier: it must not be descended into and re-wrapped, so it returns
+        # itself rather than the `WrapperToolset` default (which would `replace(...)` and fail this
+        # keyword-only constructor). Mirrors core's `DurableToolsetBase`. No public composition
+        # currently revisits an already-swapped leaf, so this is a defensive guard.
+        return self  # pragma: no cover
+
+    def _run_copy(self, wrapped: AbstractToolset[AgentDepsT]) -> _AbsurdDynamicToolset[AgentDepsT]:
+        run_copy = copy.copy(self)
+        run_copy.wrapped = wrapped
+        run_copy._run_instructions = None
+        return run_copy
+
+    async def for_run(self, ctx: RunContext[AgentDepsT]) -> AbstractToolset[AgentDepsT]:
+        if not self._in_durable_context():
+            new_wrapped = await self.wrapped.for_run(ctx)
+            return self if new_wrapped is self.wrapped else self._run_copy(new_wrapped)
+        # Resolution is deferred into the durable `get_tools`/`call_tool` steps; only isolate the
+        # per-run instructions slot from the process-shared bound wrapper.
+        return self._run_copy(self.wrapped)
+
+    async def for_run_step(self, ctx: RunContext[AgentDepsT]) -> AbstractToolset[AgentDepsT]:
+        if not self._in_durable_context():
+            new_wrapped = await self.wrapped.for_run_step(ctx)
+            return self if new_wrapped is self.wrapped else self._run_copy(new_wrapped)
+        return self
+
+    async def get_tools(self, ctx: RunContext[AgentDepsT]) -> dict[str, ToolsetTool[AgentDepsT]]:
+        if not self._in_durable_context():
+            return await super().get_tools(ctx)
+        task_ctx = _current_async_task_context()
+        assert task_ctx is not None  # pragma: no cover - gated by `_in_durable_context`
+
+        async def _inner() -> JsonValue:
+            run_toolset = await self.wrapped.for_run(ctx)
+            async with run_toolset:
+                resolved = await run_toolset.for_run_step(ctx)
+                tools = await resolved.get_tools(ctx)
+                instructions = await resolved.get_instructions(ctx)
+                return {
+                    'tools': {
+                        tool_name: {
+                            'tool_def': _tool_def_adapter.dump_python(tool.tool_def, mode='json'),
+                            'max_retries': tool.max_retries,
+                        }
+                        for tool_name, tool in tools.items()
+                    },
+                    'instructions': _instructions_adapter.dump_python(instructions, mode='json'),
+                }
+
+        payload = await task_ctx.step(f'{self._name}.get_tools', _inner)
+        assert isinstance(payload, dict)
+        self._run_instructions = _instructions_adapter.validate_python(payload['instructions'])
+        tools_payload = payload['tools']
+        assert isinstance(tools_payload, dict)
+        return {tool_name: self._tool_from_payload(info) for tool_name, info in tools_payload.items()}
+
+    def _tool_from_payload(self, info: JsonValue) -> ToolsetTool[AgentDepsT]:
+        assert isinstance(info, dict)
+        max_retries = info['max_retries']
+        assert isinstance(max_retries, int)
+        return ToolsetTool(
+            toolset=self,
+            tool_def=_tool_def_adapter.validate_python(info['tool_def']),
+            max_retries=max_retries,
+            args_validator=TOOL_SCHEMA_VALIDATOR,
+        )
+
+    async def get_instructions(self, ctx: RunContext[AgentDepsT]) -> _Instructions:
+        if not self._in_durable_context():
+            return await super().get_instructions(ctx)
+        # Collected by `get_tools`, which the framework runs earlier in each run step.
+        return self._run_instructions
+
+    async def call_tool(
+        self, name: str, tool_args: dict[str, Any], ctx: RunContext[AgentDepsT], tool: ToolsetTool[AgentDepsT]
+    ) -> Any:
+        if not self._in_durable_context():
+            return await super().call_tool(name, tool_args, ctx, tool)
+        task_ctx = _current_async_task_context()
+        assert task_ctx is not None  # pragma: no cover - gated by `_in_durable_context`
+
+        async def _inner() -> JsonValue:
+            run_toolset = await self.wrapped.for_run(ctx)
+            async with run_toolset:
+                resolved = await run_toolset.for_run_step(ctx)
+                tools = await resolved.get_tools(ctx)
+                inner_tool = tools.get(name)
+                if inner_tool is None:  # pragma: no cover - factory returned a different toolset
+                    raise UserError(
+                        f'Tool {name!r} not found in dynamic toolset {self.id!r} when re-resolving it '
+                        'inside the durable step. The toolset factory returned a different toolset than '
+                        'when the tool was listed.'
+                    )
+                result = await wrap_tool_call_result(resolved.call_tool(name, tool_args, ctx, inner_tool))
+                return _serialize_call_tool_result(result)
+
+        payload = await task_ctx.step(f'{self._name}.call_tool:{name}', _inner)
+        return unwrap_tool_call_result(_deserialize_call_tool_result(payload))
+
+
+def _build_dynamic_toolset(
+    toolset: DynamicToolset[AgentDepsT], *, step_name_prefix: str
+) -> _AbsurdDynamicToolset[AgentDepsT]:
+    return _AbsurdDynamicToolset(toolset, step_name_prefix=step_name_prefix, in_durable_context=_in_durable_context)
+
+
 @dataclass(init=False)
 class AbsurdDurability(BaseDurabilityCapability[AgentDepsT]):
     """Capability that makes an agent durable by checkpointing its I/O into Absurd steps.
 
     Attach it via `capabilities=[AbsurdDurability()]` and call `agent.run()` inside an Absurd
-    task handler: every model request, MCP call, and function tool call is wrapped in
-    `ctx.step(...)`, so a worker crash mid-run resumes from the last completed step instead of
+    task handler: every model request, MCP call, function tool call, and dynamic-toolset
+    resolution is wrapped in `ctx.step(...)`, so a worker crash mid-run resumes from the last
+    completed step instead of
     restarting. A completed step is served from its checkpoint on replay instead of being
     recomputed, so tokens are not re-spent on work that already finished. A step is checkpointed
     after it runs, so a crash between a tool's side effect and its checkpoint re-runs the tool on
@@ -362,6 +513,8 @@ class AbsurdDurability(BaseDurabilityCapability[AgentDepsT]):
     def _wrap_leaf_toolset(self, ts: AbstractToolset[AgentDepsT]) -> WrapperToolset[AgentDepsT] | None:
         if isinstance(ts, FunctionToolset):
             return _build_function_toolset(ts, step_name_prefix=self.name)
+        if isinstance(ts, DynamicToolset):
+            return _build_dynamic_toolset(ts, step_name_prefix=self.name)
         try:
             from pydantic_ai.mcp import MCPToolset
         except ImportError:  # pragma: no cover - MCP wrapping only applies when the mcp extra is installed

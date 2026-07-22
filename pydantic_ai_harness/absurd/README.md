@@ -74,6 +74,10 @@ and served from the checkpoint on replay rather than being recomputed:
   default);
 - **function tool calls** -- `{name}__function_toolset__{id}.call_tool:{tool_name}`;
 - **MCP I/O** -- `{name}__mcp_server__{id}.get_tools`, `.get_instructions`, and `.call_tool`;
+- **dynamic toolset resolution and calls** -- `{name}__dynamic_toolset__{id}.get_tools` and
+  `.call_tool:{tool_name}`. A `DynamicToolset` built at construction time is re-resolved inside the
+  step (its factory runs there, not in task code), so its resolution and inner tool calls are
+  checkpointed and not re-run on recovery;
 - **event-stream handler calls** -- `{name}__event_stream_handler`, when an `event_stream_handler`
   is set.
 
@@ -92,7 +96,9 @@ checkpoint and lines up on replay.
 
 - The agent needs a `name` (or pass `name=` to `AbsurdDurability`); it prefixes every step.
 - Leaf toolsets that execute their own tools (function toolsets, MCP servers) need a unique `id`,
-  which identifies their steps within the task.
+  which identifies their steps within the task. A `DynamicToolset` also needs an `id`; it is
+  supported when built at construction time (its factory and inner calls are checkpointed), but
+  cannot be added per-run via `run(toolsets=...)`.
 - The agent's `name` and a toolset's `id` are part of every step name, so they should not be
   changed once the durable agent has been deployed to production: a rename orphans the checkpoints
   of in-flight tasks, which resume under the old names and re-run their steps from the start.

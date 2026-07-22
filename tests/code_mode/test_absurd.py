@@ -25,7 +25,9 @@ from pydantic_ai.messages import (
     ToolReturnPart,
 )
 from pydantic_ai.models.function import AgentInfo, FunctionModel
+from pydantic_ai.tools import RunContext
 from pydantic_ai.toolsets import FunctionToolset
+from pydantic_ai.toolsets._dynamic import DynamicToolset  # pyright: ignore[reportPrivateImportUsage]
 
 from pydantic_ai_harness import CodeMode
 from pydantic_ai_harness.absurd import AbsurdDurability
@@ -100,6 +102,45 @@ class TestCodeModeUnderAbsurd:
         # The `run_code` body is plain task-body Python and re-runs on replay, so it calls
         # `search` again, but the durable step short-circuits to the stored result: the tool
         # function does not run a second time and the model is not re-called.
+        assert second.output == 'done: results for x'
+        assert calls['n'] == 1
+        assert replay.invoked == []
+
+    async def test_dynamic_toolset_inner_call_is_checkpointed(self) -> None:
+        # A construction-time dynamic toolset composed under CodeMode: the durable dynamic wrapper
+        # checkpoints resolution and the inner tool call, and the sandbox dispatches through it.
+        calls = {'n': 0}
+
+        def build(ctx: RunContext[object]) -> FunctionToolset[object]:
+            inner: FunctionToolset[object] = FunctionToolset(id='inner')
+
+            @inner.tool_plain
+            def search(query: str) -> str:
+                calls['n'] += 1
+                return f'results for {query}'
+
+            return inner
+
+        agent = Agent(
+            FunctionModel(_code_model),
+            name='composed',
+            toolsets=[DynamicToolset(build, id='dyn')],
+            capabilities=[CodeMode(), AbsurdDurability()],
+        )
+
+        ctx = FakeAsyncTaskContext()
+        with absurd_task_context(ctx):
+            first = await agent.run('go')
+
+        assert first.output == 'done: results for x'
+        assert calls['n'] == 1
+        assert 'composed__dynamic_toolset__dyn.get_tools' in ctx.stored
+        assert 'composed__dynamic_toolset__dyn.call_tool:search' in ctx.stored
+
+        replay = ctx.replay()
+        with absurd_task_context(replay):
+            second = await agent.run('go')
+
         assert second.output == 'done: results for x'
         assert calls['n'] == 1
         assert replay.invoked == []
