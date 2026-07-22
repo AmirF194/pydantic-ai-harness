@@ -9,9 +9,11 @@ description: Make a Pydantic AI agent run durable on Absurd, a Postgres-based du
 Postgres-based durable-execution engine by Armin Ronacher (Python SDK `absurd-sdk`). Attach the
 capability and call `agent.run()` inside an Absurd task handler: every model request, MCP call, and
 function tool call is checkpointed into an Absurd step (`ctx.step(...)`), so if a worker crashes
-part-way through a run it resumes from the last completed step instead of restarting -- no tokens
-are re-spent, and a tool side effect runs once. Outside a task the capability is transparent and the
-run is a normal, non-durable agent run.
+part-way through a run it resumes from the last completed step instead of restarting. A completed
+step is served from its checkpoint on replay instead of being recomputed, so tokens are not re-spent
+on work that already finished. A step is checkpointed after it runs, so a crash between a tool's side
+effect and its checkpoint re-runs the tool on recovery: keep tool side effects idempotent. Outside a
+task the capability is transparent and the run is a normal, non-durable agent run.
 
 [Source](https://github.com/pydantic/pydantic-ai-harness/tree/main/pydantic_ai_harness/absurd/)
 
@@ -67,8 +69,8 @@ because an agent run cannot be awaited from one.
 
 ## What gets checkpointed, and what replay means
 
-Each of these is wrapped in its own `ctx.step(...)`, so its result is recorded once and served from
-the checkpoint on replay rather than being recomputed:
+Each of these is wrapped in its own `ctx.step(...)`, so once it completes its result is checkpointed
+and served from the checkpoint on replay rather than being recomputed:
 
 - **model requests** -- `{name}__model.request`, `.request_stream`, and `.cancel_suspended_response`
   (the request's model id is appended as a `.{model_id}` suffix when it differs from the agent's
@@ -84,11 +86,22 @@ the model request or re-calling the tool. A `ModelRetry`, `ApprovalRequired`, or
 raised by a tool crosses the checkpoint as a serialized value, so on replay the same outcome is
 reproduced without re-running the tool.
 
+Calling `agent.run()` more than once in a single task handler works: a step name that recurs (a
+second run's model request, or the same tool called twice in one response) is disambiguated by
+Absurd's encounter-order counter (`{name}#2`, `{name}#3`, ...), so each occurrence keeps its own
+checkpoint and lines up on replay.
+
 ## Constraints
 
 - The agent needs a `name` (or pass `name=` to `AbsurdDurability`); it prefixes every step.
 - Leaf toolsets that execute their own tools (function toolsets, MCP servers) need a unique `id`,
   which identifies their steps within the task.
+- The agent's `name` and a toolset's `id` are part of every step name, so they should not be
+  changed once the durable agent has been deployed to production: a rename orphans the checkpoints
+  of in-flight tasks, which resume under the old names and re-run their steps from the start.
+- A registered model id (a `models=` key) is folded into the model step name, so it must not
+  contain `#`, the character Absurd uses to disambiguate repeated step names. A `#` in a model id
+  is rejected with a `UserError`.
 - A checkpointed tool's return value is stored in Postgres as JSON, so it must be JSON-serializable.
 - The executing toolsets are fixed when the agent is constructed. Passing an executing toolset
   per-run via `run(toolsets=...)` inside a task raises a `UserError`, because a runtime toolset has
@@ -96,8 +109,9 @@ reproduced without re-running the tool.
   `ExternalToolset` are allowed at runtime.
 - Streaming inside a task is a replay, not a live wire: the model stream is consumed and captured
   inside the step, and the run-side stream replays the captured events.
-- An `event_stream_handler` runs live inside the model-request step (its call is itself
-  checkpointed), so its side effects run once.
+- An `event_stream_handler` runs live inside the model-request step, and its call is itself
+  checkpointed. The handler may run more than once if the run recovers before that step is
+  checkpointed, so keep its side effects idempotent.
 - Do not use `run_sync` inside a task handler. The handler is async; use `await agent.run(...)`.
 
 ## Per-tool opt-out
@@ -121,6 +135,10 @@ def add(a: int, b: int) -> int:
 
 agent = Agent('openai:gpt-5', name='calc', toolsets=[tools], capabilities=[AbsurdDurability()])
 ```
+
+`False` is the only supported value for the `absurd` metadata key. A step takes no per-tool options,
+so a mapping (`metadata={'absurd': {...}}`) has nothing to apply and raises a `UserError` rather than
+being dropped.
 
 MCP tools cannot opt out: they perform I/O and so are always checkpointed. Setting
 `metadata={'absurd': False}` on an MCP tool raises a `UserError`.
@@ -150,8 +168,9 @@ format.
 ## Relation to Step Persistence
 
 `AbsurdDurability` and the [Step Persistence](step-persistence.md) capability solve different
-problems and compose. Absurd gives exactly-once crash-resume *within* a single run: a worker that
-dies mid-run picks up from the last completed step. Step Persistence records step events and
+problems and compose. Absurd gives crash-resume *within* a single run: a worker that dies mid-run
+picks up from the last completed step (steps are at-least-once, so keep side effects idempotent).
+Step Persistence records step events and
 continuation snapshots *across* runs, so a run can be resumed, forked, or replayed as a separate
 invocation later. Use Absurd for durability against crashes during a run, and Step Persistence to
 persist and resume runs as first-class records.
