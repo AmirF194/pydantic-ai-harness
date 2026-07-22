@@ -384,28 +384,50 @@ class _AbsurdDynamicToolset(WrapperToolset[AgentDepsT]):
         # Collected by `get_tools`, which the framework runs earlier in each run step.
         return self._run_instructions
 
+    async def _resolve_validate_call(self, name: str, tool_args: dict[str, Any], ctx: RunContext[AgentDepsT]) -> Any:
+        """Re-resolve the dynamic toolset, re-validate the args, and call the tool.
+
+        The outer tool the agent holds carries `TOOL_SCHEMA_VALIDATOR` (a pass-through), so args are
+        not validated upstream. Re-validate them here with the re-resolved inner tool's real
+        validator, exactly as the non-durable path would, so typed args are coerced and invalid args
+        raise a `ValidationError` (which `ToolManager` turns into a retry prompt) rather than reaching
+        the function raw. Mirrors Temporal's `_call_tool_in_activity`.
+        """
+        run_toolset = await self.wrapped.for_run(ctx)
+        async with run_toolset:
+            resolved = await run_toolset.for_run_step(ctx)
+            tools = await resolved.get_tools(ctx)
+            inner_tool = tools.get(name)
+            if inner_tool is None:  # pragma: no cover - factory returned a different toolset
+                raise UserError(
+                    f'Tool {name!r} not found in dynamic toolset {self.id!r} when re-resolving it '
+                    'inside the durable step. The toolset factory returned a different toolset than '
+                    'when the tool was listed.'
+                )
+            args_dict = inner_tool.args_validator.validate_python(tool_args)
+            return await resolved.call_tool(name, args_dict, ctx, inner_tool)
+
     async def call_tool(
         self, name: str, tool_args: dict[str, Any], ctx: RunContext[AgentDepsT], tool: ToolsetTool[AgentDepsT]
     ) -> Any:
         if not self._in_durable_context():
             return await super().call_tool(name, tool_args, ctx, tool)
+        # The outer tool's metadata was checkpointed by `get_tools`, so the config is replay-stable.
+        # A populated dict config raises here; `False` opts the tool out of checkpointing and runs it
+        # inline (un-checkpointed) through a fresh resolution, the same meaning as for a plain
+        # function tool.
+        config = _resolve_function_tool_config(tool, name)
+        if config is False:
+            return await self._resolve_validate_call(name, tool_args, ctx)
         task_ctx = _current_async_task_context()
         assert task_ctx is not None  # pragma: no cover - gated by `_in_durable_context`
 
         async def _inner() -> JsonValue:
-            run_toolset = await self.wrapped.for_run(ctx)
-            async with run_toolset:
-                resolved = await run_toolset.for_run_step(ctx)
-                tools = await resolved.get_tools(ctx)
-                inner_tool = tools.get(name)
-                if inner_tool is None:  # pragma: no cover - factory returned a different toolset
-                    raise UserError(
-                        f'Tool {name!r} not found in dynamic toolset {self.id!r} when re-resolving it '
-                        'inside the durable step. The toolset factory returned a different toolset than '
-                        'when the tool was listed.'
-                    )
-                result = await wrap_tool_call_result(resolved.call_tool(name, tool_args, ctx, inner_tool))
-                return _serialize_call_tool_result(result)
+            # A `ValidationError` from arg re-validation is deterministic and pure, so it propagates
+            # out of the step uncaught: no checkpoint slot is claimed and `ToolManager` converts it to
+            # a retry prompt. `wrap_tool_call_result` still captures `ModelRetry`/approval/deferral.
+            result = await wrap_tool_call_result(self._resolve_validate_call(name, tool_args, ctx))
+            return _serialize_call_tool_result(result)
 
         payload = await task_ctx.step(f'{self._name}.call_tool:{name}', _inner)
         return unwrap_tool_call_result(_deserialize_call_tool_result(payload))

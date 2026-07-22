@@ -144,7 +144,8 @@ agent = Agent('openai:gpt-5', name='calc', toolsets=[tools], capabilities=[Absur
 
 `False` is the only supported value for the `absurd` metadata key. A step takes no per-tool options,
 so a mapping (`metadata={'absurd': {...}}`) has nothing to apply and raises a `UserError` rather than
-being dropped.
+being dropped. The opt-out and this rule apply to a tool from a dynamic toolset as well: `False` runs
+it inline (its listing stays checkpointed), and a mapping raises.
 
 MCP tools cannot opt out: they perform I/O and so are always checkpointed. Setting
 `metadata={'absurd': False}` on an MCP tool raises a `UserError`.
