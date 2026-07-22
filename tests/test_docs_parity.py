@@ -111,6 +111,7 @@ _CAPABILITY_DOC_PAGES = _capability_doc_pages()
 # checks page-specific: a page that links the wrong module, or carries a generic
 # or empty heading, fails instead of passing on a substring match.
 _CAPABILITY_PAGE_META = {
+    'aws-lambda.md': ('aws_lambda', 'AWS Lambda Durability'),
     'code-mode.md': ('code_mode', 'Code Mode'),
     'filesystem.md': ('filesystem', 'FileSystem'),
     'shell.md': ('shell', 'Shell'),

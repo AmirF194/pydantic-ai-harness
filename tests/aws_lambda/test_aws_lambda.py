@@ -1,0 +1,412 @@
+"""Tests for the AWS Lambda durability capability."""
+
+from __future__ import annotations
+
+from typing import Any
+
+import pytest
+from pydantic_ai import Agent, RunContext
+from pydantic_ai.exceptions import ApprovalRequired, CallDeferred, ModelRetry, UserError
+from pydantic_ai.messages import (
+    AgentStreamEvent,
+    BinaryContent,
+    ModelMessage,
+    ModelResponse,
+    TextPart,
+    ToolCallPart,
+    ToolReturn,
+)
+from pydantic_ai.models.function import AgentInfo, FunctionModel
+from pydantic_ai.models.test import TestModel
+from pydantic_ai.tools import DeferredToolRequests, ToolDefinition
+from pydantic_ai.toolsets import FunctionToolset
+
+from pydantic_ai_harness.aws_lambda import LambdaDurability, run_durable
+
+from .conftest import FakeDurableContext
+
+
+def tool_then_text(tool_name: str = 'act', args: dict[str, Any] | None = None) -> FunctionModel:
+    """A model that calls `tool_name` once, then answers."""
+
+    def model_fn(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        if len(messages) == 1:
+            return ModelResponse(parts=[ToolCallPart(tool_name, args or {})])
+        return ModelResponse(parts=[TextPart('done')])
+
+    return FunctionModel(model_fn)
+
+
+def build_agent(tool: Any, *, output_type: Any = None, **kwargs: Any) -> Agent[Any, Any]:
+    extra = {'output_type': output_type} if output_type is not None else {}
+    agent = Agent(tool_then_text(), name='a', capabilities=[LambdaDurability(**kwargs)], **extra)
+    tool.__name__ = 'act'
+    agent.tool_plain(tool)
+    return agent
+
+
+class TestDurableRun:
+    def test_checkpoints_model_and_tool_steps(self) -> None:
+        agent = build_agent(lambda: 'sunny')
+        ctx = FakeDurableContext()
+
+        result = run_durable(lambda: agent.run('go'), context=ctx)
+
+        assert result.output == 'done'
+        assert ctx.step_names == [
+            'a__model.request',
+            'a__function_toolset__<agent>.call_tool:act',
+            'a__model.request',
+        ]
+        assert ctx.failed == []
+
+    def test_resume_serves_completed_steps_from_checkpoints(self) -> None:
+        calls: list[str] = []
+
+        def tool() -> str:
+            calls.append('tool')
+            return 'sunny'
+
+        agent = build_agent(tool)
+        first = FakeDurableContext()
+        run_durable(lambda: agent.run('go'), context=first)
+        assert calls == ['tool']
+
+        resumed = FakeDurableContext(journal=first.operations)
+        result = run_durable(lambda: agent.run('go'), context=resumed)
+
+        assert result.output == 'done'
+        # No step body ran again: the model was not called and the tool did not re-execute.
+        assert resumed.invoked == []
+        assert calls == ['tool']
+
+    def test_transparent_outside_a_durable_handler(self) -> None:
+        agent = build_agent(lambda: 'sunny')
+
+        result = agent.run_sync('go')
+
+        assert result.output == 'done'
+
+    def test_steps_run_on_the_handler_thread(self) -> None:
+        import threading
+
+        agent = build_agent(lambda: 'sunny')
+        ctx = FakeDurableContext()
+        handler_thread = threading.get_ident()
+
+        run_durable(lambda: agent.run('go'), context=ctx)
+
+        assert {op.thread_id for op in ctx.operations} == {handler_thread}
+
+    def test_agent_error_propagates_to_the_handler(self) -> None:
+        def tool() -> str:
+            raise RuntimeError('boom')
+
+        agent = build_agent(tool)
+        ctx = FakeDurableContext()
+
+        with pytest.raises(RuntimeError, match='boom'):
+            run_durable(lambda: agent.run('go'), context=ctx)
+
+        assert [op.status for op in ctx.failed] == ['failed']
+
+
+class TestControlFlowSignals:
+    """Control-flow signals must cross a step as values, not as step failures.
+
+    A step body that raises is recorded as failed and retried, so an approval request or a
+    deferred call would be retried and then fail the execution instead of pausing the run.
+    """
+
+    def test_approval_required_pauses_the_run(self) -> None:
+        def tool() -> str:
+            raise ApprovalRequired
+
+        agent = build_agent(tool, output_type=[str, DeferredToolRequests])
+        ctx = FakeDurableContext()
+
+        result = run_durable(lambda: agent.run('go'), context=ctx)
+
+        assert isinstance(result.output, DeferredToolRequests)
+        assert len(result.output.approvals) == 1
+        assert ctx.failed == []
+
+    def test_call_deferred_pauses_the_run(self) -> None:
+        def tool() -> str:
+            raise CallDeferred
+
+        agent = build_agent(tool, output_type=[str, DeferredToolRequests])
+        ctx = FakeDurableContext()
+
+        result = run_durable(lambda: agent.run('go'), context=ctx)
+
+        assert isinstance(result.output, DeferredToolRequests)
+        assert len(result.output.calls) == 1
+        assert ctx.failed == []
+
+    def test_model_retry_is_not_a_step_failure(self) -> None:
+        def tool() -> str:
+            raise ModelRetry('try again')
+
+        agent = build_agent(tool)
+        ctx = FakeDurableContext()
+
+        result = run_durable(lambda: agent.run('go'), context=ctx)
+
+        assert result.output == 'done'
+        assert ctx.failed == []
+
+
+class TestToolResultSerialization:
+    """A tool result is checkpointed through the SDK serializer, so it must round-trip."""
+
+    def test_tool_return_object(self) -> None:
+        agent = build_agent(lambda: ToolReturn(return_value='ok', content='extra'))
+        ctx = FakeDurableContext()
+
+        result = run_durable(lambda: agent.run('go'), context=ctx)
+
+        assert result.output == 'done'
+        assert ctx.failed == []
+
+    def test_binary_content(self) -> None:
+        agent = build_agent(lambda: BinaryContent(data=b'\x89PNG', media_type='image/png'))
+        ctx = FakeDurableContext()
+
+        result = run_durable(lambda: agent.run('go'), context=ctx)
+
+        assert result.output == 'done'
+        assert ctx.failed == []
+
+
+class TestCrashMidRunRetry:
+    def test_completed_model_step_is_reused_while_the_failed_tool_reruns(self) -> None:
+        tool_calls: list[int] = []
+
+        def tool() -> str:
+            tool_calls.append(1)
+            if len(tool_calls) == 1:
+                raise RuntimeError('transient')
+            return 'sunny'
+
+        agent = build_agent(tool)
+
+        first = FakeDurableContext()
+        with pytest.raises(RuntimeError, match='transient'):
+            run_durable(lambda: agent.run('go'), context=first)
+        assert first.step_names == ['a__model.request', 'a__function_toolset__<agent>.call_tool:act']
+
+        # Resume from the completed prefix: the model step replays, the failed tool runs again.
+        resumed = FakeDurableContext(journal=first.operations[:1])
+        result = run_durable(lambda: agent.run('go'), context=resumed)
+
+        assert result.output == 'done'
+        # The first model request came from the checkpoint; only the second one ran.
+        assert resumed.invoked == ['a__function_toolset__<agent>.call_tool:act', 'a__model.request']
+        assert len(tool_calls) == 2
+
+
+class TestStepConfig:
+    def test_base_config_is_applied_to_every_step(self) -> None:
+        from aws_durable_execution_sdk_python.config import StepSemantics
+
+        agent = build_agent(lambda: 'sunny', step_config={'step_semantics': StepSemantics.AT_MOST_ONCE_PER_RETRY})
+        ctx = FakeDurableContext()
+
+        run_durable(lambda: agent.run('go'), context=ctx)
+
+        configs = [op.config for op in ctx.operations]
+        assert all(c is not None and c.step_semantics is StepSemantics.AT_MOST_ONCE_PER_RETRY for c in configs)
+
+    def test_per_tool_metadata_overrides_the_base_config(self) -> None:
+        from aws_durable_execution_sdk_python.config import StepSemantics
+
+        toolset = FunctionToolset[object](id='tools')
+
+        @toolset.tool_plain(metadata={'aws_lambda': {'step_semantics': StepSemantics.AT_MOST_ONCE_PER_RETRY}})
+        def act() -> str:
+            return 'sunny'
+
+        agent = Agent(tool_then_text(), name='a', toolsets=[toolset], capabilities=[LambdaDurability()])
+        ctx = FakeDurableContext()
+
+        run_durable(lambda: agent.run('go'), context=ctx)
+
+        tool_op = next(op for op in ctx.operations if op.name == 'a__function_toolset__tools.call_tool:act')
+        assert tool_op.config is not None
+        assert tool_op.config.step_semantics is StepSemantics.AT_MOST_ONCE_PER_RETRY
+
+    def test_metadata_false_runs_the_tool_inline(self) -> None:
+        toolset = FunctionToolset[object](id='tools')
+
+        @toolset.tool_plain(metadata={'aws_lambda': False})
+        def act() -> str:
+            return 'sunny'
+
+        agent = Agent(tool_then_text(), name='a', toolsets=[toolset], capabilities=[LambdaDurability()])
+        ctx = FakeDurableContext()
+
+        run_durable(lambda: agent.run('go'), context=ctx)
+
+        assert ctx.step_names == ['a__model.request', 'a__model.request']
+
+    def test_unknown_config_key_is_rejected_at_construction(self) -> None:
+        with pytest.raises(UserError, match="Unknown 'aws_lambda' step config key 'retries'"):
+            LambdaDurability(step_config={'retries': 3})
+
+    def test_unknown_per_tool_config_key_is_rejected(self) -> None:
+        toolset = FunctionToolset[object](id='tools')
+
+        @toolset.tool_plain(metadata={'aws_lambda': {'retries': 3}})
+        def act() -> str:
+            return 'sunny'
+
+        agent = Agent(tool_then_text(), name='a', toolsets=[toolset], capabilities=[LambdaDurability()])
+        ctx = FakeDurableContext()
+
+        with pytest.raises(UserError, match="Unknown 'aws_lambda' step config key 'retries'"):
+            run_durable(lambda: agent.run('go'), context=ctx)
+
+
+class TestNesting:
+    """A nested durable run cannot make progress: the handler thread is blocked servicing the
+    outer step, so it cannot service the inner one. Both entry points reject it rather than hang.
+    """
+
+    def test_nested_agent_run_is_rejected_instead_of_deadlocking(self) -> None:
+        inner = Agent(TestModel(), name='inner', capabilities=[LambdaDurability()])
+
+        async def act() -> str:
+            return str((await inner.run('nested')).output)
+
+        agent = Agent(tool_then_text(), name='a', capabilities=[LambdaDurability()])
+        agent.tool_plain(act)
+        ctx = FakeDurableContext()
+
+        with pytest.raises(UserError, match='while another step is still running'):
+            run_durable(lambda: agent.run('go'), context=ctx)
+
+    def test_run_durable_inside_a_running_loop_is_rejected(self) -> None:
+        inner = Agent(TestModel(), name='inner', capabilities=[LambdaDurability()])
+        ctx = FakeDurableContext()
+
+        async def act() -> str:
+            return str(run_durable(lambda: inner.run('nested'), context=ctx).output)
+
+        agent = Agent(tool_then_text(), name='a', capabilities=[LambdaDurability()])
+        agent.tool_plain(act)
+
+        with pytest.raises(UserError, match='cannot be called from a running event loop'):
+            run_durable(lambda: agent.run('go'), context=ctx)
+
+
+def act() -> str:
+    return 'sunny'
+
+
+class TestBinding:
+    def test_agent_without_a_name_is_rejected(self) -> None:
+        with pytest.raises(UserError, match='unique `name`'):
+            Agent(TestModel(), capabilities=[LambdaDurability()])
+
+    def test_capability_name_overrides_the_agent_name(self) -> None:
+        agent = Agent(tool_then_text(), name='a', capabilities=[LambdaDurability(name='custom')])
+        agent.tool_plain(act)
+        ctx = FakeDurableContext()
+
+        run_durable(lambda: agent.run('go'), context=ctx)
+
+        assert ctx.step_names[0] == 'custom__model.request'
+
+    def test_model_id_is_folded_into_the_step_name(self) -> None:
+        extra = TestModel(custom_output_text='from extra')
+        agent = Agent(tool_then_text(), name='a', capabilities=[LambdaDurability(models={'extra': extra})])
+        agent.tool_plain(act)
+        ctx = FakeDurableContext()
+
+        run_durable(lambda: agent.run('go', model='extra'), context=ctx)
+
+        assert ctx.step_names[0] == 'a__model.request.extra'
+
+
+class TestEventStreamHandler:
+    def test_agent_events_are_checkpointed(self) -> None:
+        seen: list[AgentStreamEvent] = []
+
+        async def handler(ctx: RunContext[object], stream: Any) -> None:
+            async for event in stream:
+                seen.append(event)
+
+        # An event stream handler makes the run stream, so use a model that supports streaming.
+        agent = Agent(TestModel(), name='a', capabilities=[LambdaDurability(event_stream_handler=handler)])
+        agent.tool_plain(act)
+        ctx = FakeDurableContext()
+
+        run_durable(lambda: agent.run('go'), context=ctx)
+
+        assert 'a__model.request_stream' in ctx.step_names
+        assert 'a__event_stream_handler' in ctx.step_names
+        assert seen
+
+
+class TestCoverageOfRemainingPaths:
+    def test_sync_tool_calling_run_durable_is_rejected(self) -> None:
+        """A sync tool runs on a worker thread with the handler's context copied, so there is no
+        running loop but the bridge is still active."""
+        inner = Agent(TestModel(), name='inner', capabilities=[LambdaDurability()])
+        ctx = FakeDurableContext()
+
+        def act() -> str:
+            return str(run_durable(lambda: inner.run('nested'), context=ctx).output)
+
+        agent = Agent(tool_then_text(), name='a', capabilities=[LambdaDurability()])
+        agent.tool_plain(act)
+
+        with pytest.raises(UserError, match='already active on this thread'):
+            run_durable(lambda: agent.run('go'), context=ctx)
+
+    def test_toolsets_without_a_durable_wrapper_pass_through(self) -> None:
+        from pydantic_ai.toolsets.external import ExternalToolset
+
+        external = ExternalToolset[object]([ToolDefinition(name='remote')], id='ext')
+        agent = Agent(tool_then_text(), name='a', toolsets=[external], capabilities=[LambdaDurability()])
+        agent.tool_plain(act)
+        ctx = FakeDurableContext()
+
+        run_durable(lambda: agent.run('go'), context=ctx)
+
+        assert 'a__function_toolset__<agent>.call_tool:act' in ctx.step_names
+
+    def test_a_string_model_default_keeps_one_step_name(self) -> None:
+        """The default model carries its own name as provenance; the suffix is suppressed so the
+        default keeps a single step name."""
+        agent = Agent('test', name='a', capabilities=[LambdaDurability()])
+        ctx = FakeDurableContext()
+
+        run_durable(lambda: agent.run('go'), context=ctx)
+
+        assert ctx.step_names == ['a__model.request']
+
+    def test_cancel_suspended_response_is_checkpointed(self) -> None:
+        # The model returns a suspended response, the agent re-issues it as a continuation, the
+        # continuation fails, and the graph tears the suspended job down via
+        # `cancel_suspended_response`, which is itself checkpointed.
+        cancelled: list[ModelResponse] = []
+
+        class CancellableModel(FunctionModel):
+            async def cancel_suspended_response(self, response: ModelResponse) -> None:
+                cancelled.append(response)
+
+        def fn(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+            if not any(m.parts and getattr(m, 'state', None) == 'suspended' for m in messages):
+                return ModelResponse(parts=[TextPart(content='partial')], state='suspended')
+            raise RuntimeError('continuation failed')
+
+        agent = Agent(CancellableModel(fn, model_name='fn'), name='a', capabilities=[LambdaDurability()])
+        ctx = FakeDurableContext()
+
+        with pytest.raises(RuntimeError, match='continuation failed'):
+            run_durable(lambda: agent.run('go'), context=ctx)
+
+        assert len(cancelled) == 1
+        assert 'a__model.cancel_suspended_response' in ctx.step_names

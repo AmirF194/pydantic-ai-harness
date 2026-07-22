@@ -1,0 +1,187 @@
+"""MCP durable-wrapping tests for `LambdaDurability`.
+
+A lightweight `FakeMCPToolset` stands in for a real server: it is a genuine `MCPToolset`
+subclass, so the capability's `isinstance` wrapping and `tool_for_tool_def` rebuild apply, but
+its wire methods return in-memory results, which keeps the test off Docker and the network.
+"""
+
+from __future__ import annotations
+
+import pytest
+
+pytest.importorskip('aws_durable_execution_sdk_python')
+pytest.importorskip('pydantic_ai.mcp')
+
+from typing import Any
+
+from pydantic_ai import Agent, ToolsetTool
+from pydantic_ai.exceptions import UserError
+from pydantic_ai.mcp import MCPToolset
+from pydantic_ai.messages import (
+    InstructionPart,
+    ModelMessage,
+    ModelResponse,
+    TextPart,
+    ToolCallPart,
+    ToolReturnPart,
+)
+from pydantic_ai.models.function import AgentInfo, FunctionModel
+from pydantic_ai.tools import RunContext, ToolDefinition
+
+from pydantic_ai_harness.aws_lambda import LambdaDurability, run_durable
+
+from .conftest import FakeDurableContext
+
+_ADD_SCHEMA = {
+    'type': 'object',
+    'properties': {'a': {'type': 'integer'}, 'b': {'type': 'integer'}},
+    'required': ['a', 'b'],
+}
+
+
+class FakeMCPToolset(MCPToolset[object]):
+    """In-memory `MCPToolset` whose I/O methods return canned results.
+
+    Bypasses `MCPToolset.__init__` (which would build a real transport) and sets only the
+    attributes the durable wrapper and the run touch.
+    """
+
+    def __init__(
+        self,
+        *,
+        id: str,
+        instructions: str | None = None,
+        include_instructions: bool = True,
+        tool_metadata: dict[str, object] | None = None,
+    ) -> None:
+        self._id = id
+        self.max_retries = None
+        self.cache_tools = True
+        self.include_instructions = include_instructions
+        self.include_return_schema = None
+        self._instructions_text = instructions
+        self._tool_metadata = tool_metadata
+        self.tool_calls: list[tuple[str, dict[str, Any]]] = []
+        self.enter_count = 0
+        self._session_depth = 0
+        self.implicit_sessions = 0
+
+    async def __aenter__(self) -> FakeMCPToolset:
+        self.enter_count += 1
+        self._session_depth += 1
+        return self
+
+    async def __aexit__(self, *args: object) -> None:
+        self._session_depth -= 1
+
+    async def _require_session(self) -> None:
+        """Model a real server: I/O needs an active session, and a call without one opens its
+        own implicit session for the duration of the call, as `MCPToolset` does."""
+        if self._session_depth == 0:
+            self.implicit_sessions += 1
+            await self.__aenter__()
+            await self.__aexit__(None, None, None)
+
+    async def get_tools(self, ctx: RunContext[object]) -> dict[str, ToolsetTool[object]]:
+        await self._require_session()
+        tool_def = ToolDefinition(
+            name='add',
+            description='Add two integers.',
+            parameters_json_schema=_ADD_SCHEMA,
+            metadata=self._tool_metadata,
+        )
+        return {'add': self.tool_for_tool_def(tool_def)}
+
+    async def get_instructions(self, ctx: RunContext[object]) -> InstructionPart | None:
+        if not self.include_instructions or self._instructions_text is None:
+            return None
+        return InstructionPart(content=self._instructions_text)
+
+    async def call_tool(
+        self, name: str, tool_args: dict[str, Any], ctx: RunContext[object], tool: ToolsetTool[object]
+    ) -> int:
+        await self._require_session()
+        self.tool_calls.append((name, dict(tool_args)))
+        return int(tool_args['a']) + int(tool_args['b'])
+
+
+def add_then_done() -> FunctionModel:
+    def fn(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        answered = any(isinstance(part, ToolReturnPart) for message in messages for part in message.parts)
+        if not answered:
+            return ModelResponse(parts=[ToolCallPart(tool_name='add', args={'a': 2, 'b': 3})])
+        return ModelResponse(parts=[TextPart(content='summed')])
+
+    return FunctionModel(fn, model_name='fn')
+
+
+def build(server: FakeMCPToolset) -> Agent[Any, Any]:
+    return Agent(add_then_done(), name='calc', toolsets=[server], capabilities=[LambdaDurability()])
+
+
+class TestMcpCheckpointing:
+    def test_get_tools_instructions_and_call_tool_are_checkpointed(self) -> None:
+        server = FakeMCPToolset(id='calc', instructions='Use the calculator.')
+        agent = build(server)
+        ctx = FakeDurableContext()
+
+        result = run_durable(lambda: agent.run('add 2 and 3'), context=ctx)
+
+        assert result.output == 'summed'
+        assert server.tool_calls == [('add', {'a': 2, 'b': 3})]
+        assert 'calc__mcp_server__calc.get_tools' in ctx.step_names
+        assert 'calc__mcp_server__calc.get_instructions' in ctx.step_names
+        assert 'calc__mcp_server__calc.call_tool:add' in ctx.step_names
+
+    def test_resume_does_not_reach_the_server(self) -> None:
+        server = FakeMCPToolset(id='calc', instructions='Use the calculator.')
+        agent = build(server)
+
+        first = FakeDurableContext()
+        run_durable(lambda: agent.run('add 2 and 3'), context=first)
+        assert len(server.tool_calls) == 1
+
+        resumed = FakeDurableContext(journal=first.operations)
+        result = run_durable(lambda: agent.run('add 2 and 3'), context=resumed)
+
+        assert result.output == 'summed'
+        assert resumed.invoked == []
+        assert len(server.tool_calls) == 1
+
+    def test_instructions_are_omitted_when_disabled(self) -> None:
+        server = FakeMCPToolset(id='calc', instructions='Use it.', include_instructions=False)
+        agent = build(server)
+        ctx = FakeDurableContext()
+
+        run_durable(lambda: agent.run('add 2 and 3'), context=ctx)
+
+        assert 'calc__mcp_server__calc.get_instructions' not in ctx.step_names
+
+    def test_the_run_keeps_one_session(self) -> None:
+        """`lifecycle='enter-always'` keeps a single session for the run rather than an implicit
+        session per call, matching what a plain non-durable run does."""
+        server = FakeMCPToolset(id='calc', instructions='Use the calculator.')
+        agent = build(server)
+        ctx = FakeDurableContext()
+
+        run_durable(lambda: agent.run('add 2 and 3'), context=ctx)
+
+        assert server.implicit_sessions == 0
+        assert server.enter_count >= 1
+
+    def test_opting_an_mcp_tool_out_is_rejected(self) -> None:
+        server = FakeMCPToolset(id='calc', instructions='Use it.', tool_metadata={'aws_lambda': False})
+        agent = build(server)
+        ctx = FakeDurableContext()
+
+        with pytest.raises(UserError, match='cannot run outside a step'):
+            run_durable(lambda: agent.run('add 2 and 3'), context=ctx)
+
+    def test_transparent_outside_a_durable_handler(self) -> None:
+        server = FakeMCPToolset(id='calc', instructions='Use the calculator.')
+        agent = build(server)
+
+        result = agent.run_sync('add 2 and 3')
+
+        assert result.output == 'summed'
+        assert server.tool_calls == [('add', {'a': 2, 'b': 3})]
