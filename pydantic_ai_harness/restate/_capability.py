@@ -57,8 +57,8 @@ from pydantic_ai.tools import AgentDepsT, RunContext, ToolDefinition
 from pydantic_ai.toolsets import AbstractToolset, WrapperToolset
 from pydantic_ai.toolsets._dynamic import DynamicToolset  # pyright: ignore[reportPrivateUsage]
 from restate.context import Context, RunOptions
+from restate.extensions import current_context
 from restate.serde import JsonSerde
-from restate.server_context import current_context
 
 if TYPE_CHECKING:
     from pydantic_ai.mcp import MCPToolset
@@ -91,8 +91,8 @@ _RUN_OPTIONS: RunOptions[_JsonValue] = RunOptions(serde=_JSON_SERDE)
 def _current_restate_context() -> Context | None:
     """Return the active Restate context, or `None` outside a Restate invocation.
 
-    `restate.server_context.current_context()` reads a `ContextVar` that has no default, so it
-    raises `LookupError` outside an invocation rather than returning `None`. Catch it here so the
+    `restate.extensions.current_context()` reads a `ContextVar` that has no default, so it raises
+    `LookupError` outside an invocation rather than returning `None`. Catch it here so the
     capability is transparent off the durable path.
     """
     try:
