@@ -20,6 +20,7 @@
       { "label": "Planning", "slug": "planning" },
       { "label": "Memory", "slug": "memory" },
       { "label": "Modal Sandbox", "slug": "modal-sandbox" },
+      { "label": "Restate Durability", "slug": "restate" },
       { "label": "Runtime Authoring", "slug": "runtime-authoring" },
       { "label": "Guardrails", "slug": "guardrails" },
       { "label": "Managed Prompt", "slug": "managed-prompt" },
