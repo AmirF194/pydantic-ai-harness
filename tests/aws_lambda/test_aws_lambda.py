@@ -219,7 +219,7 @@ class TestStepConfig:
         configs = [op.config for op in ctx.operations]
         assert all(c is not None and c.step_semantics is StepSemantics.AT_MOST_ONCE_PER_RETRY for c in configs)
 
-    def test_per_tool_metadata_overrides_the_base_config(self) -> None:
+    def test_per_tool_metadata_overrides_the_base_config_key_by_key(self) -> None:
         from aws_durable_execution_sdk_python.config import StepSemantics
 
         toolset = FunctionToolset[object](id='tools')
@@ -257,10 +257,7 @@ class TestStepConfig:
 
     def test_unknown_per_tool_config_key_is_rejected(self) -> None:
         toolset = FunctionToolset[object](id='tools')
-
-        @toolset.tool_plain(metadata={'aws_lambda': {'retries': 3}})
-        def act() -> str:
-            return 'sunny'
+        toolset.add_function(act, metadata={'aws_lambda': {'retries': 3}})
 
         agent = Agent(tool_then_text(), name='a', toolsets=[toolset], capabilities=[LambdaDurability()])
         ctx = FakeDurableContext()
@@ -489,9 +486,8 @@ class TestRuntimeToolsets:
 
 class TestEnqueueGuard:
     def test_enqueue_inside_a_checkpointed_tool_raises(self) -> None:
-        def act(ctx: RunContext[object]) -> str:
+        def act(ctx: RunContext[object]) -> None:
             ctx.enqueue('later')
-            return 'sunny'
 
         agent = Agent(tool_then_text(), name='a', capabilities=[LambdaDurability()])
         agent.tool(act)
@@ -499,3 +495,36 @@ class TestEnqueueGuard:
 
         with pytest.raises(UserError, match='enqueue'):
             run_durable(lambda: agent.run('go'), context=ctx)
+
+
+class TestReplayFidelity:
+    """The fake models what the service does on resume; these pin that behaviour."""
+
+    def test_a_diverging_step_sequence_is_detected(self) -> None:
+        agent = build_agent(act)
+        first = FakeDurableContext()
+        run_durable(lambda: agent.run('go'), context=first)
+
+        # Resume an execution whose recorded operations belong to a different agent shape.
+        other = Agent(tool_then_text(), name='b', capabilities=[LambdaDurability()])
+        other.tool_plain(act)
+        resumed = FakeDurableContext(journal=first.operations)
+
+        with pytest.raises(AssertionError, match='replay divergence'):
+            run_durable(lambda: other.run('go'), context=resumed)
+
+    def test_a_recorded_step_failure_is_raised_again_on_resume(self) -> None:
+        # Once a step's retries are exhausted the failure is checkpointed, and resuming the
+        # execution re-raises it rather than re-attempting the step.
+        def failing() -> str:
+            raise RuntimeError('permanent')
+
+        agent = build_agent(failing)
+        first = FakeDurableContext()
+        with pytest.raises(RuntimeError, match='permanent'):
+            run_durable(lambda: agent.run('go'), context=first)
+
+        resumed = FakeDurableContext(journal=first.operations)
+        with pytest.raises(RuntimeError, match='permanent'):
+            run_durable(lambda: agent.run('go'), context=resumed)
+        assert resumed.invoked == []

@@ -41,6 +41,13 @@ T = TypeVar('T')
 
 ENGINE_NAME = 'AWS Lambda'
 
+_CANCEL_TIMEOUT_SECONDS = 5.0
+"""How long `run_durable` waits for an abandoned run to finish unwinding.
+
+Bounded so a tool whose cleanup hangs cannot wedge the handler, which is the failure mode the
+bridge exists to avoid everywhere else.
+"""
+
 
 class DurableStepContext(Protocol):
     """The part of `DurableContext` this package uses.
@@ -305,9 +312,21 @@ def run_durable(agent_run: Callable[[], Coroutine[Any, Any, T]], *, context: Dur
         return bridge.consume()
     finally:
         # The loop outlives the invocation, so a run abandoned by a suspension or an error escaping
-        # the handler would otherwise keep running into the next warm invocation.
+        # the handler would otherwise keep running into the next warm invocation. Wait for it to
+        # finish unwinding: an agent coroutine's `finally`/`__aexit__` cleanup runs during
+        # cancellation, and letting that overlap the next invocation would touch shared provider
+        # resources after the execution it belonged to was abandoned.
         started.wait()
         task = tasks[0]
-        if not task.done():
-            loop.call_soon_threadsafe(task.cancel)
+        finished = threading.Event()
+
+        def cancel_and_notify() -> None:
+            if task.done():
+                finished.set()
+                return
+            task.add_done_callback(lambda _: finished.set())
+            task.cancel()
+
+        loop.call_soon_threadsafe(cancel_and_notify)
+        finished.wait(timeout=_CANCEL_TIMEOUT_SECONDS)
         _active_bridge.reset(token)

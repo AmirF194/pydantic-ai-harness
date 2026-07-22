@@ -185,8 +185,8 @@ def charge_card(amount: int) -> str:
 every attempt. Use it for cheap, side-effect-free tools whose result is not worth a checkpoint. MCP
 tools cannot opt out, because they perform I/O that must not re-run when the execution resumes.
 
-`LambdaDurability(step_config=...)` sets the base configuration for every step, which per-tool
-metadata replaces.
+`LambdaDurability(step_config=...)` sets the base configuration for every step. Per-tool metadata
+overrides it key by key, so a tool that sets only `step_semantics` keeps the base `retry_strategy`.
 
 ## Composition with other capabilities
 

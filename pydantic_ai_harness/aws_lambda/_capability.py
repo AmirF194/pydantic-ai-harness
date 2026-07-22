@@ -85,6 +85,15 @@ def _require_bridge() -> StepBridge:
     return bridge
 
 
+def _merge_config(base: Mapping[str, Any] | None, per_tool: Mapping[str, Any] | None) -> Mapping[str, Any]:
+    """Per-tool step config overrides the base key by key, as it does for Temporal and Prefect.
+
+    Merging rather than replacing means a tool that sets only `step_semantics` keeps the base
+    `retry_strategy`, and an explicit empty mapping is simply a no-op.
+    """
+    return {**(base or {}), **(per_tool or {})}
+
+
 def _step_config(config: Mapping[str, Any] | None) -> StepConfig | None:
     """Build a `StepConfig` from a per-tool metadata mapping."""
     if not config:
@@ -155,7 +164,7 @@ def _build_function_toolset(
             return _serialize_call_tool_result(result)
 
         payload = await _require_bridge().run_step(
-            f'{name}.call_tool:{tool_name}', operation, _step_config(config or base_config)
+            f'{name}.call_tool:{tool_name}', operation, _step_config(_merge_config(base_config, config))
         )
         return unwrap_recorded_tool_call_result(_deserialize_call_tool_result(payload))
 
@@ -203,7 +212,7 @@ def _build_mcp_toolset(
             return _serialize_call_tool_result(result)
 
         payload = await _require_bridge().run_step(
-            f'{name}.call_tool:{tool_name}', operation, _step_config(config or base_config)
+            f'{name}.call_tool:{tool_name}', operation, _step_config(_merge_config(base_config, config))
         )
         return unwrap_recorded_tool_call_result(_deserialize_call_tool_result(payload))
 
@@ -248,7 +257,7 @@ def _build_dynamic_toolset(
             return _serialize_call_tool_result(result)
 
         payload = await _require_bridge().run_step(
-            f'{name}.call_tool:{tool_name}', operation, _step_config(config or base_config)
+            f'{name}.call_tool:{tool_name}', operation, _step_config(_merge_config(base_config, config))
         )
         return unwrap_recorded_tool_call_result(_deserialize_call_tool_result(payload))
 
@@ -336,7 +345,7 @@ class LambdaDurability(BaseDurabilityCapability[AgentDepsT]):
                 agent's `name` when the capability is bound.
             step_config: Base `StepConfig` fields applied to every step, as a mapping of
                 `retry_strategy`, `step_semantics`, and `serdes`. Per-tool
-                `metadata={'aws_lambda': {...}}` replaces it for that tool.
+                `metadata={'aws_lambda': {...}}` overrides it key by key for that tool.
         """
         super().__init__(models=models, event_stream_handler=event_stream_handler, name=name)
         # Validate eagerly so a bad config fails at construction rather than mid-execution.

@@ -224,3 +224,28 @@ class TestMultipleServers:
 
         assert result.output == 'summed'
         assert resumed.invoked == []
+
+
+class TestFakeServerFidelity:
+    def test_the_fake_opens_an_implicit_session_when_not_entered(self) -> None:
+        """Without this the `implicit_sessions == 0` assertion above would be vacuous."""
+        import anyio
+
+        server = FakeMCPToolset(id='calc')
+
+        async def call_without_entering() -> None:
+            await server._require_session()  # pyright: ignore[reportPrivateUsage]
+
+        anyio.run(call_without_entering)
+
+        assert server.implicit_sessions == 1
+
+    def test_a_server_without_instructions_contributes_none(self) -> None:
+        server = FakeMCPToolset(id='calc', instructions=None)
+        agent = build(server)
+        ctx = FakeDurableContext()
+
+        result = run_durable(lambda: agent.run('add 2 and 3'), context=ctx)
+
+        assert result.output == 'summed'
+        assert 'calc__mcp_server__calc.get_instructions' in ctx.step_names
