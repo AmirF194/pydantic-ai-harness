@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import re
 import sqlite3
 from collections import defaultdict
@@ -29,6 +30,8 @@ from pydantic_ai_harness.step_persistence._types import (
     ToolEffectRecord,
     ToolEffectStatus,
 )
+
+_logger = logging.getLogger(__name__)
 
 _DEFAULT_MEDIA_THRESHOLD_BYTES = 64 * 1024
 _AutoMedia = Literal['auto']
@@ -150,6 +153,14 @@ class InMemoryStepStore:
         if not snaps:
             return None
         return snaps[-1]
+
+    async def list_snapshots(self, *, run_id: str) -> list[ContinuableSnapshot]:
+        """Return all retained snapshots for `run_id` in write order.
+
+        Not part of the `StepStore` protocol: the `conversation_search`
+        capability consumes it through its narrower `SnapshotStore` protocol.
+        """
+        return list(self._snapshots.get(run_id, ()))
 
     async def record_tool_effect(self, record: ToolEffectRecord) -> None:
         self._tool_effects[(record.run_id, record.tool_call_id)] = record
@@ -502,6 +513,60 @@ class FileStepStore:
         data = _load_json_object(latest_path.read_text(encoding='utf-8'))
         messages_json = data['messages']
         return data, messages_json
+
+    async def list_snapshots(self, *, run_id: str) -> list[ContinuableSnapshot]:
+        """Return all retained snapshots for `run_id` in write order.
+
+        Snapshots that fail to read or parse are skipped and logged, so one
+        damaged file does not hide the rest of the run's history. Not part of
+        the `StepStore` protocol: the `conversation_search` capability consumes
+        it through its narrower `SnapshotStore` protocol.
+        """
+        texts = await anyio.to_thread.run_sync(self._sync_read_snapshot_texts, run_id)
+        snapshots: list[ContinuableSnapshot] = []
+        for text in texts:
+            try:
+                data = _load_json_object(text)
+                messages_json = data['messages']
+                if self._media_store is not None:
+                    messages_json = await restore_media(messages_json, media_store=self._media_store)
+                messages: list[ModelMessage] = ModelMessagesTypeAdapter.validate_python(messages_json)
+                timestamp_raw = data['timestamp']
+                step_raw = data['step_index']
+                if not (isinstance(timestamp_raw, str) and isinstance(step_raw, int)):
+                    raise ValueError('snapshot has wrong types')
+                snapshots.append(
+                    ContinuableSnapshot(
+                        run_id=run_id,
+                        step_index=step_raw,
+                        messages=messages,
+                        conversation_id=_opt_str(data.get('conversation_id')),
+                        parent_run_id=_opt_str(data.get('parent_run_id')),
+                        agent_name=_opt_str(data.get('agent_name')),
+                        timestamp=datetime.fromisoformat(timestamp_raw),
+                    )
+                )
+            except Exception:
+                _logger.warning('Skipping unparsable snapshot for run %s', run_id, exc_info=True)
+        return snapshots
+
+    def _sync_read_snapshot_texts(self, run_id: str) -> list[str]:
+        snap_dir = self._run_dir(run_id) / 'snapshots'
+        if not snap_dir.exists():
+            return []
+        candidates: list[tuple[int, Path]] = []
+        for path in snap_dir.glob('*.json'):
+            try:
+                candidates.append((int(path.stem), path))
+            except ValueError:
+                continue
+        texts: list[str] = []
+        for _, path in sorted(candidates, key=lambda c: c[0]):
+            try:
+                texts.append(path.read_text(encoding='utf-8'))
+            except OSError:
+                _logger.warning('Skipping unreadable snapshot file %s', path, exc_info=True)
+        return texts
 
     async def record_tool_effect(self, record: ToolEffectRecord) -> None:
         await anyio.to_thread.run_sync(self._sync_record_tool_effect, record)
@@ -877,6 +942,57 @@ class SqliteStepStore:
             timestamp_iso,
             messages_json_text,
         )
+
+    async def list_snapshots(self, *, run_id: str) -> list[ContinuableSnapshot]:
+        """Return all retained snapshots for `run_id` in write order.
+
+        Rows that fail to parse are skipped and logged, so one damaged row does
+        not hide the rest of the run's history. Not part of the `StepStore`
+        protocol: the `conversation_search` capability consumes it through its
+        narrower `SnapshotStore` protocol.
+        """
+        rows = await anyio.to_thread.run_sync(self._sync_load_snapshot_rows, run_id)
+        snapshots: list[ContinuableSnapshot] = []
+        for row in rows:
+            try:
+                step_index, conv_id, parent_id, agent_name, timestamp_iso, messages_json_text = row
+                if not (
+                    isinstance(step_index, int)
+                    and isinstance(timestamp_iso, str)
+                    and isinstance(messages_json_text, str)
+                ):
+                    raise ValueError('snapshot row has wrong types')
+                messages_json: object = json.loads(messages_json_text)
+                if self._media_store is not None:
+                    messages_json = await restore_media(messages_json, media_store=self._media_store)
+                messages: list[ModelMessage] = ModelMessagesTypeAdapter.validate_python(messages_json)
+                snapshots.append(
+                    ContinuableSnapshot(
+                        run_id=run_id,
+                        step_index=step_index,
+                        messages=messages,
+                        conversation_id=_opt_str(conv_id),
+                        parent_run_id=_opt_str(parent_id),
+                        agent_name=_opt_str(agent_name),
+                        timestamp=datetime.fromisoformat(timestamp_iso),
+                    )
+                )
+            except Exception:
+                _logger.warning('Skipping unparsable snapshot row for run %s', run_id, exc_info=True)
+        return snapshots
+
+    def _sync_load_snapshot_rows(self, run_id: str) -> list[tuple[object, ...]]:
+        conn = self._open()
+        try:
+            self._ensure_schema(conn)
+            rows = conn.execute(
+                'SELECT step_index, conversation_id, parent_run_id, agent_name, timestamp, messages '
+                'FROM snapshots WHERE run_id = ? ORDER BY seq ASC',
+                (run_id,),
+            ).fetchall()
+        finally:
+            self._maybe_close(conn)
+        return rows
 
     async def record_tool_effect(self, record: ToolEffectRecord) -> None:
         await anyio.to_thread.run_sync(self._sync_record_tool_effect, record)

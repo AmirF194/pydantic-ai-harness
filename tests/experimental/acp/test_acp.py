@@ -2011,7 +2011,7 @@ class TestDefaultCodingPresenter:
         # A recognized name whose argument is the wrong type is not mis-rendered.
         assert default_coding_presenter(_tool_call('read_file', {'path': 123})) is None
 
-    def test_unparseable_args_return_none(self) -> None:
+    def test_unparsable_args_return_none(self) -> None:
         # Malformed string args become a sentinel dict with no `path`, so the call falls back.
         assert default_coding_presenter(_tool_call('read_file', 'not json')) is None
 

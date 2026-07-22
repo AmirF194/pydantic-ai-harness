@@ -8,6 +8,7 @@ agent run (e.g. the path-traversal guard on `FileStepStore`).
 from __future__ import annotations
 
 import json
+import logging
 from pathlib import Path
 from typing import Any
 
@@ -1528,3 +1529,68 @@ class TestRunIdIsPerCall:
         effect = await store.get_tool_effect(run_id='shared', tool_call_id='pyd_ai_tool_call_id__add')
         assert effect is not None
         assert effect.status == 'completed'
+
+
+# ---------------------------------------------------------------------------
+# list_snapshots (read seam consumed by `conversation_search`)
+# ---------------------------------------------------------------------------
+
+
+class TestListSnapshots:
+    async def test_in_memory_returns_all_in_write_order(self) -> None:
+        store = InMemoryStepStore()
+        await store.save_snapshot(ContinuableSnapshot(run_id='r1', step_index=0, messages=[]))
+        await store.save_snapshot(ContinuableSnapshot(run_id='r1', step_index=1, messages=[]))
+
+        snaps = await store.list_snapshots(run_id='r1')
+        assert [s.step_index for s in snaps] == [0, 1]
+        assert await store.list_snapshots(run_id='missing') == []
+
+    async def test_file_returns_all_in_write_order(self, tmp_path: Path) -> None:
+        store = FileStepStore(tmp_path)
+        first: list[ModelMessage] = [ModelRequest(parts=[UserPromptPart(content='first message')])]
+        second = first + [ModelResponse(parts=[TextPart(content='second message')])]
+        await store.save_snapshot(
+            ContinuableSnapshot(run_id='r1', step_index=0, messages=first, conversation_id='conv')
+        )
+        await store.save_snapshot(ContinuableSnapshot(run_id='r1', step_index=1, messages=second))
+
+        snaps = await store.list_snapshots(run_id='r1')
+        assert [s.step_index for s in snaps] == [0, 1]
+        assert snaps[0].conversation_id == 'conv'
+        assert len(snaps[1].messages) == 2
+        assert await store.list_snapshots(run_id='missing') == []
+
+    async def test_file_skips_corrupt_wrong_typed_and_unreadable(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        store = FileStepStore(tmp_path, media_store=None)
+        await store.save_snapshot(
+            ContinuableSnapshot(
+                run_id='r1',
+                step_index=0,
+                messages=[ModelRequest(parts=[UserPromptPart(content='the good one')])],
+            )
+        )
+        snap_dir = tmp_path / 'r1' / 'snapshots'
+        (snap_dir / '5.json').write_text('{not valid json', encoding='utf-8')
+        (snap_dir / '7.json').write_text(
+            json.dumps({'step_index': 'not-an-int', 'timestamp': '2026-01-01T00:00:00+00:00', 'messages': []}),
+            encoding='utf-8',
+        )
+        # A directory with an int stem raises OSError on read_text.
+        (snap_dir / '9.json').mkdir()
+        # A non-int stem is not a snapshot file at all.
+        (snap_dir / 'notes.json').write_text('{}', encoding='utf-8')
+
+        with caplog.at_level(logging.WARNING):
+            snaps = await store.list_snapshots(run_id='r1')
+
+        assert [s.step_index for s in snaps] == [0]
+        messages = [record.message for record in caplog.records]
+        assert any('unreadable' in message for message in messages)
+        assert any('unparsable' in message for message in messages)
+
+    async def test_file_returns_empty_without_snapshot_dir(self, tmp_path: Path) -> None:
+        store = FileStepStore(tmp_path)
+        assert await store.list_snapshots(run_id='never-ran') == []
