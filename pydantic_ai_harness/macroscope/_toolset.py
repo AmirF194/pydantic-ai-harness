@@ -74,7 +74,7 @@ def _parse_issue(payload: str) -> MacroscopeIssue | None:
 
     The payload is the whole remainder of the line, so a log prefix before
     `issue_event=` is fine but trailing text after the JSON makes the line
-    unparseable. The CLI emits each `issue_event=` record alone on its line.
+    unparsable. The CLI emits each `issue_event=` record alone on its line.
     """
     try:
         return MacroscopeIssue.model_validate_json(payload)
