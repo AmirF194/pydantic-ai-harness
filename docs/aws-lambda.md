@@ -161,9 +161,10 @@ it was recorded for. The default model keeps the plain, suffix-less name.
   completes, so there is no channel to stream tokens to a caller while it runs. An
   `event_stream_handler` works: model events are handled live inside the model step and each
   agent-level event is checkpointed in its own step.
-- **`ctx.enqueue()` is not available inside a checkpointed tool**, because a resumed execution
-  serves the recorded step output and would drop the enqueued messages. Enqueue from handler-level
-  code instead.
+- **`ctx.enqueue()` is not available inside a durable step**, whether a checkpointed tool or an
+  `event_stream_handler` (which runs inside the model step for model events and its own step for
+  agent events), because a resumed execution serves the recorded step output and would drop the
+  enqueued messages. Enqueue from handler-level code instead.
 - **Budgets.** A durable execution allows 3,000 operations and 100 MB of cumulative checkpointed
   state. A turn costs one model step plus one step per tool call, so the operation budget is
   generous, but large tool results consume the state budget: return a reference (an S3 key, say)

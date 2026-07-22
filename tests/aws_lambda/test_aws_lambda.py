@@ -11,6 +11,7 @@ from pydantic_ai.exceptions import ApprovalRequired, CallDeferred, ModelRetry, U
 from pydantic_ai.messages import (
     AgentStreamEvent,
     BinaryContent,
+    FunctionToolCallEvent,
     ModelMessage,
     ModelResponse,
     TextPart,
@@ -491,6 +492,43 @@ class TestEnqueueGuard:
 
         agent = Agent(tool_then_text(), name='a', capabilities=[AWSLambdaDurability()])
         agent.tool(act)
+        ctx = FakeDurableContext()
+
+        with pytest.raises(UserError, match='enqueue'):
+            run_durable(lambda: agent.run('go'), context=ctx)
+
+    def test_enqueue_from_an_event_handler_on_a_model_event_raises(self) -> None:
+        """Model events reach the handler inside the model step (`capture_event_stream`); a replay
+        serves the recorded step, so an enqueue there would be dropped. The first handler call is
+        the model-request capture, so enqueuing after draining the stream raises on that path."""
+
+        async def handler(ctx: RunContext[object], stream: Any) -> None:
+            async for _event in stream:
+                pass
+            ctx.enqueue('later')
+
+        agent = Agent(TestModel(), name='a', capabilities=[AWSLambdaDurability(event_stream_handler=handler)])
+        agent.tool_plain(act)
+        ctx = FakeDurableContext()
+
+        with pytest.raises(UserError, match='enqueue'):
+            run_durable(lambda: agent.run('go'), context=ctx)
+
+    def test_enqueue_from_an_event_handler_on_an_agent_event_raises(self) -> None:
+        """Agent-level events reach the handler in their own step (`_dispatch_event_stream_event`);
+        that step is replayed too, so an enqueue there would be dropped. Enqueuing only once a
+        `FunctionToolCallEvent` is seen skips the model-capture call and hits the dispatch path."""
+
+        async def handler(ctx: RunContext[object], stream: Any) -> None:
+            saw_tool_call = False
+            async for event in stream:
+                if isinstance(event, FunctionToolCallEvent):
+                    saw_tool_call = True
+            if saw_tool_call:
+                ctx.enqueue('later')
+
+        agent = Agent(TestModel(), name='a', capabilities=[AWSLambdaDurability(event_stream_handler=handler)])
+        agent.tool_plain(act)
         ctx = FakeDurableContext()
 
         with pytest.raises(UserError, match='enqueue'):

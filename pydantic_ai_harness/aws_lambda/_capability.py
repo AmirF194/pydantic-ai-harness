@@ -109,13 +109,18 @@ def _step_config(config: Mapping[str, Any] | None) -> StepConfig | None:
 
 
 def _guard_enqueue(ctx: RunContext[AgentDepsT]) -> RunContext[AgentDepsT]:
-    """Make `ctx.enqueue()` raise inside a step-wrapped tool call.
+    """Make `ctx.enqueue()` raise inside any code that runs within a durable step.
 
-    A replay serves the recorded step output without re-running the tool, so messages enqueued
-    inside the step would be dropped.
+    A replay serves the recorded step output without re-running the code, so messages enqueued
+    from inside the step -- whether a tool call or an `event_stream_handler` delivering events
+    inside the model step or its own handler step -- would be dropped.
+
+    On `pydantic-ai` 2.16.0 this collapses onto the base's `_durable_run_context` /
+    `_durable_run_context_scope` (pydantic/pydantic-ai#6671), which guards both the passed and the
+    ambient run context from one place; this local guard covers the passed context on the 2.15.0 floor.
     """
     pending: list[PendingMessage] = EnqueueGuard(
-        '`ctx.enqueue()` is not supported inside AWS Lambda step-wrapped tools because a replay '
+        '`ctx.enqueue()` is not supported inside an AWS Lambda durable step because a replay '
         'serves the recorded step output and would drop the enqueued messages. Enqueue messages '
         'from handler-level code instead.'
     )
@@ -380,8 +385,10 @@ class AWSLambdaDurability(BaseDurabilityCapability[AgentDepsT]):
         handler = self._event_stream_handler
         assert handler is not None  # pragma: no cover - only dispatched when a handler is set
 
+        guarded = _guard_enqueue(ctx)
+
         async def operation() -> None:
-            await handler(ctx, self._single_event_stream(event))
+            await handler(guarded, self._single_event_stream(event))
 
         # Checkpoint the handler call so its side effects are not repeated when the execution resumes.
         await _require_bridge().run_step(
@@ -435,7 +442,7 @@ class AWSLambdaDurability(BaseDurabilityCapability[AgentDepsT]):
                     request.messages, request.model_settings, request.model_request_parameters, ctx
                 ) as streamed:
                     events = await capture_event_stream(
-                        run_context=ctx, stream=streamed, handler=self._event_stream_handler
+                        run_context=_guard_enqueue(ctx), stream=streamed, handler=self._event_stream_handler
                     )
                 return {
                     'response': _response_adapter.dump_python(streamed.get(), mode='json'),
