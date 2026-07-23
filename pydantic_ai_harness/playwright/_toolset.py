@@ -1,4 +1,4 @@
-"""Browser toolset -- gives an agent a real, stateful Chromium browser via async Playwright."""
+"""Playwright toolset -- gives an agent a real, stateful Chromium browser."""
 
 from __future__ import annotations
 
@@ -18,7 +18,8 @@ try:
     from playwright.async_api import async_playwright as async_playwright
 except ImportError as _import_error:  # pragma: no cover
     raise ImportError(
-        'playwright is required for Browser. Install it with: pip install "pydantic-ai-harness[browser]"\n'
+        'playwright is required for PlaywrightBrowser. '
+        'Install it with: pip install "pydantic-ai-harness[playwright]"\n'
         'Then run: playwright install chromium'
     ) from _import_error
 
@@ -92,13 +93,13 @@ def _truncate(text: str, max_chars: int) -> str:
 
 
 @dataclass
-class BrowserState:
-    """Per-run browser handles shared between `Browser` and `BrowserToolset`.
+class PlaywrightBrowserState:
+    """Per-run browser handles shared between `PlaywrightBrowser` and `PlaywrightBrowserToolset`.
 
-    `Browser.wrap_run` installs `lazy_launcher`; the first browser-tool call
-    triggers it through `ensure_page`, so Chromium starts only when a tool is
-    actually used. Each agent run gets a fresh instance (via `Browser.for_run`),
-    so concurrent runs never share a page.
+    `PlaywrightBrowser.wrap_run` installs `lazy_launcher`; the first browser-tool
+    call triggers it through `ensure_page`, so Chromium starts only when a tool
+    is actually used. Each agent run gets a fresh instance (via
+    `PlaywrightBrowser.for_run`), so concurrent runs never share a page.
     """
 
     page: _Page | None = None
@@ -108,7 +109,7 @@ class BrowserState:
     """Set when a launch attempt failed (e.g. the Chromium binary is missing)."""
 
     lazy_launcher: Callable[[], Awaitable[None]] | None = field(default=None, init=False, repr=False)
-    """Async launcher installed by `Browser.wrap_run`; populates `page` on first use."""
+    """Async launcher installed by `PlaywrightBrowser.wrap_run`; populates `page` on first use."""
 
     _launch_lock: asyncio.Lock = field(default_factory=asyncio.Lock, init=False, repr=False)
     """Serializes the lazy launch so concurrent first tool calls launch Chromium once."""
@@ -128,7 +129,8 @@ class BrowserState:
                 if self.page is None and self.launch_error is None:
                     if self.lazy_launcher is None:
                         raise RuntimeError(
-                            'Browser is not running: Browser.wrap_run must be active before any browser tool.'
+                            'PlaywrightBrowser is not running: PlaywrightBrowser.wrap_run must be active before any '
+                            'browser tool.'
                         )
                     await self.lazy_launcher()
             if self.launch_error is not None:
@@ -138,13 +140,14 @@ class BrowserState:
         return self.page
 
 
-class BrowserToolset(FunctionToolset[AgentDepsT]):
+class PlaywrightBrowserToolset(FunctionToolset[AgentDepsT]):
     """Async Playwright-backed browser tools: navigate, interact, extract, screenshot, run JS.
 
-    The tools read the active page from a shared `BrowserState`, which
-    `Browser.wrap_run` populates lazily on the first tool call. Use the toolset
-    through `Browser` rather than directly; construct it directly (with a
-    `state` whose `page` you set) only to drive tools against a page double.
+    The tools read the active page from a shared `PlaywrightBrowserState`, which
+    `PlaywrightBrowser.wrap_run` populates lazily on the first tool call. Use the
+    toolset through `PlaywrightBrowser` rather than directly; construct it
+    directly (with a `state` whose `page` you set) only to drive tools against a
+    page double.
 
     Page text is extracted with Playwright itself (`inner_text`) and truncated to
     `max_content_tokens`; no HTML-to-Markdown dependency is pulled in. `screenshot`
@@ -155,13 +158,13 @@ class BrowserToolset(FunctionToolset[AgentDepsT]):
     def __init__(
         self,
         *,
-        state: BrowserState,
+        state: PlaywrightBrowserState,
         allowed_domains: list[str] | None = None,
         screenshot_on_navigate: bool = False,
         max_content_tokens: int = DEFAULT_MAX_CONTENT_TOKENS,
         timeout_ms: int = DEFAULT_TIMEOUT_MS,
     ) -> None:
-        super().__init__(id='browser')
+        super().__init__(id='playwright')
         self._state = state
         self._allowed_domains = allowed_domains
         self._screenshot_on_navigate = screenshot_on_navigate
@@ -190,8 +193,9 @@ class BrowserToolset(FunctionToolset[AgentDepsT]):
         `location.href`, or history moves, so the current URL is re-checked after
         each such action. When it is disallowed the page is moved to `about:blank`
         and an error string is returned, so disallowed content never reaches the
-        model. The network-level route guard installed by `Browser.wrap_run` is
-        the primary boundary; this is the second layer.
+        model. The network-level route guard installed by
+        `PlaywrightBrowser.wrap_run` is the primary boundary; this is the second
+        layer.
         """
         if check_allowed_domain(page.url, self._allowed_domains):
             return None

@@ -1,4 +1,4 @@
-# Browser
+# Playwright Browser
 
 Give an agent a real, stateful Chromium browser via async
 [Playwright](https://playwright.dev/python/): navigate, click, type, scroll,
@@ -7,29 +7,29 @@ query-based web research ([`ExaSearch`](../exa/)) or a static HTTP fetch, the
 browser renders JavaScript-heavy SPAs, carries session cookies through login and
 multi-step flows, and reads content that only appears after interaction.
 
-[Source](https://github.com/pydantic/pydantic-ai-harness/tree/main/pydantic_ai_harness/browser/)
+[Source](https://github.com/pydantic/pydantic-ai-harness/tree/main/pydantic_ai_harness/playwright/)
 
 ## Installation
 
-The `browser` extra pulls in Playwright, and Chromium is a separate binary
+The `playwright` extra pulls in Playwright, and Chromium is a separate binary
 download:
 
 ```bash
-pip install 'pydantic-ai-harness[browser]'
+pip install 'pydantic-ai-harness[playwright]'
 playwright install chromium
 ```
 
 If the Chromium binary is missing at runtime, the browser tools are hidden from
 the model and calling one raises with a `playwright install chromium` hint. Set
-`auto_install=True` to fetch the binary automatically on the first miss.
+`auto_install_chromium=True` to fetch the binary automatically on the first miss.
 
 ## Usage
 
 ```python
 from pydantic_ai import Agent
-from pydantic_ai_harness.browser import Browser
+from pydantic_ai_harness.playwright import PlaywrightBrowser
 
-agent = Agent('anthropic:claude-sonnet-4-6', capabilities=[Browser()])
+agent = Agent('anthropic:claude-sonnet-4-6', capabilities=[PlaywrightBrowser()])
 result = await agent.run('Open https://example.com and tell me the page title.')
 ```
 
@@ -61,7 +61,7 @@ a wall of base64 in the text context.
 | `screenshot_on_navigate` | `False` | Attach a screenshot to every `navigate` result. |
 | `max_content_tokens` | `4000` | Approximate token budget for page text. |
 | `timeout_ms` | `30000` | Default Playwright navigation/action timeout. |
-| `auto_install` | `False` | Fetch Chromium automatically when the binary is missing. |
+| `auto_install_chromium` | `False` | Fetch Chromium automatically when the binary is missing. |
 
 ## Lifecycle
 

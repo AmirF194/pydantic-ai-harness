@@ -1,11 +1,11 @@
 ---
-title: Browser
+title: Playwright Browser
 description: Give a Pydantic AI agent a real, stateful Chromium browser via async Playwright -- navigate, click, type, scroll, extract page text, run JavaScript, and screenshot JS-heavy or authenticated pages.
 ---
 
-# Browser
+# Playwright Browser
 
-`Browser` gives an agent a real, stateful Chromium browser via async
+`PlaywrightBrowser` gives an agent a real, stateful Chromium browser via async
 [Playwright](https://playwright.dev/python/): navigate, click, type, scroll,
 move through history, extract page text, run JavaScript, and screenshot. Reach
 for it when the lighter web tools fall short -- pages behind login or session
@@ -13,33 +13,33 @@ cookies, JavaScript-rendered SPAs, and interactive multi-step flows. For
 query-based research prefer [Exa Search](exa-search.md); for a static URL prefer
 a web-fetch tool.
 
-[Source](https://github.com/pydantic/pydantic-ai-harness/tree/main/pydantic_ai_harness/browser/)
+[Source](https://github.com/pydantic/pydantic-ai-harness/tree/main/pydantic_ai_harness/playwright/)
 
 ## Installation
 
-The `browser` extra pulls in Playwright, and Chromium is a separate binary
+The `playwright` extra pulls in Playwright, and Chromium is a separate binary
 download:
 
 ```bash
-pip install 'pydantic-ai-harness[browser]'
+pip install 'pydantic-ai-harness[playwright]'
 playwright install chromium
 ```
 
 If the Chromium binary is missing at runtime, the browser tools are hidden from
 the model and calling one raises with a `playwright install chromium` hint. Set
-`auto_install=True` to fetch the binary automatically on the first miss.
+`auto_install_chromium=True` to fetch the binary automatically on the first miss.
 
 ## Usage
 
 ```python
 from pydantic_ai import Agent
-from pydantic_ai_harness.browser import Browser
+from pydantic_ai_harness.playwright import PlaywrightBrowser
 
-agent = Agent('anthropic:claude-sonnet-4-6', capabilities=[Browser()])
+agent = Agent('anthropic:claude-sonnet-4-6', capabilities=[PlaywrightBrowser()])
 result = await agent.run('Open https://example.com and tell me the page title.')
 ```
 
-`Browser` is a [capability](/ai/core-concepts/capabilities/): it registers the
+`PlaywrightBrowser` is a [capability](/ai/core-concepts/capabilities/): it registers the
 browser toolset, injects short when-to-use guidance into the system prompt, and
 manages the Chromium lifecycle for the run.
 
@@ -71,7 +71,7 @@ a wall of base64 in the text context.
 | `screenshot_on_navigate` | `False` | Attach a screenshot to every `navigate` result. |
 | `max_content_tokens` | `4000` | Approximate token budget for page text. |
 | `timeout_ms` | `30000` | Default Playwright navigation/action timeout. |
-| `auto_install` | `False` | Fetch Chromium automatically when the binary is missing. |
+| `auto_install_chromium` | `False` | Fetch Chromium automatically when the binary is missing. |
 
 ## Lifecycle
 
@@ -101,4 +101,11 @@ safe out of the box) is tracked in
 capability ships the opt-in allowlist and documents the default, and does not yet
 block internal addresses on its own.
 
-::: pydantic_ai_harness.browser.Browser
+## Stability
+
+This capability is available today and its API may change as the harness
+evolves. Pin the harness version if you need a stable surface.
+
+## API reference
+
+::: pydantic_ai_harness.playwright.PlaywrightBrowser

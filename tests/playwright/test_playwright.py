@@ -1,4 +1,4 @@
-"""Tests for the Browser capability.
+"""Tests for the Playwright capability.
 
 The Playwright API surface is mocked throughout: no real Chromium is launched.
 An in-memory page double (`_FakePage`) backs the toolset, and a fake Playwright
@@ -18,13 +18,13 @@ from pydantic_ai.models.test import TestModel
 from pydantic_ai.tools import RunContext, ToolDefinition
 from pydantic_ai.usage import RunUsage
 
-import pydantic_ai_harness.browser._capability as capability_module
-from pydantic_ai_harness.browser import (
+import pydantic_ai_harness.playwright._capability as capability_module
+from pydantic_ai_harness.playwright import (
     DEFAULT_MAX_CONTENT_TOKENS,
     DEFAULT_TIMEOUT_MS,
-    Browser,
-    BrowserState,
-    BrowserToolset,
+    PlaywrightBrowser,
+    PlaywrightBrowserState,
+    PlaywrightBrowserToolset,
 )
 
 pytestmark = pytest.mark.anyio
@@ -132,7 +132,7 @@ class _FakePage:
         self.popup_events.append(event)
 
 
-class _FakeBrowser:
+class _FakePlaywrightBrowser:
     def __init__(self, page: _FakePage, *, close_error: Exception | None = None) -> None:
         self._page = page
         self._close_error = close_error
@@ -163,17 +163,17 @@ class _FakeChromium:
         self._launch_error = launch_error
         self._close_error = close_error
         self.launched: list[bool] = []
-        self.browser: _FakeBrowser | None = None
+        self.browser: _FakePlaywrightBrowser | None = None
 
     @property
     def executable_path(self) -> str:
         return self._executable_path
 
-    async def launch(self, *, headless: bool) -> _FakeBrowser:
+    async def launch(self, *, headless: bool) -> _FakePlaywrightBrowser:
         self.launched.append(headless)
         if self._launch_error is not None:
             raise self._launch_error
-        self.browser = _FakeBrowser(self._page, close_error=self._close_error)
+        self.browser = _FakePlaywrightBrowser(self._page, close_error=self._close_error)
         return self.browser
 
 
@@ -203,11 +203,11 @@ def _toolset(
     allowed_domains: list[str] | None = None,
     screenshot_on_navigate: bool = False,
     max_content_tokens: int = DEFAULT_MAX_CONTENT_TOKENS,
-) -> BrowserToolset[None]:
+) -> PlaywrightBrowserToolset[None]:
     """Build a toolset whose active page is the given double."""
-    state = BrowserState()
+    state = PlaywrightBrowserState()
     state.page = page
-    return BrowserToolset[None](
+    return PlaywrightBrowserToolset[None](
         state=state,
         allowed_domains=allowed_domains,
         screenshot_on_navigate=screenshot_on_navigate,
@@ -239,7 +239,7 @@ def _install_fake_driver(
 # --- Tool behavior ----------------------------------------------------------
 
 
-class TestBrowserTools:
+class TestPlaywrightBrowserTools:
     async def test_navigate_returns_url_title_and_text(self) -> None:
         toolset = _toolset(_FakePage(title='Docs', body='Page text here'))
         result = await toolset.navigate('https://example.com/')
@@ -431,22 +431,22 @@ class TestBrowserTools:
 # --- State / ensure_page ----------------------------------------------------
 
 
-class TestBrowserState:
+class TestPlaywrightBrowserState:
     async def test_tool_raises_when_wrap_run_not_active(self) -> None:
-        toolset = BrowserToolset[None](state=BrowserState())
-        with pytest.raises(RuntimeError, match='Browser is not running'):
+        toolset = PlaywrightBrowserToolset[None](state=PlaywrightBrowserState())
+        with pytest.raises(RuntimeError, match='PlaywrightBrowser is not running'):
             await toolset.screenshot()
 
     async def test_tool_raises_on_launch_error(self) -> None:
-        state = BrowserState()
+        state = PlaywrightBrowserState()
         state.launch_error = 'Chromium is not installed.'
-        toolset = BrowserToolset[None](state=state)
+        toolset = PlaywrightBrowserToolset[None](state=state)
         with pytest.raises(RuntimeError, match='Chromium is not installed'):
             await toolset.screenshot()
 
     async def test_concurrent_ensure_page_launches_once(self) -> None:
         # Two tool calls that race before the page exists must launch Chromium once.
-        state = BrowserState()
+        state = PlaywrightBrowserState()
         launches: list[int] = []
 
         async def _launch() -> None:
@@ -460,7 +460,7 @@ class TestBrowserState:
         assert first is second
 
     async def test_concurrent_ensure_page_failed_launch_raises_once(self) -> None:
-        state = BrowserState()
+        state = PlaywrightBrowserState()
         launches: list[int] = []
 
         async def _launch() -> None:
@@ -477,34 +477,34 @@ class TestBrowserState:
 # --- Capability hooks -------------------------------------------------------
 
 
-class TestBrowserHooks:
+class TestPlaywrightBrowserHooks:
     def test_get_instructions_reports_allowlist(self) -> None:
-        instructions = Browser[None](allowed_domains=['a.com', 'b.com']).get_instructions()
+        instructions = PlaywrightBrowser[None](allowed_domains=['a.com', 'b.com']).get_instructions()
         text = instructions(_ctx())
         assert text is not None and 'Allowed domains: a.com, b.com' in text
 
     def test_get_instructions_reports_all_domains(self) -> None:
-        instructions = Browser[None]().get_instructions()
+        instructions = PlaywrightBrowser[None]().get_instructions()
         text = instructions(_ctx())
         assert text is not None and 'Allowed domains: all' in text
 
     def test_get_instructions_reports_empty_allowlist_as_none(self) -> None:
         # An empty allowlist blocks every domain, so the model must be told 'none',
         # not 'all' (which list-truthiness would collapse it to).
-        instructions = Browser[None](allowed_domains=[]).get_instructions()
+        instructions = PlaywrightBrowser[None](allowed_domains=[]).get_instructions()
         text = instructions(_ctx())
         assert text is not None and 'Allowed domains: none' in text
 
     def test_get_instructions_suppressed_on_launch_error(self) -> None:
-        browser = Browser[None]()
+        browser = PlaywrightBrowser[None]()
         browser._state.launch_error = 'boom'
         assert browser.get_instructions()(_ctx()) is None
 
     async def test_prepare_tools_reset_unapproved(self) -> None:
-        browser = Browser[None]()
+        browser = PlaywrightBrowser[None]()
         defs = [
             ToolDefinition(
-                name='navigate', parameters_json_schema={'type': 'object'}, kind='unapproved', toolset_id='browser'
+                name='navigate', parameters_json_schema={'type': 'object'}, kind='unapproved', toolset_id='playwright'
             ),
             ToolDefinition(name='other', parameters_json_schema={'type': 'object'}, kind='function', toolset_id='misc'),
         ]
@@ -514,11 +514,11 @@ class TestBrowserHooks:
         assert by_name['other'].kind == 'function'
 
     async def test_prepare_tools_hides_tools_on_launch_error(self) -> None:
-        browser = Browser[None]()
+        browser = PlaywrightBrowser[None]()
         browser._state.launch_error = 'boom'
         defs = [
             ToolDefinition(
-                name='navigate', parameters_json_schema={'type': 'object'}, kind='function', toolset_id='browser'
+                name='navigate', parameters_json_schema={'type': 'object'}, kind='function', toolset_id='playwright'
             ),
             ToolDefinition(name='other', parameters_json_schema={'type': 'object'}, kind='function', toolset_id='misc'),
         ]
@@ -531,48 +531,48 @@ class TestBrowserHooks:
         foreign = ToolDefinition(
             name='navigate', parameters_json_schema={'type': 'object'}, kind='unapproved', toolset_id='other_toolset'
         )
-        browser = Browser[None]()
+        browser = PlaywrightBrowser[None]()
         assert (await browser.prepare_tools(_ctx(), [foreign]))[0].kind == 'unapproved'
         browser._state.launch_error = 'boom'
         assert [td.name for td in await browser.prepare_tools(_ctx(), [foreign])] == ['navigate']
 
     async def test_for_run_isolates_state(self) -> None:
-        browser = Browser[None]()
+        browser = PlaywrightBrowser[None]()
         first = await browser.for_run(_ctx())
         second = await browser.for_run(_ctx())
         assert first._state is not second._state
         assert first._state is not browser._state
 
     def test_from_spec_round_trips_fields(self) -> None:
-        browser = Browser[None].from_spec(
+        browser = PlaywrightBrowser[None].from_spec(
             headless=False,
             allowed_domains=['x.com'],
             screenshot_on_navigate=True,
             max_content_tokens=100,
             timeout_ms=5000,
-            auto_install=True,
+            auto_install_chromium=True,
         )
         assert browser.headless is False
         assert browser.allowed_domains == ['x.com']
         assert browser.screenshot_on_navigate is True
         assert browser.max_content_tokens == 100
         assert browser.timeout_ms == 5000
-        assert browser.auto_install is True
+        assert browser.auto_install_chromium is True
 
     def test_from_spec_defaults_to_open_egress(self) -> None:
-        browser = Browser[None].from_spec()
+        browser = PlaywrightBrowser[None].from_spec()
         assert browser.allowed_domains is None
-        assert browser.auto_install is False
+        assert browser.auto_install_chromium is False
 
 
 # --- Lifecycle through Agent + wrap_run -------------------------------------
 
 
-class TestBrowserLifecycle:
+class TestPlaywrightBrowserLifecycle:
     async def test_lazy_launch_and_cleanup(self, monkeypatch: pytest.MonkeyPatch) -> None:
         page = _FakePage()
         cm = _install_fake_driver(monkeypatch, page)
-        agent = Agent(TestModel(call_tools=['screenshot']), capabilities=[Browser()])
+        agent = Agent(TestModel(call_tools=['screenshot']), capabilities=[PlaywrightBrowser()])
         await agent.run('use the browser')
         chromium = cm._driver.chromium
         assert chromium.launched == [True]
@@ -584,14 +584,16 @@ class TestBrowserLifecycle:
     async def test_allowlist_registers_route_guard(self, monkeypatch: pytest.MonkeyPatch) -> None:
         page = _FakePage()
         _install_fake_driver(monkeypatch, page)
-        agent = Agent(TestModel(call_tools=['screenshot']), capabilities=[Browser(allowed_domains=['example.com'])])
+        agent = Agent(
+            TestModel(call_tools=['screenshot']), capabilities=[PlaywrightBrowser(allowed_domains=['example.com'])]
+        )
         await agent.run('screenshot the page')
         assert page.routes == ['**/*']
 
     async def test_run_without_browser_tool_skips_launch(self, monkeypatch: pytest.MonkeyPatch) -> None:
         page = _FakePage()
         cm = _install_fake_driver(monkeypatch, page)
-        agent = Agent(TestModel(call_tools=[]), capabilities=[Browser()])
+        agent = Agent(TestModel(call_tools=[]), capabilities=[PlaywrightBrowser()])
         await agent.run('do nothing with the browser')
         assert cm.entered is False
         assert cm.exited is False
@@ -599,7 +601,7 @@ class TestBrowserLifecycle:
     async def test_missing_binary_raises_install_hint(self, monkeypatch: pytest.MonkeyPatch) -> None:
         page = _FakePage()
         cm = _install_fake_driver(monkeypatch, page, executable_missing=True)
-        agent = Agent(TestModel(call_tools=['screenshot']), capabilities=[Browser()])
+        agent = Agent(TestModel(call_tools=['screenshot']), capabilities=[PlaywrightBrowser()])
         with pytest.raises(RuntimeError, match='playwright install chromium'):
             await agent.run('screenshot the page')
         assert cm._driver.chromium.launched == []  # never attempted launch on a missing binary
@@ -615,8 +617,10 @@ class TestBrowserLifecycle:
         monkeypatch.setattr(capability_module, '_auto_install_chromium', _spy_install)
         page = _FakePage()
         cm = _install_fake_driver(monkeypatch, page, launch_error=RuntimeError('sandbox denied'))
-        # auto_install=True proves a real launch failure does not trigger a download.
-        agent = Agent(TestModel(call_tools=['screenshot']), capabilities=[Browser(auto_install=True)])
+        # auto_install_chromium=True proves a real launch failure does not trigger a download.
+        agent = Agent(
+            TestModel(call_tools=['screenshot']), capabilities=[PlaywrightBrowser(auto_install_chromium=True)]
+        )
         with pytest.raises(RuntimeError, match='sandbox denied'):
             await agent.run('screenshot the page')
         assert installs == []  # binary present -> no install attempt
@@ -630,14 +634,16 @@ class TestBrowserLifecycle:
             return False
 
         monkeypatch.setattr(capability_module, '_auto_install_chromium', _fake_install)
-        agent = Agent(TestModel(call_tools=['screenshot']), capabilities=[Browser(auto_install=True)])
+        agent = Agent(
+            TestModel(call_tools=['screenshot']), capabilities=[PlaywrightBrowser(auto_install_chromium=True)]
+        )
         with pytest.raises(RuntimeError, match='Chromium is not installed'):
             await agent.run('screenshot the page')
 
     async def test_close_error_still_exits_driver(self, monkeypatch: pytest.MonkeyPatch) -> None:
         page = _FakePage()
         cm = _install_fake_driver(monkeypatch, page, close_error=RuntimeError('close failed'))
-        agent = Agent(TestModel(call_tools=['screenshot']), capabilities=[Browser()])
+        agent = Agent(TestModel(call_tools=['screenshot']), capabilities=[PlaywrightBrowser()])
         with pytest.raises(RuntimeError, match='close failed'):
             await agent.run('screenshot the page')
         assert cm.exited is True  # driver exited despite the close error
@@ -645,12 +651,12 @@ class TestBrowserLifecycle:
     async def test_pending_popup_tasks_cancelled_on_run_end(self, monkeypatch: pytest.MonkeyPatch) -> None:
         page = _FakePage()
         _install_fake_driver(monkeypatch, page)
-        browser = Browser()
+        browser = PlaywrightBrowser()
 
-        async def _same_instance(self: Browser[None], ctx: RunContext[None]) -> Browser[None]:
+        async def _same_instance(self: PlaywrightBrowser[None], ctx: RunContext[None]) -> PlaywrightBrowser[None]:
             return self
 
-        monkeypatch.setattr(Browser, 'for_run', _same_instance)
+        monkeypatch.setattr(PlaywrightBrowser, 'for_run', _same_instance)
         pending = asyncio.ensure_future(asyncio.sleep(3600))
         browser._popup_tasks.add(pending)
         agent = Agent(TestModel(call_tools=['screenshot']), capabilities=[browser])
@@ -665,6 +671,6 @@ class TestBrowserLifecycle:
 def test_public_exports() -> None:
     assert DEFAULT_MAX_CONTENT_TOKENS == 4000
     assert DEFAULT_TIMEOUT_MS == 30_000
-    assert issubclass(Browser, object)
-    assert BrowserToolset is not None
-    assert BrowserState is not None
+    assert issubclass(PlaywrightBrowser, object)
+    assert PlaywrightBrowserToolset is not None
+    assert PlaywrightBrowserState is not None

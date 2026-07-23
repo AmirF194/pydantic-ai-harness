@@ -63,7 +63,7 @@ acp = [
 exa = [
     "exa-py>=2.16.0",
 ]
-browser = [
+playwright = [
     "playwright>=1.61.0",
 ]
 

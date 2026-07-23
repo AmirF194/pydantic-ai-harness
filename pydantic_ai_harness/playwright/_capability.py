@@ -1,4 +1,4 @@
-"""Browser capability -- a real, stateful Chromium browser for agents, via async Playwright."""
+"""Playwright capability -- a real, stateful Chromium browser for agents."""
 
 from __future__ import annotations
 
@@ -13,11 +13,11 @@ from pydantic_ai import AgentRunResult, RunContext
 from pydantic_ai.capabilities import AbstractCapability, WrapRunHandler
 from pydantic_ai.tools import AgentDepsT, ToolDefinition
 
-from pydantic_ai_harness.browser._toolset import (
+from pydantic_ai_harness.playwright._toolset import (
     DEFAULT_MAX_CONTENT_TOKENS,
     DEFAULT_TIMEOUT_MS,
-    BrowserState,
-    BrowserToolset,
+    PlaywrightBrowserState,
+    PlaywrightBrowserToolset,
     async_playwright,
     check_allowed_domain,
 )
@@ -25,7 +25,7 @@ from pydantic_ai_harness.browser._toolset import (
 if TYPE_CHECKING:
     from collections.abc import Callable
 
-    from playwright.async_api import Browser as PlaywrightBrowser
+    from playwright.async_api import Browser as PlaywrightBrowserHandle
     from playwright.async_api import Page as PlaywrightPage
     from playwright.async_api import Playwright as PlaywrightDriver
     from playwright.async_api import Request as PlaywrightRequest
@@ -53,9 +53,9 @@ selector to read a specific section of a large page. The browser is single-tab. 
 async def _auto_install_chromium() -> bool:  # pragma: no cover
     """Run `playwright install chromium` in this interpreter; return whether it succeeded.
 
-    Only invoked when `auto_install=True` and the binary is missing. It shells out
-    to a subprocess and downloads a browser, so it runs outside the mocked test
-    surface.
+    Only invoked when `auto_install_chromium=True` and the binary is missing. It
+    shells out to a subprocess and downloads a browser, so it runs outside the
+    mocked test surface.
     """
     proc = await asyncio.create_subprocess_exec(
         sys.executable,
@@ -71,7 +71,7 @@ async def _auto_install_chromium() -> bool:  # pragma: no cover
 
 
 @dataclass
-class Browser(AbstractCapability[AgentDepsT]):
+class PlaywrightBrowser(AbstractCapability[AgentDepsT]):
     """A real, stateful Chromium browser for an agent, via async Playwright.
 
     Adds nine tools -- navigate, click, type_text, screenshot, get_text, scroll,
@@ -84,15 +84,15 @@ class Browser(AbstractCapability[AgentDepsT]):
 
     ```python
     from pydantic_ai import Agent
-    from pydantic_ai_harness.browser import Browser
+    from pydantic_ai_harness.playwright import PlaywrightBrowser
 
-    agent = Agent('anthropic:claude-sonnet-4-6', capabilities=[Browser()])
+    agent = Agent('anthropic:claude-sonnet-4-6', capabilities=[PlaywrightBrowser()])
     ```
 
-    Requires the `browser` optional extra and the Chromium binary:
+    Requires the `playwright` optional extra and the Chromium binary:
 
     ```bash
-    pip install 'pydantic-ai-harness[browser]'
+    pip install 'pydantic-ai-harness[playwright]'
     playwright install chromium
     ```
 
@@ -110,7 +110,8 @@ class Browser(AbstractCapability[AgentDepsT]):
     run ends (on success, error, or cancellation); runs that never call a browser
     tool pay no Playwright cost. When the Chromium binary is missing the tools are
     hidden from the model and calling one raises with a `playwright install
-    chromium` hint; set `auto_install=True` to fetch it automatically instead.
+    chromium` hint; set `auto_install_chromium=True` to fetch it automatically
+    instead.
     """
 
     headless: bool = True
@@ -135,7 +136,7 @@ class Browser(AbstractCapability[AgentDepsT]):
     timeout_ms: int = DEFAULT_TIMEOUT_MS
     """Default Playwright navigation/action timeout in milliseconds."""
 
-    auto_install: bool = False
+    auto_install_chromium: bool = False
     """Fetch the Chromium binary via `playwright install chromium` on the first miss.
 
     Off by default: a library should not download a browser as a side effect. When
@@ -143,13 +144,13 @@ class Browser(AbstractCapability[AgentDepsT]):
     clear install hint. Set `True` to opt into the automatic download instead.
     """
 
-    _state: BrowserState = field(default_factory=BrowserState, init=False, repr=False)
-    _toolset: BrowserToolset[AgentDepsT] = field(init=False, repr=False)
-    _browser: PlaywrightBrowser | None = field(default=None, init=False, repr=False)
+    _state: PlaywrightBrowserState = field(default_factory=PlaywrightBrowserState, init=False, repr=False)
+    _toolset: PlaywrightBrowserToolset[AgentDepsT] = field(init=False, repr=False)
+    _browser: PlaywrightBrowserHandle | None = field(default=None, init=False, repr=False)
     _popup_tasks: set[asyncio.Task[None]] = field(default_factory=set[asyncio.Task[None]], init=False, repr=False)
 
     def __post_init__(self) -> None:
-        self._toolset = BrowserToolset[AgentDepsT](
+        self._toolset = PlaywrightBrowserToolset[AgentDepsT](
             state=self._state,
             allowed_domains=self.allowed_domains,
             screenshot_on_navigate=self.screenshot_on_navigate,
@@ -157,11 +158,11 @@ class Browser(AbstractCapability[AgentDepsT]):
             timeout_ms=self.timeout_ms,
         )
 
-    async def for_run(self, ctx: RunContext[AgentDepsT]) -> Browser[AgentDepsT]:
+    async def for_run(self, ctx: RunContext[AgentDepsT]) -> PlaywrightBrowser[AgentDepsT]:
         """Return a fresh instance per run so concurrent runs never share a page or browser."""
         return replace(self)
 
-    def get_toolset(self) -> BrowserToolset[AgentDepsT]:
+    def get_toolset(self) -> PlaywrightBrowserToolset[AgentDepsT]:
         """Provide the nine browser tools."""
         return self._toolset
 
@@ -195,7 +196,7 @@ class Browser(AbstractCapability[AgentDepsT]):
             for td in tool_defs
         ]
 
-    async def _install_and_retry(self, pw: PlaywrightDriver) -> PlaywrightBrowser | None:
+    async def _install_and_retry(self, pw: PlaywrightDriver) -> PlaywrightBrowserHandle | None:
         """Fetch Chromium and relaunch once; `None` when the install itself failed."""
         if not await _auto_install_chromium():
             return None
@@ -254,7 +255,7 @@ class Browser(AbstractCapability[AgentDepsT]):
                 # when opted in. A launch failure with the binary present (sandbox,
                 # missing system libs, no display) is left to surface as its own
                 # error rather than being masked as "Chromium is not installed".
-                browser = await self._install_and_retry(pw) if self.auto_install else None
+                browser = await self._install_and_retry(pw) if self.auto_install_chromium else None
                 if browser is None:  # pragma: no branch
                     self._state.launch_error = _CHROMIUM_MISSING_MESSAGE
                     return
@@ -297,8 +298,8 @@ class Browser(AbstractCapability[AgentDepsT]):
         screenshot_on_navigate: bool = False,
         max_content_tokens: int = DEFAULT_MAX_CONTENT_TOKENS,
         timeout_ms: int = DEFAULT_TIMEOUT_MS,
-        auto_install: bool = False,
-    ) -> Browser[AgentDepsT]:
+        auto_install_chromium: bool = False,
+    ) -> PlaywrightBrowser[AgentDepsT]:
         """Construct the capability from serializable spec options (all fields are plain scalars/lists)."""
         return cls(
             headless=headless,
@@ -306,5 +307,5 @@ class Browser(AbstractCapability[AgentDepsT]):
             screenshot_on_navigate=screenshot_on_navigate,
             max_content_tokens=max_content_tokens,
             timeout_ms=timeout_ms,
-            auto_install=auto_install,
+            auto_install_chromium=auto_install_chromium,
         )
