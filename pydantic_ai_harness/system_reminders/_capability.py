@@ -189,14 +189,22 @@ class SystemReminders(AbstractCapability[AgentDepsT]):
         cannot desync this pass.
         """
         eligible: list[tuple[int, str]] = []
+        pending: dict[int, int] = {}
         for reminder in tuple(self.reminders):
             if not _should_fire(reminder, self._request_count):
                 continue
             if reminder.trigger is not None and not reminder.trigger(ctx):
                 continue
             key = id(reminder)
-            if reminder.max_fires is not None and self._fire_counts.get(key, 0) >= reminder.max_fires:
+            # `pending` counts this reminder's fires already selected in this same pass, so the
+            # same instance listed more than once still respects `max_fires` (its budget is not
+            # committed until after injection).
+            if (
+                reminder.max_fires is not None
+                and self._fire_counts.get(key, 0) + pending.get(key, 0) >= reminder.max_fires
+            ):
                 continue
+            pending[key] = pending.get(key, 0) + 1
             eligible.append((key, _render_content(reminder)))
         return eligible
 

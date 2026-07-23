@@ -247,6 +247,14 @@ class TestMaxFires:
         assert _fired_text(await _run_wrap(cap, _fresh_request())) == 'limited'
         assert _fired_text(await _run_wrap(cap, _fresh_request())) is None
 
+    async def test_duplicate_instance_respects_max_fires(self) -> None:
+        # The same Reminder instance listed twice shares one identity budget, so max_fires=1
+        # fires it once per turn, not once per list entry.
+        r = Reminder('r', max_fires=1, tag=None)
+        cap = SystemReminders[None](reminders=[r, r])
+        assert _fired_text(await _run_wrap(cap, _fresh_request())) == 'r'
+        assert _fired_text(await _run_wrap(cap, _fresh_request())) is None
+
     async def test_per_reminder_independence(self) -> None:
         cap = SystemReminders[None](
             reminders=[Reminder('once', max_fires=1, tag=None), Reminder('twice', max_fires=2, tag=None)]
