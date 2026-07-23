@@ -1,6 +1,6 @@
 ---
-title: You're absolutely right, my agent has access to AWS
-description: An agent is fast, fearless, and willing to be wrong on the way to being right. A real cloud account punishes all three. Give it a disposable one instead, and something falls out that real AWS can't do.
+title: Ten agents, ten clouds, one answer
+description: Give each agent in a fan-out its own disposable cloud, and a team of them can build and test many designs at once. It's the experiment real AWS can't run at any price. The pattern scales to ten; the demo runs three.
 draft: true
 series: Pydantic AI Harness
 ---
