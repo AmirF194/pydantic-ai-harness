@@ -155,7 +155,14 @@ class SystemReminders(AbstractCapability[AgentDepsT]):
         # cadence slot (the counter advances inside the guard, not before it).
         if messages and isinstance(last := messages[-1], ModelRequest):
             self._request_count += 1
-            texts = [*self._collect_static(ctx), *await self._collect_dynamic(ctx)]
+            # Select which reminders fire before mutating any state: `_eligible_static` is
+            # pure, and `_collect_dynamic` can raise (a user callback, a model call). Fire
+            # state and `on_fire` are committed only once the reminder is actually appended, so
+            # a raising dynamic reminder never leaves a static reminder's `max_fires` budget
+            # spent or reports a fire that never reached the model.
+            fired = self._eligible_static(ctx)
+            dynamic_texts = await self._collect_dynamic(ctx)
+            texts = [text for _, text in fired] + dynamic_texts
             if texts:
                 content: list[CachePoint | str] = []
                 # A leading `CachePoint` is only valid when the request already carries a
@@ -164,24 +171,29 @@ class SystemReminders(AbstractCapability[AgentDepsT]):
                     content.append(CachePoint(ttl=self.cache_ttl))
                 content.append('\n\n'.join(texts))
                 messages[-1] = replace(last, parts=[*last.parts, UserPromptPart(content=content)])
+                for idx, _text in fired:
+                    self._fire_counts[idx] = self._fire_counts.get(idx, 0) + 1
+                if self.on_fire is not None:
+                    for text in texts:
+                        self.on_fire(text)
         return await handler(request_context)
 
-    def _collect_static(self, ctx: RunContext[AgentDepsT]) -> list[str]:
-        texts: list[str] = []
+    def _eligible_static(self, ctx: RunContext[AgentDepsT]) -> list[tuple[int, str]]:
+        """Static reminders whose cadence, trigger, and `max_fires` allow firing this request.
+
+        Pure: it reads `_fire_counts` but does not mutate it, so the caller can commit fire
+        state only after the reminders are actually injected.
+        """
+        eligible: list[tuple[int, str]] = []
         for idx, reminder in enumerate(self.reminders):
             if not _should_fire(reminder, self._request_count):
                 continue
             if reminder.trigger is not None and not reminder.trigger(ctx):
                 continue
-            fired = self._fire_counts.get(idx, 0)
-            if reminder.max_fires is not None and fired >= reminder.max_fires:
+            if reminder.max_fires is not None and self._fire_counts.get(idx, 0) >= reminder.max_fires:
                 continue
-            self._fire_counts[idx] = fired + 1
-            rendered = _render_content(reminder)
-            texts.append(rendered)
-            if self.on_fire is not None:
-                self.on_fire(rendered)
-        return texts
+            eligible.append((idx, _render_content(reminder)))
+        return eligible
 
     async def _collect_dynamic(self, ctx: RunContext[AgentDepsT]) -> list[str]:
         texts: list[str] = []
@@ -191,8 +203,6 @@ class SystemReminders(AbstractCapability[AgentDepsT]):
                 result = await result
             if result is not None:
                 texts.append(result)
-                if self.on_fire is not None:
-                    self.on_fire(result)
         return texts
 
     @classmethod
@@ -304,6 +314,8 @@ def _is_user_content_item(item: object) -> bool:
         return False
     if isinstance(item, str):
         return bool(item)
+    if isinstance(item, TextContent):
+        return bool(item.content)
     return True
 
 

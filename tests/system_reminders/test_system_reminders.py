@@ -254,6 +254,40 @@ class TestMaxFires:
         assert _fired_text(await _run_wrap(cap, _fresh_request())) == 'twice'
         assert _fired_text(await _run_wrap(cap, _fresh_request())) is None
 
+    async def test_callback_growing_reminders_does_not_raise(self) -> None:
+        # A user callback that appends to the reminders list must not desync the fire counts:
+        # `_fire_counts` is a dict, so a newly appended reminder just starts at 0 rather than
+        # indexing past a once-sized list (which previously raised IndexError). The append
+        # lands after this turn's eligibility snapshot, so the new reminder fires next turn.
+        reminders: list[Reminder[None]] = [Reminder('first', tag=None)]
+
+        def grow(_text: str) -> None:
+            if len(reminders) == 1:
+                reminders.append(Reminder('appended', tag=None))
+
+        cap = SystemReminders[None](reminders=reminders, on_fire=grow)
+        assert _fired_text(await _run_wrap(cap, _fresh_request())) == 'first'
+        assert _fired_text(await _run_wrap(cap, _fresh_request())) == 'first\n\nappended'
+
+    async def test_dynamic_error_leaves_static_fire_state_untouched(self) -> None:
+        # A raising dynamic reminder aborts the request; static fire state and on_fire are
+        # committed only after injection, so the static reminder's budget is not consumed and
+        # no false fire is reported.
+        fired: list[str] = []
+
+        def boom(ctx: Any) -> str | None:
+            raise RuntimeError('dynamic down')
+
+        cap = SystemReminders[None](
+            reminders=[Reminder('s', max_fires=1, tag=None)],
+            dynamic_reminders=[boom],
+            on_fire=fired.append,
+        )
+        with pytest.raises(RuntimeError, match='dynamic down'):
+            await _run_wrap(cap, _fresh_request())
+        assert cap._fire_counts == {}
+        assert fired == []
+
 
 # --- Dynamic reminders ---
 
@@ -376,6 +410,18 @@ class TestCachePointGuard:
         tail = ModelRequest(parts=[UserPromptPart(content=[CachePoint(), '', 'real'])])
         seen = await _run_wrap(cap, [tail])
         assert _injected_leads_with_cache_point(seen)
+
+    async def test_cache_point_with_text_content(self) -> None:
+        cap = SystemReminders[None](reminders=[Reminder('r', tag=None)])
+        seen = await _run_wrap(cap, [ModelRequest(parts=[UserPromptPart(content=[TextContent('goal')])])])
+        assert _injected_leads_with_cache_point(seen)
+
+    async def test_no_cache_point_with_empty_text_content(self) -> None:
+        # An empty TextContent maps to nothing (like an empty str), so no CachePoint may lead.
+        cap = SystemReminders[None](reminders=[Reminder('r', tag=None)])
+        seen = await _run_wrap(cap, [ModelRequest(parts=[UserPromptPart(content=[TextContent('')])])])
+        assert _fired_text(seen) == 'r'
+        assert not _injected_leads_with_cache_point(seen)
 
     async def test_no_cache_point_with_system_prompt_only(self) -> None:
         cap = SystemReminders[None](reminders=[Reminder('r', tag=None)])
