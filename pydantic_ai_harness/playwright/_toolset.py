@@ -16,7 +16,10 @@ from pydantic_ai.toolsets import FunctionToolset
 try:
     # Import-time gate (mirrors `pydantic_ai_harness.exa._toolset`): importing the
     # capability fails fast with an install hint when the optional dep is absent.
+    from playwright.async_api import Error as _PlaywrightError
     from playwright.async_api import async_playwright as async_playwright
+
+    PlaywrightError = _PlaywrightError
 except ImportError as _import_error:  # pragma: no cover
     raise ImportError(
         'playwright is required for PlaywrightBrowser. '
@@ -28,7 +31,7 @@ if TYPE_CHECKING:
     from collections.abc import AsyncGenerator, Awaitable, Callable
 
 DEFAULT_MAX_CONTENT_TOKENS: int = 4000
-"""Default token budget for page text injected into the agent context."""
+"""Default token budget for textual tool results injected into the agent context."""
 
 DEFAULT_TIMEOUT_MS: int = 30_000
 """Default Playwright navigation/action timeout in milliseconds."""
@@ -94,10 +97,10 @@ def check_allowed_domain(url: str, allowed_domains: list[str] | None) -> bool:
 
 
 def _truncate(text: str, max_chars: int) -> str:
-    """Cap page text at `max_chars`, keeping the head where the substance sits."""
+    """Cap tool output at `max_chars`, keeping the head where the substance sits."""
     if len(text) <= max_chars:
         return text
-    return f'{text[:max_chars]}\n[... page text truncated at {max_chars} characters]'
+    return f'{text[:max_chars]}\n[... tool output truncated at {max_chars} characters]'
 
 
 @dataclass
@@ -157,10 +160,10 @@ class PlaywrightBrowserToolset(FunctionToolset[AgentDepsT]):
     directly (with a `state` whose `page` you set) only to drive tools against a
     page double.
 
-    Page text is extracted with Playwright itself (`inner_text`) and truncated to
-    `max_content_tokens`; no HTML-to-Markdown dependency is pulled in. `screenshot`
-    returns a `ToolReturn` carrying `BinaryContent` so vision models see the image
-    natively instead of a base64 string bloating the text context.
+    Page text is extracted with Playwright itself (`inner_text`), and every textual
+    result is truncated to `max_content_tokens`; no HTML-to-Markdown dependency is
+    pulled in. `screenshot` returns a `ToolReturn` carrying `BinaryContent` so vision
+    models see the image natively instead of a base64 string bloating the text context.
     """
 
     def __init__(
@@ -201,6 +204,10 @@ class PlaywrightBrowserToolset(FunctionToolset[AgentDepsT]):
         """Return the current page's visible text, truncated to the token budget."""
         page = await self._state.ensure_page()
         text = await page.inner_text('body')
+        return self._truncate_output(text)
+
+    def _truncate_output(self, text: str) -> str:
+        """Apply the configured token budget to a model-facing textual result."""
         return _truncate(text, self._max_content_tokens * _CHARS_PER_TOKEN)
 
     async def _enforce_allowed_domain(self, page: _Page, action: str) -> str | None:
@@ -218,7 +225,7 @@ class PlaywrightBrowserToolset(FunctionToolset[AgentDepsT]):
             return None
         blocked = page.url
         await page.goto('about:blank')
-        return f'Error: {action} reached a domain not in allowed_domains: {blocked}'
+        return self._truncate_output(f'Error: {action} reached a domain not in allowed_domains: {blocked}')
 
     async def navigate(self, url: str) -> str | ToolReturn[str]:
         """Navigate to a URL and return the page's title and visible text.
@@ -232,7 +239,7 @@ class PlaywrightBrowserToolset(FunctionToolset[AgentDepsT]):
         """
         async with self._serialize_operation():
             if not check_allowed_domain(url, self._allowed_domains):
-                return f'Error: domain not in allowed_domains: {url}'
+                return self._truncate_output(f'Error: domain not in allowed_domains: {url}')
             page = await self._state.ensure_page()
             await page.goto(url, timeout=self._timeout_ms)
             await page.wait_for_load_state('domcontentloaded')
@@ -241,7 +248,7 @@ class PlaywrightBrowserToolset(FunctionToolset[AgentDepsT]):
                 return blocked
             title = await page.title()
             text = await self._page_text()
-            result = f'URL: {page.url}\nTitle: {title}\n\n{text}'
+            result = self._truncate_output(f'URL: {page.url}\nTitle: {title}\n\n{text}')
             if not self._screenshot_on_navigate:
                 return result
             png = await page.screenshot()
@@ -268,7 +275,7 @@ class PlaywrightBrowserToolset(FunctionToolset[AgentDepsT]):
             blocked = await self._enforce_allowed_domain(page, 'click')
             if blocked is not None:
                 return blocked
-            return f"Clicked '{selector}'. URL: {page.url}\n\n{await self._page_text()}"
+            return self._truncate_output(f"Clicked '{selector}'. URL: {page.url}\n\n{await self._page_text()}")
 
     async def type_text(self, selector: str, text: str) -> str:
         """Type text into an input field, replacing any existing value.
@@ -283,7 +290,7 @@ class PlaywrightBrowserToolset(FunctionToolset[AgentDepsT]):
         async with self._serialize_operation():
             page = await self._state.ensure_page()
             await page.fill(selector, text, timeout=self._timeout_ms)
-            return f"Typed into '{selector}'.\n\n{await self._page_text()}"
+            return self._truncate_output(f"Typed into '{selector}'.\n\n{await self._page_text()}")
 
     async def screenshot(self, full_page: bool = False) -> ToolReturn[str]:
         """Capture a screenshot of the current page.
@@ -300,7 +307,7 @@ class PlaywrightBrowserToolset(FunctionToolset[AgentDepsT]):
             page = await self._state.ensure_page()
             png = await page.screenshot(full_page=full_page)
             return ToolReturn(
-                f'Screenshot captured. URL: {page.url}',
+                self._truncate_output(f'Screenshot captured. URL: {page.url}'),
                 content=[BinaryContent(data=png, media_type='image/png')],
             )
 
@@ -320,8 +327,8 @@ class PlaywrightBrowserToolset(FunctionToolset[AgentDepsT]):
                 try:
                     text = await page.inner_text(selector, timeout=self._timeout_ms)
                 except Exception as exc:
-                    return f"Error getting text from '{selector}': {exc}"
-                return _truncate(text, self._max_content_tokens * _CHARS_PER_TOKEN)
+                    return self._truncate_output(f"Error getting text from '{selector}': {exc}")
+                return self._truncate_output(text)
             return await self._page_text()
 
     async def scroll(self, direction: str, x: int | None = None, y: int | None = None) -> str:
@@ -344,14 +351,14 @@ class PlaywrightBrowserToolset(FunctionToolset[AgentDepsT]):
             }
             delta = deltas.get(direction.lower())
             if delta is None:
-                return f'Error: invalid direction {direction!r}; use up/down/left/right'
+                return self._truncate_output(f'Error: invalid direction {direction!r}; use up/down/left/right')
             page = await self._state.ensure_page()
             if x is not None and y is not None:
                 await page.mouse.move(x, y)
                 await page.mouse.wheel(*delta)
             else:
                 await page.evaluate(f'window.scrollBy({delta[0]}, {delta[1]})')
-            return f'Scrolled {direction}.\n\n{await self._page_text()}'
+            return self._truncate_output(f'Scrolled {direction}.\n\n{await self._page_text()}')
 
     async def go_back(self) -> str:
         """Navigate back in the browser history.
@@ -366,7 +373,7 @@ class PlaywrightBrowserToolset(FunctionToolset[AgentDepsT]):
             blocked = await self._enforce_allowed_domain(page, 'go_back')
             if blocked is not None:
                 return blocked
-            return f'Went back. URL: {page.url}\n\n{await self._page_text()}'
+            return self._truncate_output(f'Went back. URL: {page.url}\n\n{await self._page_text()}')
 
     async def go_forward(self) -> str:
         """Navigate forward in the browser history.
@@ -381,7 +388,7 @@ class PlaywrightBrowserToolset(FunctionToolset[AgentDepsT]):
             blocked = await self._enforce_allowed_domain(page, 'go_forward')
             if blocked is not None:
                 return blocked
-            return f'Went forward. URL: {page.url}\n\n{await self._page_text()}'
+            return self._truncate_output(f'Went forward. URL: {page.url}\n\n{await self._page_text()}')
 
     async def execute_js(self, script: str) -> str:
         """Evaluate a JavaScript expression and return its result.
@@ -398,15 +405,15 @@ class PlaywrightBrowserToolset(FunctionToolset[AgentDepsT]):
             try:
                 result = await page.evaluate(script)
             except Exception as exc:
-                return f'JS error: {exc}'
+                return self._truncate_output(f'JS error: {exc}')
             blocked = await self._enforce_allowed_domain(page, 'execute_js')
             if blocked is not None:
                 return blocked
             if result is None:
-                return 'undefined'
+                return self._truncate_output('undefined')
             if isinstance(result, str):
-                return result
+                return self._truncate_output(result)
             try:
-                return json.dumps(result, default=str)
+                return self._truncate_output(json.dumps(result, default=str))
             except TypeError:  # pragma: no cover
-                return str(result)
+                return self._truncate_output(str(result))

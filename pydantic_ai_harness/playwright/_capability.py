@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import functools
 import os
 import sys
 from dataclasses import dataclass, field, replace
@@ -18,6 +17,7 @@ from pydantic_ai_harness.playwright._toolset import (
     DEFAULT_TIMEOUT_MS,
     PlaywrightBrowserState,
     PlaywrightBrowserToolset,
+    PlaywrightError,
     async_playwright,
     check_allowed_domain,
 )
@@ -45,7 +45,7 @@ Tools: `navigate(url)`, `click(selector)` (CSS selector or 'x,y' pixel coordinat
 `type_text(selector, text)`, `screenshot(full_page?)`, `get_text(selector?)`,
 `scroll(direction)`, `go_back()`, `go_forward()`, `execute_js(script)`.
 
-Page text is returned truncated to roughly {max_content_tokens} tokens; use `get_text` with a CSS
+Textual tool results are truncated to roughly {max_content_tokens} tokens; use `get_text` with a CSS
 selector to read a specific section of a large page. The browser is single-tab. Allowed domains: {allowed_domains}.
 """
 
@@ -131,7 +131,7 @@ class PlaywrightBrowser(AbstractCapability[AgentDepsT]):
     """Attach a screenshot (as image content) to every `navigate` result."""
 
     max_content_tokens: int = DEFAULT_MAX_CONTENT_TOKENS
-    """Approximate token budget for page text returned by the tools."""
+    """Approximate token budget for textual tool results."""
 
     timeout_ms: int = DEFAULT_TIMEOUT_MS
     """Default Playwright navigation/action timeout in milliseconds."""
@@ -183,7 +183,7 @@ class PlaywrightBrowser(AbstractCapability[AgentDepsT]):
         return _instructions
 
     async def prepare_tools(self, ctx: RunContext[AgentDepsT], tool_defs: list[ToolDefinition]) -> list[ToolDefinition]:
-        """Hide the browser tools when Chromium is unavailable; keep them approval-free otherwise.
+        """Hide the browser tools when Chromium is unavailable.
 
         Tools are matched by `toolset_id` so a same-named tool from another toolset
         (e.g. a different `navigate`) is left untouched.
@@ -191,10 +191,7 @@ class PlaywrightBrowser(AbstractCapability[AgentDepsT]):
         toolset_id = self._toolset.id
         if self._state.launch_error is not None:
             return [td for td in tool_defs if td.toolset_id != toolset_id]
-        return [
-            replace(td, kind='function') if td.toolset_id == toolset_id and td.kind == 'unapproved' else td
-            for td in tool_defs
-        ]
+        return tool_defs
 
     async def _install_and_retry(self, pw: PlaywrightDriver) -> PlaywrightBrowserHandle | None:
         """Fetch Chromium and relaunch once; `None` when the install itself failed."""
@@ -202,39 +199,40 @@ class PlaywrightBrowser(AbstractCapability[AgentDepsT]):
             return None
         return await pw.chromium.launch(headless=self.headless)  # pragma: no cover
 
-    async def _route_guard(  # pragma: no cover
-        self, page: PlaywrightPage, route: PlaywrightRoute, request: PlaywrightRequest
-    ) -> None:
+    async def _route_guard(self, route: PlaywrightRoute, request: PlaywrightRequest) -> None:  # pragma: no cover
         """Network-layer allowlist: abort disallowed top-level navigations, pass the rest.
 
         Runs only as a real Playwright route callback, so it is outside the mocked
         test surface.
         """
-        if (
-            request.is_navigation_request()
-            and request.frame == page.main_frame
-            and not check_allowed_domain(request.url, self.allowed_domains)
-        ):
+        if not request.is_navigation_request() or check_allowed_domain(request.url, self.allowed_domains):
+            await route.continue_()
+            return
+        try:
+            frame = request.frame
+        except PlaywrightError:
+            await route.abort()
+            return
+        if frame == frame.page.main_frame:
             await route.abort()
             return
         await route.continue_()
 
-    async def _handle_popup(self, page: PlaywrightPage, popup: PlaywrightPage) -> None:  # pragma: no cover
-        """Single-tab: close a popup and redirect the main tab to it if the allowlist permits.
-
-        Runs only as a real Playwright popup callback, so it is outside the mocked
-        test surface.
-        """
-        new_url = popup.url
+    async def _handle_popup(self, popup: PlaywrightPage) -> None:
+        """Keep the browser single-tab by closing popup pages."""
         await popup.close()
-        if check_allowed_domain(new_url, self.allowed_domains):
-            await page.goto(new_url)
 
-    def _on_popup(self, page: PlaywrightPage, popup: PlaywrightPage) -> None:  # pragma: no cover
+    def _popup_done(self, task: asyncio.Task[None]) -> None:
+        """Release a finished popup task and retrieve any close error."""
+        self._popup_tasks.discard(task)
+        if not task.cancelled():
+            task.exception()
+
+    def _on_popup(self, popup: PlaywrightPage) -> None:
         """Schedule popup handling, keeping a strong task reference until it finishes."""
-        task = asyncio.ensure_future(self._handle_popup(page, popup))
+        task = asyncio.create_task(self._handle_popup(popup))
         self._popup_tasks.add(task)
-        task.add_done_callback(self._popup_tasks.discard)
+        task.add_done_callback(self._popup_done)
 
     async def wrap_run(self, ctx: RunContext[AgentDepsT], *, handler: WrapRunHandler) -> AgentRunResult[AgentDepsT]:
         """Install a lazy Chromium launcher and guarantee cleanup when the run ends.
@@ -264,8 +262,8 @@ class PlaywrightBrowser(AbstractCapability[AgentDepsT]):
             self._browser = browser
             page = await browser.new_page()
             if self.allowed_domains is not None:
-                await page.route('**/*', functools.partial(self._route_guard, page))
-            page.on('popup', functools.partial(self._on_popup, page))
+                await page.context.route('**/*', self._route_guard)
+            page.on('popup', self._on_popup)
             self._state.page = page
 
         self._state.lazy_launcher = _launch

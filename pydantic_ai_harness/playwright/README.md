@@ -19,8 +19,8 @@ pip install 'pydantic-ai-harness[playwright]'
 playwright install chromium
 ```
 
-If the Chromium binary is missing at runtime, the browser tools are hidden from
-the model and calling one raises with a `playwright install chromium` hint. Set
+If the Chromium binary is missing at runtime, the first browser tool call fails
+the run with a `playwright install chromium` hint. Set
 `auto_install_chromium=True` to fetch the binary automatically on the first miss.
 
 ## Usage
@@ -59,7 +59,7 @@ a wall of base64 in the text context.
 | `headless` | `True` | Run Chromium without a visible window (suits servers and CI). |
 | `allowed_domains` | `None` | Navigation allowlist; `None` allows all domains (see [Egress](#egress-and-ssrf)). |
 | `screenshot_on_navigate` | `False` | Attach a screenshot to every `navigate` result. |
-| `max_content_tokens` | `4000` | Approximate token budget for page text. |
+| `max_content_tokens` | `4000` | Approximate token budget for every textual tool result. |
 | `timeout_ms` | `30000` | Default Playwright navigation/action timeout. |
 | `auto_install_chromium` | `False` | Fetch Chromium automatically when the binary is missing. |
 

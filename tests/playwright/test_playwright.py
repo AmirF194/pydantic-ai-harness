@@ -10,8 +10,11 @@ from __future__ import annotations
 
 import asyncio
 import sys
+from collections.abc import Awaitable, Callable
+from typing import Protocol
 
 import pytest
+from playwright.async_api import Error as PlaywrightError
 from pydantic_ai import Agent
 from pydantic_ai.messages import BinaryContent, ToolReturn
 from pydantic_ai.models.test import TestModel
@@ -53,6 +56,73 @@ class _FakeMouse:
         self.calls.append(('wheel', int(delta_x), int(delta_y)))
 
 
+class _FakeRoute:
+    def __init__(self) -> None:
+        self.aborted = False
+        self.continued = False
+
+    async def abort(self) -> None:
+        self.aborted = True
+
+    async def continue_(self) -> None:
+        self.continued = True
+
+
+class _FakeRequestPage:
+    def __init__(self) -> None:
+        self.main_frame = _FakeFrame(self)
+
+
+class _FakeFrame:
+    def __init__(self, page: _FakeRequestPage) -> None:
+        self.page = page
+
+
+class _FakeRequest:
+    def __init__(
+        self,
+        url: str,
+        *,
+        navigation: bool,
+        frame: _FakeFrame | None = None,
+        frame_error: PlaywrightError | None = None,
+    ) -> None:
+        self.url = url
+        self._navigation = navigation
+        self._frame = frame
+        self._frame_error = frame_error
+
+    def is_navigation_request(self) -> bool:
+        return self._navigation
+
+    @property
+    def frame(self) -> _FakeFrame:
+        if self._frame_error is not None:
+            raise self._frame_error
+        assert self._frame is not None
+        return self._frame
+
+
+class _FakeRouteHandler(Protocol):
+    def __call__(self, route: _FakeRoute, request: _FakeRequest) -> Awaitable[None]: ...  # pragma: no cover
+
+
+class _FakeBrowserContext:
+    def __init__(self) -> None:
+        self.routes: list[str] = []
+        self.route_handler: _FakeRouteHandler | None = None
+
+    async def route(self, url: str, handler: _FakeRouteHandler) -> None:
+        self.routes.append(url)
+        self.route_handler = handler
+
+    async def dispatch(self, request: _FakeRequest) -> _FakeRoute:
+        assert self.route_handler is not None
+        route = _FakeRoute()
+        await self.route_handler(route, request)
+        return route
+
+
 class _FakePage:
     def __init__(
         self,
@@ -66,6 +136,7 @@ class _FakePage:
         element_text: str | None = None,
         redirect_to: str | None = None,
         screenshot_bytes: bytes = b'PNG-BYTES',
+        close_error: Exception | None = None,
     ) -> None:
         self._url = url
         self._title = title
@@ -76,16 +147,24 @@ class _FakePage:
         self._element_text = element_text
         self._redirect_to = redirect_to
         self._screenshot_bytes = screenshot_bytes
+        self._close_error = close_error
+        self._context = _FakeBrowserContext()
+        self._popup_on_screenshot: _FakePage | None = None
         self.mouse = _FakeMouse()
         self.goto_calls: list[str] = []
         self.filled: list[tuple[str, str]] = []
         self.clicked: list[str] = []
-        self.routes: list[str] = []
         self.popup_events: list[str] = []
+        self.popup_handlers: list[Callable[[_FakePage], None]] = []
+        self.closed = False
 
     @property
     def url(self) -> str:
         return self._url
+
+    @property
+    def context(self) -> _FakeBrowserContext:
+        return self._context
 
     async def goto(self, url: str, *, timeout: float | None = None) -> None:
         self.goto_calls.append(url)
@@ -113,6 +192,11 @@ class _FakePage:
         self.filled.append((selector, value))
 
     async def screenshot(self, *, full_page: bool = False) -> bytes:
+        if self._popup_on_screenshot is not None:
+            for handler in self.popup_handlers:
+                handler(self._popup_on_screenshot)
+            await asyncio.sleep(0)
+            await asyncio.sleep(0)
         return self._screenshot_bytes
 
     async def evaluate(self, expression: str) -> object:
@@ -126,11 +210,14 @@ class _FakePage:
     async def go_forward(self, *, timeout: float | None = None) -> None:
         return None
 
-    async def route(self, url: str, handler: object) -> None:
-        self.routes.append(url)
+    async def close(self) -> None:
+        self.closed = True
+        if self._close_error is not None:
+            raise self._close_error
 
-    def on(self, event: str, handler: object) -> None:
+    def on(self, event: str, handler: Callable[[_FakePage], None]) -> None:
         self.popup_events.append(event)
+        self.popup_handlers.append(handler)
 
 
 class _ControlledNavigationPage(_FakePage):
@@ -334,7 +421,13 @@ class TestPlaywrightBrowserTools:
         toolset = _toolset(_FakePage(body='X' * 40), max_content_tokens=1)
         result = await toolset.navigate('https://example.com/')
         assert isinstance(result, str)
-        assert 'page text truncated at 4 characters' in result
+        assert 'tool output truncated at 4 characters' in result
+
+    async def test_navigate_truncates_url_and_title_within_shared_budget(self) -> None:
+        url = f'https://example.com/{"u" * 40}'
+        toolset = _toolset(_FakePage(title='T' * 40), max_content_tokens=2)
+        result = await toolset.navigate(url)
+        assert result == 'URL: htt\n[... tool output truncated at 8 characters]'
 
     async def test_navigate_bounces_on_redirect_to_disallowed_host(self) -> None:
         page = _FakePage(redirect_to='https://evil.com/landing')
@@ -407,6 +500,15 @@ class TestPlaywrightBrowserTools:
         result = await toolset.screenshot(full_page=True)
         assert isinstance(result, ToolReturn)
 
+    async def test_screenshot_bounds_text_without_dropping_image(self) -> None:
+        page = _FakePage(url=f'https://example.com/{"u" * 40}')
+        result = await _toolset(page, max_content_tokens=1).screenshot()
+        assert result.return_value == 'Scre\n[... tool output truncated at 4 characters]'
+        assert result.content is not None
+        image = result.content[0]
+        assert isinstance(image, BinaryContent)
+        assert image.data == b'PNG-BYTES'
+
     async def test_get_text_with_selector(self) -> None:
         toolset = _toolset(_FakePage())
         assert await toolset.get_text('h1') == 'text:h1'
@@ -424,7 +526,7 @@ class TestPlaywrightBrowserTools:
         toolset = _toolset(_FakePage(element_text='Y' * 40), max_content_tokens=1)
         result = await toolset.get_text('article')
         assert result.startswith('Y' * 4)
-        assert 'page text truncated at 4 characters' in result
+        assert 'tool output truncated at 4 characters' in result
 
     async def test_scroll_window(self) -> None:
         page = _FakePage(body='scrolled')
@@ -473,6 +575,17 @@ class TestPlaywrightBrowserTools:
     async def test_execute_js_json_result(self) -> None:
         toolset = _toolset(_FakePage(evaluate_result={'a': 1}))
         assert await toolset.execute_js('({a:1})') == '{"a": 1}'
+
+    @pytest.mark.parametrize(
+        ('value', 'prefix'),
+        [
+            ('S' * 40, 'SSSS'),
+            ({'value': 'J' * 40}, '{"va'),
+        ],
+    )
+    async def test_execute_js_truncates_string_and_serialized_results(self, value: object, prefix: str) -> None:
+        toolset = _toolset(_FakePage(evaluate_result=value), max_content_tokens=1)
+        assert await toolset.execute_js('largeResult') == (f'{prefix}\n[... tool output truncated at 4 characters]')
 
     async def test_execute_js_null_result(self) -> None:
         toolset = _toolset(_FakePage(evaluate_result=None))
@@ -572,7 +685,7 @@ class TestPlaywrightBrowserHooks:
         browser._state.launch_error = 'boom'
         assert browser.get_instructions()(_ctx()) is None
 
-    async def test_prepare_tools_reset_unapproved(self) -> None:
+    async def test_prepare_tools_preserves_upstream_unapproved_kind(self) -> None:
         browser = PlaywrightBrowser[None]()
         defs = [
             ToolDefinition(
@@ -582,7 +695,7 @@ class TestPlaywrightBrowserHooks:
         ]
         result = await browser.prepare_tools(_ctx(), defs)
         by_name = {td.name: td for td in result}
-        assert by_name['navigate'].kind == 'function'
+        assert by_name['navigate'].kind == 'unapproved'
         assert by_name['other'].kind == 'function'
 
     async def test_prepare_tools_hides_tools_on_launch_error(self) -> None:
@@ -649,18 +762,96 @@ class TestPlaywrightBrowserLifecycle:
         chromium = cm._driver.chromium
         assert chromium.launched == [True]
         assert page.popup_events == ['popup']
-        assert page.routes == []  # no allowlist -> no route guard registered
+        assert page.context.routes == []  # no allowlist -> no route guard registered
         assert chromium.browser is not None and chromium.browser.closed is True
         assert cm.exited is True
 
-    async def test_allowlist_registers_route_guard(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    async def test_allowlist_registers_route_guard_on_browser_context(self, monkeypatch: pytest.MonkeyPatch) -> None:
         page = _FakePage()
         _install_fake_driver(monkeypatch, page)
         agent = Agent(
             TestModel(call_tools=['screenshot']), capabilities=[PlaywrightBrowser(allowed_domains=['example.com'])]
         )
         await agent.run('screenshot the page')
-        assert page.routes == ['**/*']
+        assert page.context.routes == ['**/*']
+
+    async def test_context_route_guard_applies_to_each_pages_top_level_navigation(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        page = _FakePage()
+        _install_fake_driver(monkeypatch, page)
+        agent = Agent(
+            TestModel(call_tools=['screenshot']), capabilities=[PlaywrightBrowser(allowed_domains=['example.com'])]
+        )
+        await agent.run('screenshot the page')
+
+        popup_page = _FakeRequestPage()
+        blocked = await page.context.dispatch(
+            _FakeRequest('https://evil.com/popup', navigation=True, frame=popup_page.main_frame)
+        )
+        assert blocked.aborted is True
+        assert blocked.continued is False
+
+        allowed = await page.context.dispatch(
+            _FakeRequest('https://example.com/popup', navigation=True, frame=popup_page.main_frame)
+        )
+        assert allowed.aborted is False
+        assert allowed.continued is True
+
+        non_navigation = await page.context.dispatch(
+            _FakeRequest(
+                'https://evil.com/script.js',
+                navigation=False,
+                frame_error=PlaywrightError('frame must not be accessed'),
+            )
+        )
+        assert non_navigation.aborted is False
+        assert non_navigation.continued is True
+
+        popup_before_frame_creation = await page.context.dispatch(
+            _FakeRequest(
+                'https://evil.com/first-popup-request',
+                navigation=True,
+                frame_error=PlaywrightError('frame is not available yet'),
+            )
+        )
+        assert popup_before_frame_creation.aborted is True
+        assert popup_before_frame_creation.continued is False
+
+    async def test_popup_is_closed_without_navigating_main_page(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        popup = _FakePage(url='https://example.com/popup')
+        page = _FakePage()
+        page._popup_on_screenshot = popup
+        _install_fake_driver(monkeypatch, page)
+        agent = Agent(TestModel(call_tools=['screenshot']), capabilities=[PlaywrightBrowser()])
+        await agent.run('screenshot the page')
+        assert popup.closed is True
+        assert page.goto_calls == []
+
+    async def test_popup_close_error_is_observed_and_does_not_fail_run(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        popup = _FakePage(url='https://example.com/popup', close_error=RuntimeError('popup close failed'))
+        page = _FakePage()
+        page._popup_on_screenshot = popup
+        _install_fake_driver(monkeypatch, page)
+        browser = PlaywrightBrowser[object]()
+
+        async def _same_instance(self: PlaywrightBrowser[object], ctx: RunContext[object]) -> PlaywrightBrowser[object]:
+            return self
+
+        monkeypatch.setattr(PlaywrightBrowser, 'for_run', _same_instance)
+        agent = Agent(TestModel(call_tools=['screenshot']), capabilities=[browser])
+        await agent.run('screenshot the page')
+        assert popup.closed is True
+        assert browser._popup_tasks == set()
+
+    async def test_cancelled_popup_task_is_discarded(self) -> None:
+        browser = PlaywrightBrowser[None]()
+        task = asyncio.create_task(asyncio.sleep(1))
+        browser._popup_tasks.add(task)
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        browser._popup_done(task)
+        assert browser._popup_tasks == set()
 
     async def test_run_without_browser_tool_skips_launch(self, monkeypatch: pytest.MonkeyPatch) -> None:
         page = _FakePage()
