@@ -166,20 +166,13 @@ await judge(task='Recommend one rate-limiter design, citing which actually held 
                  + '\n\n---\n\n'.join(reports))
 ```
 
-Three real deployments, built and pushed past their limits in parallel, each on its own
-cloud, judged on what actually held. The whole tree runs inside one `run_workflow` call,
-so only the recommendation reaches the architect, not the deploy logs. The choreography
-moved out of the conversation and into code, and the cloud it runs on is one you can
-afford three of.
-
-None of this is hypothetical. Run it, and the architect writes one script: three
-engineers each spin up their own cloud, build their limiter, and drive requests past it
-in parallel, and the judge reads what came back and picks. In the run behind this post,
-all three held the limit and rejected the sixth request, but on different bills: the
-fixed-window counter and the token bucket each decide with a single conditional DynamoDB
-write, while the sliding-window log spends two, a put and a count, on every request. The
-judge picked the counter. Three real deployments, judged on what they did, on clouds that
-came up in seconds and deleted themselves when the run ended.
+Three real deployments, built and tested in parallel, each on its own cloud. The whole
+tree runs inside one `run_workflow` call, so only the recommendation reaches the
+architect, not the deploy logs. In the run behind this post, all three held the limit and
+rejected the sixth request, but on different bills: the fixed-window counter and the token
+bucket each decide with a single conditional DynamoDB write, while the sliding-window log
+spends two, a put and a count, on every request. The judge picked the counter, on clouds
+that came up in seconds and deleted themselves when the run ended.
 
 The disposable cloud removes the cloud bill, but the model still costs tokens.
 `max_agent_calls` caps the number of sub-agent runs exactly, even under fan-out, so a
