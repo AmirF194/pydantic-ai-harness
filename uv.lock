@@ -15,9 +15,6 @@ pydantic-graph = false
 pydantic-ai = false
 pydantic-evals = false
 
-[manifest]
-constraints = [{ name = "pydantic-monty-runtime", specifier = ">=0.0.19b6" }]
-
 [[package]]
 name = "agent-client-protocol"
 version = "0.11.0"
@@ -1863,15 +1860,18 @@ acp = [
 ]
 code-mode = [
     { name = "pydantic-monty" },
+    { name = "pydantic-monty-runtime" },
 ]
 codemode = [
     { name = "pydantic-monty" },
+    { name = "pydantic-monty-runtime" },
 ]
 dbos = [
     { name = "pydantic-ai-slim", extra = ["dbos"] },
 ]
 dynamic-workflow = [
     { name = "pydantic-monty" },
+    { name = "pydantic-monty-runtime" },
 ]
 exa = [
     { name = "exa-py" },
@@ -1920,6 +1920,9 @@ requires-dist = [
     { name = "pydantic-monty", marker = "extra == 'code-mode'", specifier = ">=0.0.19b6,<0.0.20" },
     { name = "pydantic-monty", marker = "extra == 'codemode'", specifier = ">=0.0.19b6,<0.0.20" },
     { name = "pydantic-monty", marker = "extra == 'dynamic-workflow'", specifier = ">=0.0.19b6,<0.0.20" },
+    { name = "pydantic-monty-runtime", marker = "extra == 'code-mode'", specifier = "==0.0.19b6" },
+    { name = "pydantic-monty-runtime", marker = "extra == 'codemode'", specifier = "==0.0.19b6" },
+    { name = "pydantic-monty-runtime", marker = "extra == 'dynamic-workflow'", specifier = "==0.0.19b6" },
 ]
 provides-extras = ["acp", "code-mode", "codemode", "dbos", "dynamic-workflow", "exa", "logfire", "modal", "temporal"]
 

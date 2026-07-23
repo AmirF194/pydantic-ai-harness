@@ -35,10 +35,12 @@ dependencies = [
 [project.optional-dependencies]
 code-mode = [
     "pydantic-monty>=0.0.19b6,<0.0.20",
+    "pydantic-monty-runtime==0.0.19b6",
 ]
 # Extras metadata has no native redirect syntax, so aliases are represented as duplicate extras.
 codemode = [
     "pydantic-monty>=0.0.19b6,<0.0.20",
+    "pydantic-monty-runtime==0.0.19b6",
 ]
 temporal = [
     'pydantic-ai-slim[temporal]',
@@ -55,6 +57,7 @@ modal = [
 ]
 dynamic-workflow = [
     "pydantic-monty>=0.0.19b6,<0.0.20",
+    "pydantic-monty-runtime==0.0.19b6",
 ]
 acp = [
     # The SDK breaks across minors, so cap per minor.
@@ -99,17 +102,6 @@ source = 'uv-dynamic-versioning'
 vcs = 'git'
 style = 'pep440'
 bump = true
-
-[tool.uv]
-# Let PydanticAI packages install fresh regardless of any exclude-newer pin
-# (was previously in uv.toml; see #238). Consolidated here so the constraint
-# below lives in the same table -- uv reads `constraint-dependencies` from
-# `[tool.uv]`, not from an adjacent `uv.toml`.
-exclude-newer-package = { pydantic-ai = false, pydantic-ai-slim = false, pydantic-evals = false, pydantic-graph = false }
-# monty pins its runtime exactly, but uv only honors pre-release specifiers on
-# direct requirements/constraints, so opt the runtime into pre-release
-# resolution here. Drop once monty ships a stable release.
-constraint-dependencies = ['pydantic-monty-runtime>=0.0.19b6']
 
 
 [tool.hatch.build.targets.wheel]
