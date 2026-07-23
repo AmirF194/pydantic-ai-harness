@@ -28,6 +28,7 @@ from pydantic_ai.usage import RunUsage
 
 from pydantic_ai_harness.planning import Planning
 from pydantic_ai_harness.system_reminders import (
+    DynamicReminder,
     GoalReanchor,
     LLMReminder,
     Reminder,
@@ -269,6 +270,31 @@ class TestMaxFires:
         assert _fired_text(await _run_wrap(cap, _fresh_request())) == 'first'
         assert _fired_text(await _run_wrap(cap, _fresh_request())) == 'first\n\nappended'
 
+    async def test_fire_budget_follows_identity_across_removal(self) -> None:
+        # `_fire_counts` keys on reminder identity, not list index, so removing an earlier
+        # reminder does not shift a survivor onto a stale budget slot.
+        a = Reminder('a', interval=2, tag=None)  # does not fire on request 1
+        b = Reminder('b', max_fires=1, tag=None)  # fires once on request 1
+        reminders: list[Reminder[None]] = [a, b]
+        cap = SystemReminders[None](reminders=reminders)
+        assert _fired_text(await _run_wrap(cap, _fresh_request())) == 'b'
+        reminders.pop(0)  # remove `a`; `b` shifts from index 1 to index 0
+        # `b`'s max_fires=1 is spent; the index shift must not revive it.
+        assert _fired_text(await _run_wrap(cap, _fresh_request())) is None
+
+    async def test_self_appending_dynamic_reminder_does_not_loop(self) -> None:
+        # `_collect_dynamic` snapshots the sequence, so a reminder that appends to it does not
+        # extend this turn's iteration into a hang.
+        dynamics: list[DynamicReminder[None]] = []
+
+        def self_append(ctx: Any) -> str | None:
+            dynamics.append(lambda _c: 'never-reached')
+            return 'once'
+
+        dynamics.append(self_append)
+        cap = SystemReminders[None](dynamic_reminders=dynamics)
+        assert _fired_text(await _run_wrap(cap, _fresh_request())) == 'once'
+
     async def test_dynamic_error_leaves_static_fire_state_untouched(self) -> None:
         # A raising dynamic reminder aborts the request; static fire state and on_fire are
         # committed only after injection, so the static reminder's budget is not consumed and
@@ -467,7 +493,7 @@ class TestForRun:
         cap = SystemReminders[None](reminders=[Reminder('r', max_fires=5, tag=None)], cache_ttl='1h')
         await _run_wrap(cap, _fresh_request())
         assert cap._request_count == 1
-        assert cap._fire_counts == {0: 1}
+        assert cap._fire_counts == {id(cap.reminders[0]): 1}
 
         fresh = await cap.for_run(_ctx())
         assert fresh is not cap

@@ -119,6 +119,8 @@ class SystemReminders(AbstractCapability[AgentDepsT]):
     """Optional observability callback invoked with each rendered reminder as it fires."""
 
     _request_count: int = field(default=0, init=False, repr=False, compare=False)
+    # Keyed by `id(reminder)`, not list index: a user callback that inserts or removes a
+    # reminder mid-run must not shift another reminder onto a stale budget.
     _fire_counts: dict[int, int] = field(default_factory=dict[int, int], init=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
@@ -171,8 +173,8 @@ class SystemReminders(AbstractCapability[AgentDepsT]):
                     content.append(CachePoint(ttl=self.cache_ttl))
                 content.append('\n\n'.join(texts))
                 messages[-1] = replace(last, parts=[*last.parts, UserPromptPart(content=content)])
-                for idx, _text in fired:
-                    self._fire_counts[idx] = self._fire_counts.get(idx, 0) + 1
+                for key, _text in fired:
+                    self._fire_counts[key] = self._fire_counts.get(key, 0) + 1
                 if self.on_fire is not None:
                     for text in texts:
                         self.on_fire(text)
@@ -181,23 +183,27 @@ class SystemReminders(AbstractCapability[AgentDepsT]):
     def _eligible_static(self, ctx: RunContext[AgentDepsT]) -> list[tuple[int, str]]:
         """Static reminders whose cadence, trigger, and `max_fires` allow firing this request.
 
-        Pure: it reads `_fire_counts` but does not mutate it, so the caller can commit fire
-        state only after the reminders are actually injected.
+        Returns `(id(reminder), rendered_text)` pairs. Pure: it reads `_fire_counts` but does
+        not mutate it, so the caller commits fire state only after the reminders are injected.
+        The `reminders` sequence is snapshotted so a `trigger` that mutates it mid-iteration
+        cannot desync this pass.
         """
         eligible: list[tuple[int, str]] = []
-        for idx, reminder in enumerate(self.reminders):
+        for reminder in tuple(self.reminders):
             if not _should_fire(reminder, self._request_count):
                 continue
             if reminder.trigger is not None and not reminder.trigger(ctx):
                 continue
-            if reminder.max_fires is not None and self._fire_counts.get(idx, 0) >= reminder.max_fires:
+            key = id(reminder)
+            if reminder.max_fires is not None and self._fire_counts.get(key, 0) >= reminder.max_fires:
                 continue
-            eligible.append((idx, _render_content(reminder)))
+            eligible.append((key, _render_content(reminder)))
         return eligible
 
     async def _collect_dynamic(self, ctx: RunContext[AgentDepsT]) -> list[str]:
         texts: list[str] = []
-        for dynamic in self.dynamic_reminders:
+        # Snapshot so a callback that appends to `dynamic_reminders` cannot extend the loop.
+        for dynamic in tuple(self.dynamic_reminders):
             result = dynamic(ctx)
             if isinstance(result, Awaitable):
                 result = await result
