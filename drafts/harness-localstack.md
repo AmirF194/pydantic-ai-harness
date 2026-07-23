@@ -172,9 +172,13 @@ so only the recommendation reaches the architect, not the deploy logs. The chore
 moved out of the conversation and into code, and the cloud it runs on is one you can
 afford three of.
 
-None of this is hypothetical. A token bucket sized to five lets five requests through
-and rejects the sixth, on a container that starts in seconds and deletes itself when the
-run ends. The AWS CLI the agent already speaks is enough to build it and prove it.
+None of this is hypothetical. Run it, and the architect writes one script: three
+engineers each spin up their own cloud, build their limiter, and drive requests past it
+in parallel, and the judge reads what came back and picks. In the run behind this post,
+the token bucket and the fixed-window counter both rejected the sixth request on a single
+DynamoDB call each; the sliding-window log was the one that wobbled, letting a request
+through right after a rejection. Three real deployments, judged on what they did, on
+clouds that came up in seconds and deleted themselves when the run ended.
 
 The disposable cloud removes the cloud bill, but the model still costs tokens.
 `max_agent_calls` caps the number of sub-agent runs exactly, even under fan-out, so a
