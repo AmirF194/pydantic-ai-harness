@@ -102,6 +102,39 @@ Before treating a capability as done, check how it composes with:
 `CodeMode` is a useful reference for wrapper-toolset composition, tool
 selection, `ToolSearch` interaction, public docs, and test depth.
 
+## CI And Dependency Footprint
+
+Most capabilities add a package extra and a test module, which is cheap. Some
+pull heavier machinery: a Docker image, an external service that needs a secret
+or auth token, a large system binary (a cloud CLI), or live network calls. That
+machinery makes CI slower and more failure-prone, and every unrelated PR would
+otherwise pay for it on the critical path.
+
+When a capability needs machinery of that weight:
+
+- Keep its runtime dependency behind the capability's own extra, so importing the
+  root package never pulls it in (see "Capability Submodules And Exports").
+- Scope its expensive CI job to the capability. A `changes` job
+  (`dorny/paths-filter`) reports whether the PR touched the capability's paths,
+  and the heavy job runs only when it did. Run it unconditionally on `push`/tag
+  so releases still exercise the live path:
+  `if: always() && (github.event_name != 'pull_request' || needs.changes.outputs.<name> == 'true')`.
+- Keep the aggregate `check` job green when the heavy job is skipped but red when
+  it runs and fails. `re-actors/alls-green` with
+  `allowed-skips: changes, <heavy-job>` does both: a skip does not block, a real
+  failure still votes.
+- Grant the `changes` job `pull-requests: read`. Without a checkout, paths-filter
+  lists PR files through the GitHub API, which needs that scope. A public repo
+  allows it under `contents: read`, but it fails on a private repo or under
+  tightened default token scopes.
+- Scope any secret to the step that needs it (not the job `env`) and bind the job
+  to a CI `environment` that holds the secret, so checkout and setup steps never
+  see it.
+
+The `localstack` capability's `localstack-integration` job is the reference for
+this shape. Whether the heavy job blocks merges (listed in `check`'s `needs`) or
+only signals is the capability owner's call; state which in the PR.
+
 ## Docs
 
 Each user-facing capability needs docs close to the code. Explain:
