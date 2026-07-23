@@ -132,6 +132,20 @@ class _FakePage:
         self.popup_events.append(event)
 
 
+class _ControlledNavigationPage(_FakePage):
+    def __init__(self) -> None:
+        super().__init__()
+        self.first_navigation_started = asyncio.Event()
+        self.release_first_navigation = asyncio.Event()
+
+    async def goto(self, url: str, *, timeout: float | None = None) -> None:
+        self.goto_calls.append(url)
+        self._url = url
+        if url == 'https://example.com/first':
+            self.first_navigation_started.set()
+            await self.release_first_navigation.wait()
+
+
 class _FakePlaywrightBrowser:
     def __init__(self, page: _FakePage, *, close_error: Exception | None = None) -> None:
         self._page = page
@@ -298,6 +312,23 @@ class TestPlaywrightBrowserTools:
         result = await toolset.navigate('https://example.com/start')
         assert result == 'Error: navigate reached a domain not in allowed_domains: https://evil.com/landing'
         assert page.goto_calls == ['https://example.com/start', 'about:blank']
+
+    async def test_concurrent_navigations_return_their_own_page_state(self) -> None:
+        page = _ControlledNavigationPage()
+        toolset = _toolset(page)
+        first = asyncio.create_task(toolset.navigate('https://example.com/first'))
+        await page.first_navigation_started.wait()
+
+        second = asyncio.create_task(toolset.navigate('https://example.com/second'))
+        await asyncio.sleep(0)
+        assert page.goto_calls == ['https://example.com/first']
+
+        page.release_first_navigation.set()
+        first_result, second_result = await asyncio.gather(first, second)
+        assert isinstance(first_result, str)
+        assert first_result.startswith('URL: https://example.com/first')
+        assert isinstance(second_result, str)
+        assert second_result.startswith('URL: https://example.com/second')
 
     async def test_click_css_selector(self) -> None:
         page = _FakePage(body='after click')
