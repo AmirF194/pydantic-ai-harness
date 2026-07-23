@@ -6,7 +6,6 @@ from pydantic_ai_harness.system_reminders._capability import (
     GoalReanchor,
     LLMReminder,
     Reminder,
-    ReminderGenerator,
     SystemReminders,
 )
 
@@ -16,6 +15,5 @@ __all__ = [
     'GoalReanchor',
     'LLMReminder',
     'Reminder',
-    'ReminderGenerator',
     'SystemReminders',
 ]

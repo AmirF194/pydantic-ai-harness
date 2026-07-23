@@ -13,14 +13,18 @@ from pydantic_ai.messages import (
     ModelMessage,
     ModelRequest,
     ModelResponse,
+    RetryPromptPart,
     SystemPromptPart,
+    TextContent,
     TextPart,
     ToolCallPart,
+    ToolReturnPart,
     UserPromptPart,
 )
 from pydantic_ai.models import ModelRequestContext, ModelRequestParameters
 from pydantic_ai.models.function import AgentInfo, FunctionModel
 from pydantic_ai.models.test import TestModel
+from pydantic_ai.usage import RunUsage
 
 from pydantic_ai_harness.planning import Planning
 from pydantic_ai_harness.system_reminders import (
@@ -43,6 +47,7 @@ def _ctx(*, run_step: int = 1, messages: list[ModelMessage] | None = None) -> An
     ctx = MagicMock()
     ctx.run_step = run_step
     ctx.messages = messages if messages is not None else []
+    ctx.usage = RunUsage()
     return ctx
 
 
@@ -114,6 +119,17 @@ def _has_cache_point(messages: list[ModelMessage]) -> bool:
     )
 
 
+def _injected_leads_with_cache_point(messages: list[ModelMessage]) -> bool:
+    """Whether the reminder appended this turn (the tail's last part) leads with a `CachePoint`."""
+    part = messages[-1].parts[-1]
+    return (
+        isinstance(part, UserPromptPart)
+        and isinstance(part.content, list)
+        and len(part.content) > 0
+        and isinstance(part.content[0], CachePoint)
+    )
+
+
 # --- Reminder validation ---
 
 
@@ -138,14 +154,19 @@ class TestReminderValidation:
 
 
 class TestRenderContent:
-    def test_default_tag_wraps(self) -> None:
-        assert Reminder('stay focused').render_content() == '<system-reminder>\nstay focused\n</system-reminder>'
+    async def test_default_tag_wraps(self) -> None:
+        cap = SystemReminders[None](reminders=[Reminder('stay focused')])
+        assert (
+            _fired_text(await _run_wrap(cap, _fresh_request())) == '<system-reminder>\nstay focused\n</system-reminder>'
+        )
 
-    def test_custom_tag(self) -> None:
-        assert Reminder('x', tag='note').render_content() == '<note>\nx\n</note>'
+    async def test_custom_tag(self) -> None:
+        cap = SystemReminders[None](reminders=[Reminder('x', tag='note')])
+        assert _fired_text(await _run_wrap(cap, _fresh_request())) == '<note>\nx\n</note>'
 
-    def test_no_tag_raw(self) -> None:
-        assert Reminder('x', tag=None).render_content() == 'x'
+    async def test_no_tag_raw(self) -> None:
+        cap = SystemReminders[None](reminders=[Reminder('x', tag=None)])
+        assert _fired_text(await _run_wrap(cap, _fresh_request())) == 'x'
 
 
 # --- SystemReminders validation ---
@@ -310,9 +331,69 @@ class TestInjectionMechanics:
         prior = ModelResponse(parts=[TextPart('prior')])
         seen = await _run_wrap(cap, [prior])
         assert seen[-1] is prior
-        # No ModelRequest tail: the fire budget and on_fire are not consumed.
-        assert cap._fire_counts == [0]
+        # No ModelRequest tail: no cadence slot spent, and the fire budget and on_fire untouched.
+        assert cap._request_count == 0
+        assert cap._fire_counts == {}
         assert fired == []
+
+    async def test_empty_message_list_is_a_noop(self) -> None:
+        cap = SystemReminders[None](reminders=[Reminder('r', tag=None)])
+        seen = await _run_wrap(cap, [])
+        assert seen == []
+        assert cap._request_count == 0
+
+
+# --- CachePoint guard (leading CachePoint is illegal without preceding user content) ---
+
+
+class TestCachePointGuard:
+    async def test_cache_point_with_user_prompt(self) -> None:
+        cap = SystemReminders[None](reminders=[Reminder('r', tag=None)])
+        seen = await _run_wrap(cap, _fresh_request())
+        assert _fired_text(seen) == 'r'
+        assert _injected_leads_with_cache_point(seen)
+
+    async def test_cache_point_with_tool_return(self) -> None:
+        cap = SystemReminders[None](reminders=[Reminder('r', tag=None)])
+        tail = ModelRequest(parts=[ToolReturnPart('tool', 'out', tool_call_id='c1')])
+        seen = await _run_wrap(cap, [tail])
+        assert _injected_leads_with_cache_point(seen)
+
+    async def test_cache_point_with_retry_prompt(self) -> None:
+        cap = SystemReminders[None](reminders=[Reminder('r', tag=None)])
+        tail = ModelRequest(parts=[RetryPromptPart('try again', tool_name='tool', tool_call_id='c1')])
+        seen = await _run_wrap(cap, [tail])
+        assert _injected_leads_with_cache_point(seen)
+
+    async def test_cache_point_with_binary_user_content(self) -> None:
+        img = BinaryContent(data=b'\x00', media_type='image/png')
+        cap = SystemReminders[None](reminders=[Reminder('r', tag=None)])
+        seen = await _run_wrap(cap, [ModelRequest(parts=[UserPromptPart(content=[img])])])
+        assert _injected_leads_with_cache_point(seen)
+
+    async def test_cache_point_with_mixed_list_content(self) -> None:
+        cap = SystemReminders[None](reminders=[Reminder('r', tag=None)])
+        tail = ModelRequest(parts=[UserPromptPart(content=[CachePoint(), '', 'real'])])
+        seen = await _run_wrap(cap, [tail])
+        assert _injected_leads_with_cache_point(seen)
+
+    async def test_no_cache_point_with_system_prompt_only(self) -> None:
+        cap = SystemReminders[None](reminders=[Reminder('r', tag=None)])
+        seen = await _run_wrap(cap, [ModelRequest(parts=[SystemPromptPart('sys')])])
+        assert _fired_text(seen) == 'r'
+        assert not _injected_leads_with_cache_point(seen)
+
+    async def test_no_cache_point_with_empty_user_prompt(self) -> None:
+        cap = SystemReminders[None](reminders=[Reminder('r', tag=None)])
+        seen = await _run_wrap(cap, [ModelRequest(parts=[UserPromptPart('')])])
+        assert _fired_text(seen) == 'r'
+        assert not _injected_leads_with_cache_point(seen)
+
+    async def test_no_cache_point_with_cachepoint_only_content(self) -> None:
+        cap = SystemReminders[None](reminders=[Reminder('r', tag=None)])
+        seen = await _run_wrap(cap, [ModelRequest(parts=[UserPromptPart(content=[CachePoint()])])])
+        assert _fired_text(seen) == 'r'
+        assert not _injected_leads_with_cache_point(seen)
 
 
 # --- on_fire callback ---
@@ -340,12 +421,12 @@ class TestForRun:
         cap = SystemReminders[None](reminders=[Reminder('r', max_fires=5, tag=None)], cache_ttl='1h')
         await _run_wrap(cap, _fresh_request())
         assert cap._request_count == 1
-        assert cap._fire_counts == [1]
+        assert cap._fire_counts == {0: 1}
 
         fresh = await cap.for_run(_ctx())
         assert fresh is not cap
         assert fresh._request_count == 0
-        assert fresh._fire_counts == [0]
+        assert fresh._fire_counts == {}
         assert fresh.reminders is cap.reminders
         assert fresh.cache_ttl == '1h'
 
@@ -386,6 +467,14 @@ class TestGoalReanchor:
         text = GoalReanchor()(_ctx(messages=messages))
         assert text is not None
         assert 'find bugs' in text
+
+    def test_extracts_text_content_goal(self) -> None:
+        messages: list[ModelMessage] = [
+            ModelRequest(parts=[UserPromptPart(content=[TextContent('refactor the auth module')])])
+        ]
+        text = GoalReanchor()(_ctx(messages=messages))
+        assert text is not None
+        assert 'refactor the auth module' in text
 
     def test_fallback_when_no_user_message(self) -> None:
         assert GoalReanchor(fallback='hold').__call__(_ctx(messages=[])) == 'hold'
@@ -465,6 +554,16 @@ class TestLLMReminder:
         result = await reminder(_ctx(messages=messages))
         assert result is not None
         assert 'ship the fix' in result  # GoalReanchor fallback text
+
+    def test_zero_max_context_messages_raises(self) -> None:
+        with pytest.raises(ValueError, match='max_context_messages must be >= 1'):
+            LLMReminder(model=TestModel(), max_context_messages=0)
+
+    async def test_threads_usage_onto_parent_run(self) -> None:
+        store: dict[str, str] = {}
+        ctx = _ctx(messages=[ModelRequest(parts=[UserPromptPart('g')])])
+        await LLMReminder(model=_capture_model(store))(ctx)
+        assert ctx.usage.requests == 1
 
 
 # --- End-to-end through Agent ---

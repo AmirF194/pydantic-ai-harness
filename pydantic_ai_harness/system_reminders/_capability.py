@@ -4,11 +4,22 @@ from __future__ import annotations
 
 from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass, field, replace
-from typing import TYPE_CHECKING, Any, Literal
+from typing import TYPE_CHECKING, Generic, Literal
 
 from pydantic_ai import Agent
 from pydantic_ai.capabilities import AbstractCapability
-from pydantic_ai.messages import CachePoint, ModelMessage, ModelRequest, ModelResponse, TextPart, UserPromptPart
+from pydantic_ai.messages import (
+    CachePoint,
+    ModelMessage,
+    ModelRequest,
+    ModelRequestPart,
+    ModelResponse,
+    RetryPromptPart,
+    TextContent,
+    TextPart,
+    ToolReturnPart,
+    UserPromptPart,
+)
 from pydantic_ai.models import KnownModelName, Model
 from pydantic_ai.tools import AgentDepsT, RunContext
 
@@ -18,31 +29,30 @@ if TYPE_CHECKING:
 
 
 @dataclass
-class Reminder:
-    r"""A static reminder injected on a cadence during an agent run.
-
-    Args:
-        content: The reminder text.
-        interval: Fire every N model requests within a run. `interval=3` fires on the
-            3rd, 6th, 9th, ... request.
-        first_after: Request number of the first fire. `None` (the default) fires on the
-            first multiple of `interval` (plain modulo). When set, the reminder fires at
-            `first_after`, then every `interval` requests after that.
-        trigger: Optional predicate over the current `RunContext`. When set, the reminder
-            fires only when the trigger returns `True` *and* the cadence condition is met.
-        max_fires: Maximum number of times this reminder may fire within a run. `None`
-            means no limit.
-        tag: When set, wrap the content in an XML tag: `<tag>\ncontent\n</tag>`. Defaults
-            to `'system-reminder'` (Claude Code's convention); set `None` to emit the raw
-            content.
-    """
+class Reminder(Generic[AgentDepsT]):
+    r"""A static reminder injected on a cadence during an agent run."""
 
     content: str
+    """The reminder text."""
+
     interval: int = 1
+    """Fire every N model requests within a run. `interval=3` fires on the 3rd, 6th, 9th, ... request."""
+
     first_after: int | None = None
-    trigger: Callable[[RunContext[Any]], bool] | None = None
+    """Request number of the first fire. `None` (the default) fires on the first multiple of
+    `interval` (plain modulo). When set, the reminder fires at `first_after`, then every
+    `interval` requests after that."""
+
+    trigger: Callable[[RunContext[AgentDepsT]], bool] | None = None
+    """Optional predicate over the current `RunContext`. When set, the reminder fires only when
+    the trigger returns `True` *and* the cadence condition is met."""
+
     max_fires: int | None = None
+    """Maximum number of times this reminder may fire within a run. `None` means no limit."""
+
     tag: str | None = 'system-reminder'
+    r"""When set, wrap the content in an XML tag: `<tag>\ncontent\n</tag>`. Defaults to
+    `'system-reminder'` (Claude Code's convention); set `None` to emit the raw content."""
 
     def __post_init__(self) -> None:
         if self.interval < 1:
@@ -52,33 +62,16 @@ class Reminder:
         if self.max_fires is not None and self.max_fires < 1:
             raise ValueError(f'max_fires must be >= 1, got {self.max_fires}')
 
-    def should_fire(self, count: int) -> bool:
-        """Whether the cadence fires on request number `count` (1-based)."""
-        base = self.interval if self.first_after is None else self.first_after
-        return count >= base and (count - base) % self.interval == 0
 
-    def render_content(self) -> str:
-        """Return the content, XML-wrapped when `tag` is set."""
-        if self.tag is not None:
-            return f'<{self.tag}>\n{self.content}\n</{self.tag}>'
-        return self.content
-
-
-DynamicReminder = Callable[[RunContext[Any]], 'str | None']
+DynamicReminder = Callable[[RunContext[AgentDepsT]], 'str | None']
 """A callable returning reminder text (or `None` to skip), evaluated every model request.
 
 The callable reads the current `RunContext`, so it subsumes token-budget, post-compaction,
 mode-switch, and other conditions without hardcoded detectors: the user writes the condition.
 """
 
-AsyncDynamicReminder = Callable[[RunContext[Any]], 'Awaitable[str | None]']
+AsyncDynamicReminder = Callable[[RunContext[AgentDepsT]], 'Awaitable[str | None]']
 """Async variant of `DynamicReminder`."""
-
-ReminderGenerator = AsyncDynamicReminder
-"""Alias for an async dynamic reminder: `async (RunContext) -> str | None`.
-
-`LLMReminder` satisfies this shape. `GoalReanchor` is synchronous, so it satisfies
-`DynamicReminder` (the sync alias) instead."""
 
 
 @dataclass
@@ -113,12 +106,10 @@ class SystemReminders(AbstractCapability[AgentDepsT]):
     ```
     """
 
-    reminders: list[Reminder] = field(default_factory=list[Reminder])
+    reminders: Sequence[Reminder[AgentDepsT]] = ()
     """Static reminders injected on a cadence."""
 
-    dynamic_reminders: list[DynamicReminder | AsyncDynamicReminder] = field(
-        default_factory=list['DynamicReminder | AsyncDynamicReminder']
-    )
+    dynamic_reminders: Sequence[DynamicReminder[AgentDepsT] | AsyncDynamicReminder[AgentDepsT]] = ()
     """Callables evaluated every model request; return text to inject or `None` to skip."""
 
     cache_ttl: Literal['5m', '1h'] = '5m'
@@ -128,18 +119,18 @@ class SystemReminders(AbstractCapability[AgentDepsT]):
     """Optional observability callback invoked with each rendered reminder as it fires."""
 
     _request_count: int = field(default=0, init=False, repr=False, compare=False)
-    _fire_counts: list[int] = field(default_factory=list[int], init=False, repr=False, compare=False)
+    _fire_counts: dict[int, int] = field(default_factory=dict[int, int], init=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
         if not self.reminders and not self.dynamic_reminders:
             raise ValueError('At least one static or dynamic reminder must be provided.')
-        self._fire_counts = [0] * len(self.reminders)
 
     async def for_run(self, ctx: RunContext[AgentDepsT]) -> SystemReminders[AgentDepsT]:
         """Return a fresh per-run instance with reset counters (config preserved).
 
-        `replace` re-runs `__post_init__`, which zeroes `_request_count` and `_fire_counts`,
-        so concurrent runs on the same agent never share fire state.
+        `replace` builds a new instance whose generated `__init__` re-initializes the
+        `init=False` fields -- `_request_count` back to `0` and `_fire_counts` to an empty
+        dict -- so concurrent runs on the same agent never share fire state.
         """
         return replace(self)
 
@@ -156,27 +147,37 @@ class SystemReminders(AbstractCapability[AgentDepsT]):
         here is never written back, so the reminder and its `CachePoint` reach the model but
         never enter `ctx.state.message_history`.
         """
-        self._request_count += 1
         messages = request_context.messages
-        last = messages[-1]
-        if isinstance(last, ModelRequest):
+        # A provider-resume turn (`_prepare_resume_request`) hands back a message list whose
+        # tail is a suspended `ModelResponse`, and that exact history is echoed to the provider
+        # verbatim to continue the turn -- injecting into it would corrupt the continuation. So
+        # only a real `ModelRequest` tail carries a reminder, and only such a turn spends a
+        # cadence slot (the counter advances inside the guard, not before it).
+        if messages and isinstance(last := messages[-1], ModelRequest):
+            self._request_count += 1
             texts = [*self._collect_static(ctx), *await self._collect_dynamic(ctx)]
             if texts:
-                reminder = UserPromptPart(content=[CachePoint(ttl=self.cache_ttl), '\n\n'.join(texts)])
-                messages[-1] = replace(last, parts=[*last.parts, reminder])
+                content: list[CachePoint | str] = []
+                # A leading `CachePoint` is only valid when the request already carries a
+                # user-content block for it to attach to; Anthropic and Bedrock raise otherwise.
+                if _has_user_content(last.parts):
+                    content.append(CachePoint(ttl=self.cache_ttl))
+                content.append('\n\n'.join(texts))
+                messages[-1] = replace(last, parts=[*last.parts, UserPromptPart(content=content)])
         return await handler(request_context)
 
     def _collect_static(self, ctx: RunContext[AgentDepsT]) -> list[str]:
         texts: list[str] = []
         for idx, reminder in enumerate(self.reminders):
-            if not reminder.should_fire(self._request_count):
+            if not _should_fire(reminder, self._request_count):
                 continue
             if reminder.trigger is not None and not reminder.trigger(ctx):
                 continue
-            if reminder.max_fires is not None and self._fire_counts[idx] >= reminder.max_fires:
+            fired = self._fire_counts.get(idx, 0)
+            if reminder.max_fires is not None and fired >= reminder.max_fires:
                 continue
-            self._fire_counts[idx] += 1
-            rendered = reminder.render_content()
+            self._fire_counts[idx] = fired + 1
+            rendered = _render_content(reminder)
             texts.append(rendered)
             if self.on_fire is not None:
                 self.on_fire(rendered)
@@ -201,7 +202,7 @@ class SystemReminders(AbstractCapability[AgentDepsT]):
 
 
 @dataclass
-class GoalReanchor:
+class GoalReanchor(Generic[AgentDepsT]):
     """Zero-cost dynamic reminder that re-states the run's first user request as the anchor.
 
     No model call and no dependencies: it reads the first user message from `ctx.messages`
@@ -211,7 +212,7 @@ class GoalReanchor:
 
     fallback: str = 'Stay on task.'
 
-    def __call__(self, ctx: RunContext[Any]) -> str | None:
+    def __call__(self, ctx: RunContext[AgentDepsT]) -> str | None:
         goal = _first_user_text(ctx.messages)
         if goal is None:
             return self.fallback
@@ -229,12 +230,16 @@ _LLM_INSTRUCTIONS = (
 
 
 @dataclass
-class LLMReminder:
+class LLMReminder(Generic[AgentDepsT]):
     """Dynamic reminder whose text a model generates from a compact transcript.
 
     Opt-in and dependency-free (it uses `pydantic_ai.Agent`). `model` is required and has no
     default -- pass an explicit model. On any error it falls back to `GoalReanchor` text, so a
     failed generation never blocks the run. Add it to `SystemReminders.dynamic_reminders`.
+
+    Like every dynamic reminder it is evaluated on every model request, so it issues one extra
+    model call per turn; its usage is threaded onto the parent run (`ctx.usage`). Gate it on a
+    cadence (see the docs) if per-turn generation is too costly.
     """
 
     model: Model | KnownModelName | str
@@ -242,18 +247,64 @@ class LLMReminder:
     instructions: str = _LLM_INSTRUCTIONS
     _agent: Agent[None, str] | None = field(default=None, init=False, repr=False, compare=False)
 
-    async def __call__(self, ctx: RunContext[Any]) -> str | None:
+    def __post_init__(self) -> None:
+        if self.max_context_messages < 1:
+            raise ValueError(f'max_context_messages must be >= 1, got {self.max_context_messages}')
+
+    async def __call__(self, ctx: RunContext[AgentDepsT]) -> str | None:
         try:
             agent = self._agent
             if agent is None:
                 agent = Agent(self.model, instructions=self.instructions, output_type=str)
                 self._agent = agent
             transcript = _build_compact_transcript(ctx.messages, self.max_context_messages)
-            result = await agent.run(transcript)
+            result = await agent.run(transcript, usage=ctx.usage)
             text = result.output.strip()
             return text or None
         except Exception:
-            return GoalReanchor()(ctx)
+            return GoalReanchor[AgentDepsT]()(ctx)
+
+
+def _should_fire(reminder: Reminder[AgentDepsT], count: int) -> bool:
+    """Whether `reminder`'s cadence fires on request number `count` (1-based)."""
+    base = reminder.interval if reminder.first_after is None else reminder.first_after
+    return count >= base and (count - base) % reminder.interval == 0
+
+
+def _render_content(reminder: Reminder[AgentDepsT]) -> str:
+    """Return `reminder`'s content, XML-wrapped when its `tag` is set."""
+    if reminder.tag is not None:
+        return f'<{reminder.tag}>\n{reminder.content}\n</{reminder.tag}>'
+    return reminder.content
+
+
+def _has_user_content(parts: Sequence[ModelRequestPart]) -> bool:
+    """Whether these request parts already carry a block a `CachePoint` can attach to.
+
+    Anthropic and Bedrock reject a `CachePoint` that is the first content of a user message,
+    so the tail reminder leads with one only when the request already contributes user-mappable
+    content: a non-empty user prompt, a tool return, or a retry prompt. `SystemPromptPart` maps
+    to the system field, not user content, so it does not count.
+    """
+    for part in parts:
+        if isinstance(part, (ToolReturnPart, RetryPromptPart)):
+            return True
+        if isinstance(part, UserPromptPart):
+            content = part.content
+            if isinstance(content, str):
+                if content:
+                    return True
+            elif any(_is_user_content_item(item) for item in content):
+                return True
+    return False
+
+
+def _is_user_content_item(item: object) -> bool:
+    if isinstance(item, CachePoint):
+        return False
+    if isinstance(item, str):
+        return bool(item)
+    return True
 
 
 def _first_user_text(messages: Sequence[ModelMessage]) -> str | None:
@@ -270,7 +321,13 @@ def _first_user_text(messages: Sequence[ModelMessage]) -> str | None:
 def _prompt_text(content: str | Sequence[object]) -> str:
     if isinstance(content, str):
         return content
-    return ' '.join(item for item in content if isinstance(item, str))
+    texts: list[str] = []
+    for item in content:
+        if isinstance(item, str):
+            texts.append(item)
+        elif isinstance(item, TextContent):
+            texts.append(item.content)
+    return ' '.join(texts)
 
 
 def _build_compact_transcript(messages: Sequence[ModelMessage], max_messages: int) -> str:

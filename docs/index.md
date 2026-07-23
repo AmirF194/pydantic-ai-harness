@@ -126,6 +126,7 @@ Each capability is a self-contained battery you drop into an agent's `capabiliti
 | [Subagents](subagents.md) | Delegates subtasks to specialized child agents through a delegate tool. | -- |
 | [Dynamic Workflow](dynamic-workflow.md) | Orchestrates sub-agents from a model-written Python script -- fan-out, chaining, and voting in a single tool call. | `dynamic-workflow` |
 | [Planning](planning.md) | Breaks a complex task into a structured plan before execution and tracks progress against it. | -- |
+| [System Reminders](system-reminders.md) | Re-injects behavioral guidance mid-run -- on a cadence or reactively from a condition -- to counter instruction fade in long sessions, without invalidating the prompt cache. | -- |
 | [Memory](memory.md) | Gives an agent a persistent, namespaced notebook with bounded prompt injection, on-demand search, and concurrency-safe stores. | -- |
 | [Runtime Authoring](runtime-authoring.md) | Lets an agent author, validate, and load real capabilities at runtime. | -- |
 | [Guardrails](guardrails.md) | Validates user input before a run starts and model output after it completes -- block or redact, with structured results. | -- |

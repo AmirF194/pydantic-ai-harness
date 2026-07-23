@@ -96,6 +96,17 @@ from pydantic_ai_harness.system_reminders import SystemReminders, LLMReminder
 SystemReminders(dynamic_reminders=[LLMReminder(model='anthropic:claude-haiku-4-5')])
 ```
 
+Dynamic reminders have no cadence of their own -- they run on every model request. `LLMReminder` therefore issues one extra model call per turn (its usage is threaded onto the parent run via `ctx.usage`, so it shows up in `result.usage()`). Because the fallback is silent, a persistently misconfigured `model` (bad id, missing key) looks like normal operation. To bound the cost, gate it behind a cadence with an async wrapper:
+
+```python
+_llm = LLMReminder(model='anthropic:claude-haiku-4-5')
+
+async def every_tenth(ctx):
+    return await _llm(ctx) if ctx.run_step % 10 == 0 else None
+
+SystemReminders(dynamic_reminders=[every_tenth])
+```
+
 ## Configuration
 
 ```python
@@ -115,17 +126,17 @@ Per-run state (the request counter and per-reminder fire counts) is isolated via
 
 Reminders are never injected into the system prompt or instructions. They ride the ephemeral tail behind a `CachePoint`, so across turns:
 
-- the durable history grows append-only and is replayed byte-identically, so the whole prefix is a cache hit;
+- the durable history grows append-only and is replayed byte-identically, so the whole prefix stays eligible for a cache hit (subject to the provider's cache TTL -- a gap longer than `cache_ttl` expires the entry even under an unchanged prefix);
 - the reminder and its `CachePoint` live only in the per-request copy, so they can't invalidate anything and aren't persisted.
 
-`CachePoint` is supported on Anthropic and Amazon Bedrock; on providers without prompt caching it's simply ignored (nothing to bust).
+`CachePoint` is supported on Anthropic, Amazon Bedrock (Converse API), and OpenRouter (Anthropic and Gemini models); on providers without prompt caching it's simply ignored (nothing to bust). The reminder leads with its `CachePoint` only when the request already carries user content for the breakpoint to attach to -- on a turn whose only tail content is the reminder (for example an `instructions`-only run's first request), the reminder is injected without a breakpoint, since there is no prefix to protect.
 
 ## Composition
 
-- [Planning](planning.md) uses the same ephemeral-tail mechanism to surface the plan. Both compose in one agent: each appends its own tail part behind its own `CachePoint`, neither clobbers the other, and neither is persisted.
+- [Planning](planning.md) uses the same ephemeral-tail mechanism to surface the plan. Both compose in one agent: each appends its own tail part behind its own `CachePoint`, and neither is persisted. Note that each ephemeral-tail capability adds a cache breakpoint: Anthropic allows 4 (3 with automatic caching), and core trims the excess oldest-first, so stacking several tail-injecting capabilities alongside `anthropic_cache_instructions` / `anthropic_cache_tool_definitions` can evict an older breakpoint. Two capabilities plus the defaults stay within budget.
 - Loop detection (detect-and-interrupt with a durable nudge) is a separate concern. `SystemReminders` is cadence/condition steering that stays ephemeral; a dynamic reminder can read loop state from your deps if you want to steer on it.
 
-The tail reminder is only appended when the last message in the request is a `ModelRequest` and at least one reminder fires, so a turn where nothing fires adds nothing to the request.
+The tail reminder is only appended when the last message in the request is a `ModelRequest` and at least one reminder fires, so a turn where nothing fires adds nothing to the request. Provider-resume turns (where the request tail is a suspended `ModelResponse` that is echoed back verbatim) are skipped and do not consume a cadence slot.
 
 ## Not spec-serializable
 
@@ -141,3 +152,9 @@ The tail reminder is only appended when the last message in the request is a `Mo
 ## API reference
 
 ::: pydantic_ai_harness.system_reminders.SystemReminders
+
+::: pydantic_ai_harness.system_reminders.Reminder
+
+::: pydantic_ai_harness.system_reminders.GoalReanchor
+
+::: pydantic_ai_harness.system_reminders.LLMReminder
