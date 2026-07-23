@@ -1,6 +1,6 @@
 ---
 title: Ten agents, ten clouds, one answer
-description: Give each agent in a fan-out its own disposable cloud, and a team of them can build and test many designs at once. It's the experiment real AWS can't run at any price. The pattern scales to ten; the demo runs three.
+description: Give each agent in a fan-out its own disposable cloud, and a team of them can build and test many designs at once. It's the experiment you'd never run on real AWS. The pattern scales to ten; the demo runs three.
 draft: true
 series: Pydantic AI Harness
 ---
@@ -19,8 +19,7 @@ your absolutely-right agent just did.
 Give an agent a real cloud task, like "add a rate limiter to the checkout API," and it
 writes clean CDK in seconds. Then it stops being fast. Every deploy waits minutes on a
 control plane in another region. Every experiment is a line item. Every mistake lands
-in an account something real depends on. The agent runs at agent speed; the cloud
-answers at cloud speed, and charges for the conversation.
+in an account something real depends on, and the cloud charges for the conversation.
 
 Wiring it up takes almost nothing. `Shell` gives the agent a terminal, your AWS
 credentials are already in the environment, and `aws` is one command away:
@@ -37,7 +36,7 @@ agent = Agent(
 result = agent.run_sync('Deploy the checkout stack and smoke-test the endpoint.')
 ```
 
-It works. The agent creates the bucket, writes the function, wires the trigger. Then
+It works. The agent creates the bucket, ships the function, wires the trigger. Then
 you remember it's doing all of that in a real account.
 
 ## The cloud punishes what the agent is good at
@@ -54,11 +53,9 @@ built to punish. You supervise it not because it's bad at the task but because t
 environment is unforgiving, it's your name on the account, and your credit card pays
 the invoice.
 
-## The agent isn't the problem. The cloud is.
+## Change what it deploys against
 
-So don't change the agent. Change what it deploys against.
-
-The [LocalStack capability](https://github.com/pydantic/pydantic-ai-harness/tree/main/pydantic_ai_harness/localstack/)
+The agent isn't the problem. The cloud is. The [LocalStack capability](https://github.com/pydantic/pydantic-ai-harness/tree/main/pydantic_ai_harness/localstack/)
 gives an agent an emulated AWS: the real service APIs, running in a container. It
 injects the endpoint and credentials, so the agent just issues plain `aws` commands.
 One line puts it in reach:
@@ -81,11 +78,10 @@ account made expensive:
 - The bill is zero. Nothing is provisioned anywhere you pay for.
 - The blast radius is nothing. There's no production, only a container you throw away.
 
-And because each run gets its own container, "reset to before the agent touched it"
-isn't an afternoon of cleanup. It's the next run. Nothing persists unless you ask it
-to.
+And because each run gets its own container, "reset to before the agent touched it" is
+the next run, not an afternoon of cleanup. Nothing carries over between runs.
 
-## The part that isn't just faster
+## A cloud each
 
 A throwaway cloud does more than speed the agent up. It removes a constraint you
 didn't notice you were obeying.
@@ -102,7 +98,7 @@ LocalStack, and let each build its design, deploy it, and exercise it against an
 identical clean cloud. Then compare the three that ran, on what happened rather than
 what was promised.
 
-On real AWS this isn't expensive. It's impossible. Here each engineer is an agent with
+On real AWS you could run this. You never would. Here each engineer is an agent with
 its own container:
 
 ```python
@@ -121,10 +117,11 @@ engineers = [
     Agent(
         'anthropic:claude-sonnet-4-6',
         name=f'build_{key}',
-        description=f'Builds and load-tests: {spec}',
+        description=f'Builds and tests one design: {spec}',
         instructions=(
-            'Deploy your design to your LocalStack with the AWS CLI, exercise it under '
-            'load, and report throughput, errors, and the IAM it needs.'
+            'Deploy your design to your LocalStack with the AWS CLI, push traffic through '
+            'it until it should start rejecting, and report whether it holds the limit, '
+            'the errors it returns, and the IAM it needs.'
         ),
         capabilities=[
             LocalStack(manage_container=True, endpoint_url=f'http://localhost.localstack.cloud:{port}'),
@@ -146,8 +143,8 @@ architect = Agent(
 )
 ```
 
-The distinct ports aren't incidental. They're the idea made literal: each engineer gets
-its own cloud, so three of them run at once without stepping on each other.
+The distinct ports aren't incidental. Each engineer gets its own container, so three of
+them run at once without stepping on each other.
 
 Given the task, the architect doesn't make a dozen tool calls and narrate the results
 back to itself. `DynamicWorkflow` hands it one tool, `run_workflow`, and it writes a
@@ -156,7 +153,7 @@ script:
 ```python
 import asyncio
 
-prompt = 'Build and load-test your design. Report throughput, errors, and the IAM it needs.'
+prompt = 'Deploy your design, push traffic until it should start rejecting, and report whether it holds the limit and the IAM it needs.'
 
 reports = await asyncio.gather(
     build_dynamo(task=prompt),
@@ -164,32 +161,30 @@ reports = await asyncio.gather(
     build_redis(task=prompt),
 )
 
-await judge(task='Recommend one rate-limiter design, citing the load and IAM evidence:\n\n'
+await judge(task='Recommend one rate-limiter design, citing which held the limit and the IAM each needed:\n\n'
                  + '\n\n---\n\n'.join(reports))
 ```
 
-Three real deployments, built and load-tested in parallel, each on its own cloud, judged
-on what held up. The whole tree runs inside one `run_workflow` call. The architect's
+Three real deployments, built and pushed past their limits in parallel, each on its own
+cloud, judged on what actually held. The whole tree runs inside one `run_workflow` call. The architect's
 context never fills with deploy logs; only the recommendation comes back. The
-choreography moved out of the conversation and into code, and the cloud it choreographs
-is one you can afford to run three of.
+choreography moved out of the conversation and into code, and the cloud it runs on is
+one you can afford three of.
 
-Cheap to run isn't free. `max_agent_calls` caps the number of sub-agent runs exactly,
-even under fan-out, so a workflow that decides to explore a dozen designs instead of
-three stops at the ceiling you set. The disposable cloud removes the cloud bill; the
-budget keeps the model bill honest.
+The disposable cloud removes the cloud bill, but the model still costs tokens.
+`max_agent_calls` caps the number of sub-agent runs exactly, even under fan-out, so a
+workflow that explores a dozen designs instead of three stops at the ceiling you set.
 
 ## Where this goes
 
-There's a version of this that outlives one run. A migration that takes an afternoon,
-moving every service to least-privilege IAM one at a time, wants to keep its progress
-when the process dies and pick up where it left off. Pydantic AI's durable execution and
-`DynamicWorkflow`'s durable workflows are heading there. No harness ships that end to end
+There's a version of this that outlives one run: a migration that saves its progress
+between steps and resumes after a crash. Pydantic AI's durable execution and
+`DynamicWorkflow`'s durable workflows are heading there; no harness ships it end to end
 yet.
 
-For now the smaller thing is enough, and it isn't small. The agent can be wrong. It can
-drop the table, over-scope the IAM, ship the design that folds under load, and find out
-in seconds, for free, on a cloud that starts clean the next time you run it.
+For now the smaller thing is enough. The agent can be wrong. It can drop the table,
+over-scope the IAM, ship the design that folds when the traffic climbs, and find out in
+seconds, for free, on a cloud that starts clean the next time you run it.
 
 "You're absolutely right" stops being the sentence you brace for. It becomes a
 hypothesis you can afford to test.
