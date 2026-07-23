@@ -259,6 +259,15 @@ class TestPlaywrightBrowserTools:
         assert toolset_module.check_allowed_domain('https://[::1', None) is False
         assert toolset_module.check_allowed_domain('https://[::1', ['::1']) is False
 
+    @pytest.mark.parametrize('url', ['mailto:a@b.com', 'about:blank'])
+    def test_check_allowed_domain_rejects_hostless_url_with_open_egress(self, url: str) -> None:
+        assert toolset_module.check_allowed_domain(url, None) is False
+
+    def test_check_allowed_domain_rejects_trailing_dot_host_for_blank_entries(self) -> None:
+        url = 'https://169.254.169.254./'
+        assert toolset_module.check_allowed_domain(url, ['']) is False
+        assert toolset_module.check_allowed_domain(url, [' \t ']) is False
+
     async def test_navigate_returns_url_title_and_text(self) -> None:
         toolset = _toolset(_FakePage(title='Docs', body='Page text here'))
         result = await toolset.navigate('https://example.com/')
@@ -288,11 +297,20 @@ class TestPlaywrightBrowserTools:
         assert isinstance(result, str) and result.startswith('URL:')
         assert page.goto_calls == ['http://[::1]:8080/']
 
-    async def test_navigate_rejects_url_without_host(self) -> None:
+    @pytest.mark.parametrize('url', ['mailto:a@b.com', 'about:blank'])
+    async def test_navigate_rejects_url_without_host(self, url: str) -> None:
         page = _FakePage()
-        toolset = _toolset(page, allowed_domains=['example.com'])
-        result = await toolset.navigate('mailto:a@b.com')
-        assert result == 'Error: domain not in allowed_domains: mailto:a@b.com'
+        toolset = _toolset(page)
+        result = await toolset.navigate(url)
+        assert result == f'Error: domain not in allowed_domains: {url}'
+        assert page.goto_calls == []
+
+    async def test_navigate_rejects_trailing_dot_host_for_blank_allowlist_entry(self) -> None:
+        page = _FakePage()
+        toolset = _toolset(page, allowed_domains=[' \t '])
+        url = 'https://evil.example./'
+        result = await toolset.navigate(url)
+        assert result == f'Error: domain not in allowed_domains: {url}'
         assert page.goto_calls == []
 
     async def test_navigate_rejects_malformed_url(self) -> None:

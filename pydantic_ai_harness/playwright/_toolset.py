@@ -82,11 +82,15 @@ def check_allowed_domain(url: str, allowed_domains: list[str] | None) -> bool:
         host = urlparse(url).hostname
     except ValueError:
         return False
-    if allowed_domains is None:
-        return True
     if host is None:
         return False
-    return any(host == entry.lower() or host.endswith('.' + entry.lower()) for entry in allowed_domains)
+    if allowed_domains is None:
+        return True
+    for entry in allowed_domains:
+        domain = entry.strip().lower()
+        if domain and (host == domain or host.endswith('.' + domain)):
+            return True
+    return False
 
 
 def _truncate(text: str, max_chars: int) -> str:
