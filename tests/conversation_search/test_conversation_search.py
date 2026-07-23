@@ -14,6 +14,7 @@ from pathlib import Path
 import pytest
 from pydantic_ai import Agent
 from pydantic_ai.messages import (
+    BinaryContent,
     ModelMessage,
     ModelRequest,
     ModelResponse,
@@ -167,6 +168,28 @@ class TestSnapshotHistorySource:
         source = SnapshotHistorySource(InMemoryStepStore())
         assert await source.run_history(run_id='never-ran') == []
 
+    async def test_recovery_round_trips_through_durable_stores(self, tmp_path: Path) -> None:
+        # `message_hash` claims stability across snapshot round-trips; the durable
+        # stores actually re-serialize and re-validate messages on read, unlike
+        # `InMemoryStepStore`, so dedup must hold on reconstructed objects too.
+        stores: list[FileStepStore | SqliteStepStore] = [
+            FileStepStore(tmp_path / 'runs'),
+            SqliteStepStore(database=tmp_path / 'runs.db'),
+        ]
+        for store in stores:
+            original = _user('the ZEBRA passphrase is 42')
+            reply = _reply('noted')
+            summary = ModelRequest(parts=[SystemPromptPart(content='Summary of previous conversation:\n\nolder')])
+            await store.register_run(RunRecord(run_id='r1'))
+            await store.save_snapshot(ContinuableSnapshot(run_id='r1', step_index=0, messages=[original, reply]))
+            await store.save_snapshot(ContinuableSnapshot(run_id='r1', step_index=1, messages=[summary, reply]))
+
+            history = await SnapshotHistorySource(store).run_history(run_id='r1')
+            rendered = [str(part) for message in history for part in message.parts]
+            assert sum('ZEBRA' in text for text in rendered) == 1
+            assert sum('noted' in text for text in rendered) == 1
+            assert not any('Summary of previous conversation' in text for text in rendered)
+
     async def test_list_runs_delegates_to_store(self) -> None:
         store = InMemoryStepStore()
         await store.register_run(RunRecord(run_id='r1'))
@@ -251,6 +274,75 @@ class TestConversationSearch:
             if isinstance(part, ToolReturnPart) and part.tool_name == 'search_conversation_history'
         )
         assert 'ZEBRA' in returned
+
+    async def test_capability_params_flow_into_the_toolset(self) -> None:
+        store = InMemoryStepStore()
+        await _seed_run(store, 'r1', [_user(f'needle entry {i} filler') for i in range(5)])
+        calls: list[int] = []
+
+        def model_fn(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+            if not calls:
+                calls.append(1)
+                return ModelResponse(parts=[ToolCallPart('search_conversation_history', {'query': 'needle'})])
+            return ModelResponse(parts=[TextPart('done')])
+
+        agent: Agent[None, str] = Agent(
+            FunctionModel(model_fn),
+            capabilities=[ConversationSearch(SnapshotHistorySource(store), max_matches=1, context_lines=0)],
+        )
+        result = await agent.run('recall')
+        rendered = next(
+            str(part.content)
+            for message in result.all_messages()
+            for part in getattr(message, 'parts', [])
+            if isinstance(part, ToolReturnPart) and part.tool_name == 'search_conversation_history'
+        )
+        assert rendered.count('[score:') == 1
+        *_, excerpt = rendered.split('\n\n')
+        assert len(excerpt.splitlines()) == 2  # the score line plus a single-line window
+
+    async def test_model_recovers_compacted_original_through_the_tool(self) -> None:
+        # The full user story in one flow: compaction drops the original from the
+        # live history, and a model tool call over the shared store gets it back.
+        store = InMemoryStepStore()
+        writer = Agent(
+            TestModel(custom_output_text='reply'),
+            capabilities=[
+                StepPersistence(store=store),
+                SummarizingCompaction(
+                    max_messages=2,
+                    keep_messages=1,
+                    model=TestModel(custom_output_text='SUMMARY TEXT'),
+                ),
+            ],
+        )
+        result = await writer.run('the CRIMSON marker is important')
+        result = await writer.run('second turn', message_history=result.all_messages())
+        result = await writer.run('third turn', message_history=result.all_messages())
+        live = ' '.join(str(part) for message in result.all_messages() for part in message.parts)
+        assert 'SUMMARY TEXT' in live
+
+        calls: list[int] = []
+
+        def model_fn(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+            if not calls:
+                calls.append(1)
+                return ModelResponse(parts=[ToolCallPart('search_conversation_history', {'query': 'CRIMSON'})])
+            return ModelResponse(parts=[TextPart('done')])
+
+        searcher: Agent[None, str] = Agent(
+            FunctionModel(model_fn),
+            capabilities=[ConversationSearch(SnapshotHistorySource(store))],
+        )
+        recall = await searcher.run('what was the marker?')
+        returned = next(
+            str(part.content)
+            for message in recall.all_messages()
+            for part in getattr(message, 'parts', [])
+            if isinstance(part, ToolReturnPart) and part.tool_name == 'search_conversation_history'
+        )
+        assert 'CRIMSON' in returned
+        assert 'SUMMARY TEXT' not in returned
 
     def test_add_instructions_toggle(self) -> None:
         source = SnapshotHistorySource(InMemoryStepStore())
@@ -386,6 +478,22 @@ class TestSearchTool:
         await _seed_run(store, 'r1', corpus)
         rendered = await _search(SnapshotHistorySource(store), 'needle', max_matches=1, context_lines=0)
         assert rendered.count('[score:') == 1
+        *_, excerpt = rendered.split('\n\n')
+        assert len(excerpt.splitlines()) == 2  # the score line plus a single-line window
+
+    async def test_media_content_stays_searchable_around_the_binary(self) -> None:
+        store = InMemoryStepStore()
+        media_prompt = ModelRequest(
+            parts=[
+                UserPromptPart(
+                    content=['the FIGURE caption text', BinaryContent(data=b'\x89PNG fake', media_type='image/png')]
+                )
+            ]
+        )
+        await _seed_run(store, 'r1', [media_prompt, _user('an unrelated entry')])
+        rendered = await _search(SnapshotHistorySource(store), 'FIGURE')
+        assert '[score:' in rendered
+        assert 'FIGURE caption' in rendered
 
     async def test_index_prefix_is_not_a_searchable_token(self) -> None:
         # The `[N]` excerpt numbering must stay display-only: indexed, each

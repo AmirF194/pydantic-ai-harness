@@ -145,6 +145,8 @@ def _format_message(message: ModelMessage, *, truncate: bool) -> str:
                 lines.append(f'User: {content}')
             elif isinstance(part, SystemPromptPart):
                 content = part.content
+                # Defensive for sources that do not filter compaction artifacts;
+                # `SnapshotHistorySource` already excludes them from the corpus.
                 if content.startswith('Summary of previous conversation'):
                     lines.append('[Compaction summary]')
                 else:
