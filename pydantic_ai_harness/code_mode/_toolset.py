@@ -2,12 +2,11 @@
 
 from __future__ import annotations
 
-import asyncio
 import inspect
 import keyword
 import re
 import warnings
-from collections.abc import Callable, Coroutine, Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field, replace
 from typing import Annotated, Any
 
@@ -35,19 +34,12 @@ except ImportError:  # pragma: no cover
 try:
     from pydantic_monty import (
         AbstractOS,
-        ExternalException,
-        ExternalResult,
-        ExternalReturnValue,
-        FunctionSnapshot,
-        FutureSnapshot,
         Monty,
-        MontyComplete,
         MontyRepl,
         MontyRuntimeError,
         MontySyntaxError,
         MontyTypingError,
         MountDir,
-        NameLookupSnapshot,
         OsFunction,
     )
 except ImportError as _import_error:  # pragma: no cover
@@ -56,8 +48,7 @@ except ImportError as _import_error:  # pragma: no cover
     ) from _import_error
 from typing_extensions import NotRequired, TypedDict
 
-# Type alias for the dispatch callback passed to _execution_loop.
-_DispatchFn = Callable[[str, dict[str, Any]], Coroutine[Any, Any, Any]]
+from pydantic_ai_harness._monty_exec import MontyExecutor, PrintCapture, is_sandbox_panic
 
 # A raw OS callback. Return `pydantic_monty.NOT_HANDLED` to defer the call to the
 # sandbox's default, which leaves it unavailable.
@@ -94,7 +85,7 @@ Write and run Python code in a sandboxed environment.
 The sandbox uses Monty, a subset of Python. Key restrictions:
 - **No classes**: class definitions are not supported
 - **No third-party libraries**: only the standard library modules listed below can be used
-- **Importable standard library modules**: `sys`, `typing`, `asyncio`, `math`, `json`, `re`, `datetime`, `os`, `pathlib`. These must be imported before use, just like in regular Python. For example: `import asyncio` then `results = await asyncio.gather(tool_one(...), tool_two(...))`."""
+- **Importable standard library modules**: `sys`, `typing`, `asyncio`, `math`, `json`, `re`, `datetime`, `os`, `pathlib`. These must be imported before use, just like in regular Python. For example: `import asyncio` then `await asyncio.gather(tool_one(...), tool_two(...))`."""
 
 # Timing/OS restriction line, swapped depending on what host access the agent
 # configured. Three states, because `mount` and `os` enable different things:
@@ -125,11 +116,23 @@ _RUN_CODE_DESCRIPTION_TAIL = """\
 State is preserved between calls (REPL-style). Set `restart: true` to reset state.
 
 The last expression's value is automatically captured as the return value -- you do **not** need to \
-`print()` it. Avoid `print()` for return values as it produces Python string representations, not \
-structured data. Use `print()` only for supplementary logging or debug output.
+`print()` it. End the snippet with the value to return as a bare expression. A final assignment stores \
+the value but does not return it. A final expression that evaluates to `None` is treated as no result. \
+Without a non-`None` final expression or print output, `run_code` returns `{}`. For example:
 
-Returns the last expression's value directly. If `print()` was also called, returns \
-`{"output": "<printed text>", "result": <last expression>}`.\
+```python
+result = some_expression
+result
+```
+
+Avoid `print()` for return values as it produces Python string representations, not structured data. \
+Use `print()` only for supplementary logging or debug output.
+
+Returns a non-`None` last expression's value directly when nothing is printed. With `print()` output \
+and no non-`None` final expression, returns `{"output": "<printed text>"}`. With `print()` output and a \
+plain, non-`None` final expression, returns \
+`{"output": "<printed text>", "result": <last expression>}`. With `print()` output and a multimodal \
+final expression, returns a list with the printed text followed by the native content.\
 """
 
 
@@ -158,15 +161,15 @@ def _functions_header(*, has_sync: bool, has_async: bool) -> str:
     if has_async and not has_sync:
         return base + (
             ' All tool functions are async: invoke them with `await`,'
-            ' e.g. `result = await tool_name(arg=value)`.'
+            ' e.g. `await tool_name(arg=value)`.'
             ' Calling without `await` returns an unresolved future, not the value.'
         )
     if has_sync and not has_async:
-        return base + (' All tool functions are synchronous: call them directly, e.g. `result = tool_name(arg=value)`.')
+        return base + (' All tool functions are synchronous: call them directly, e.g. `tool_name(arg=value)`.')
     return base + (
         ' Async functions (`async def`) must be invoked with `await`,'
-        ' e.g. `result = await tool_name(arg=value)`.'
-        ' Sync functions (`def`) are called directly, e.g. `result = tool_name(arg=value)`.'
+        ' e.g. `await tool_name(arg=value)`.'
+        ' Sync functions (`def`) are called directly, e.g. `tool_name(arg=value)`.'
     )
 
 
@@ -181,6 +184,18 @@ _TOOL_SEARCH_ADDENDUM = (
 )
 
 _INVALID_IDENT_CHARS = re.compile(r'[^a-zA-Z0-9_]')
+
+
+def _is_code_execution_tool(tool_def: ToolDefinition) -> bool:
+    """Whether a tool is itself a code-execution sandbox that takes a code string.
+
+    Such tools (this `run_code`, or DynamicWorkflow's `run_workflow`) carry `code_arg_name`
+    metadata -- the same marker instrumentation reads to render the argument as code. They must
+    not be folded into `run_code`: nesting one code sandbox inside another would make the model
+    write a script that passes a second script as a string literal. They stay native so the two
+    code surfaces sit side by side.
+    """
+    return bool(tool_def.metadata and 'code_arg_name' in tool_def.metadata)
 
 
 def _sanitize_tool_name(name: str) -> str:
@@ -352,6 +367,10 @@ class CodeModeToolset(WrapperToolset[AgentDepsT]):
                 # Keep the local fallback native so `Model.prepare_request` can drop it
                 # when the provider supports the native tool.
                 native_tools[name] = tool
+            elif _is_code_execution_tool(tool.tool_def):
+                # A tool that is itself a code-execution sandbox (e.g. DynamicWorkflow's
+                # `run_workflow`) is a peer of `run_code`, not something to fold inside it.
+                native_tools[name] = tool
             elif await matches_tool_selector(self.tool_selector, ctx, tool.tool_def):
                 sandboxed_tools[name] = tool
             else:
@@ -459,7 +478,7 @@ class CodeModeToolset(WrapperToolset[AgentDepsT]):
         nested_returns: dict[str, ToolReturnPart] = {}
         call_counter = 0
 
-        async def dispatch_tool_call(original_name: str, kwargs: dict[str, Any]) -> Any:
+        async def dispatch_tool_call(sandbox_name: str, kwargs: dict[str, Any]) -> Any:
             """Dispatch a single tool call from inside the sandbox.
 
             Returns the serialized tool result on success. On failure, the
@@ -468,6 +487,7 @@ class CodeModeToolset(WrapperToolset[AgentDepsT]):
             `await` site.
             """
             nonlocal call_counter
+            original_name = sanitized_to_original.get(sandbox_name, sandbox_name)
             call_counter += 1
             parent_id = ctx.tool_call_id or 'pyd_ai_code_mode'
             tool_call_id = f'{parent_id}__{call_counter}'
@@ -531,24 +551,22 @@ class CodeModeToolset(WrapperToolset[AgentDepsT]):
             self._repl = MontyRepl()
         assert self._repl is not None
 
-        capture = _PrintCapture()
+        capture = PrintCapture()
 
         try:
             monty_state = self._repl.feed_start(code, print_callback=capture, os=self.os_access, mount=self.mount)
-            completed = await _execution_loop(
-                monty_state,
+            completed = await MontyExecutor(
                 dispatch=dispatch_tool_call,
-                callable_defs=callable_defs,
-                sanitized_to_original=sanitized_to_original,
-                sequential_tools=sequential_tools,
+                valid_names=callable_defs,
+                sequential_names=sequential_tools,
                 global_sequential=global_sequential,
                 os_access=self.os_access,
                 mount=self.mount,
-            )
+            ).run(monty_state)
         except MontySyntaxError as e:
-            raise ModelRetry(f'Syntax error in code:\n{_prepend_prints(e.display(), capture)}') from e
+            raise ModelRetry(f'Syntax error in code:\n{capture.prepend_to(e.display())}') from e
         except MontyTypingError as e:  # pragma: no cover -- MontyRepl.feed_start doesn't raise this
-            raise ModelRetry(f'Type error in code:\n{_prepend_prints(e.display(), capture)}') from e
+            raise ModelRetry(f'Type error in code:\n{capture.prepend_to(e.display())}') from e
         except MontyRuntimeError as e:
             # Exceptions raised inside dispatch_tool_call (e.g. UserError from
             # ApprovalRequired, or ModelRetry from a wrapped tool) are passed
@@ -559,7 +577,20 @@ class CodeModeToolset(WrapperToolset[AgentDepsT]):
             # ModelRetry from a wrapped tool gets double-wrapped
             # (ModelRetry → MontyRuntimeError → ModelRetry), but the retry
             # semantics are the same -- the model gets another chance.
-            raise ModelRetry(f'Runtime error:\n{_prepend_prints(e.display(), capture)}') from e
+            raise ModelRetry(f'Runtime error:\n{capture.prepend_to(e.display())}') from e
+        except BaseException as e:
+            # Convert a model-provokable sandbox panic to a retry (see `is_sandbox_panic`);
+            # anything else (CancelledError, ...) re-raises unchanged.
+            if not is_sandbox_panic(e):
+                raise
+            # The panic aborts the VM mid-execution, so the REPL's accumulated state cannot
+            # be trusted; drop it so the retry starts from a fresh, type-checked session.
+            self._repl = None
+            raise ModelRetry(
+                'The code aborted inside the sandbox and the session was reset. This can happen '
+                'when the same tool call is awaited more than once in one asyncio.gather -- give '
+                'each gathered call its own invocation. Revise the code and try again.'
+            ) from e
 
         result = completed.output
         printed = capture.joined
@@ -721,194 +752,6 @@ def _get_sigs_and_conflicting(
     return sigs, FunctionSignature.get_conflicting_type_names(sigs)
 
 
-async def _execution_loop(
-    monty_state: FunctionSnapshot | FutureSnapshot | NameLookupSnapshot | MontyComplete,
-    *,
-    dispatch: _DispatchFn,
-    callable_defs: dict[str, ToolDefinition],
-    sanitized_to_original: dict[str, str],
-    sequential_tools: set[str],
-    global_sequential: bool,
-    os_access: CodeModeOS | None,
-    mount: CodeModeMount | None,
-) -> MontyComplete:
-    """Drive the Monty REPL via the synchronous snapshot API until completion.
-
-    Uses Monty's `feed_start`/`resume` snapshot API instead of `feed_run_async`
-    to avoid background threads and `call_soon_threadsafe`. This makes it safe
-    to run inside restricted event loops like Temporal's workflow sandbox.
-
-    Tool calls are handled based on their execution mode:
-
-    - **Parallel tools** (`async def`): deferred via `resume({'future': ...})`
-      and eagerly scheduled as `asyncio.Task`s for concurrent execution.
-      Resolved at `FutureSnapshot` via `asyncio.gather`.
-    - **Sequential tools** (`def`): resolved inline at `FunctionSnapshot`
-      via `resume({'return_value': ...})` or `resume({'exception': ...})`. Before
-      dispatching, any pending parallel tasks are awaited to maintain ordering.
-    - **Global sequential mode** (DBOS/Temporal): all tools are deferred via
-      `resume({'future': ...})` but stored as bare coroutines and awaited
-      one-at-a-time at `FutureSnapshot` to prevent interleaving.
-
-    `os`/`mount` must be passed to every `resume` call (not just `feed_start`):
-    Monty's auto-dispatch of OS calls stops the moment a resume omits them.
-    """
-    pending: dict[int, asyncio.Task[Any] | Coroutine[Any, Any, Any]] = {}
-    # Results from parallel tasks that were awaited early (at a sequential-tool
-    # barrier) but whose FutureSnapshot hasn't been reached yet.
-    pre_resolved: dict[int, ExternalResult] = {}
-    try:
-        while not isinstance(monty_state, MontyComplete):
-            if isinstance(monty_state, NameLookupSnapshot):
-                monty_state = monty_state.resume(os=os_access, mount=mount)
-            elif isinstance(monty_state, FunctionSnapshot):
-                monty_state = await _handle_function_snapshot(
-                    monty_state,
-                    dispatch,
-                    callable_defs,
-                    sanitized_to_original,
-                    sequential_tools=sequential_tools,
-                    global_sequential=global_sequential,
-                    pending=pending,
-                    pre_resolved=pre_resolved,
-                    os_access=os_access,
-                    mount=mount,
-                )
-            else:
-                monty_state = await _resolve_future_snapshot(
-                    monty_state,
-                    pending=pending,
-                    pre_resolved=pre_resolved,
-                    global_sequential=global_sequential,
-                    os_access=os_access,
-                    mount=mount,
-                )
-    finally:
-        for item in pending.values():  # pragma: no cover
-            if isinstance(item, asyncio.Task):
-                item.cancel()
-            else:
-                item.close()
-
-    return monty_state
-
-
-async def _handle_function_snapshot(
-    snapshot: FunctionSnapshot,
-    dispatch: _DispatchFn,
-    callable_defs: dict[str, ToolDefinition],
-    sanitized_to_original: dict[str, str],
-    *,
-    sequential_tools: set[str],
-    global_sequential: bool,
-    pending: dict[int, asyncio.Task[Any] | Coroutine[Any, Any, Any]],
-    pre_resolved: dict[int, ExternalResult],
-    os_access: CodeModeOS | None,
-    mount: CodeModeMount | None,
-) -> FunctionSnapshot | FutureSnapshot | NameLookupSnapshot | MontyComplete:
-    """Handle a single FunctionSnapshot from the Monty execution loop."""
-    fn_name = snapshot.function_name
-
-    if fn_name not in callable_defs:
-        return snapshot.resume({'exception': NameError(f'Unknown function: {fn_name}')}, os=os_access, mount=mount)
-
-    if snapshot.args:
-        return snapshot.resume(
-            {'exception': TypeError(f'{fn_name}() does not accept positional arguments; use keyword arguments')},
-            os=os_access,
-            mount=mount,
-        )
-
-    original_name = sanitized_to_original.get(fn_name, fn_name)
-
-    if fn_name in sequential_tools:
-        # Per-tool sequential: rendered as `def` (sync), so must resolve inline --
-        # the sandbox code doesn't `await` the result. Await pending parallel
-        # tasks first (barrier) to maintain ordering.
-        for cid in list(pending):
-            pre_resolved[cid] = await _resolve_coro(pending.pop(cid))
-        outcome = await _resolve_coro(dispatch(original_name, snapshot.kwargs))
-        if 'return_value' in outcome:
-            return snapshot.resume({'return_value': outcome['return_value']}, os=os_access, mount=mount)
-        return snapshot.resume({'exception': outcome['exception']}, os=os_access, mount=mount)
-
-    # Deferred execution -- store for later resolution at FutureSnapshot.
-    if global_sequential:
-        # Bare coroutine -- don't schedule on the event loop yet.
-        pending[snapshot.call_id] = dispatch(original_name, snapshot.kwargs)
-    else:
-        # Eagerly schedule as a Task for concurrent execution.
-        pending[snapshot.call_id] = asyncio.ensure_future(dispatch(original_name, snapshot.kwargs))
-    return snapshot.resume({'future': ...}, os=os_access, mount=mount)
-
-
-async def _resolve_future_snapshot(
-    snapshot: FutureSnapshot,
-    *,
-    pending: dict[int, asyncio.Task[Any] | Coroutine[Any, Any, Any]],
-    pre_resolved: dict[int, ExternalResult],
-    global_sequential: bool,
-    os_access: CodeModeOS | None,
-    mount: CodeModeMount | None,
-) -> FunctionSnapshot | FutureSnapshot | NameLookupSnapshot | MontyComplete:
-    """Resolve pending tool calls at a FutureSnapshot."""
-    pending_ids = snapshot.pending_call_ids
-    if not pending_ids:  # pragma: no cover
-        return snapshot.resume(results={}, os=os_access, mount=mount)
-
-    results: dict[int, ExternalResult] = {}
-    for cid in pending_ids:
-        if cid in pre_resolved:
-            results[cid] = pre_resolved.pop(cid)
-        elif global_sequential:
-            results[cid] = await _resolve_coro(pending.pop(cid))
-
-    # Gather remaining parallel tasks.
-    gather_ids = [cid for cid in pending_ids if cid not in results]
-    if gather_ids:
-        tasks = [pending[cid] for cid in gather_ids]
-        settled = await asyncio.gather(*tasks, return_exceptions=True)
-        for cid in gather_ids:
-            del pending[cid]
-        for cid, outcome in zip(gather_ids, settled):
-            results[cid] = _settle_outcome(outcome)
-
-    return snapshot.resume(results=results, os=os_access, mount=mount)
-
-
-async def _resolve_coro(
-    coro: Coroutine[Any, Any, Any] | asyncio.Task[Any],
-) -> ExternalReturnValue | ExternalException:
-    """Await a single coroutine/task and wrap the result for Monty."""
-    try:
-        result = await coro
-    except Exception as exc:
-        return ExternalException(exception=exc)
-    else:
-        return ExternalReturnValue(return_value=result)
-
-
-def _settle_outcome(outcome: Any) -> ExternalReturnValue | ExternalException:
-    """Wrap an `asyncio.gather(return_exceptions=True)` outcome for Monty."""
-    if isinstance(outcome, Exception):
-        return ExternalException(exception=outcome)
-    if isinstance(outcome, BaseException):  # pragma: no cover
-        raise outcome
-    return ExternalReturnValue(return_value=outcome)
-
-
-def _prepend_prints(error_message: str, capture: _PrintCapture) -> str:
-    """Prepend any captured print output to an error message.
-
-    When sandbox code prints debug output before crashing, this preserves
-    that output in the error so the model can use it for debugging.
-    """
-    printed = capture.joined.rstrip('\n')
-    if not printed:
-        return error_message
-    return f'[stdout before error]\n{printed}\n[/stdout before error]\n{error_message}'
-
-
 def _contains_multimodal(value: Any) -> bool:
     """Check if a value is or directly contains multimodal content (images, audio, etc.)."""
     if is_multi_modal_content(value):
@@ -916,21 +759,3 @@ def _contains_multimodal(value: Any) -> bool:
     if isinstance(value, list):
         return any(is_multi_modal_content(item) for item in value)  # pyright: ignore[reportUnknownVariableType]
     return False
-
-
-class _PrintCapture:
-    """Accumulates print-callback chunks from the Monty REPL.
-
-    Pulled out to module scope (rather than a closure inside `call_tool`) so
-    the callback path is testable in isolation and visible to coverage.py.
-    """
-
-    def __init__(self) -> None:
-        self._chunks: list[str] = []
-
-    def __call__(self, _stream: str, text: str) -> None:
-        self._chunks.append(text)
-
-    @property
-    def joined(self) -> str:
-        return ''.join(self._chunks)

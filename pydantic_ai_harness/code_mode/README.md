@@ -2,6 +2,8 @@
 
 Replace individual tool calls with a single sandboxed Python execution environment.
 
+[Source](https://github.com/pydantic/pydantic-ai-harness/tree/main/pydantic_ai_harness/code_mode/)
+
 ## The problem
 
 Standard tool calling requires one model round-trip per tool call. An agent that needs to fetch 10 items and process each one makes 11+ model calls -- slow, expensive, and context-heavy.
@@ -42,6 +44,8 @@ print(result.output)
 The model writes code like:
 
 ```python
+import asyncio
+
 paris, tokyo = await asyncio.gather(
     get_weather(city='Paris'),
     get_weather(city='Tokyo'),
@@ -57,7 +61,7 @@ The [harness Quick start](../../README.md#quick-start) wires `CodeMode` up again
 
 [![CodeMode's first run_code: parallel asyncio.gather over three HN feeds, then a dedupe and a score filter](../../docs/images/code-mode-trace.png)](https://logfire-us.pydantic.dev/public-trace/84bcf123-2106-49da-9f6f-5c26395339bb?spanId=7650806a0785b946)
 
-**[See the full Logfire trace →](https://logfire-us.pydantic.dev/public-trace/84bcf123-2106-49da-9f6f-5c26395339bb?spanId=7650806a0785b946)** Each `run_code` span fans out into the tool calls the model issued from inside the sandbox -- the easiest way to understand what code mode actually did. See the [Pydantic AI Logfire docs](https://ai.pydantic.dev/logfire/) for setup details.
+**[See the full Logfire trace ->](https://logfire-us.pydantic.dev/public-trace/84bcf123-2106-49da-9f6f-5c26395339bb?spanId=7650806a0785b946)** Each `run_code` span fans out into the tool calls the model issued from inside the sandbox -- the easiest way to understand what code mode actually did. See the [Pydantic AI Logfire docs](https://ai.pydantic.dev/logfire/) for setup details.
 
 ## Installation
 
@@ -142,13 +146,21 @@ become callable functions inside `run_code`. Tools without
 
 ## Return values
 
-The last expression in the code snippet is automatically captured as the return value -- the model does not need to `print()`.
+The last expression in the code snippet is automatically captured as the return value -- the model does not need to `print()`. An assignment stores a value in the REPL but does not return it. A final expression that evaluates to `None` is also treated as no result. Without a non-`None` final expression or print output, `run_code` returns `{}`. Put the assigned name on the final line:
+
+```python
+result = await get_weather(city='Paris')
+result
+```
 
 | Scenario | Return |
 |---|---|
-| No print output | Last expression value |
-| With print output | `{"output": "<printed text>", "result": <last expression>}` |
-| Multimodal content (e.g. images) | Returned natively for model processing |
+| Non-`None` final expression with no print output | Last expression value |
+| Final assignment or `None` result with no print output | `{}` |
+| Print output with no final expression or a `None` result | `{"output": "<printed text>"}` |
+| Print output with a plain, non-`None` final expression | `{"output": "<printed text>", "result": <last expression>}` |
+| Multimodal final expression with no print output | Returned natively for model processing |
+| Print output with a multimodal final expression | List with printed text followed by native multimodal content |
 
 ## REPL state
 
@@ -239,19 +251,20 @@ Code runs inside [Monty](https://github.com/pydantic/monty), a sandboxed Python 
 
 - No class definitions
 - No third-party imports (allowed stdlib: `sys`, `typing`, `asyncio`, `math`, `json`, `re`, `datetime`, `os`, `pathlib`)
-- No wall-clock or timing primitives by default (`asyncio.sleep`, `datetime.now()`, `date.today()`, `time`) -- `datetime.now()`/`date.today()` become available with an `os_access` handler (above); `asyncio.sleep`/`time` never do
+- No wall-clock or timing primitives by default (`asyncio.sleep`, `datetime.datetime.now()`, `datetime.date.today()`, `time`) -- `datetime.datetime.now()`/`datetime.date.today()` become available with an `os_access` handler (above); `asyncio.sleep`/`time` never do
 - No `import *`
 - Filesystem I/O needs an `os_access` handler or a `mount`; `os.getenv`/`os.environ` need an `os_access` handler
-- Tools requiring approval or with deferred execution are excluded from the sandbox
+- Tools requiring approval or with deferred (`CallDeferred`) execution are sandboxed like any other tool; without a `HandleDeferredToolCalls` (or equivalent) capability on the agent to resolve them inline, calling one from `run_code` raises an error that surfaces to the model as a retry
 
 ## API
 
-```python
+```python {test="skip"}
 CodeMode(
     tools: ToolSelector = 'all',        # 'all', list[str], callable, or dict
     max_retries: int = 3,               # retries on sandbox execution errors
     os_access: CodeModeOS | None = None,   # host handler for env vars, clock, and file I/O
     mount: CodeModeMount | None = None,    # host directories to share with the sandbox
+    dynamic_catalog: bool = False,      # keep run_code's description cache-stable; catalog moves into instructions
 )
 ```
 
