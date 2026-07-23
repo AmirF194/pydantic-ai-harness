@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import warnings
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Collection, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -13,7 +13,7 @@ from pydantic_ai.tools import AgentDepsT
 from pydantic_ai_harness.skills._loader import SkillDefinition, load_skill_libraries
 
 
-@dataclass
+@dataclass(init=False)
 class Skills(AbstractCapability[AgentDepsT]):
     """Load filesystem Agent Skills as deferred instructions.
 
@@ -23,20 +23,50 @@ class Skills(AbstractCapability[AgentDepsT]):
     discovery, activation, and message-history replay.
 
     v1 exposes instructions only. It does not read supporting files or run
-    bundled scripts. Resource and script support returns once skills sit on a
-    sandbox abstraction.
+    bundled scripts. Applications can grant access to bundled files separately
+    through a filesystem capability whose root contains the skill directory.
     """
 
-    directories: Sequence[str | Path]
+    id: str | None = field(init=False, default=None, repr=False, compare=False)
+    description: str | None = field(init=False, default=None, repr=False, compare=False)
+    defer_loading: bool = field(init=False, default=False, repr=False, compare=False)
+
+    directories: tuple[str | Path, ...]
     """Skill-library roots whose immediate child directories are scanned."""
+
+    include: frozenset[str] | None
+    """Exact skill names to expose, or `None` to expose every discovered skill."""
+
+    exclude: frozenset[str]
+    """Exact skill names to hide."""
 
     _skill_capabilities: tuple[Capability[AgentDepsT], ...] = field(init=False, repr=False, compare=False)
 
-    def __post_init__(self) -> None:
-        if isinstance(self.directories, (str, Path)):
-            raise TypeError('directories must be a sequence of skill-library paths, for example `["./skills"]`.')
-        self.directories = tuple(self.directories)
-        definitions = load_skill_libraries(self.directories)
+    def __init__(
+        self,
+        directories: str | Path | Sequence[str | Path],
+        *,
+        include: Collection[str] | None = None,
+        exclude: Collection[str] = (),
+    ) -> None:
+        """Build an immutable snapshot of selected Agent Skills.
+
+        Args:
+            directories: One skill-library path, or a sequence of paths.
+            include: Exact skill names to expose. Omit to expose all discovered skills.
+            exclude: Exact skill names to hide. Cannot be combined with `include`.
+        """
+        if include is not None and exclude:
+            raise ValueError('include and exclude cannot be used together.')
+
+        self.id = None
+        self.description = None
+        self.defer_loading = False
+        self.directories = self._normalize_directories(directories)
+        self.include = self._normalize_selection('include', include) if include is not None else None
+        self.exclude = self._normalize_selection('exclude', exclude)
+
+        definitions = load_skill_libraries(self.directories, include=self.include, exclude=self.exclude)
         ignored = [
             f'{skill.name}: {", ".join(skill.ignored_behavioral_fields)}'
             for skill in definitions
@@ -49,6 +79,25 @@ class Skills(AbstractCapability[AgentDepsT]):
                 stacklevel=2,
             )
         self._skill_capabilities = tuple(self._to_capability(skill) for skill in definitions)
+
+    @staticmethod
+    def _normalize_directories(
+        directories: str | Path | Sequence[str | Path],
+    ) -> tuple[str | Path, ...]:
+        if isinstance(directories, (str, Path)):
+            return (directories,)
+        return tuple(directories)
+
+    @staticmethod
+    def _normalize_selection(name: str, values: Collection[object]) -> frozenset[str]:
+        if isinstance(values, str):
+            raise TypeError(f'{name} must be a collection of skill names, not a string.')
+        normalized: set[str] = set()
+        for value in values:
+            if not isinstance(value, str):
+                raise TypeError(f'{name} must contain only skill names as strings.')
+            normalized.add(value)
+        return frozenset(normalized)
 
     def apply(self, visitor: Callable[[AbstractCapability[AgentDepsT]], None]) -> None:
         """Expose each loaded skill as a leaf capability to Pydantic AI."""
@@ -69,6 +118,8 @@ class Skills(AbstractCapability[AgentDepsT]):
             f'# Skill: {skill.name}',
             '',
             f'Skill directory: `{absolute_directory}`.',
+            'Files referenced by this skill are relative to that directory.',
+            'Access them only through filesystem tools provided by the application.',
         ]
         body = skill.body.replace('${CLAUDE_SKILL_DIR}', absolute_directory)
         if body:

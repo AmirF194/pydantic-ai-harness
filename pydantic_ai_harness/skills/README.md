@@ -13,12 +13,9 @@ The model initially sees each skill's name and description. When it calls the co
 
 v1 exposes instructions only. Each skill is its `SKILL.md` frontmatter (`name`,
 `description`) plus the Markdown body, rendered as a deferred capability. Skills
-does not read a skill's supporting files, run bundled scripts, or expose any
-assets. Behavioral frontmatter fields that other clients act on are accepted but
-ignored with a warning (see below).
-
-Resource and script support is planned for a later version, once skills sit on a
-sandbox abstraction that owns file and command access.
+reads `SKILL.md` when it is constructed. It does not read other bundled files,
+run scripts, or grant filesystem permissions. Behavioral frontmatter fields that
+other clients act on are accepted but ignored with a warning (see below).
 
 ## Installation
 
@@ -30,8 +27,8 @@ uv add "pydantic-ai-harness[skills]"
 
 ## Skill layout
 
-Pass one or more explicit skill-library directories. Each immediate child directory
-containing `SKILL.md` is a skill:
+Pass one explicit skill-library directory or a sequence of directories. Each
+immediate child directory containing `SKILL.md` is a skill:
 
 ```text
 .agents/skills/
@@ -66,25 +63,103 @@ from pydantic_ai_harness.skills import Skills
 
 agent = Agent(
     'anthropic:claude-sonnet-4-6',
-    capabilities=[Skills(directories=['.agents/skills'])],
+    capabilities=[Skills('.agents/skills')],
 )
 ```
 
 Skills does not discover `.agents`, `.claude`, or home-directory libraries implicitly.
 Pass every library the application intends to expose.
 
-## What v1 does not do
+## Select skills per agent
 
-- No file reading. A skill body that references `references/guide.md` is passed to the
-  model verbatim; Skills does not read that file or grant permission to read it.
-- No script execution. A skill body that references `scripts/verify.py` is passed
-  through unchanged; Skills does not run it.
-- No assets. Skills does not enumerate a skill directory's contents.
+Use `include` when several agents share a library but each workload should see a
+specific set:
 
-The rendered instructions include the skill's absolute directory and expand
-`${CLAUDE_SKILL_DIR}` to that path. These are cheap spec-compatibility: a portable
-skill body degrades gracefully if the application happens to expose its own file
-tools, but Skills itself grants no access.
+```python
+from pydantic_ai import Agent
+from pydantic_ai_harness.skills import Skills
+
+invoice_agent = Agent(
+    'anthropic:claude-sonnet-4-6',
+    capabilities=[
+        Skills(
+            '.agents/skills',
+            include=['invoice-review', 'vat-policy'],
+        )
+    ],
+)
+```
+
+Use `exclude` when an agent should see all but a small number of skills:
+
+```python
+from pydantic_ai import Agent
+from pydantic_ai_harness.skills import Skills
+
+support_agent = Agent(
+    'anthropic:claude-sonnet-4-6',
+    capabilities=[
+        Skills(
+            '.agents/skills',
+            exclude=['deployment', 'incident-response'],
+        )
+    ],
+)
+```
+
+`include` and `exclude` match exact skill names and cannot be combined. Unknown
+names fail during construction. An empty `include` exposes no skills. Selection
+happens before `SKILL.md` is parsed, so unselected skills do not add validation
+or prompt context to that agent.
+
+Use `include` when the set is an access or workload policy. A skill added to the
+shared directory is not exposed until the agent's allowlist includes it.
+
+## Bundled files and filesystem access
+
+Agent Skills may bundle files next to `SKILL.md`:
+
+- `references/` commonly contains documentation or data to read when needed;
+- `assets/` commonly contains templates or files used in generated output;
+- `scripts/` commonly contains executable helpers.
+
+Skills does not enumerate, read, or execute these files. Loaded instructions
+include the absolute skill directory and expand `${CLAUDE_SKILL_DIR}` to that
+path. If a body references `references/guide.md`, the model can resolve it
+relative to the displayed skill directory.
+
+The application decides whether the agent can access that path. For example,
+compose Skills with `FileSystem` and choose a root that contains the skill
+library:
+
+```python
+from pathlib import Path
+
+from pydantic_ai import Agent
+from pydantic_ai_harness.filesystem import FileSystem
+from pydantic_ai_harness.skills import Skills
+
+skill_library = Path('.agents/skills').resolve()
+
+agent = Agent(
+    'anthropic:claude-sonnet-4-6',
+    capabilities=[
+        FileSystem(
+            root_dir=skill_library,
+            protected_patterns=['**'],
+        ),
+        Skills(skill_library),
+    ],
+)
+```
+
+`FileSystem` includes write, edit, and create tools. Setting
+`protected_patterns=['**']` makes every path under this root read-only, so those
+tools reject changes while read and search operations remain available.
+
+Without an application-provided tool that authorizes the path, the skill
+receives its instructions but cannot read bundled files. Skills does not inspect
+other tools or infer filesystem authority from tool names.
 
 ## Claude Code compatibility
 
@@ -116,8 +191,10 @@ Skills works with Pydantic AI's YAML/JSON agent spec:
 model: anthropic:claude-sonnet-4-6
 capabilities:
   - Skills:
-      directories:
-        - .agents/skills
+      directories: .agents/skills
+      include:
+        - invoice-review
+        - vat-policy
 ```
 
 ```python
@@ -133,15 +210,26 @@ The `[skills]` extra provides the same PyYAML parser used for direct constructio
 
 ```python {test="skip"}
 Skills(
-    directories: Sequence[str | Path],
+    directories: str | Path | Sequence[str | Path],
+    *,
+    include: Collection[str] | None = None,
+    exclude: Collection[str] = (),
 )
 ```
 
-- `directories` scans immediate child skill packages under the listed roots.
+- `directories` accepts one skill-library path or a sequence of paths and scans
+  immediate child skill packages.
+- `include` exposes only the named skills.
+- `exclude` hides the named skills.
 
 Malformed required metadata, invalid or mismatched names, duplicate skill names,
-missing roots, and non-directory roots fail during construction. Ordinary files and
-child directories without `SKILL.md` are ignored.
+unknown selections, missing roots, and non-directory roots fail during
+construction. Ordinary files and child directories without `SKILL.md` are
+ignored.
+
+Every selected skill uses its frontmatter `description` and is deferred
+individually. `Skills` is a composite and does not accept capability-level `id`,
+`description`, or `defer_loading` options.
 
 ## Further reading
 

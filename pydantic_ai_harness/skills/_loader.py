@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import re
-from collections.abc import Sequence
+from collections.abc import Collection, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -131,7 +131,12 @@ def load_skill(skill_file: Path) -> SkillDefinition:
     )
 
 
-def load_skill_libraries(directories: Sequence[str | Path]) -> tuple[SkillDefinition, ...]:
+def load_skill_libraries(
+    directories: Sequence[str | Path],
+    *,
+    include: Collection[str] | None,
+    exclude: Collection[str],
+) -> tuple[SkillDefinition, ...]:
     """Discover immediate child skill packages under explicit library roots."""
     roots: list[Path] = []
     seen_roots: set[Path] = set()
@@ -147,18 +152,45 @@ def load_skill_libraries(directories: Sequence[str | Path]) -> tuple[SkillDefini
         seen_roots.add(resolved)
         roots.append(root)
 
-    skills: list[SkillDefinition] = []
-    names: dict[str, Path] = {}
+    skill_files: list[Path] = []
     for root in roots:
-        skill_files = sorted(
-            (child / 'SKILL.md' for child in root.iterdir() if child.is_dir() and (child / 'SKILL.md').is_file()),
-            key=lambda path: path.parent.name,
+        skill_files.extend(
+            sorted(
+                (child / 'SKILL.md' for child in root.iterdir() if child.is_dir() and (child / 'SKILL.md').is_file()),
+                key=lambda path: path.parent.name,
+            )
         )
-        for skill_file in skill_files:
-            skill = load_skill(skill_file)
-            if previous := names.get(skill.name):
-                raise ValueError(f'Duplicate skill name {skill.name!r}: {previous} and {skill_file.resolve()}.')
-            names[skill.name] = skill_file.resolve()
-            skills.append(skill)
 
-    return tuple(skills)
+    available = frozenset(skill_file.parent.name for skill_file in skill_files)
+    _validate_selection('include', include, available)
+    _validate_selection('exclude', exclude, available)
+    selected = include if include is not None else available.difference(exclude)
+
+    selected_files: list[Path] = []
+    names: dict[str, Path] = {}
+    for skill_file in skill_files:
+        name = skill_file.parent.name
+        if name not in selected:
+            continue
+        resolved = skill_file.resolve()
+        if previous := names.get(name):
+            raise ValueError(f'Duplicate skill name {name!r}: {previous} and {resolved}.')
+        names[name] = resolved
+        selected_files.append(skill_file)
+
+    return tuple(load_skill(skill_file) for skill_file in selected_files)
+
+
+def _validate_selection(
+    name: str,
+    selected: Collection[str] | None,
+    available: Collection[str],
+) -> None:
+    if selected is None:
+        return
+    unknown = sorted(set(selected).difference(available))
+    if not unknown:
+        return
+    noun = 'skill' if len(unknown) == 1 else 'skills'
+    available_text = ', '.join(sorted(available)) or '(none)'
+    raise ValueError(f'Unknown {noun} in {name}: {", ".join(unknown)}. Available skills: {available_text}.')
