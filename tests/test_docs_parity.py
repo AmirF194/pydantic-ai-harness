@@ -96,7 +96,7 @@ _EXPERIMENTAL_MARKERS = ('HarnessExperimentalWarning', 'removed in any release',
 # Lifecycle hook names must not lead a page -- mechanism goes below the purpose.
 _LEAD_HOOK_NAMES = ('before_model_request', 'after_model_request', 'before_tool_execute', 'after_tool_execute')
 # ClassName-style headings are a smell, except where the class name IS the name.
-_ALLOWED_CLASSNAME_HEADINGS = {'FileSystem'}
+_ALLOWED_CLASSNAME_HEADINGS = {'FileSystem', 'LocalStack'}
 _FORBIDDEN_HEADINGS = {'overflow', 'authoring', 'overflow capability', 'compaction capabilities'}
 
 
@@ -120,6 +120,7 @@ _CAPABILITY_PAGE_META = {
     'context.md': ('context', 'Context'),
     'pydantic-ai-docs.md': ('docs', 'Pydantic AI Docs'),
     'exa-search.md': ('exa', 'Exa Search'),
+    'macroscope.md': ('macroscope', 'Macroscope'),
     'compaction.md': ('compaction', 'Compaction'),
     'overflowing-tool-output.md': ('overflowing_tool_output', 'Overflowing Tool Output'),
     'cache-stability.md': ('cache_stability', 'Cache Stability Monitor'),
@@ -131,6 +132,7 @@ _CAPABILITY_PAGE_META = {
     'planning.md': ('planning', 'Planning'),
     'runtime-authoring.md': ('runtime_authoring', 'Runtime Authoring'),
     'guardrails.md': ('guardrails', 'Input & Output Guardrails'),
+    'localstack.md': ('localstack', 'LocalStack'),
     'acp.md': ('experimental/acp', 'ACP (Agent Client Protocol)'),
 }
 

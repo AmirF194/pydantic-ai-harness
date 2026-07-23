@@ -44,7 +44,7 @@ agent = Agent(
 
 ## How recovery works
 
-`StepPersistence` saves a full-history snapshot at every step boundary. A compaction strategy that persists its edits (like `SummarizingCompaction`) carries those edits into *later* snapshots -- but the earlier snapshots of the same run were taken while the originals were still live. `SnapshotHistorySource` unions each run's snapshots in write order, keeping the first occurrence of every message (by content hash) and skipping derived summary artifacts, which recovers the originals plus everything compaction never touched.
+`StepPersistence` saves a full-history snapshot at every step boundary. A compaction strategy that persists its edits (like `SummarizingCompaction`) carries those edits into *later* snapshots -- but the earlier snapshots of the same run were taken while the originals were still live. `SnapshotHistorySource` unions each run's snapshots in write order, keeping the first occurrence of every message (by content hash) and skipping derived summary artifacts, which recovers the originals plus everything compaction never touched. Only `complete` snapshots contribute: `interrupted` captures (unsettled tool work, synthesized tool returns) are excluded by the stores' default read gate.
 
 The dedup keys off a content hash of each serialized message, not object identity: consecutive snapshots re-serialize the same growing history, and durable executors (Temporal, DBOS) re-instantiate messages between steps.
 

@@ -150,6 +150,19 @@ class TestSnapshotHistorySource:
         history = await SnapshotHistorySource(store).run_history(run_id='r1')
         assert history == [original]
 
+    async def test_interrupted_snapshots_stay_out_of_the_corpus(self) -> None:
+        store = InMemoryStepStore()
+        await store.register_run(RunRecord(run_id='r1'))
+        settled = _user('the settled SIGNAL detail')
+        frontier = _user('the unsettled FRONTIER detail')
+        await store.save_snapshot(ContinuableSnapshot(run_id='r1', step_index=0, messages=[settled]))
+        await store.save_snapshot(
+            ContinuableSnapshot(run_id='r1', step_index=1, messages=[settled, frontier], state='interrupted')
+        )
+
+        history = await SnapshotHistorySource(store).run_history(run_id='r1')
+        assert history == [settled]
+
     async def test_unknown_run_yields_empty(self) -> None:
         source = SnapshotHistorySource(InMemoryStepStore())
         assert await source.run_history(run_id='never-ran') == []

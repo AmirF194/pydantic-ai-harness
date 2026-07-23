@@ -26,6 +26,7 @@ from pydantic_ai_harness.step_persistence._types import (
     ContinuableSnapshot,
     EventKind,
     RunRecord,
+    SnapshotState,
     StepEvent,
     ToolEffectRecord,
     ToolEffectStatus,
@@ -73,6 +74,10 @@ class StepStore(Protocol):
 
     All methods are async so the same protocol covers in-memory stores and
     file/database stores that would otherwise block the event loop.
+
+    `latest_snapshot` returns the newest snapshot whose `state` is
+    `complete`; with `include_interrupted=True` it returns the newest
+    snapshot regardless of state (see `SnapshotState`).
     """
 
     async def register_run(self, record: RunRecord) -> None: ...  # pragma: no cover
@@ -99,7 +104,9 @@ class StepStore(Protocol):
 
     async def save_snapshot(self, snapshot: ContinuableSnapshot) -> None: ...  # pragma: no cover
 
-    async def latest_snapshot(self, *, run_id: str) -> ContinuableSnapshot | None: ...  # pragma: no cover
+    async def latest_snapshot(
+        self, *, run_id: str, include_interrupted: bool = False
+    ) -> ContinuableSnapshot | None: ...  # pragma: no cover
 
     async def record_tool_effect(self, record: ToolEffectRecord) -> None: ...  # pragma: no cover
 
@@ -148,19 +155,25 @@ class InMemoryStepStore:
     async def save_snapshot(self, snapshot: ContinuableSnapshot) -> None:
         self._snapshots[snapshot.run_id].append(snapshot)
 
-    async def latest_snapshot(self, *, run_id: str) -> ContinuableSnapshot | None:
+    async def latest_snapshot(self, *, run_id: str, include_interrupted: bool = False) -> ContinuableSnapshot | None:
         snaps = self._snapshots.get(run_id)
         if not snaps:
             return None
-        return snaps[-1]
+        for snap in reversed(snaps):
+            if include_interrupted or snap.state == 'complete':
+                return snap
+        return None
 
-    async def list_snapshots(self, *, run_id: str) -> list[ContinuableSnapshot]:
-        """Return all retained snapshots for `run_id` in write order.
+    async def list_snapshots(self, *, run_id: str, include_interrupted: bool = False) -> list[ContinuableSnapshot]:
+        """Return retained snapshots for `run_id` in write order.
 
-        Not part of the `StepStore` protocol: the `conversation_search`
-        capability consumes it through its narrower `SnapshotStore` protocol.
+        Mirrors the `latest_snapshot` gate: `interrupted` snapshots are skipped
+        unless `include_interrupted=True`. Not part of the `StepStore` protocol:
+        the `conversation_search` capability consumes it through its narrower
+        `SnapshotStore` protocol.
         """
-        return list(self._snapshots.get(run_id, ()))
+        snaps = self._snapshots.get(run_id, ())
+        return [snap for snap in snaps if include_interrupted or snap.state == 'complete']
 
     async def record_tool_effect(self, record: ToolEffectRecord) -> None:
         self._tool_effects[(record.run_id, record.tool_call_id)] = record
@@ -178,6 +191,19 @@ def _opt_str(value: object) -> str | None:
     if not isinstance(value, str):
         raise ValueError(f'expected str|None, got {type(value).__name__}')
     return value
+
+
+def _snapshot_state(value: object) -> SnapshotState:
+    """Parse a persisted snapshot `state`, defaulting missing values to `complete`.
+
+    Rows and files written before the field existed were all gate-checked
+    provider-valid, so `complete` is the correct reading for them.
+    """
+    if value is None or value == 'complete':
+        return 'complete'
+    if value == 'interrupted':
+        return 'interrupted'
+    raise ValueError(f'unknown snapshot state: {value!r}')
 
 
 _STR_STR_DICT_ADAPTER: TypeAdapter[dict[str, str]] = TypeAdapter(dict[str, str])
@@ -451,6 +477,7 @@ class FileStepStore:
             'parent_run_id': snapshot.parent_run_id,
             'agent_name': snapshot.agent_name,
             'timestamp': snapshot.timestamp.isoformat(),
+            'state': snapshot.state,
             'messages': messages_json,
         }
         seq = self._next_snapshot_seq(snap_dir)
@@ -475,8 +502,8 @@ class FileStepStore:
                 max_seq = seq
         return max_seq + 1
 
-    async def latest_snapshot(self, *, run_id: str) -> ContinuableSnapshot | None:
-        loaded = await anyio.to_thread.run_sync(self._sync_load_latest_snapshot, run_id)
+    async def latest_snapshot(self, *, run_id: str, include_interrupted: bool = False) -> ContinuableSnapshot | None:
+        loaded = await anyio.to_thread.run_sync(self._sync_load_latest_snapshot, run_id, include_interrupted)
         if loaded is None:
             return None
         data, messages_json = loaded
@@ -495,9 +522,12 @@ class FileStepStore:
             parent_run_id=_opt_str(data.get('parent_run_id')),
             agent_name=_opt_str(data.get('agent_name')),
             timestamp=datetime.fromisoformat(timestamp_raw),
+            state=_snapshot_state(data.get('state')),
         )
 
-    def _sync_load_latest_snapshot(self, run_id: str) -> tuple[dict[str, object], object] | None:
+    def _sync_load_latest_snapshot(
+        self, run_id: str, include_interrupted: bool
+    ) -> tuple[dict[str, object], object] | None:
         snap_dir = self._run_dir(run_id) / 'snapshots'
         if not snap_dir.exists():
             return None
@@ -507,26 +537,30 @@ class FileStepStore:
                 candidates.append((int(path.stem), path))
             except ValueError:
                 continue
-        if not candidates:
-            return None
-        _, latest_path = max(candidates, key=lambda c: c[0])
-        data = _load_json_object(latest_path.read_text(encoding='utf-8'))
-        messages_json = data['messages']
-        return data, messages_json
+        for _, path in sorted(candidates, key=lambda c: c[0], reverse=True):
+            data = _load_json_object(path.read_text(encoding='utf-8'))
+            if include_interrupted or _snapshot_state(data.get('state')) == 'complete':
+                return data, data['messages']
+        return None
 
-    async def list_snapshots(self, *, run_id: str) -> list[ContinuableSnapshot]:
-        """Return all retained snapshots for `run_id` in write order.
+    async def list_snapshots(self, *, run_id: str, include_interrupted: bool = False) -> list[ContinuableSnapshot]:
+        """Return retained snapshots for `run_id` in write order.
 
-        Snapshots that fail to read or parse are skipped and logged, so one
-        damaged file does not hide the rest of the run's history. Not part of
-        the `StepStore` protocol: the `conversation_search` capability consumes
-        it through its narrower `SnapshotStore` protocol.
+        Mirrors the `latest_snapshot` gate: `interrupted` snapshots are skipped
+        unless `include_interrupted=True`. Snapshots that fail to read or parse
+        are skipped and logged, so one damaged file does not hide the rest of
+        the run's history. Not part of the `StepStore` protocol: the
+        `conversation_search` capability consumes it through its narrower
+        `SnapshotStore` protocol.
         """
         texts = await anyio.to_thread.run_sync(self._sync_read_snapshot_texts, run_id)
         snapshots: list[ContinuableSnapshot] = []
         for text in texts:
             try:
                 data = _load_json_object(text)
+                state = _snapshot_state(data.get('state'))
+                if state == 'interrupted' and not include_interrupted:
+                    continue
                 messages_json = data['messages']
                 if self._media_store is not None:
                     messages_json = await restore_media(messages_json, media_store=self._media_store)
@@ -544,6 +578,7 @@ class FileStepStore:
                         parent_run_id=_opt_str(data.get('parent_run_id')),
                         agent_name=_opt_str(data.get('agent_name')),
                         timestamp=datetime.fromisoformat(timestamp_raw),
+                        state=state,
                     )
                 )
             except Exception:
@@ -647,6 +682,7 @@ CREATE TABLE IF NOT EXISTS snapshots (
     parent_run_id TEXT,
     agent_name TEXT,
     timestamp TEXT NOT NULL,
+    state TEXT NOT NULL DEFAULT 'complete',
     messages TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_snapshots_run ON snapshots(run_id, seq);
@@ -744,8 +780,29 @@ class SqliteStepStore:
         if self._schema_ready:
             return
         conn.executescript(_SQLITE_SCHEMA)
+        # Databases created before the `state` column existed: `CREATE TABLE
+        # IF NOT EXISTS` keeps their old shape, so add the column here. The
+        # default backfills existing rows as `complete`, which is correct --
+        # the gated design only ever wrote provider-valid snapshots.
+        # Attempt-and-catch rather than a `PRAGMA table_info` pre-check: two
+        # store instances migrating the same old file concurrently would both
+        # pass the pre-check and the loser's `ALTER` would raise. Only a column
+        # that is already there is benign, so confirm that is what happened --
+        # a locked or readonly database raises the same `OperationalError`, and
+        # swallowing it would mark the schema ready while `state` is still
+        # missing, with every later snapshot read failing on `no such column:
+        # state` and `_schema_ready` never letting the migration retry.
+        try:
+            conn.execute("ALTER TABLE snapshots ADD COLUMN state TEXT NOT NULL DEFAULT 'complete'")
+        except sqlite3.OperationalError:
+            if 'state' not in self._snapshot_columns(conn):
+                raise
         conn.commit()
         self._schema_ready = True
+
+    @staticmethod
+    def _snapshot_columns(conn: sqlite3.Connection) -> set[str]:
+        return {row[1] for row in conn.execute('PRAGMA table_info(snapshots)')}
 
     async def register_run(self, record: RunRecord) -> None:
         await anyio.to_thread.run_sync(self._sync_register_run, record)
@@ -882,8 +939,8 @@ class SqliteStepStore:
             self._ensure_schema(conn)
             conn.execute(
                 'INSERT INTO snapshots ('
-                'run_id, step_index, conversation_id, parent_run_id, agent_name, timestamp, messages'
-                ') VALUES (?, ?, ?, ?, ?, ?, ?)',
+                'run_id, step_index, conversation_id, parent_run_id, agent_name, timestamp, state, messages'
+                ') VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
                 (
                     snapshot.run_id,
                     snapshot.step_index,
@@ -891,17 +948,18 @@ class SqliteStepStore:
                     snapshot.parent_run_id,
                     snapshot.agent_name,
                     snapshot.timestamp.isoformat(),
+                    snapshot.state,
                     json.dumps(messages_json),
                 ),
             )
         finally:
             self._maybe_close(conn)
 
-    async def latest_snapshot(self, *, run_id: str) -> ContinuableSnapshot | None:
-        row = await anyio.to_thread.run_sync(self._sync_load_latest_snapshot, run_id)
+    async def latest_snapshot(self, *, run_id: str, include_interrupted: bool = False) -> ContinuableSnapshot | None:
+        row = await anyio.to_thread.run_sync(self._sync_load_latest_snapshot, run_id, include_interrupted)
         if row is None:
             return None
-        step_index, conv_id, parent_id, agent_name, timestamp_iso, messages_json_text = row
+        step_index, conv_id, parent_id, agent_name, timestamp_iso, state, messages_json_text = row
         messages_json: object = json.loads(messages_json_text)
         if self._media_store is not None:
             messages_json = await restore_media(messages_json, media_store=self._media_store)
@@ -914,24 +972,27 @@ class SqliteStepStore:
             parent_run_id=parent_id,
             agent_name=agent_name,
             timestamp=datetime.fromisoformat(timestamp_iso),
+            state=state,
         )
 
     def _sync_load_latest_snapshot(
-        self, run_id: str
-    ) -> tuple[int, str | None, str | None, str | None, str, str] | None:
+        self, run_id: str, include_interrupted: bool
+    ) -> tuple[int, str | None, str | None, str | None, str, SnapshotState, str] | None:
         conn = self._open()
         try:
             self._ensure_schema(conn)
-            row = conn.execute(
-                'SELECT step_index, conversation_id, parent_run_id, agent_name, timestamp, messages '
-                'FROM snapshots WHERE run_id = ? ORDER BY seq DESC LIMIT 1',
-                (run_id,),
-            ).fetchone()
+            sql = (
+                'SELECT step_index, conversation_id, parent_run_id, agent_name, timestamp, state, messages '
+                'FROM snapshots WHERE run_id = ?'
+            )
+            if not include_interrupted:
+                sql += " AND state = 'complete'"
+            row = conn.execute(sql + ' ORDER BY seq DESC LIMIT 1', (run_id,)).fetchone()
         finally:
             self._maybe_close(conn)
         if row is None:
             return None
-        step_index, conv_id, parent_id, agent_name, timestamp_iso, messages_json_text = row
+        step_index, conv_id, parent_id, agent_name, timestamp_iso, state_raw, messages_json_text = row
         if not (isinstance(step_index, int) and isinstance(timestamp_iso, str) and isinstance(messages_json_text, str)):
             raise ValueError('snapshot row has wrong types')
         return (
@@ -940,22 +1001,24 @@ class SqliteStepStore:
             _opt_str(parent_id),
             _opt_str(agent_name),
             timestamp_iso,
+            _snapshot_state(state_raw),
             messages_json_text,
         )
 
-    async def list_snapshots(self, *, run_id: str) -> list[ContinuableSnapshot]:
-        """Return all retained snapshots for `run_id` in write order.
+    async def list_snapshots(self, *, run_id: str, include_interrupted: bool = False) -> list[ContinuableSnapshot]:
+        """Return retained snapshots for `run_id` in write order.
 
-        Rows that fail to parse are skipped and logged, so one damaged row does
-        not hide the rest of the run's history. Not part of the `StepStore`
-        protocol: the `conversation_search` capability consumes it through its
-        narrower `SnapshotStore` protocol.
+        Mirrors the `latest_snapshot` gate: `interrupted` snapshots are skipped
+        unless `include_interrupted=True`. Rows that fail to parse are skipped
+        and logged, so one damaged row does not hide the rest of the run's
+        history. Not part of the `StepStore` protocol: the `conversation_search`
+        capability consumes it through its narrower `SnapshotStore` protocol.
         """
-        rows = await anyio.to_thread.run_sync(self._sync_load_snapshot_rows, run_id)
+        rows = await anyio.to_thread.run_sync(self._sync_load_snapshot_rows, run_id, include_interrupted)
         snapshots: list[ContinuableSnapshot] = []
         for row in rows:
             try:
-                step_index, conv_id, parent_id, agent_name, timestamp_iso, messages_json_text = row
+                step_index, conv_id, parent_id, agent_name, timestamp_iso, state_raw, messages_json_text = row
                 if not (
                     isinstance(step_index, int)
                     and isinstance(timestamp_iso, str)
@@ -975,21 +1038,24 @@ class SqliteStepStore:
                         parent_run_id=_opt_str(parent_id),
                         agent_name=_opt_str(agent_name),
                         timestamp=datetime.fromisoformat(timestamp_iso),
+                        state=_snapshot_state(state_raw),
                     )
                 )
             except Exception:
                 _logger.warning('Skipping unparsable snapshot row for run %s', run_id, exc_info=True)
         return snapshots
 
-    def _sync_load_snapshot_rows(self, run_id: str) -> list[tuple[object, ...]]:
+    def _sync_load_snapshot_rows(self, run_id: str, include_interrupted: bool) -> list[tuple[object, ...]]:
         conn = self._open()
         try:
             self._ensure_schema(conn)
-            rows = conn.execute(
-                'SELECT step_index, conversation_id, parent_run_id, agent_name, timestamp, messages '
-                'FROM snapshots WHERE run_id = ? ORDER BY seq ASC',
-                (run_id,),
-            ).fetchall()
+            sql = (
+                'SELECT step_index, conversation_id, parent_run_id, agent_name, timestamp, state, messages '
+                'FROM snapshots WHERE run_id = ?'
+            )
+            if not include_interrupted:
+                sql += " AND state = 'complete'"
+            rows = conn.execute(sql + ' ORDER BY seq ASC', (run_id,)).fetchall()
         finally:
             self._maybe_close(conn)
         return rows

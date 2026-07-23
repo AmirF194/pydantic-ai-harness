@@ -115,6 +115,10 @@ class SnapshotHistorySource:
     summary. Iterating snapshots in write order and keeping the first occurrence of
     every message (by content hash, skipping summary artifacts) yields the originals
     plus everything compaction never touched.
+
+    The shipped stores' `list_snapshots` defaults to `complete` snapshots only
+    (mirroring `latest_snapshot`), so `interrupted` captures -- which can carry
+    unsettled tool work and synthesized tool returns -- stay out of the corpus.
     """
 
     def __init__(self, store: SnapshotStore) -> None:
