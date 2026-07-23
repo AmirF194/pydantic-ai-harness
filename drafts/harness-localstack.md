@@ -71,7 +71,8 @@ agent = Agent(
 ```
 
 `manage_container=True` starts a fresh LocalStack container for the run and stops it at
-the end. The agent's `aws` commands don't change. What changes is everything the
+the end. (It needs a free LocalStack auth token in `LOCALSTACK_AUTH_TOKEN`, or an older
+tokenless `image=`.) The agent's `aws` commands don't change. What changes is everything the
 account made expensive:
 
 - The four-minute deploy takes seconds. There's no remote control plane to wait on.
@@ -86,17 +87,17 @@ the next run, not an afternoon of cleanup. Nothing carries over between runs.
 A throwaway cloud does more than speed the agent up. It removes a constraint you
 didn't notice you were obeying.
 
-You would never point five agents at one AWS account at once. Five agents, one
-production, shared state, five times the bill: obviously not. But a cloud that costs
+You would never point ten agents at one AWS account at once. Ten agents, one
+production, shared state, ten times the bill: obviously not. But a cloud that costs
 nothing to run and starts clean every time takes that off the table. So don't give one
 agent one cloud. Give each agent its own.
 
-Say you want to choose a rate-limiter design, and you have three candidates: a DynamoDB
-token bucket, API Gateway usage plans, a Redis sliding window. Instead of asking one
-agent to reason about all three on paper, hand each to its own engineer with its own
-LocalStack, and let each build its design, deploy it, and exercise it against an
-identical clean cloud. Then compare the three that ran, on what happened rather than
-what was promised.
+Say you want to choose a rate-limiter design, and you have three candidates: a
+fixed-window counter, a sliding-window log, a token bucket, each backed by DynamoDB.
+Instead of asking one agent to reason about all three on paper, hand each to its own
+engineer with its own LocalStack, and let each build its design, deploy it, and drive
+requests through it until it should start rejecting. Then compare the three that ran, on
+what happened rather than what was promised.
 
 On real AWS you could run this. You never would. Here each engineer is an agent with
 its own container:
@@ -107,9 +108,9 @@ from pydantic_ai_harness.localstack import LocalStack
 from pydantic_ai_harness.dynamic_workflow import DynamicWorkflow
 
 designs = {
-    'dynamo': 'DynamoDB on-demand + a token bucket in the handler',
-    'apigw': 'API Gateway usage plans + API keys',
-    'redis': 'ElastiCache (Redis) sliding-window counter',
+    'fixed': 'DynamoDB fixed-window counter (conditional increment, reset each window)',
+    'sliding': 'DynamoDB sliding-window log (timestamped items with TTL, count the recent ones)',
+    'bucket': 'DynamoDB token bucket (conditional decrement, refill over time)',
 }
 
 # One engineer per design, each with its own throwaway cloud on its own port.
@@ -119,9 +120,9 @@ engineers = [
         name=f'build_{key}',
         description=f'Builds and tests one design: {spec}',
         instructions=(
-            'Deploy your design to your LocalStack with the AWS CLI, push traffic through '
-            'it until it should start rejecting, and report whether it holds the limit, '
-            'the errors it returns, and the IAM it needs.'
+            'Deploy your design to your LocalStack with the AWS CLI, send requests through '
+            'it past the limit, and report whether it actually starts rejecting and the '
+            'DynamoDB calls it takes to decide.'
         ),
         capabilities=[
             LocalStack(manage_container=True, endpoint_url=f'http://localhost.localstack.cloud:{port}'),
@@ -137,9 +138,9 @@ judge = Agent(
 )
 
 architect = Agent(
-    'anthropic:claude-opus-4-7',
+    'anthropic:claude-opus-4-8',
     instructions='Have each design built and tested in parallel, then recommend the one the evidence supports.',
-    capabilities=[DynamicWorkflow(agents=[*engineers, judge], max_agent_calls=12)],
+    capabilities=[DynamicWorkflow(agents=[*engineers, judge], max_agent_calls=20)],
 )
 ```
 
@@ -153,23 +154,23 @@ script:
 ```python
 import asyncio
 
-prompt = 'Deploy your design, push traffic until it should start rejecting, and report whether it holds the limit and the IAM it needs.'
+prompt = 'Deploy your design, send requests past the limit, and report whether it actually starts rejecting.'
 
 reports = await asyncio.gather(
-    build_dynamo(task=prompt),
-    build_apigw(task=prompt),
-    build_redis(task=prompt),
+    build_fixed(task=prompt),
+    build_sliding(task=prompt),
+    build_bucket(task=prompt),
 )
 
-await judge(task='Recommend one rate-limiter design, citing which held the limit and the IAM each needed:\n\n'
+await judge(task='Recommend one rate-limiter design, citing which actually held the limit:\n\n'
                  + '\n\n---\n\n'.join(reports))
 ```
 
 Three real deployments, built and pushed past their limits in parallel, each on its own
-cloud, judged on what actually held. The whole tree runs inside one `run_workflow` call. The architect's
-context never fills with deploy logs; only the recommendation comes back. The
-choreography moved out of the conversation and into code, and the cloud it runs on is
-one you can afford three of.
+cloud, judged on what actually held. The whole tree runs inside one `run_workflow` call,
+so only the recommendation reaches the architect, not the deploy logs. The choreography
+moved out of the conversation and into code, and the cloud it runs on is one you can
+afford three of.
 
 The disposable cloud removes the cloud bill, but the model still costs tokens.
 `max_agent_calls` caps the number of sub-agent runs exactly, even under fan-out, so a
@@ -182,8 +183,8 @@ between steps and resumes after a crash. Pydantic AI's durable execution and
 `DynamicWorkflow`'s durable workflows are heading there; no harness ships it end to end
 yet.
 
-For now the smaller thing is enough. The agent can be wrong. It can drop the table,
-over-scope the IAM, ship the design that folds when the traffic climbs, and find out in
+For now the smaller thing is enough. The agent can be wrong. It can drop the wrong
+table, ship a limiter that never rejects, break the deploy outright, and find out in
 seconds, for free, on a cloud that starts clean the next time you run it.
 
 "You're absolutely right" stops being the sentence you brace for. It becomes a
