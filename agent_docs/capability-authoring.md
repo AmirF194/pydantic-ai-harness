@@ -135,6 +135,36 @@ The `localstack` capability's `localstack-integration` job is the reference for
 this shape. Whether the heavy job blocks merges (listed in `check`'s `needs`) or
 only signals is the capability owner's call; state which in the PR.
 
+## External-Service Assumptions And Refresh
+
+A capability that wraps an external service, image, or CLI (`localstack`,
+`modal_sandbox`, `exa`, `macroscope`) depends on facts that live outside this
+repo and change on the vendor's schedule: auth requirements, version-gated
+behavior, default ports, endpoints, wire formats. When one of those shifts the
+capability can break in a way local tests miss (the emulator or API is mocked or
+absent). Record the load-bearing assumptions so a future agent can refresh them
+deliberately instead of rediscovering them from a failure.
+
+For each such capability, keep a short block -- a module docstring or a comment
+near the constants it pins -- that lists each external assumption with the date
+it was last verified and a link to the authoritative source, and says how to
+re-check it. Before changing auth, version, or protocol handling, re-verify the
+relevant assumptions against those sources first. When you confirm one still
+holds, bump its date; when it changed, update the code and the date together.
+
+`localstack` is the worked example (verified 2026-07):
+
+- The default `localstack/localstack` image requires `LOCALSTACK_AUTH_TOKEN` to
+  start since LocalStack 2026.03.0; a pre-2026.03.0 tag (for example `4.x`) runs
+  tokenless. Source: <https://docs.localstack.cloud/aws/getting-started/auth-token/>.
+- Edge port `4566`; health at `/_localstack/health`; `localhost.localstack.cloud`
+  resolves to `127.0.0.1` (needed for S3 subdomain-style addressing). Source:
+  <https://docs.localstack.cloud/aws/capabilities/config/configuration/>.
+- The AWS CLI accepts any unambiguous prefix of a global option (`--endpoint`
+  for `--endpoint-url`) and the last value wins, so the command guard rejects
+  prefixes of forbidden globals, not just exact names. Re-verify against the
+  installed `aws` CLI if that guard changes.
+
 ## Docs
 
 Each user-facing capability needs docs close to the code. Explain:
