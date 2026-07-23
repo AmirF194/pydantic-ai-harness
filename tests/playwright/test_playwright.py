@@ -420,14 +420,13 @@ class TestPlaywrightBrowserTools:
     async def test_navigate_truncates_long_page_text(self) -> None:
         toolset = _toolset(_FakePage(body='X' * 40), max_content_tokens=1)
         result = await toolset.navigate('https://example.com/')
-        assert isinstance(result, str)
-        assert 'tool output truncated at 4 characters' in result
+        assert result == 'URL:'
 
     async def test_navigate_truncates_url_and_title_within_shared_budget(self) -> None:
         url = f'https://example.com/{"u" * 40}'
         toolset = _toolset(_FakePage(title='T' * 40), max_content_tokens=2)
         result = await toolset.navigate(url)
-        assert result == 'URL: htt\n[... tool output truncated at 8 characters]'
+        assert result == 'URL: htt'
 
     async def test_navigate_bounces_on_redirect_to_disallowed_host(self) -> None:
         page = _FakePage(redirect_to='https://evil.com/landing')
@@ -472,6 +471,12 @@ class TestPlaywrightBrowserTools:
         await toolset.click('-10,-20')
         assert page.mouse.calls == [('click', -10, -20)]
 
+    async def test_click_malformed_coordinates_are_treated_as_css(self) -> None:
+        page = _FakePage()
+        await _toolset(page).click('--1,2')
+        assert page.clicked == ['--1,2']
+        assert page.mouse.calls == []
+
     async def test_click_bounces_off_disallowed_domain(self) -> None:
         page = _FakePage(url='https://evil.com/landing')
         toolset = _toolset(page, allowed_domains=['example.com'])
@@ -503,7 +508,7 @@ class TestPlaywrightBrowserTools:
     async def test_screenshot_bounds_text_without_dropping_image(self) -> None:
         page = _FakePage(url=f'https://example.com/{"u" * 40}')
         result = await _toolset(page, max_content_tokens=1).screenshot()
-        assert result.return_value == 'Scre\n[... tool output truncated at 4 characters]'
+        assert result.return_value == 'Scre'
         assert result.content is not None
         image = result.content[0]
         assert isinstance(image, BinaryContent)
@@ -525,8 +530,7 @@ class TestPlaywrightBrowserTools:
     async def test_get_text_selector_truncated(self) -> None:
         toolset = _toolset(_FakePage(element_text='Y' * 40), max_content_tokens=1)
         result = await toolset.get_text('article')
-        assert result.startswith('Y' * 4)
-        assert 'tool output truncated at 4 characters' in result
+        assert result == 'Y' * 4
 
     async def test_scroll_window(self) -> None:
         page = _FakePage(body='scrolled')
@@ -585,7 +589,13 @@ class TestPlaywrightBrowserTools:
     )
     async def test_execute_js_truncates_string_and_serialized_results(self, value: object, prefix: str) -> None:
         toolset = _toolset(_FakePage(evaluate_result=value), max_content_tokens=1)
-        assert await toolset.execute_js('largeResult') == (f'{prefix}\n[... tool output truncated at 4 characters]')
+        assert await toolset.execute_js('largeResult') == prefix
+
+    def test_truncation_marker_fits_inside_budget(self) -> None:
+        result = toolset_module._truncate('X' * 200, 80)
+        assert len(result) == 80
+        assert result.endswith('[... tool output truncated at 80 characters]')
+        assert toolset_module._truncate('content', 0) == ''
 
     async def test_execute_js_null_result(self) -> None:
         toolset = _toolset(_FakePage(evaluate_result=None))

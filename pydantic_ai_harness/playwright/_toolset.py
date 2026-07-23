@@ -100,7 +100,10 @@ def _truncate(text: str, max_chars: int) -> str:
     """Cap tool output at `max_chars`, keeping the head where the substance sits."""
     if len(text) <= max_chars:
         return text
-    return f'{text[:max_chars]}\n[... tool output truncated at {max_chars} characters]'
+    marker = f'\n[... tool output truncated at {max_chars} characters]'
+    if len(marker) >= max_chars:
+        return text[:max_chars]
+    return f'{text[: max_chars - len(marker)]}{marker}'
 
 
 @dataclass
@@ -267,8 +270,14 @@ class PlaywrightBrowserToolset(FunctionToolset[AgentDepsT]):
         async with self._serialize_operation():
             page = await self._state.ensure_page()
             parts = selector.split(',', 1)
-            if len(parts) == 2 and all(part.strip().lstrip('-').isdigit() for part in parts):
-                await page.mouse.click(int(parts[0]), int(parts[1]))
+            coordinates: tuple[int, int] | None = None
+            if len(parts) == 2:
+                try:
+                    coordinates = (int(parts[0]), int(parts[1]))
+                except ValueError:
+                    pass
+            if coordinates is not None:
+                await page.mouse.click(*coordinates)
             else:
                 await page.click(selector, timeout=self._timeout_ms)
             await page.wait_for_load_state('domcontentloaded')
