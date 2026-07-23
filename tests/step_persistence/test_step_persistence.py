@@ -8,12 +8,14 @@ agent run (e.g. the path-traversal guard on `FileStepStore`).
 from __future__ import annotations
 
 import json
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 import pytest
-from pydantic_ai import Agent, RunContext
+from pydantic_ai import Agent, CallToolsNode, ModelRequestNode, ModelRetry, RunContext
 from pydantic_ai._agent_graph import GraphAgentState  # pyright: ignore[reportPrivateUsage]
+from pydantic_ai.capabilities import AbstractCapability
 from pydantic_ai.messages import (
     ModelMessage,
     ModelRequest,
@@ -25,6 +27,7 @@ from pydantic_ai.messages import (
     UserPromptPart,
 )
 from pydantic_ai.models import ModelRequestContext, ModelRequestParameters
+from pydantic_ai.models.function import AgentInfo, FunctionModel
 from pydantic_ai.models.test import TestModel
 from pydantic_ai.run import AgentRunResult
 from pydantic_ai.tools import ToolDefinition
@@ -61,6 +64,7 @@ def build_run_context(
     run_id: str | None = None,
     run_step: int = 0,
     conversation_id: str | None = None,
+    messages: list[ModelMessage] | None = None,
 ) -> RunContext[Any]:
     """Fabricate a minimal `RunContext` for direct hook invocation."""
     return RunContext[Any](
@@ -68,7 +72,7 @@ def build_run_context(
         model=TestModel(),
         usage=RunUsage(),
         prompt=None,
-        messages=[],
+        messages=messages if messages is not None else [],
         run_step=run_step,
         run_id=run_id,
         conversation_id=conversation_id,
@@ -83,6 +87,26 @@ def make_simple_agent(capabilities: list[Any]) -> Agent[object, str]:
         return a + b
 
     return agent
+
+
+class WorkerInterruptedError(RuntimeError):
+    """Simulate a worker stopping before its second model request."""
+
+
+@dataclass
+class InterruptBeforeSecondModelRequest(AbstractCapability[object]):
+    requests: int = 0
+
+    async def before_model_request(
+        self,
+        ctx: RunContext[object],
+        request_context: ModelRequestContext,
+    ) -> ModelRequestContext:
+        del ctx
+        self.requests += 1
+        if self.requests == 2:
+            raise WorkerInterruptedError('worker stopped after the completed tool call')
+        return request_context
 
 
 async def first_run_id(store: StepStore) -> str:
@@ -658,6 +682,55 @@ class TestFileStepStore:
 
 
 class TestStepPersistenceCapability:
+    async def test_interrupted_run_resumes_from_completed_tool_boundary(self) -> None:
+        store = InMemoryStepStore()
+        interrupt = InterruptBeforeSecondModelRequest()
+        agent = make_simple_agent(
+            [
+                StepPersistence(store=store, run_id='interrupted-read'),
+                interrupt,
+            ]
+        )
+
+        with pytest.raises(WorkerInterruptedError, match='completed tool call'):
+            await agent.run('add 1 and 2')
+
+        history = await continue_run(store, run_id='interrupted-read')
+        effect = await store.get_tool_effect(
+            run_id='interrupted-read',
+            tool_call_id='pyd_ai_tool_call_id__add',
+        )
+
+        assert is_provider_valid(history) is True
+        assert any(
+            isinstance(part, ToolReturnPart)
+            for message in history
+            if isinstance(message, ModelRequest)
+            for part in message.parts
+        )
+        assert effect is not None
+        assert effect.status == 'completed'
+
+    async def test_run_stream_snapshot_keeps_the_final_response(self) -> None:
+        """A completed `run_stream` resumes from its final assistant turn, not the tool boundary.
+
+        `run_stream` ends through `SetFinalResult`, not a terminal
+        `CallToolsNode`, and its final response reaches the history only after
+        that boundary -- so no `after_node_run` save can carry it and the
+        `after_run` fallback is the only writer that sees the whole run.
+        """
+        store = InMemoryStepStore()
+        agent = make_simple_agent([StepPersistence(store=store, run_id='streamed')])
+
+        async with agent.run_stream('add 1 and 2') as result:
+            await result.get_output()
+
+        snapshot = await store.latest_snapshot(run_id='streamed')
+        assert snapshot is not None
+        assert is_provider_valid(snapshot.messages) is True
+        assert isinstance(snapshot.messages[-1], ModelResponse)
+        assert snapshot.messages == result.all_messages()
+
     async def test_basic_run_records_lifecycle_and_snapshot(self) -> None:
         store = InMemoryStepStore()
         agent = make_simple_agent([StepPersistence(store=store, agent_name='librarian')])
@@ -1015,6 +1088,228 @@ class TestCrashMidToolCallContract:
         assert len(snap_after_crash.messages) == len(result.all_messages())
 
 
+class TestOnRunErrorSnapshot:
+    """`on_run_error` rescues a provider-valid resume point no snapshot captured (#253).
+
+    A provider-valid history can exist at a boundary that no snapshot records --
+    for instance the `CallToolsNode` after a text response, where output
+    validation raising skips its own `after_node_run`. `on_run_error` persists
+    the last such history, and skips when the crash left a dangling tool call --
+    so `latest_snapshot` never regresses to an unsendable point.
+
+    These run-level tests assert the resume point a failed run ends up with.
+    Since `after_node_run` folds the pending request into its `CallToolsNode`
+    snapshot (#373), the error paths are no longer the only writer of these
+    histories; `TestCapabilityHookBranches` pins each error hook's own save
+    directly.
+    """
+
+    async def test_rescues_provider_valid_history_when_next_model_request_raises(self) -> None:
+        """Issue #253 acceptance test: request 1 tool call, request 2 raises.
+
+        The run must end with the resolved tool cycle
+        `[prompt, response, tool-return]` as its resume point -- provider-valid,
+        no open tool calls. Since #373 the `CallToolsNode` boundary also saves
+        that history, so this asserts the outcome rather than which hook wrote
+        it; `test_on_model_request_error_saves_resumable_payload` pins the
+        error-path save on its own.
+        """
+        store = InMemoryStepStore()
+
+        def model(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+            prior_responses = [m for m in messages if isinstance(m, ModelResponse)]
+            if not prior_responses:
+                return ModelResponse(parts=[ToolCallPart('lookup', {}, tool_call_id='lookup-1')])
+            raise RuntimeError('provider down on request 2')
+
+        agent: Agent[object, str] = Agent(
+            FunctionModel(model),
+            capabilities=[StepPersistence(store=store, agent_name='delegate')],
+        )
+
+        @agent.tool_plain
+        def lookup() -> str:  # pyright: ignore[reportUnusedFunction]
+            return 'ok'
+
+        with pytest.raises(RuntimeError, match='provider down on request 2'):
+            await agent.run('go')
+
+        rid = await first_run_id(store)
+        assert 'run_failed' in [e.kind for e in await store.list_events(run_id=rid)]
+
+        snap = await store.latest_snapshot(run_id=rid)
+        assert snap is not None
+        assert is_provider_valid(snap.messages) is True
+        # The resolved tool cycle: the tool call has its return, no open calls.
+        assert any(
+            isinstance(part, ToolReturnPart) and part.tool_call_id == 'lookup-1'
+            for msg in snap.messages
+            if isinstance(msg, ModelRequest)
+            for part in msg.parts
+        )
+
+    async def test_rescues_text_response_when_output_validation_raises(self) -> None:
+        """Text response then a hard output-validation error: the clean tail is rescued.
+
+        The terminal `CallToolsNode` raises inside output validation before its
+        `after_node_run` fires; `on_run_error` captures the provider-valid
+        `[prompt, text-response]` history from the `after_node_run` boundary.
+        """
+        store = InMemoryStepStore()
+        agent: Agent[object, str] = Agent(
+            TestModel(custom_output_text='final answer'),
+            capabilities=[StepPersistence(store=store, agent_name='delegate')],
+        )
+
+        @agent.output_validator
+        def reject(value: str) -> str:  # pyright: ignore[reportUnusedFunction]
+            raise RuntimeError('validator down')
+
+        with pytest.raises(RuntimeError, match='validator down'):
+            await agent.run('answer please')
+
+        rid = await first_run_id(store)
+        assert 'run_failed' in [e.kind for e in await store.list_events(run_id=rid)]
+
+        snap = await store.latest_snapshot(run_id=rid)
+        assert snap is not None
+        assert is_provider_valid(snap.messages) is True
+        assert isinstance(snap.messages[-1], ModelResponse)
+        assert any(isinstance(part, TextPart) for part in snap.messages[-1].parts)
+
+    async def test_skips_snapshot_when_crash_leaves_dangling_tool_call(self) -> None:
+        """A crash mid-tool-call leaves a dangling call that is never a resume point."""
+        store = InMemoryStepStore()
+
+        def model(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+            return ModelResponse(parts=[ToolCallPart('boom', {}, tool_call_id='boom-1')])
+
+        agent: Agent[object, str] = Agent(
+            FunctionModel(model),
+            capabilities=[StepPersistence(store=store, agent_name='delegate')],
+        )
+
+        @agent.tool_plain
+        def boom() -> str:  # pyright: ignore[reportUnusedFunction]
+            raise ValueError('kaboom')
+
+        with pytest.raises(ValueError, match='kaboom'):
+            await agent.run('go')
+
+        rid = await first_run_id(store)
+        assert 'run_failed' in [e.kind for e in await store.list_events(run_id=rid)]
+        # The only history reached is the bare prompt (skipped) and the dangling
+        # `boom` call (provider-invalid, skipped): no false continuation point.
+        assert await store.latest_snapshot(run_id=rid) is None
+
+    async def test_does_not_regress_to_stale_stash_after_model_request_save(self) -> None:
+        """A stale completed-node stash must not supersede a newer resolved-cycle save.
+
+        req1 text -> output-validation `ModelRetry` (run continues; the text
+        history is stashed into `latest_node_history`). req2 tool call resolves
+        cleanly. req3 raises: `on_model_request_error` saves the newer resolved
+        tool cycle, and `on_run_error` must not re-save the older text stash
+        over it (both save sites write to the same store, and `latest_snapshot`
+        returns the last write).
+        """
+        store = InMemoryStepStore()
+
+        def model(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+            n_resp = len([m for m in messages if isinstance(m, ModelResponse)])
+            if n_resp == 0:
+                return ModelResponse(parts=[TextPart('draft')])
+            if n_resp == 1:
+                return ModelResponse(parts=[ToolCallPart('lookup', {}, tool_call_id='lookup-1')])
+            raise RuntimeError('provider down on request 3')
+
+        agent: Agent[object, str] = Agent(
+            FunctionModel(model),
+            capabilities=[StepPersistence(store=store, agent_name='delegate')],
+            output_type=str,
+        )
+
+        @agent.output_validator
+        def gate(value: str) -> str:  # pyright: ignore[reportUnusedFunction]
+            raise ModelRetry('call a tool first')
+
+        @agent.tool_plain
+        def lookup() -> str:  # pyright: ignore[reportUnusedFunction]
+            return 'ok'
+
+        with pytest.raises(RuntimeError, match='provider down on request 3'):
+            await agent.run('go')
+
+        rid = await first_run_id(store)
+        snap = await store.latest_snapshot(run_id=rid)
+        assert snap is not None
+        assert is_provider_valid(snap.messages) is True
+        # The newest safe resume point is the resolved tool cycle, not the older text history.
+        assert any(
+            isinstance(part, ToolReturnPart) and part.tool_call_id == 'lookup-1'
+            for msg in snap.messages
+            if isinstance(msg, ModelRequest)
+            for part in msg.parts
+        )
+
+    async def test_rescues_newest_text_history_over_earlier_saved_snapshot(self) -> None:
+        """`on_run_error` still saves its stash when it is newer than the store's latest snapshot.
+
+        Two text responses each pass an output-validation `ModelRetry`, then the
+        second validator raises hard. The first cycle already saved a snapshot;
+        the `on_run_error` stash (the newer text history) supersedes it.
+        """
+        store = InMemoryStepStore()
+
+        def model(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+            n_resp = len([m for m in messages if isinstance(m, ModelResponse)])
+            return ModelResponse(parts=[TextPart('v1' if n_resp == 0 else 'v2')])
+
+        agent: Agent[object, str] = Agent(
+            FunctionModel(model),
+            capabilities=[StepPersistence(store=store, agent_name='delegate')],
+            output_type=str,
+        )
+        calls = {'n': 0}
+
+        @agent.output_validator
+        def gate(value: str) -> str:  # pyright: ignore[reportUnusedFunction]
+            calls['n'] += 1
+            if calls['n'] == 1:
+                raise ModelRetry('retry once')
+            raise RuntimeError('validator down')
+
+        with pytest.raises(RuntimeError, match='validator down'):
+            await agent.run('go')
+
+        rid = await first_run_id(store)
+        snap = await store.latest_snapshot(run_id=rid)
+        assert snap is not None
+        assert is_provider_valid(snap.messages) is True
+        # The latest resume point is the newer history including `v2`, not the earlier `v1`-only snapshot.
+        assert any(
+            isinstance(part, TextPart) and part.content == 'v2'
+            for msg in snap.messages
+            if isinstance(msg, ModelResponse)
+            for part in msg.parts
+        )
+
+    async def test_on_run_error_without_stashed_history_saves_nothing(self) -> None:
+        """Direct-hook: no provider-valid boundary reached -> no snapshot, `run_failed` still emitted.
+
+        Covers the `stashed is None` branch -- `on_run_error` invoked before any
+        boundary refreshed `latest_node_history`.
+        """
+        store = InMemoryStepStore()
+        cap: StepPersistence[object] = StepPersistence(store=store)
+        ctx = build_run_context(run_id='r1', run_step=1)
+
+        with pytest.raises(RuntimeError, match='boom'):
+            await cap.on_run_error(ctx, error=RuntimeError('boom'))
+
+        assert await store.latest_snapshot(run_id='r1') is None
+        assert [e.kind for e in await store.list_events(run_id='r1')] == ['run_failed']
+
+
 # ---------------------------------------------------------------------------
 # Hook-level branches awkward to reach through Agent
 # ---------------------------------------------------------------------------
@@ -1032,6 +1327,25 @@ class TestCapabilityHookBranches:
         assert record is not None
         events = await store.list_events(run_id='configured')
         assert [e.kind for e in events] == ['run_started']
+
+    async def test_after_node_run_skips_snapshot_when_appended_request_leaves_history_invalid(self) -> None:
+        """The `CallToolsNode` candidate is still filtered through `is_provider_valid`.
+
+        Folding in `result.request` is what makes the ordinary boundary
+        provider-valid, but it is not assumed to: a request that does not carry
+        the pending tool return leaves an orphan `ToolCallPart`, so no snapshot
+        is saved.
+        """
+        store = InMemoryStepStore()
+        cap: StepPersistence[object] = StepPersistence(store=store)
+        response = ModelResponse(parts=[ToolCallPart(tool_name='add', args={}, tool_call_id='orphan')])
+        unmatched: list[ModelMessage] = [ModelRequest(parts=[UserPromptPart(content='hi')]), response]
+        ctx = build_run_context(deps=None, run_id='r1', messages=unmatched)
+        node_result = ModelRequestNode[Any, Any](ModelRequest(parts=[UserPromptPart(content='next')]))
+
+        assert await cap.after_node_run(ctx, node=CallToolsNode(response), result=node_result) is node_result
+
+        assert await store.latest_snapshot(run_id='r1') is None
 
     async def test_after_run_skips_snapshot_when_history_not_provider_valid(self) -> None:
         """`after_run` only persists a snapshot when the history is provider-valid."""
@@ -1094,6 +1408,38 @@ class TestCapabilityHookBranches:
         events = await store.list_events(run_id='r1')
         assert [e.kind for e in events] == ['model_request_failed']
         assert events[0].error is not None and 'nope' in events[0].error
+        assert await store.latest_snapshot(run_id='r1') is None
+
+    async def test_on_model_request_error_saves_resumable_payload(self) -> None:
+        """The failing request's payload is itself persisted as a resume point.
+
+        Pinned directly because the run-level `TestOnRunErrorSnapshot` cases no
+        longer isolate this hook: since #373 the `CallToolsNode` boundary saves
+        the same resolved-cycle history, so those assertions hold even with this
+        save removed.
+        """
+        store = InMemoryStepStore()
+        cap: StepPersistence[object] = StepPersistence(store=store)
+        ctx = build_run_context(deps=None, run_id='r1', run_step=4)
+        resumable: list[ModelMessage] = [
+            ModelRequest(parts=[UserPromptPart(content='hi')]),
+            ModelResponse(parts=[ToolCallPart(tool_name='add', args={}, tool_call_id='add-1')]),
+            ModelRequest(parts=[ToolReturnPart(tool_name='add', content=3, tool_call_id='add-1')]),
+        ]
+        request_context = ModelRequestContext(
+            model=ctx.model,
+            messages=resumable,
+            model_settings=None,
+            model_request_parameters=ModelRequestParameters(),
+        )
+
+        with pytest.raises(RuntimeError, match='nope'):
+            await cap.on_model_request_error(ctx, request_context=request_context, error=RuntimeError('nope'))
+
+        snap = await store.latest_snapshot(run_id='r1')
+        assert snap is not None
+        assert snap.step_index == 4
+        assert snap.messages == resumable
 
     async def test_for_run_returns_self_when_resolution_is_no_op(self) -> None:
         """When `run_id` is explicit and no contextvar is set, `for_run` returns `self`."""
