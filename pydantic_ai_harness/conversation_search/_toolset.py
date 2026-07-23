@@ -86,7 +86,7 @@ def _bm25_score(
     params: _Bm25Params,
 ) -> float:
     dl = len(doc_tokens)
-    if dl == 0 or avgdl == 0:  # pragma: no cover - every rendered doc carries its `[index]` token, so dl >= 1
+    if dl == 0 or avgdl == 0:
         return 0.0
 
     tf_map: dict[str, int] = {}
@@ -178,12 +178,21 @@ def _format_message(message: ModelMessage, *, truncate: bool) -> str:
 
 
 def _format_messages(messages: list[ModelMessage], *, truncate: bool) -> list[str]:
-    """Render messages to numbered lines, index-aligned with `messages`."""
-    lines: list[str] = []
-    for index, message in enumerate(messages):
-        formatted = _format_message(message, truncate=truncate)
-        lines.append(f'[{index}] {formatted}')
-    return lines
+    """Render messages to text lines, index-aligned with `messages`."""
+    return [_format_message(message, truncate=truncate) for message in messages]
+
+
+def _display_lines(messages: list[ModelMessage]) -> list[str]:
+    """Render the numbered excerpt lines shown to the model.
+
+    The `[index]` prefix lives only here, not in the indexed rendering: BM25
+    would otherwise treat each ordinal as a rare, high-IDF token, letting a
+    numeric query match a message by position instead of content. A message
+    with no renderable text (e.g. a thinking-only response) gets a placeholder
+    so excerpts do not show bare numbered blanks.
+    """
+    lines = _format_messages(messages, truncate=True)
+    return [f'[{index}] {line or "[no text content]"}' for index, line in enumerate(lines)]
 
 
 @dataclass
@@ -261,7 +270,9 @@ class ConversationSearchToolset(FunctionToolset[AgentDepsT]):
 
         results: list[str] = []
         shown: set[tuple[int, int]] = set()
-        for doc_idx, score in ranked[: self._max_matches]:
+        for doc_idx, score in ranked:
+            if len(results) == self._max_matches:
+                break
             section_idx, line_idx = locations[doc_idx]
             if (section_idx, line_idx) in shown:
                 continue
@@ -293,7 +304,7 @@ class ConversationSearchToolset(FunctionToolset[AgentDepsT]):
                 _RunSection(
                     label=label,
                     index_lines=_format_messages(messages, truncate=False),
-                    display_lines=_format_messages(messages, truncate=True),
+                    display_lines=_display_lines(messages),
                 )
             )
         return sections

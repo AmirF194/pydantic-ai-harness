@@ -386,3 +386,33 @@ class TestSearchTool:
         await _seed_run(store, 'r1', corpus)
         rendered = await _search(SnapshotHistorySource(store), 'needle', max_matches=1, context_lines=0)
         assert rendered.count('[score:') == 1
+
+    async def test_index_prefix_is_not_a_searchable_token(self) -> None:
+        # The `[N]` excerpt numbering must stay display-only: indexed, each
+        # ordinal would be a rare high-IDF token and numeric queries would
+        # match messages by position instead of content.
+        store = InMemoryStepStore()
+        await _seed_run(store, 'r1', [_user('alpha'), _user('beta'), _user('gamma')])
+        rendered = await _search(SnapshotHistorySource(store), '1')
+        assert 'No matches' in rendered
+
+    async def test_unrenderable_message_gets_placeholder_and_stays_unindexed(self) -> None:
+        store = InMemoryStepStore()
+        thinking = ModelResponse(parts=[ThinkingPart(content='private reasoning')])
+        await _seed_run(store, 'r1', [_user('the needle target'), thinking, _user('after')])
+
+        rendered = await _search(SnapshotHistorySource(store), 'needle', context_lines=5)
+        assert '[1] [no text content]' in rendered
+        # Neither the thinking text nor the placeholder wording is searchable.
+        assert 'No matches' in await _search(SnapshotHistorySource(store), 'reasoning')
+        assert 'No matches' in await _search(SnapshotHistorySource(store), 'content')
+
+    async def test_overlap_skip_backfills_lower_ranked_matches(self) -> None:
+        # Two top-ranked matches sharing one excerpt window must not exhaust
+        # `max_matches`: distinct lower-ranked matches take the freed slots.
+        store = InMemoryStepStore()
+        await _seed_run(store, 'r1', [_user('needle needle needle first'), _user('needle needle needle second')])
+        await _seed_run(store, 'r2', [_user('a single needle far away')])
+        rendered = await _search(SnapshotHistorySource(store), 'needle', max_matches=2, context_lines=5)
+        assert rendered.count('[score:') == 2
+        assert 'run: r2' in rendered
