@@ -47,6 +47,7 @@ jobs:
               - 'pydantic_ai_harness/localstack/**'
               - 'tests/localstack/**'
               - 'integration_tests/localstack/**'
+              - 'Makefile'
               - '.github/workflows/main.yml'
 
   lint:
