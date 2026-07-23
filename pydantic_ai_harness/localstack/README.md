@@ -135,7 +135,9 @@ starts and stops the container when it ends (even if the run raises). Each run
 gets its own container, so concurrent runs of one agent need distinct host ports
 or an externally managed instance (`manage_container=False`).
 
-Managed containers bind to `127.0.0.1` by default. The default image is
+Managed containers bind to `127.0.0.1` by default, reached through
+`localhost.localstack.cloud`. Set `host_address` to publish on a different
+address; a non-loopback value is then also used as the tool endpoint host. The default image is
 `localstack/localstack`, which since LocalStack 2026.03.0 is a single image that
 requires an auth token to start (a free Hobby/OSS token covers community usage).
 When `LOCALSTACK_AUTH_TOKEN` is set in the current process it is forwarded to the
