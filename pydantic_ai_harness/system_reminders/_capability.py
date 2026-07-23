@@ -250,6 +250,12 @@ class LLMReminder(Generic[AgentDepsT]):
     Like every dynamic reminder it is evaluated on every model request, so it issues one extra
     model call per turn; its usage is threaded onto the parent run (`ctx.usage`). Gate it on a
     cadence (see the docs) if per-turn generation is too costly.
+
+    The generation runs inside `wrap_model_request`, so under durable execution (Temporal,
+    DBOS, Prefect) it executes in orchestration context rather than a durable step: the model
+    call is non-deterministic on replay and is not checkpointed, and its errors fall back
+    silently to `GoalReanchor`. For durable runs prefer `GoalReanchor`, which makes no model
+    call, or gate `LLMReminder` off.
     """
 
     model: Model | KnownModelName | str

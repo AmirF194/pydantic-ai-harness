@@ -107,6 +107,8 @@ async def every_tenth(ctx):
 SystemReminders(dynamic_reminders=[every_tenth])
 ```
 
+`LLMReminder` generates inside `wrap_model_request`, so under durable execution (Temporal, DBOS, Prefect) its model call runs in orchestration context rather than a durable step -- non-deterministic on replay and not checkpointed, with errors falling back silently to `GoalReanchor`. For durable runs prefer `GoalReanchor` (no model call) or gate `LLMReminder` off.
+
 ## Configuration
 
 ```python
