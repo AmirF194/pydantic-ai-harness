@@ -19,6 +19,7 @@ from pydantic_ai.tools import RunContext, ToolDefinition
 from pydantic_ai.usage import RunUsage
 
 import pydantic_ai_harness.playwright._capability as capability_module
+import pydantic_ai_harness.playwright._toolset as toolset_module
 from pydantic_ai_harness.playwright import (
     DEFAULT_MAX_CONTENT_TOKENS,
     DEFAULT_TIMEOUT_MS,
@@ -254,6 +255,10 @@ def _install_fake_driver(
 
 
 class TestPlaywrightBrowserTools:
+    def test_check_allowed_domain_rejects_malformed_url(self) -> None:
+        assert toolset_module.check_allowed_domain('https://[::1', None) is False
+        assert toolset_module.check_allowed_domain('https://[::1', ['::1']) is False
+
     async def test_navigate_returns_url_title_and_text(self) -> None:
         toolset = _toolset(_FakePage(title='Docs', body='Page text here'))
         result = await toolset.navigate('https://example.com/')
@@ -288,6 +293,13 @@ class TestPlaywrightBrowserTools:
         toolset = _toolset(page, allowed_domains=['example.com'])
         result = await toolset.navigate('mailto:a@b.com')
         assert result == 'Error: domain not in allowed_domains: mailto:a@b.com'
+        assert page.goto_calls == []
+
+    async def test_navigate_rejects_malformed_url(self) -> None:
+        page = _FakePage()
+        toolset = _toolset(page)
+        result = await toolset.navigate('https://[::1')
+        assert result == 'Error: domain not in allowed_domains: https://[::1'
         assert page.goto_calls == []
 
     async def test_navigate_attaches_screenshot_when_configured(self) -> None:
@@ -463,6 +475,12 @@ class TestPlaywrightBrowserTools:
 
 
 class TestPlaywrightBrowserState:
+    def test_toolset_validates_max_content_tokens(self) -> None:
+        state = PlaywrightBrowserState()
+        with pytest.raises(ValueError, match='^max_content_tokens must be greater than or equal to 0$'):
+            PlaywrightBrowserToolset[None](state=state, max_content_tokens=-1)
+        PlaywrightBrowserToolset[None](state=state, max_content_tokens=0)
+
     async def test_tool_raises_when_wrap_run_not_active(self) -> None:
         toolset = PlaywrightBrowserToolset[None](state=PlaywrightBrowserState())
         with pytest.raises(RuntimeError, match='PlaywrightBrowser is not running'):
@@ -509,6 +527,11 @@ class TestPlaywrightBrowserState:
 
 
 class TestPlaywrightBrowserHooks:
+    def test_capability_validates_max_content_tokens(self) -> None:
+        with pytest.raises(ValueError, match='^max_content_tokens must be greater than or equal to 0$'):
+            PlaywrightBrowser[None](max_content_tokens=-1)
+        PlaywrightBrowser[None](max_content_tokens=0)
+
     def test_get_instructions_reports_allowlist(self) -> None:
         instructions = PlaywrightBrowser[None](allowed_domains=['a.com', 'b.com']).get_instructions()
         text = instructions(_ctx())

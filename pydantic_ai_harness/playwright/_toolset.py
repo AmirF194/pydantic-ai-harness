@@ -78,9 +78,12 @@ def check_allowed_domain(url: str, allowed_domains: list[str] | None) -> bool:
     strips the port and brackets, so bracketed IPv6 literals compare correctly. A
     URL without a host (e.g. `about:blank`, `mailto:`) is rejected.
     """
+    try:
+        host = urlparse(url).hostname
+    except ValueError:
+        return False
     if allowed_domains is None:
         return True
-    host = urlparse(url).hostname
     if host is None:
         return False
     return any(host == entry.lower() or host.endswith('.' + entry.lower()) for entry in allowed_domains)
@@ -165,6 +168,8 @@ class PlaywrightBrowserToolset(FunctionToolset[AgentDepsT]):
         max_content_tokens: int = DEFAULT_MAX_CONTENT_TOKENS,
         timeout_ms: int = DEFAULT_TIMEOUT_MS,
     ) -> None:
+        if max_content_tokens < 0:
+            raise ValueError('max_content_tokens must be greater than or equal to 0')
         super().__init__(id='playwright')
         self._state = state
         self._allowed_domains = allowed_domains
