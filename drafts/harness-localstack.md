@@ -175,10 +175,11 @@ afford three of.
 None of this is hypothetical. Run it, and the architect writes one script: three
 engineers each spin up their own cloud, build their limiter, and drive requests past it
 in parallel, and the judge reads what came back and picks. In the run behind this post,
-the token bucket and the fixed-window counter both rejected the sixth request on a single
-DynamoDB call each; the sliding-window log was the one that wobbled, letting a request
-through right after a rejection. Three real deployments, judged on what they did, on
-clouds that came up in seconds and deleted themselves when the run ended.
+all three held the limit and rejected the sixth request, but on different bills: the
+fixed-window counter and the token bucket each decide with a single conditional DynamoDB
+write, while the sliding-window log spends two, a put and a count, on every request. The
+judge picked the counter. Three real deployments, judged on what they did, on clouds that
+came up in seconds and deleted themselves when the run ended.
 
 The disposable cloud removes the cloud bill, but the model still costs tokens.
 `max_agent_calls` caps the number of sub-agent runs exactly, even under fan-out, so a
