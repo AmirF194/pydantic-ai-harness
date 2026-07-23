@@ -172,9 +172,13 @@ so only the recommendation reaches the architect, not the deploy logs. The chore
 moved out of the conversation and into code, and the cloud it runs on is one you can
 afford three of.
 
+None of this is hypothetical. A token bucket sized to five lets five requests through
+and rejects the sixth, on a container that starts in seconds and deletes itself when the
+run ends. The AWS CLI the agent already speaks is enough to build it and prove it.
+
 The disposable cloud removes the cloud bill, but the model still costs tokens.
 `max_agent_calls` caps the number of sub-agent runs exactly, even under fan-out, so a
-workflow that explores a dozen designs instead of three stops at the ceiling you set.
+workflow that explores ten designs instead of three stops at the ceiling you set.
 
 ## Where this goes
 
