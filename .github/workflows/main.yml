@@ -29,6 +29,13 @@ jobs:
   changes:
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
+    # paths-filter runs without a checkout, so it lists PR files via the GitHub
+    # API (REST mode), which needs `pull-requests: read`. Public repos happen to
+    # allow it under `contents: read`; granting it explicitly keeps the job
+    # working if the repo goes private or default token scopes tighten.
+    permissions:
+      contents: read
+      pull-requests: read
     outputs:
       localstack: ${{ steps.filter.outputs.localstack }}
     steps:

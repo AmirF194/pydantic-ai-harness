@@ -55,6 +55,18 @@ def test_localstack_integration_is_scoped_to_localstack_changes() -> None:
     assert any('allowed-skips: changes, localstack-integration' in line for line in lines)
 
 
+def test_changes_job_can_read_pull_request_files() -> None:
+    lines = _workflow_lines()
+
+    # paths-filter runs without a checkout, so it lists PR files via the GitHub
+    # API, which needs `pull-requests: read`. Without it the job fails on private
+    # repos (or under tightened default token scopes) and the live job is skipped.
+    changes_index = lines.index('  changes:')
+    lint_index = lines.index('  lint:')
+    changes_block = lines[changes_index:lint_index]
+    assert '      pull-requests: read' in changes_block
+
+
 def test_localstack_ci_scopes_the_auth_token_to_the_test_step() -> None:
     lines = _workflow_lines()
 
