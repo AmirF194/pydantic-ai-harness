@@ -20,7 +20,8 @@ class Skills(AbstractCapability[AgentDepsT]):
     Every immediate child directory containing `SKILL.md` becomes an independent
     deferred capability whose description and body come from the skill's
     frontmatter and Markdown. Pydantic AI's `load_capability` tool handles
-    discovery, activation, and message-history replay.
+    discovery, activation, and message-history replay. Every discovered skill is
+    deferred by design; there is no option to change this.
 
     v1 exposes instructions only. It does not read supporting files or run
     bundled scripts. Applications can grant access to bundled files separately

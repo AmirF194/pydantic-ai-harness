@@ -227,9 +227,10 @@ unknown selections, missing roots, and non-directory roots fail during
 construction. Ordinary files and child directories without `SKILL.md` are
 ignored.
 
-Every selected skill uses its frontmatter `description` and is deferred
-individually. `Skills` is a composite and does not accept capability-level `id`,
-`description`, or `defer_loading` options.
+Every selected skill uses its frontmatter `description` and is always deferred
+individually. This is part of the Skills design, not a configurable option: the
+model sees the skill catalog first and loads a skill's full instructions only
+when needed.
 
 ## Further reading
 
