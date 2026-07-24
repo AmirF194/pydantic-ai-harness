@@ -208,8 +208,9 @@ class TestFileStorePruneEdgeCases:
         """
         root = tmp_path / 'runs'
         store = FileStepStore(root, media_store=None, max_snapshots_per_run=1)
+        # Only one save before arming: 0.json is still present (prune is a no-op
+        # at one file), so the next save's prune enumerates it and reads it.
         await _save(store, 'r1', 0)
-        await _save(store, 'r1', 1)
 
         vanishing = root / 'r1' / 'snapshots' / '0.json'
         original_read_text = Path.read_text
@@ -222,12 +223,14 @@ class TestFileStorePruneEdgeCases:
 
         monkeypatch.setattr(Path, 'read_text', racing_read_text)
 
-        # This save's prune parses siblings; 0.json vanishes mid-parse. Must not raise.
-        await _save(store, 'r1', 2)
+        # This save's prune enumerates {0,1} and reads 0.json, which vanishes
+        # mid-parse. The parse must skip it rather than raise.
+        await _save(store, 'r1', 1)
 
+        assert not vanishing.exists()
         latest = await store.latest_snapshot(run_id='r1')
         assert latest is not None
-        assert latest.step_index == 2
+        assert latest.step_index == 1
 
     async def test_prune_tolerates_candidate_unlinked_by_concurrent_prune(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -240,9 +243,14 @@ class TestFileStorePruneEdgeCases:
         root = tmp_path / 'runs'
         store = FileStepStore(root, media_store=None, max_snapshots_per_run=1)
         await _save(store, 'r1', 0)
-        await _save(store, 'r1', 1)
+        # Seed a second non-retained sibling so the next save's prune unlinks two
+        # files: the raced victim (0.json) and one survivor of the race (1.json).
+        # The prune only reads `state` during its parse, so a minimal payload is
+        # enough to make 1.json a live candidate.
+        snap_dir = root / 'r1' / 'snapshots'
+        (snap_dir / '1.json').write_text('{"state": "complete"}', encoding='utf-8')
 
-        victim = root / 'r1' / 'snapshots' / '0.json'
+        victim = snap_dir / '0.json'
         original_unlink = Path.unlink
 
         def racing_unlink(self: Path, missing_ok: bool = False) -> None:
@@ -252,10 +260,12 @@ class TestFileStorePruneEdgeCases:
 
         monkeypatch.setattr(Path, 'unlink', racing_unlink)
 
-        # This save's prune unlinks 0.json (already gone) and 1.json. Must not raise.
+        # This save's prune unlinks the non-retained 0.json (already removed by
+        # the race) and 1.json. `missing_ok` must swallow the vanished 0.json.
         await _save(store, 'r1', 2)
 
         assert not victim.exists()
+        assert not (snap_dir / '1.json').exists()
         latest = await store.latest_snapshot(run_id='r1')
         assert latest is not None
         assert latest.step_index == 2
