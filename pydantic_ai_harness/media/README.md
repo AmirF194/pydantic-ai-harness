@@ -34,9 +34,9 @@ Every store implements the `MediaStore` protocol: `put`, `get`, `exists`, `publi
 | `DiskMediaStore(directory=...)` | A directory on disk | Local runs and tests |
 | `SqliteMediaStore(...)` | A SQLite database | A single-file store that travels with the data |
 | `S3MediaStore(...)` | S3 or an S3-compatible bucket | Shared or production storage |
-| `MongoMediaStore(...)` | MongoDB (sha256-addressed manual chunking) | A MongoDB deployment; blobs of any size, chunked under the 16MB BSON cap |
+| `MongoMediaStore(...)` | MongoDB (sha256-addressed manual chunking) | A MongoDB deployment; blob payloads of any size, split so no chunk hits the 16MB BSON cap |
 
-`MongoMediaStore` needs the `mongodb` extra (`pip install pydantic-ai-harness[mongodb]`) and is imported the same way (`from pydantic_ai_harness.media import MongoMediaStore`). It stores each blob as sha256-addressed chunks across a `media` document and a sibling `media_chunks` collection, so no single document approaches MongoDB's 16MB limit. Manual chunking is used instead of GridFS: it keeps content-addressed dedup (GridFS keys files by `ObjectId` and does none) and stays fully testable in-memory.
+`MongoMediaStore` needs the `mongodb` extra (`pip install pydantic-ai-harness[mongodb]`) and is imported the same way (`from pydantic_ai_harness.media import MongoMediaStore`). It stores each blob as sha256-addressed chunks (default 8MB) in a `media_chunks` collection, with a `media` manifest document per blob. The chunking bounds the byte payload so it never lands in one oversized document. The manifest itself holds `MediaContext.metadata` inline and is not chunked, so keep per-blob metadata small. Manual chunking is used instead of GridFS: it keeps content-addressed dedup (GridFS keys files by `ObjectId` and does none) and stays fully testable in-memory.
 
 A `KeyStrategy` controls the on-store layout, and a `PublicUrlResolver` (or `make_static_public_url`) turns a stored URI into a public URL when the store is served over HTTP.
 

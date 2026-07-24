@@ -10,6 +10,7 @@ store only uses the async collection surface both share.
 from __future__ import annotations
 
 import pytest
+from bson.binary import Binary
 from mongomock_motor import AsyncMongoMockClient
 from pymongo import AsyncMongoClient
 
@@ -42,6 +43,11 @@ class TestMongoMediaStoreConstruction:
     def test_rejects_non_positive_chunk_size(self) -> None:
         with pytest.raises(ValueError, match='`chunk_size_bytes` must be positive'):
             MongoMediaStore(client=_mock_client(), database='t', chunk_size_bytes=0)
+
+    def test_rejects_oversized_chunk_size(self) -> None:
+        """A chunk size above the BSON headroom ceiling would build a rejected chunk doc."""
+        with pytest.raises(ValueError, match='must not exceed'):
+            MongoMediaStore(client=_mock_client(), database='t', chunk_size_bytes=20 * 1024 * 1024)
 
     async def test_db_url_owns_client_and_aclose_closes_it(self) -> None:
         store = MongoMediaStore(db_url='mongodb://localhost:59017', database='t')
@@ -100,6 +106,37 @@ class TestMongoMediaStoreRoundTrip:
         await client['t']['media'].update_one({'_id': digest}, {'$set': {'size_bytes': 999}})
         with pytest.raises(ValueError, match='reassembly mismatch'):
             await store.get(uri)
+
+    async def test_stale_chunks_from_crashed_write_never_silently_corrupt(self) -> None:
+        """Stale chunks from a crashed prior write at a different chunk size cannot corrupt a read.
+
+        Chunk `_id`s are `<digest>:<n>`, so a retry at a different
+        `chunk_size_bytes` leaves the old chunks in place (`$setOnInsert` will
+        not overwrite them). Every chunk under a digest is a slice of the SAME
+        content, so a mismatched-layout retry can only ever reassemble the
+        identical bytes (length matches) or fail the `size_bytes` guard -- it
+        can never return wrong bytes silently. In this constructed layout the
+        stale 8-byte chunks plus the fresh 4-byte chunks over-count the length,
+        so `get` fails loudly, which is the outcome asserted here. This is the
+        evidence for Macroscope 446-1.
+        """
+        client = _mock_client()
+        data = bytes(range(64))
+        digest = parse_media_uri(media_uri_for(data))
+        # Simulate a crashed write that used an 8-byte chunk size and left its
+        # chunks behind for this digest without ever writing the manifest.
+        chunks = client['t']['media_chunks']
+        for n, start in enumerate(range(0, len(data), 8)):
+            await chunks.update_one(
+                {'_id': f'{digest}:{n}'},
+                {'$setOnInsert': {'files_id': digest, 'n': n, 'data': Binary(data[start : start + 8])}},
+                upsert=True,
+            )
+        # A fresh write re-puts the same content at a 4-byte chunk size.
+        store = MongoMediaStore(client=client, database='t', chunk_size_bytes=4)
+        await store.put(data)
+        with pytest.raises(ValueError, match='reassembly mismatch'):
+            await store.get(media_uri_for(data))
 
     async def test_metadata_round_trips(self) -> None:
         store = MongoMediaStore(client=_mock_client(), database='t')

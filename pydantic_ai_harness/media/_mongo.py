@@ -1,10 +1,12 @@
 """MongoDB-backed `MediaStore` with content-addressed manual chunking.
 
 Blobs are split into fixed-size chunks stored across two collections -- a
-`files` document keyed by the sha256 hex digest plus one document per chunk
-in a sibling `<collection>_chunks` collection. This keeps any single
-document well under MongoDB's 16MB BSON cap regardless of blob size, without
-depending on the GridFS driver.
+`files` manifest document keyed by the sha256 hex digest plus one document
+per chunk in a sibling `<collection>_chunks` collection. Chunking bounds the
+byte payload so it never lands in one oversized document regardless of blob
+size, without depending on the GridFS driver. The manifest itself stores
+`MediaContext.metadata` inline and is not chunked, so callers should keep
+per-blob metadata small (it is not covered by the chunk-size bound).
 
 Manual chunking is chosen over GridFS deliberately:
 
@@ -42,6 +44,10 @@ from pydantic_ai_harness.media._store import (
 )
 
 _DEFAULT_CHUNK_SIZE_BYTES = 8 * 1024 * 1024
+# 16MiB BSON document cap minus headroom for the chunk document's own framing
+# (`_id`, `files_id`, `n`, the `Binary` subtype/length prefix). A larger value
+# would build a chunk document that MongoDB rejects on insert.
+_MAX_CHUNK_SIZE_BYTES = 16 * 1024 * 1024 - 64 * 1024
 _COLLECTION_NAME_RE = re.compile(r'^[A-Za-z_][A-Za-z0-9_]*$')
 
 _MongoDocument = dict[str, object]
@@ -57,16 +63,18 @@ class MongoMediaStore:
 
     Layout, for the default `collection='media'`:
 
-    - `media` -- one document per blob, `_id = <sha256-hex>`, with fields
-      `media_type`, `size_bytes`, `chunk_count`, and `metadata` (canonical
-      JSON of `context.metadata`).
+    - `media` -- one manifest document per blob, `_id = <sha256-hex>`, with
+      fields `media_type`, `size_bytes`, `chunk_count`, and `metadata`
+      (canonical JSON of `context.metadata`). The manifest is not chunked, so
+      unbounded `metadata` could itself approach the 16MB cap -- keep per-blob
+      metadata small.
     - `media_chunks` -- one document per chunk, `_id = '<digest>:<n>'`, with
       `files_id = <digest>`, `n` (0-based order), and `data` (`Binary`).
 
     Writes are idempotent via `$setOnInsert` upserts: re-`put`-ing the same
-    bytes is a no-op. `chunk_size_bytes` (default 8MB, safely under the 16MB
-    cap) bounds each chunk document; lower it in tests to exercise the
-    multi-chunk split cheaply.
+    bytes is a no-op. `chunk_size_bytes` (default 8MB) bounds each chunk
+    document below the 16MB cap; it is rejected outside `1..~16MB`. Lower it
+    in tests to exercise the multi-chunk split cheaply.
     """
 
     def __init__(
@@ -87,6 +95,8 @@ class MongoMediaStore:
             raise ValueError(f'invalid collection name: {collection!r}')
         if chunk_size_bytes < 1:
             raise ValueError('`chunk_size_bytes` must be positive')
+        if chunk_size_bytes > _MAX_CHUNK_SIZE_BYTES:
+            raise ValueError(f'`chunk_size_bytes` must not exceed {_MAX_CHUNK_SIZE_BYTES} (MongoDB 16MB document cap)')
 
         if client is not None:
             self._client = client
