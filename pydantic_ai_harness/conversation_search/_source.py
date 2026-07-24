@@ -125,6 +125,16 @@ class SnapshotHistorySource:
     """
 
     def __init__(self, store: SnapshotStore) -> None:
+        # Fail at construction, not mid-search, when a store lacks the read seam.
+        # Not every first-party store implements `list_snapshots` yet (e.g.
+        # `MongoStepStore`, pydantic-ai-harness#446); without this a missing seam
+        # surfaces as an obscure `AttributeError` deep inside a tool call.
+        if not isinstance(store, SnapshotStore):  # pyright: ignore[reportUnnecessaryIsInstance]
+            raise TypeError(
+                f'{type(store).__name__} is not a supported search substrate: SnapshotHistorySource '
+                'needs a store providing both `list_runs` and `list_snapshots`. The shipped '
+                'InMemoryStepStore, FileStepStore, and SqliteStepStore satisfy this.'
+            )
         self._store = store
 
     async def list_runs(self) -> list[RunRecord]:

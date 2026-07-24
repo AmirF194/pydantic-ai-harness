@@ -44,7 +44,7 @@ agent = Agent(
 
 ## How recovery works
 
-`StepPersistence` saves a full-history snapshot at every step boundary. A compaction strategy that persists its edits (like `SummarizingCompaction`) carries those edits into *later* snapshots -- but the earlier snapshots of the same run were taken while the originals were still live. `SnapshotHistorySource` unions each run's snapshots in write order, keeping the first occurrence of every message (by content hash) and skipping derived summary artifacts, which recovers the originals plus everything compaction never touched. Only `complete` snapshots contribute: `interrupted` captures (unsettled tool work, synthesized tool returns) are excluded by the stores' default read gate.
+`StepPersistence` saves a full-history snapshot at every step boundary. A compaction strategy that persists its edits (like `SummarizingCompaction`) carries those edits into *later* snapshots -- but the earlier snapshots of the same run were taken while the originals were still live. `SnapshotHistorySource` unions each run's snapshots in write order, keeping the first occurrence of every message (by content hash) and skipping derived summary artifacts, which recovers the originals plus everything compaction never touched -- as far back as the store still retains those pre-compaction snapshots (see Limitations). Only `complete` snapshots contribute: `interrupted` captures (unsettled tool work, synthesized tool returns) are excluded by the stores' default read gate.
 
 The dedup keys off a content hash of each serialized message, not object identity: consecutive snapshots re-serialize the same growing history, and durable executors (Temporal, DBOS) re-instantiate messages between steps.
 
@@ -65,6 +65,7 @@ The dedup keys off a content hash of each serialized message, not object identit
 ## Limitations
 
 - Search only reaches what was persisted: history inherited from runs that never ran with `StepPersistence` (for example a long `message_history` passed in from an unpersisted session) cannot be recovered if compaction drops it before the first snapshot.
+- Recovery of compaction-dropped originals depends on the pre-compaction snapshots still being retained. A store with bounded snapshot retention (for example a per-run snapshot cap) can prune the early snapshots that held those originals; a search then returns only what the surviving snapshots still carry, degrading to a partial result rather than erroring. Retain full snapshot history for the run if complete recovery matters.
 - The corpus is rebuilt on each tool call by reading every run's snapshots. Snapshot storage is cumulative (each snapshot re-serializes the growing history), so large stores make each search proportionally more expensive. A persistent index (SQLite FTS5, tracked in [#124](https://github.com/pydantic/pydantic-ai-harness/issues/124)) is the scaling path.
 - Reading snapshots restores externalized media (large binary payloads) even though the text index never uses it; stores with remote media backends pay that fetch cost per search.
 

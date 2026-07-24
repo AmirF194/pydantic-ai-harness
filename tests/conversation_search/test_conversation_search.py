@@ -21,6 +21,7 @@ from pydantic_ai.messages import (
     ModelResponse,
     RetryPromptPart,
     SystemPromptPart,
+    TextContent,
     TextPart,
     ThinkingPart,
     ToolCallPart,
@@ -215,6 +216,40 @@ class TestSnapshotHistorySource:
         assert isinstance(InMemoryStepStore(), SnapshotStore)
         assert isinstance(FileStepStore(tmp_path / 'runs'), SnapshotStore)
         assert isinstance(SqliteStepStore(database=tmp_path / 'runs.db'), SnapshotStore)
+
+    def test_rejects_store_without_snapshot_seam(self) -> None:
+        # A store that lists runs but has not implemented `list_snapshots` (for
+        # example `MongoStepStore`, pydantic-ai-harness#446) fails at construction
+        # with a clear error, not mid-search with an obscure `AttributeError`.
+        class _RunsOnlyStore:
+            async def list_runs(
+                self,
+                *,
+                parent_run_id: str | None = None,
+                conversation_id: str | None = None,
+            ) -> list[RunRecord]:
+                return []  # pragma: no cover
+
+        with pytest.raises(TypeError, match='not a supported search substrate'):
+            SnapshotHistorySource(_RunsOnlyStore())  # pyright: ignore[reportArgumentType]
+
+    async def test_pruned_precompaction_snapshot_degrades_gracefully(self) -> None:
+        # Bounded snapshot retention (pydantic-ai-harness#442) can prune the early,
+        # pre-compaction snapshot that held an original before a search runs. With
+        # only the post-compaction snapshot surviving, recovery degrades to a
+        # partial result (the original is unrecoverable) rather than erroring.
+        store = InMemoryStepStore()
+        reply = _reply('noted')
+        summary = ModelRequest(parts=[SystemPromptPart(content='Summary of previous conversation:\n\nolder context')])
+        follow_up = _user('what was it again?')
+        # The pre-compaction snapshot ([original, reply]) has been pruned; only the
+        # later snapshot remains, and it never carried the original.
+        await _seed_run(store, 'r1', [summary, reply, follow_up])
+
+        history = await SnapshotHistorySource(store).run_history(run_id='r1')
+        assert history == [reply, follow_up]
+        # Search over the survivors still works; it simply cannot surface the lost original.
+        assert 'No matches' in await _search(SnapshotHistorySource(store), 'ZEBRA')
 
 
 class TestConversationSearch:
@@ -509,6 +544,40 @@ class TestSearchTool:
         rendered = await _search(SnapshotHistorySource(store), 'FIGURE')
         assert '[score:' in rendered
         assert 'FIGURE caption' in rendered
+
+    async def test_externalized_media_binary_never_enters_the_corpus(self, tmp_path: Path) -> None:
+        # The durable stores externalize a large `BinaryContent` and restore it on
+        # read. The text index must render only the textual parts of the prompt:
+        # str()-ing the whole content would fold the image's byte representation
+        # into the corpus (a 70 KiB image is ~280k escaped-byte characters),
+        # bloating the index and leaking binary into excerpts.
+        store = FileStepStore(tmp_path / 'runs')
+        blob = b'\x89PNG\r\n' + b'\x00' * (70 * 1024)
+        media_prompt = ModelRequest(
+            parts=[
+                UserPromptPart(
+                    content=[
+                        'the FIGURE caption text',
+                        TextContent(content='ANNOTATED note'),
+                        BinaryContent(data=blob, media_type='image/png'),
+                    ]
+                )
+            ]
+        )
+        await store.register_run(RunRecord(run_id='r1'))
+        await store.save_snapshot(ContinuableSnapshot(run_id='r1', step_index=0, messages=[media_prompt]))
+
+        source = SnapshotHistorySource(store)
+        rendered = await _search(source, 'FIGURE')
+        assert 'FIGURE caption' in rendered
+        # `TextContent` carries searchable text and is indexed alongside plain strings.
+        assert 'ANNOTATED' in await _search(source, 'ANNOTATED')
+        assert 'BinaryContent' not in rendered
+        assert 'image/png' not in rendered
+        # The escaped-byte tokens the raw representation would contribute (e.g. `x00`,
+        # `x89png`) are absent from the index, so they match nothing.
+        assert 'No matches' in await _search(source, 'x00')
+        assert 'No matches' in await _search(source, 'x89png')
 
     async def test_index_prefix_is_not_a_searchable_token(self) -> None:
         # The `[N]` excerpt numbering must stay display-only: indexed, each

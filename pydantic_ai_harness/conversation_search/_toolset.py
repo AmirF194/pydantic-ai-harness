@@ -20,6 +20,7 @@ from pydantic_ai.messages import (
     ModelMessage,
     ModelRequest,
     SystemPromptPart,
+    TextContent,
     TextPart,
     ToolCallPart,
     ToolReturnPart,
@@ -128,6 +129,27 @@ def _bm25_rank(query: str, documents: list[str], params: _Bm25Params) -> list[tu
     return results
 
 
+def _user_prompt_text(part: UserPromptPart) -> str:
+    """Render only the textual content of a user prompt.
+
+    `UserPromptPart.content` can interleave text with binary and URL parts
+    (`BinaryContent`, `ImageUrl`, ...). Only `str` and `TextContent` carry
+    searchable text; str()-ing the whole content would fold a `BinaryContent`
+    part's byte representation into the BM25 corpus (a 70 KiB image renders as
+    hundreds of thousands of escaped-byte characters). Mirrors the text
+    extraction in `pydantic_ai_harness.compaction._shared`.
+    """
+    if isinstance(part.content, str):
+        return part.content
+    texts: list[str] = []
+    for item in part.content:
+        if isinstance(item, str):
+            texts.append(item)
+        elif isinstance(item, TextContent):
+            texts.append(item.content)
+    return ' '.join(texts)
+
+
 def _format_message(message: ModelMessage, *, truncate: bool) -> str:
     """Render one message to text.
 
@@ -139,7 +161,7 @@ def _format_message(message: ModelMessage, *, truncate: bool) -> str:
     if isinstance(message, ModelRequest):
         for part in message.parts:
             if isinstance(part, UserPromptPart):
-                content = str(part.content)
+                content = _user_prompt_text(part)
                 if truncate and len(content) > 500:
                     content = content[:500] + '...'
                 lines.append(f'User: {content}')
