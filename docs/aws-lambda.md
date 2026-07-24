@@ -115,7 +115,7 @@ Step names are built from the agent's `name` and each toolset's `id`:
 | `{name}__function_toolset__{id}.call_tool:{tool}` | a function tool call |
 | `{name}__mcp_server__{id}.get_tools` | listing an MCP server's tools |
 | `{name}__mcp_server__{id}.get_instructions` | an MCP server's instructions |
-| `{name}__mcp_server__{id}.call_tool:{tool}` | an MCP tool call |
+| `{name}__mcp_server__{id}.call_tool` | an MCP tool call |
 | `{name}__dynamic_toolset__{id}.get_tools` | resolving a dynamic toolset |
 | `{name}__dynamic_toolset__{id}.call_tool:{tool}` | a dynamic toolset's tool call |
 | `{name}__event_stream_handler` | one event delivered to an `event_stream_handler` |
