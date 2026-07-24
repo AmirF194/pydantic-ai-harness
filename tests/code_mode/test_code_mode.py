@@ -487,10 +487,12 @@ class TestCodeMode:
         with pytest.raises(ModelRetry, match='memory limit exceeded'):
             await wrapper.call_tool(
                 'run_code',
-                {'code': "print('x' * (10 * 1024 * 1024))"},
+                {'code': "x = 7\nprint('x' * (10 * 1024 * 1024))"},
                 ctx,
                 tools['run_code'],
             )
+        result = await wrapper.call_tool('run_code', {'code': 'x + 1'}, ctx, tools['run_code'])
+        assert result.return_value == 8
 
     async def test_run_code_syntax_error_becomes_model_retry(self) -> None:
         """A Python syntax error is surfaced as `ModelRetry` so the model can fix it."""
