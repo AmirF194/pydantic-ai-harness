@@ -613,7 +613,15 @@ class FileStepStore:
             except ValueError:
                 continue
         for _, path in sorted(candidates, key=lambda c: c[0], reverse=True):
-            data = _load_json_object(path.read_text(encoding='utf-8'))
+            # A bounded save pruning on another worker thread can unlink a
+            # non-retained candidate between this enumeration and the read.
+            # The newest overall and newest `complete` are always retained, so
+            # skipping a vanished candidate still reaches the right snapshot (or
+            # a correct `None`).
+            try:
+                data = _load_json_object(path.read_text(encoding='utf-8'))
+            except FileNotFoundError:
+                continue
             if include_interrupted or _snapshot_state(data.get('state')) == 'complete':
                 return data, data['messages']
         return None

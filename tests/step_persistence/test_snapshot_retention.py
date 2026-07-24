@@ -187,6 +187,36 @@ class TestFileStorePruneEdgeCases:
         assert latest is not None
         assert latest.step_index == 2
 
+    async def test_read_skips_candidate_that_vanishes_mid_read(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A concurrent prune can unlink an enumerated candidate before the reader opens it.
+
+        The default read enumerates the interrupted newest, then reads it to
+        check its state. If a prune on another worker thread unlinks that file
+        between enumeration and read, `latest_snapshot` must skip it and reach
+        the retained `complete` snapshot rather than raising `FileNotFoundError`.
+        """
+        root = tmp_path / 'runs'
+        store = FileStepStore(root, media_store=None)
+        await _save(store, 'r1', 0, state='complete')
+        await _save(store, 'r1', 1, state='interrupted')
+
+        vanishing = root / 'r1' / 'snapshots' / '1.json'
+        original_read_text = Path.read_text
+
+        def racing_read_text(self: Path, encoding: str | None = None, errors: str | None = None) -> str:
+            if self == vanishing and vanishing.exists():
+                vanishing.unlink()
+                raise FileNotFoundError(vanishing)
+            return original_read_text(self, encoding=encoding, errors=errors)
+
+        monkeypatch.setattr(Path, 'read_text', racing_read_text)
+
+        latest = await store.latest_snapshot(run_id='r1')
+        assert latest is not None
+        assert latest.step_index == 0
+
 
 class TestSqliteStorePruneEdgeCases:
     async def test_large_bound_does_not_exceed_sql_variable_limit(self, tmp_path: Path) -> None:
