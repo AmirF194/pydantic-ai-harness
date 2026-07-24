@@ -29,6 +29,12 @@ from pydantic_ai_harness.media._store import MediaContext, MediaStore
 
 _EXTERNAL_MARKER = '__harness_external_media__'
 _TEXT_MARKER = '__harness_external_text__'
+# The externalized-blob reference is stored under a namespaced key, not `uri`,
+# so a part or arbitrary `ToolReturnPart.content` mapping that already carries
+# its own `uri` field round-trips it intact. `ToolReturnContent` permits any
+# `Mapping[str, ...]`, so a user payload can legitimately collide on
+# `part_kind`/`content`/`uri`; a plain `uri` marker key would drop the original.
+_URI_KEY = '__harness_external_uri__'
 
 
 def _is_json_dict(node: object) -> TypeGuard[dict[str, object]]:
@@ -59,9 +65,12 @@ def _is_text_part(node: dict[str, object]) -> bool:
 
     Requires a string `part_kind` -- the discriminator every `pydantic_ai`
     message part serializes -- as well as a string `content`. Gating on
-    `part_kind` keeps arbitrary nested data that merely happens to carry a
-    string `content` key (e.g. a tool-return payload with its own `content`
-    field) from being mistaken for a part and having its fields rewritten.
+    `part_kind` narrows the match, but `ToolReturnContent` permits arbitrary
+    `Mapping[str, ...]` payloads, so a user structure can still carry a string
+    `part_kind` and `content` and be treated here as a part. That stays
+    lossless: the externalized `content` re-inlines byte-for-byte on restore,
+    and the reference URI lives under the namespaced `_URI_KEY`, so a colliding
+    payload's own `uri` (or any other field) round-trips untouched.
     Covers `TextPart`, `ToolReturnPart` with a string return, and
     string-valued `UserPromptPart`. A bare string element inside a
     `UserPromptPart.content` list is not a dict, so it is never a candidate
@@ -121,7 +130,7 @@ async def _maybe_externalize_binary(
     # are recursively walked so any nested externalizable payload still goes out.
     marker = await _preserve_fields(node, 'data', media_store, threshold_bytes)
     marker[_EXTERNAL_MARKER] = True
-    marker['uri'] = uri
+    marker[_URI_KEY] = uri
     return marker
 
 
@@ -144,7 +153,7 @@ async def _maybe_externalize_text(
     marker = await _preserve_fields(node, 'content', media_store, threshold_bytes)
     marker[_EXTERNAL_MARKER] = True
     marker[_TEXT_MARKER] = True
-    marker['uri'] = uri
+    marker[_URI_KEY] = uri
     return marker
 
 
@@ -186,17 +195,18 @@ async def restore_media(node: object, *, media_store: MediaStore) -> object:
 
 
 async def _restore_external(node: dict[str, object], media_store: MediaStore) -> dict[str, object]:
-    uri_value = node.get('uri')
+    uri_value = node.get(_URI_KEY)
     if not isinstance(uri_value, str):
         raise ValueError(f'externalized media marker missing string uri: {node!r}')
     raw = await media_store.get(uri_value)
     # Inverse of `_maybe_externalize_*`: drop the marker keys, restore the
-    # externalized field, keep every other field the original part carried.
+    # externalized field, keep every other field the original part carried
+    # (including a genuine `uri`, which the namespaced `_URI_KEY` never shadows).
     # Preserved fields are recursively restored so a nested marker (from the
     # externalize-side recursion) is re-inlined too.
     restored: dict[str, object] = {}
     for key, value in node.items():
-        if key in (_EXTERNAL_MARKER, _TEXT_MARKER, 'uri'):
+        if key in (_EXTERNAL_MARKER, _TEXT_MARKER, _URI_KEY):
             continue
         restored[key] = await restore_media(value, media_store=media_store)
     if node.get(_TEXT_MARKER) is True:

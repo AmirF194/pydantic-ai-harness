@@ -400,11 +400,12 @@ class MediaContext:
 
 All fields default; new fields are added non-breakingly as use cases emerge. Pass what you have, ignore the rest.
 
-**Persistence by store.** `get_metadata(uri)` round-trips the user-supplied `metadata` mapping on all three stores. `media_type` is also persisted but is not part of what `get_metadata` returns (it is stored for the byte payload itself, for example as the `Content-Type`).
+**Persistence by store.** `get_metadata(uri)` round-trips the user-supplied `metadata` mapping on all four stores. `media_type` is also persisted but is not part of what `get_metadata` returns (it is stored for the byte payload itself, for example as the `Content-Type`).
 
 - `SqliteMediaStore` writes `metadata` to a JSON column and `media_type` to a dedicated column.
 - `S3MediaStore` sends `metadata` as signed `x-amz-meta-*` headers (ASCII alphanumeric plus dash key names) and `media_type` as `Content-Type`; `get_metadata` reads the `x-amz-meta-*` values back from the HEAD response.
 - `DiskMediaStore` writes a sidecar JSON file (`<resolved>.meta.json`) alongside each blob, atomic via tmp plus rename. Sidecars are absent only when the put carried no metadata.
+- `MongoMediaStore` writes `metadata` as a JSON string and `media_type` as a dedicated field on the blob's `files` document; `get_metadata` decodes the JSON string back.
 
 ### `key_strategy`: controlling the backend storage path
 
@@ -427,7 +428,7 @@ store = DiskMediaStore('runs', key_strategy=by_media_type)
 
 `DiskMediaStore` rejects strategies that produce absolute paths or paths containing `..` segments, to prevent escaping the store directory.
 
-Separately, all three stores accept a `public_url=` resolver, useful when a CDN, local HTTP server, or signed-URL service fronts the bytes. Without it `public_url(...)` returns `None` (the model never sees a URL unless a resolver is configured and it returns a string).
+Separately, all four stores accept a `public_url=` resolver, useful when a CDN, local HTTP server, or signed-URL service fronts the bytes. Without it `public_url(...)` returns `None` (the model never sees a URL unless a resolver is configured and it returns a string).
 
 pydantic_ai providers transparently download bytes from a URL when the target model does not natively accept that URL type, so emitting a URL is always safe: you only ever lose wire savings, never correctness.
 

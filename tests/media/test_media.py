@@ -282,7 +282,7 @@ class TestExternalizeRestoreWalker:
         store = DiskMediaStore(tmp_path)
         marker = {
             '__harness_external_media__': True,
-            'uri': 'media+sha256://' + '0' * 64,
+            '__harness_external_uri__': 'media+sha256://' + '0' * 64,
             'kind': 'binary',
             'media_type': 'image/png',
         }
@@ -378,6 +378,31 @@ class TestExternalizeRestoreWalker:
 
         restored = await restore_media(externalized, media_store=store)
         assert restored == node  # both fields re-inlined
+
+    async def test_colliding_uri_field_round_trips(self, tmp_path: Path) -> None:
+        """A lookalike mapping carrying its own `uri` keeps it across the round-trip.
+
+        `ToolReturnContent` permits arbitrary `Mapping[str, ...]`, so a genuine
+        tool-return payload can carry `part_kind` + a large string `content` +
+        its own `uri` (e.g. `source://original`). The walker externalizes the
+        large `content`, but the reference URI is stored under a namespaced key,
+        so the payload's own `uri` must survive externalize -> restore intact.
+        """
+        import json as _json
+
+        store = DiskMediaStore(tmp_path)
+        node = {
+            'part_kind': 'tool-return',
+            'content': 'x' * 70_000,
+            'uri': 'source://original',
+            'tool_name': 'scrape',
+        }
+        externalized = await externalize_media(node, media_store=store, threshold_bytes=64 * 1024)
+        dumped = _json.dumps(externalized)
+        assert '__harness_external_text__' in dumped  # large content went external
+        assert 'source://original' in dumped  # original uri untouched, not overwritten
+        restored = await restore_media(externalized, media_store=store)
+        assert restored == node  # original uri survives, content re-inlined
 
 
 class TestSigV4Signer:

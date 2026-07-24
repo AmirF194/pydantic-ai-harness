@@ -123,7 +123,7 @@ class MediaContext:
     metadata: Mapping[str, str] = field(default_factory=dict)  # user-supplied tags
 ```
 
-All fields default, so you pass what you have and ignore the rest; new fields are added non-breakingly as use cases emerge. `get_metadata(uri)` round-trips the user-supplied `metadata` mapping on all three stores; `media_type` is persisted separately (as the byte payload's `Content-Type`).
+All fields default, so you pass what you have and ignore the rest; new fields are added non-breakingly as use cases emerge. `get_metadata(uri)` round-trips the user-supplied `metadata` mapping on all four stores; `media_type` is persisted separately (as the byte payload's `Content-Type`).
 
 ## `KeyStrategy`
 
