@@ -19,7 +19,7 @@ from pydantic_ai_harness.playwright._toolset import (
     PlaywrightBrowserToolset,
     PlaywrightError,
     async_playwright,
-    check_allowed_domain,
+    blocked_navigation_reason,
 )
 
 if TYPE_CHECKING:
@@ -112,14 +112,16 @@ class PlaywrightBrowser(AbstractCapability[AgentDepsT]):
     playwright install chromium
     ```
 
-    Egress: `allowed_domains=None` (the default) places no restriction on the
-    URLs the agent can reach, including internal or link-local addresses (for
-    example `169.254.169.254` or `localhost`). Pass `allowed_domains=[...]` to
-    restrict navigation to an allowlist. The allowlist governs page navigation
+    Egress: `allowed_domains=None` (the default) places no domain restriction on
+    the URLs the agent can reach; pass `allowed_domains=[...]` to restrict
+    navigation to an allowlist. Independently, `block_private_addresses=True`
+    (the default) refuses navigation to private, loopback, link-local, and other
+    reserved IP literals (for example `169.254.169.254`, `127.0.0.1`, or
+    `localhost`), even under open egress. Both policies govern page navigation
     (top-level document requests), not requests made by in-page JavaScript
-    (`fetch`/XHR via `execute_js`). Blocking private/link-local ranges by default
-    and constraining in-page requests are tracked in
-    https://github.com/pydantic/pydantic-ai-harness/issues/415; until then, set
+    (`fetch`/XHR via `execute_js`), and the private-address block matches IP
+    literals rather than resolving hostnames; those gaps are tracked in
+    https://github.com/pydantic/pydantic-ai-harness/issues/415. Set
     `allowed_domains` when the agent may act on untrusted input.
 
     Chromium starts lazily on the first browser-tool call and is closed when the
@@ -141,6 +143,17 @@ class PlaywrightBrowser(AbstractCapability[AgentDepsT]):
     clicks, `execute_js`, and history moves, not just `navigate`), and each
     tool re-checks the resulting URL and bounces to `about:blank` so disallowed
     content never reaches the model.
+    """
+
+    block_private_addresses: bool = True
+    """Refuse navigation to private, loopback, link-local, and other reserved IP literals.
+
+    Covers the cloud metadata endpoint (`169.254.169.254`), loopback
+    (`127.0.0.1`, `::1`, `localhost`), and the RFC 1918 ranges, independent of
+    `allowed_domains` -- open egress still cannot reach them. Only IP literals
+    and `localhost` names are matched; hostnames are not resolved (see the
+    egress note above). Set `False` when the agent should reach a local app or
+    an internal dashboard.
     """
 
     screenshot_on_navigate: bool = False
@@ -179,6 +192,7 @@ class PlaywrightBrowser(AbstractCapability[AgentDepsT]):
         self._toolset = PlaywrightBrowserToolset[AgentDepsT](
             state=self._state,
             allowed_domains=self.allowed_domains,
+            block_private_addresses=self.block_private_addresses,
             screenshot_on_navigate=self.screenshot_on_navigate,
             max_content_tokens=self.max_content_tokens,
             timeout_ms=self.timeout_ms,
@@ -204,6 +218,8 @@ class PlaywrightBrowser(AbstractCapability[AgentDepsT]):
                 domains = ', '.join(self.allowed_domains)
             else:
                 domains = 'none'
+            if self.block_private_addresses:
+                domains += ' (private/internal addresses blocked)'
             return _INSTRUCTIONS.format(max_content_tokens=self.max_content_tokens, allowed_domains=domains)
 
         return _instructions
@@ -233,12 +249,13 @@ class PlaywrightBrowser(AbstractCapability[AgentDepsT]):
         return None
 
     async def _route_guard(self, route: PlaywrightRoute, request: PlaywrightRequest) -> None:  # pragma: no cover
-        """Network-layer allowlist: abort disallowed top-level navigations, pass the rest.
+        """Network-layer navigation policy: abort disallowed top-level navigations, pass the rest.
 
-        Runs only as a real Playwright route callback, so it is outside the mocked
-        test surface.
+        Applies both the allowlist and the private-address block. Runs only as a
+        real Playwright route callback, so it is outside the mocked test surface.
         """
-        if not request.is_navigation_request() or check_allowed_domain(request.url, self.allowed_domains):
+        permitted = blocked_navigation_reason(request.url, self.allowed_domains, self.block_private_addresses) is None
+        if not request.is_navigation_request() or permitted:
             await route.continue_()
             return
         try:
@@ -294,9 +311,11 @@ class PlaywrightBrowser(AbstractCapability[AgentDepsT]):
             else:
                 browser = await pw.chromium.launch(headless=self.headless)
             self._browser = browser
-            context = await browser.new_context(storage_state=self.storage_state)
+            # Service workers can issue requests that context routes never see, so
+            # they are blocked to keep all traffic on the routable path.
+            context = await browser.new_context(storage_state=self.storage_state, service_workers='block')
             page = await context.new_page()
-            if self.allowed_domains is not None:
+            if self.allowed_domains is not None or self.block_private_addresses:
                 await context.route('**/*', self._route_guard)
             page.on('popup', self._on_popup)
             self._state.page = page
@@ -335,6 +354,7 @@ class PlaywrightBrowser(AbstractCapability[AgentDepsT]):
         *,
         headless: bool = True,
         allowed_domains: list[str] | None = None,
+        block_private_addresses: bool = True,
         screenshot_on_navigate: bool = False,
         max_content_tokens: int = DEFAULT_MAX_CONTENT_TOKENS,
         timeout_ms: int = DEFAULT_TIMEOUT_MS,
@@ -349,6 +369,7 @@ class PlaywrightBrowser(AbstractCapability[AgentDepsT]):
         return cls(
             headless=headless,
             allowed_domains=list(allowed_domains) if allowed_domains is not None else None,
+            block_private_addresses=block_private_addresses,
             screenshot_on_navigate=screenshot_on_navigate,
             max_content_tokens=max_content_tokens,
             timeout_ms=timeout_ms,

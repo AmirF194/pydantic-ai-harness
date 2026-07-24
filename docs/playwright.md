@@ -85,6 +85,7 @@ not raised to abort the agent run.
 |---|---|---|
 | `headless` | `True` | Run Chromium without a visible window (suits servers and CI). |
 | `allowed_domains` | `None` | Navigation allowlist; `None` allows all domains (see [Egress](#egress-and-ssrf)). |
+| `block_private_addresses` | `True` | Refuse navigation to private, loopback, link-local, and other reserved IP literals (see [Egress](#egress-and-ssrf)). |
 | `screenshot_on_navigate` | `False` | Attach a screenshot to every `navigate` result. |
 | `max_content_tokens` | `4000` | Approximate token budget for every textual tool result. |
 | `timeout_ms` | `30000` | Default Playwright navigation/action timeout. |
@@ -153,32 +154,36 @@ page and browser, so concurrent `agent.run()` calls never share a tab.
 
 ## Egress and SSRF
 
-With `allowed_domains=None` (the default) the agent can reach any URL, including
-internal or link-local addresses such as `169.254.169.254` (cloud metadata) or
-`localhost`. When the agent may act on untrusted input, set `allowed_domains` to
-an explicit allowlist. Each entry matches its exact host and any subdomain. The
-allowlist is enforced at two layers: a network route guard aborts disallowed
-top-level navigations (covering clicks, `execute_js`, and history moves, not just
-`navigate`), and each tool re-checks the resulting URL and bounces to
-`about:blank` so disallowed content never reaches the model.
+By default the browser refuses navigation to IP literals that are not globally
+routable -- `169.254.169.254` (the cloud metadata endpoint), `127.0.0.1`, `::1`,
+`localhost` and `*.localhost` names, and the RFC 1918 private ranges -- even
+when no allowlist is set. Set `block_private_addresses=False` when the agent
+should reach a local app or an internal dashboard.
 
-`allowed_domains` constrains top-level navigation; it is not a general security
-boundary. Microsoft's own playwright-mcp disclaims its origin filter the same
-way. The allowlist governs page navigation (top-level document requests), not
-requests initiated by in-page JavaScript (`fetch`/XHR via `execute_js`);
-constraining those is tracked in #415. WebSocket connections and service-worker
-traffic are likewise not covered by the navigation allowlist.
+With `allowed_domains=None` (the default) the agent can reach any public URL.
+When the agent may act on untrusted input, set `allowed_domains` to an explicit
+allowlist. Each entry matches its exact host and any subdomain. The two
+policies are independent: an allowlisted private address is still refused until
+you opt out of `block_private_addresses`. Both are enforced at two layers: a
+network route guard aborts disallowed top-level navigations (covering clicks,
+`execute_js`, and history moves, not just `navigate`), and each tool re-checks
+the resulting URL and bounces to `about:blank` so disallowed content never
+reaches the model. Service workers are blocked in the browser context so their
+traffic cannot slip past the route guard.
+
+Neither policy is a general security boundary. Microsoft's own playwright-mcp
+disclaims its origin filter the same way. Both govern page navigation
+(top-level document requests), not requests initiated by in-page JavaScript
+(`fetch`/XHR via `execute_js`); the private-address block matches IP literals
+and `localhost` names, not hostnames that resolve to private addresses (DNS
+rebinding); and WebSocket connections are not covered. Constraining in-page
+requests and resolution-based blocking are tracked in
+[#415](https://github.com/pydantic/pydantic-ai-harness/issues/415).
 
 For untrusted-input scenarios, run the browser in a container or VM with an
 egress firewall, or front it with a proxy, and pair it with the harness's
 tool-approval hooks for consequential actions. Treat these as defense in depth,
 not a guarantee.
-
-Blocking private and link-local address ranges by default (so open egress is
-safe out of the box) is tracked in
-[#415](https://github.com/pydantic/pydantic-ai-harness/issues/415); this
-capability ships the opt-in allowlist and documents the default, and does not yet
-block internal addresses on its own.
 
 ## Stability
 

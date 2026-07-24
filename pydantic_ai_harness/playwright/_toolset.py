@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import ipaddress
 import json
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
@@ -101,6 +102,22 @@ def _to_idna(host: str) -> str:
         return host
 
 
+def _url_host(url: str) -> str | None:
+    """Extract the host that policy checks run against, or `None` when there is none.
+
+    A URL containing a backslash is treated as hostless: WHATWG parsing (what
+    Chromium applies) turns a backslash into `/`, so `urlparse` would report a
+    host the browser never connects to. A malformed URL that `urlparse` rejects
+    is also treated as hostless, so it fails closed instead of crashing the caller.
+    """
+    if '\\' in url:
+        return None
+    try:
+        return urlparse(url).hostname
+    except ValueError:
+        return None
+
+
 def check_allowed_domain(url: str, allowed_domains: list[str] | None) -> bool:
     """Return whether `url`'s host is permitted by the allowlist.
 
@@ -111,12 +128,7 @@ def check_allowed_domain(url: str, allowed_domains: list[str] | None) -> bool:
     so a Unicode host and its `xn--` spelling get the same verdict. A URL without
     a host (e.g. `about:blank`, `mailto:`) is rejected.
     """
-    if '\\' in url:
-        return False
-    try:
-        host = urlparse(url).hostname
-    except ValueError:
-        return False
+    host = _url_host(url)
     if host is None:
         return False
     if allowed_domains is None:
@@ -127,6 +139,50 @@ def check_allowed_domain(url: str, allowed_domains: list[str] | None) -> bool:
         if domain and (host == domain or host.endswith('.' + domain)):
             return True
     return False
+
+
+def is_blocked_address(host: str) -> bool:
+    """Return whether `host` names an address that is not globally routable.
+
+    Covers private (RFC 1918), loopback, link-local (including the cloud
+    metadata endpoint), carrier-grade NAT, reserved, and multicast ranges. Only
+    IP literals and the loopback hostnames `localhost` / `*.localhost` are
+    detected; a public hostname that resolves to a private address is not (DNS
+    resolution happens in Chromium after this check -- resolution-based blocking
+    is tracked in https://github.com/pydantic/pydantic-ai-harness/issues/415).
+    A trailing dot is stripped so the fully-qualified spelling gets the same
+    verdict, and an IPv4-mapped IPv6 literal is classified by its embedded IPv4
+    address. The named category flags are checked alongside `is_global` because
+    older stdlib versions classify some of these ranges as global.
+    """
+    host = host.lower().rstrip('.')
+    if host == 'localhost' or host.endswith('.localhost'):
+        return True
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        return False
+    if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped is not None:
+        ip = ip.ipv4_mapped
+    return not ip.is_global or ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved or ip.is_multicast
+
+
+def blocked_navigation_reason(url: str, allowed_domains: list[str] | None, block_private_addresses: bool) -> str | None:
+    """Return why navigating to `url` is denied, or `None` when it is permitted.
+
+    The two policies are orthogonal: `check_allowed_domain` applies the opt-in
+    allowlist, and `is_blocked_address` refuses private/link-local/metadata IP
+    literals even when the allowlist permits the host or no allowlist is set, so
+    open egress still cannot reach `http://169.254.169.254/`. The returned phrase
+    names which policy denied the URL, so the model and logs can tell an
+    allowlist miss from a private-address block.
+    """
+    host = _url_host(url)
+    if host is None or not check_allowed_domain(url, allowed_domains):
+        return 'domain not in allowed_domains'
+    if block_private_addresses and is_blocked_address(host):
+        return 'blocked private or link-local address'
+    return None
 
 
 def _truncate(text: str, max_chars: int) -> str:
@@ -207,6 +263,7 @@ class PlaywrightBrowserToolset(FunctionToolset[AgentDepsT]):
         *,
         state: PlaywrightBrowserState,
         allowed_domains: list[str] | None = None,
+        block_private_addresses: bool = True,
         screenshot_on_navigate: bool = False,
         max_content_tokens: int = DEFAULT_MAX_CONTENT_TOKENS,
         timeout_ms: int = DEFAULT_TIMEOUT_MS,
@@ -216,6 +273,7 @@ class PlaywrightBrowserToolset(FunctionToolset[AgentDepsT]):
         super().__init__(id='playwright')
         self._state = state
         self._allowed_domains = allowed_domains
+        self._block_private_addresses = block_private_addresses
         self._screenshot_on_navigate = screenshot_on_navigate
         self._max_content_tokens = max_content_tokens
         self._timeout_ms = timeout_ms
@@ -290,22 +348,24 @@ class PlaywrightBrowserToolset(FunctionToolset[AgentDepsT]):
             return self._truncate_output('Error: timeout_ms must be greater than or equal to 0.')
         return None
 
-    async def _enforce_allowed_domain(self, page: _Page, action: str) -> str | None:
-        """After an action, bounce to `about:blank` if the page left the allowlist.
+    async def _enforce_navigation_policy(self, page: _Page, action: str) -> str | None:
+        """After an action, bounce to `about:blank` if the page left the permitted set.
 
         Navigation can happen through clicks, `execute_js` setting
-        `location.href`, or history moves, so the current URL is re-checked after
-        each such action. When it is disallowed the page is moved to `about:blank`
+        `location.href`, or history moves, so the current URL is re-checked --
+        against both the allowlist and the private-address block -- after each
+        such action. When it is disallowed the page is moved to `about:blank`
         and an error string is returned, so disallowed content never reaches the
         model. The network-level route guard installed by
         `PlaywrightBrowser.wrap_run` is the primary boundary; this is the second
         layer.
         """
-        if check_allowed_domain(page.url, self._allowed_domains):
+        reason = blocked_navigation_reason(page.url, self._allowed_domains, self._block_private_addresses)
+        if reason is None:
             return None
         blocked = page.url
         await page.goto('about:blank')
-        return self._truncate_output(f'Error: {action} reached a domain not in allowed_domains: {blocked}')
+        return self._truncate_output(f'Error: {action} reached a {reason}: {blocked}')
 
     async def navigate(self, url: str, timeout_ms: int | None = None) -> str | ToolReturn[str]:
         """Navigate to a URL and return the page's title and visible text.
@@ -321,14 +381,15 @@ class PlaywrightBrowserToolset(FunctionToolset[AgentDepsT]):
         async with self._serialize_operation():
             if (error := self._timeout_error(timeout_ms)) is not None:
                 return error
-            if not check_allowed_domain(url, self._allowed_domains):
-                return self._truncate_output(f'Error: domain not in allowed_domains: {url}')
+            reason = blocked_navigation_reason(url, self._allowed_domains, self._block_private_addresses)
+            if reason is not None:
+                return self._truncate_output(f'Error: {reason}: {url}')
             page = await self._state.ensure_page()
             timeout = self._resolve_timeout(timeout_ms)
             try:
                 await page.goto(url, timeout=timeout)
                 await page.wait_for_load_state('domcontentloaded', timeout=timeout)
-                blocked = await self._enforce_allowed_domain(page, 'navigate')
+                blocked = await self._enforce_navigation_policy(page, 'navigate')
                 if blocked is not None:
                     return blocked
                 title = await self._await_with_timeout(page.title(), timeout)
@@ -370,7 +431,7 @@ class PlaywrightBrowserToolset(FunctionToolset[AgentDepsT]):
                 else:
                     await page.click(selector, timeout=self._resolve_timeout(timeout_ms))
                 await page.wait_for_load_state('domcontentloaded')
-                blocked = await self._enforce_allowed_domain(page, 'click')
+                blocked = await self._enforce_navigation_policy(page, 'click')
                 if blocked is not None:
                     return blocked
                 return self._truncate_output(f"Clicked '{selector}'. URL: {page.url}\n\n{await self._page_text()}")
@@ -497,7 +558,7 @@ class PlaywrightBrowserToolset(FunctionToolset[AgentDepsT]):
                 if response is None:
                     return self._truncate_output('No previous page in browser history.')
                 await page.wait_for_load_state('domcontentloaded')
-                blocked = await self._enforce_allowed_domain(page, 'go_back')
+                blocked = await self._enforce_navigation_policy(page, 'go_back')
                 if blocked is not None:
                     return blocked
                 return self._truncate_output(f'Went back. URL: {page.url}\n\n{await self._page_text()}')
@@ -522,7 +583,7 @@ class PlaywrightBrowserToolset(FunctionToolset[AgentDepsT]):
                 if response is None:
                     return self._truncate_output('No next page in browser history.')
                 await page.wait_for_load_state('domcontentloaded')
-                blocked = await self._enforce_allowed_domain(page, 'go_forward')
+                blocked = await self._enforce_navigation_policy(page, 'go_forward')
                 if blocked is not None:
                     return blocked
                 return self._truncate_output(f'Went forward. URL: {page.url}\n\n{await self._page_text()}')
@@ -545,7 +606,7 @@ class PlaywrightBrowserToolset(FunctionToolset[AgentDepsT]):
                 result = await page.evaluate(script)
             except Exception as exc:
                 return self._truncate_output(f'JS error: {exc}')
-            blocked = await self._enforce_allowed_domain(page, 'execute_js')
+            blocked = await self._enforce_navigation_policy(page, 'execute_js')
             if blocked is not None:
                 return blocked
             if result is None:

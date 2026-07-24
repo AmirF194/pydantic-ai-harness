@@ -112,9 +112,12 @@ class _FakeRouteHandler(Protocol):
 
 
 class _FakeBrowserContext:
-    def __init__(self, page: _FakePage, *, storage_state: str | None = None) -> None:
+    def __init__(
+        self, page: _FakePage, *, storage_state: str | None = None, service_workers: str | None = None
+    ) -> None:
         self.page = page
         self.storage_state = storage_state
+        self.service_workers = service_workers
         self.routes: list[str] = []
         self.route_handler: _FakeRouteHandler | None = None
 
@@ -360,8 +363,10 @@ class _FakePlaywrightBrowser:
         self.closed = False
         self.contexts: list[_FakeBrowserContext] = []
 
-    async def new_context(self, *, storage_state: str | None = None) -> _FakeBrowserContext:
-        context = _FakeBrowserContext(self._page, storage_state=storage_state)
+    async def new_context(
+        self, *, storage_state: str | None = None, service_workers: str | None = None
+    ) -> _FakeBrowserContext:
+        context = _FakeBrowserContext(self._page, storage_state=storage_state, service_workers=service_workers)
         self._page._context = context
         self.contexts.append(context)
         return context
@@ -426,6 +431,7 @@ def _toolset(
     page: _FakePage,
     *,
     allowed_domains: list[str] | None = None,
+    block_private_addresses: bool = True,
     screenshot_on_navigate: bool = False,
     max_content_tokens: int = DEFAULT_MAX_CONTENT_TOKENS,
 ) -> PlaywrightBrowserToolset[None]:
@@ -435,6 +441,7 @@ def _toolset(
     return PlaywrightBrowserToolset[None](
         state=state,
         allowed_domains=allowed_domains,
+        block_private_addresses=block_private_addresses,
         screenshot_on_navigate=screenshot_on_navigate,
         max_content_tokens=max_content_tokens,
     )
@@ -523,9 +530,10 @@ class TestPlaywrightBrowserTools:
 
     async def test_navigate_allows_ipv6_host_in_allowlist(self) -> None:
         # A bracketed IPv6 literal must match its allowlist entry (regression: the
-        # old netloc.split(':') turned '[::1]' into '[').
+        # old netloc.split(':') turned '[::1]' into '['). Loopback needs the
+        # private-address opt-out on top of the allowlist entry.
         page = _FakePage(url='http://[::1]:8080/')
-        toolset = _toolset(page, allowed_domains=['::1'])
+        toolset = _toolset(page, allowed_domains=['::1'], block_private_addresses=False)
         result = await toolset.navigate('http://[::1]:8080/')
         assert isinstance(result, str) and result.startswith('URL:')
         assert page.goto_calls == ['http://[::1]:8080/']
@@ -800,6 +808,92 @@ class TestPlaywrightBrowserTools:
         assert result == 'Error: execute_js reached a domain not in allowed_domains: https://evil.com/'
 
 
+_BLOCKED_ADDRESS_HOSTS = [
+    '127.0.0.1',
+    '10.0.0.5',
+    '172.16.0.1',
+    '192.168.1.1',
+    '169.254.169.254',
+    '0.0.0.0',
+    '100.64.0.1',
+    '224.0.0.1',
+    '240.0.0.1',
+    '::1',
+    'fe80::1',
+    'fd00::1',
+    '::ffff:127.0.0.1',
+    'localhost',
+    'LOCALHOST',
+    'app.localhost',
+    'localhost.',
+    '169.254.169.254.',
+]
+
+_PUBLIC_ADDRESS_HOSTS = ['example.com', '8.8.8.8', '2606:4700:4700::1111', 'localhost.example.com', 'my-localhost.dev']
+
+
+class TestPrivateAddressBlocking:
+    @pytest.mark.parametrize('host', _BLOCKED_ADDRESS_HOSTS)
+    def test_is_blocked_address_detects_reserved_ranges(self, host: str) -> None:
+        assert toolset_module.is_blocked_address(host) is True
+
+    @pytest.mark.parametrize('host', _PUBLIC_ADDRESS_HOSTS)
+    def test_is_blocked_address_allows_public_hosts(self, host: str) -> None:
+        assert toolset_module.is_blocked_address(host) is False
+
+    def test_blocked_navigation_reason_names_the_denying_policy(self) -> None:
+        reason = toolset_module.blocked_navigation_reason
+        assert reason('https://example.com/', None, True) is None
+        assert reason('http://127.0.0.1/', None, True) == 'blocked private or link-local address'
+        assert reason('http://127.0.0.1/', None, False) is None
+        # An allowlist miss wins the message even for a private address...
+        assert reason('http://127.0.0.1/', ['example.com'], True) == 'domain not in allowed_domains'
+        # ...but an allowlisted private address is still blocked (deny over allow).
+        assert reason('http://127.0.0.1/', ['127.0.0.1'], True) == 'blocked private or link-local address'
+        assert reason('about:blank', None, True) == 'domain not in allowed_domains'
+
+    async def test_navigate_blocks_private_address_under_open_egress(self) -> None:
+        page = _FakePage()
+        toolset = _toolset(page)
+        result = await toolset.navigate('http://169.254.169.254/latest/meta-data/')
+        assert result == 'Error: blocked private or link-local address: http://169.254.169.254/latest/meta-data/'
+        assert page.goto_calls == []
+
+    async def test_navigate_opt_out_reaches_private_address(self) -> None:
+        page = _FakePage(url='http://127.0.0.1:8000/')
+        toolset = _toolset(page, block_private_addresses=False)
+        result = await toolset.navigate('http://127.0.0.1:8000/')
+        assert isinstance(result, str) and result.startswith('URL:')
+        assert page.goto_calls == ['http://127.0.0.1:8000/']
+
+    async def test_navigate_blocks_allowlisted_private_address_without_opt_out(self) -> None:
+        page = _FakePage()
+        toolset = _toolset(page, allowed_domains=['127.0.0.1'])
+        result = await toolset.navigate('http://127.0.0.1:8000/admin')
+        assert result == 'Error: blocked private or link-local address: http://127.0.0.1:8000/admin'
+        assert page.goto_calls == []
+
+    async def test_navigate_bounces_on_redirect_to_private_address(self) -> None:
+        page = _FakePage(redirect_to='http://169.254.169.254/')
+        toolset = _toolset(page)
+        result = await toolset.navigate('https://example.com/start')
+        assert result == 'Error: navigate reached a blocked private or link-local address: http://169.254.169.254/'
+        assert page.goto_calls == ['https://example.com/start', 'about:blank']
+
+    async def test_click_bounces_off_private_address(self) -> None:
+        page = _FakePage(url='http://127.0.0.1:8000/admin')
+        toolset = _toolset(page)
+        result = await toolset.click('a.local')
+        assert result == 'Error: click reached a blocked private or link-local address: http://127.0.0.1:8000/admin'
+        assert page.goto_calls == ['about:blank']
+
+    async def test_execute_js_bounces_off_private_address(self) -> None:
+        page = _FakePage(url='http://169.254.169.254/', evaluate_result='x')
+        toolset = _toolset(page)
+        result = await toolset.execute_js('location.href="http://169.254.169.254/"')
+        assert result == 'Error: execute_js reached a blocked private or link-local address: http://169.254.169.254/'
+
+
 class TestPlaywrightErrorHandling:
     async def test_navigate_timeout_returns_bounded_error(self) -> None:
         page = _FakePage(goto_error=PlaywrightTimeoutError('Timeout 30000ms exceeded.'))
@@ -1070,6 +1164,17 @@ class TestPlaywrightBrowserHooks:
         text = instructions(_ctx())
         assert text is not None and 'Allowed domains: none' in text
 
+    def test_get_instructions_notes_private_address_block(self) -> None:
+        text = PlaywrightBrowser[None]().get_instructions()(_ctx())
+        assert text is not None
+        assert 'Allowed domains: all (private/internal addresses blocked)' in text
+
+    def test_get_instructions_omits_private_note_when_opted_out(self) -> None:
+        text = PlaywrightBrowser[None](block_private_addresses=False).get_instructions()(_ctx())
+        assert text is not None
+        assert 'private/internal addresses blocked' not in text
+        assert 'Allowed domains: all' in text
+
     def test_get_instructions_suppressed_on_launch_error(self) -> None:
         browser = PlaywrightBrowser[None]()
         browser._state.launch_error = 'boom'
@@ -1122,6 +1227,7 @@ class TestPlaywrightBrowserHooks:
         browser = PlaywrightBrowser[None].from_spec(
             headless=False,
             allowed_domains=['x.com'],
+            block_private_addresses=False,
             screenshot_on_navigate=True,
             max_content_tokens=100,
             timeout_ms=5000,
@@ -1130,6 +1236,7 @@ class TestPlaywrightBrowserHooks:
         )
         assert browser.headless is False
         assert browser.allowed_domains == ['x.com']
+        assert browser.block_private_addresses is False
         assert browser.screenshot_on_navigate is True
         assert browser.max_content_tokens == 100
         assert browser.timeout_ms == 5000
@@ -1139,6 +1246,7 @@ class TestPlaywrightBrowserHooks:
     def test_from_spec_defaults_to_open_egress(self) -> None:
         browser = PlaywrightBrowser[None].from_spec()
         assert browser.allowed_domains is None
+        assert browser.block_private_addresses is True
         assert browser.auto_install_chromium is False
         assert browser.storage_state is None
 
@@ -1188,7 +1296,7 @@ class TestPlaywrightBrowserLifecycle:
         chromium = cm._driver.chromium
         assert chromium.launched == [True]
         assert page.popup_events == ['popup']
-        assert page.context.routes == []  # no allowlist -> no route guard registered
+        assert page.context.routes == ['**/*']  # the default private-address block installs the route guard
         assert chromium.browser is not None and chromium.browser.closed is True
         assert cm.exited is True
 
@@ -1212,6 +1320,46 @@ class TestPlaywrightBrowserLifecycle:
         browser = cm._driver.chromium.browser
         assert browser is not None
         assert [c.storage_state for c in browser.contexts] == [None]
+
+    async def test_context_blocks_service_workers(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        page = _FakePage()
+        cm = _install_fake_driver(monkeypatch, page)
+        agent = Agent(TestModel(call_tools=['screenshot']), capabilities=[PlaywrightBrowser()])
+        await agent.run('screenshot the page')
+        browser = cm._driver.chromium.browser
+        assert browser is not None
+        # Service-worker traffic bypasses context routes, so workers are blocked
+        # to keep the route guard authoritative for all requests.
+        assert [c.service_workers for c in browser.contexts] == ['block']
+
+    async def test_no_route_guard_when_open_egress_and_private_opt_out(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        page = _FakePage()
+        _install_fake_driver(monkeypatch, page)
+        agent = Agent(
+            TestModel(call_tools=['screenshot']),
+            capabilities=[PlaywrightBrowser(block_private_addresses=False)],
+        )
+        await agent.run('screenshot the page')
+        assert page.context.routes == []
+
+    async def test_route_guard_blocks_private_navigation_under_open_egress(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        page = _FakePage()
+        _install_fake_driver(monkeypatch, page)
+        agent = Agent(TestModel(call_tools=['screenshot']), capabilities=[PlaywrightBrowser()])
+        await agent.run('screenshot the page')
+        request_page = _FakeRequestPage()
+        blocked = await page.context.dispatch(
+            _FakeRequest('http://169.254.169.254/latest/', navigation=True, frame=request_page.main_frame)
+        )
+        assert blocked.aborted is True
+        assert blocked.continued is False
+        allowed = await page.context.dispatch(
+            _FakeRequest('https://example.com/', navigation=True, frame=request_page.main_frame)
+        )
+        assert allowed.aborted is False
+        assert allowed.continued is True
 
     async def test_only_popup_listener_registered_not_dialog(self, monkeypatch: pytest.MonkeyPatch) -> None:
         page = _FakePage()
