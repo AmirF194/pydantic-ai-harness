@@ -195,9 +195,6 @@ jobs:
     if: ${{ always() && (github.ref_type == 'tag' || needs.changes.outputs.localstack == 'true') }}
     runs-on: ubuntu-latest
     name: LocalStack integration tests
-    # The auth token secret lives in this environment; binding the job to it also
-    # satisfies zizmor's secrets-outside-env audit (same pattern as the release job).
-    environment: localstack-integration
     env:
       # LOCALSTACK_REQUIRE_AUTH_TOKEN makes a missing token fail the job instead
       # of silently skipping the container tests. The token itself is scoped to
@@ -228,7 +225,8 @@ jobs:
       - run: make integration-localstack
         env:
           # Since LocalStack 2026.03.0 the single image requires an auth token to start.
-          LOCALSTACK_AUTH_TOKEN: ${{ secrets.LOCALSTACK_AUTH_TOKEN }}
+          # The job executes the full PR checkout, so path detection is not a security boundary.
+          LOCALSTACK_AUTH_TOKEN: ${{ secrets.LOCALSTACK_AUTH_TOKEN }} # zizmor: ignore[secrets-outside-env]
 
   coverage:
     needs: [test]
