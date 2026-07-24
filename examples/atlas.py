@@ -142,13 +142,22 @@ def _git(workspace: Path, *args: str) -> str:
     return result.stdout.strip()
 
 
+def _commit_exists(workspace: Path, ref: str) -> bool:
+    check = subprocess.run(
+        ['git', 'rev-parse', '--quiet', '--verify', f'{ref}^{{commit}}'], cwd=workspace, capture_output=True, timeout=30
+    )
+    return check.returncode == 0
+
+
 def change_evidence(workspace: Path, last_commit: str | None) -> str:
     """Summarize what changed since the last run, computed here so the model starts from facts."""
-    if last_commit:
+    # A rebase or force-push can invalidate the recorded commit; fall back to
+    # recent history rather than failing the refresh.
+    if last_commit and _commit_exists(workspace, last_commit):
         commits = _git(workspace, 'log', '--oneline', '--name-only', f'{last_commit}..HEAD')
     else:
         commits = _git(workspace, 'log', '--oneline', '--name-only', '-25')
-    pending = _git(workspace, 'status', '--porcelain')
+    pending = _git(workspace, 'status', '--porcelain', '--', '.', ':!atlas')
     return (
         f'Recent commits and the files they touched:\n{commits or "(none)"}\n\n'
         f'Uncommitted work in progress:\n{pending or "(none)"}'
@@ -162,8 +171,9 @@ def main() -> None:
     state: dict[str, str] = json.loads(state_path.read_text()) if state_path.exists() else {}
     head = _git(workspace, 'rev-parse', 'HEAD')
 
-    # The zero-token gate: clean tree and unchanged HEAD means there is nothing to do.
-    if state.get('commit') == head and not _git(workspace, 'status', '--short'):
+    # The zero-token gate: unchanged HEAD and a clean tree (ignoring the map's
+    # own uncommitted files, which every run produces) means there is nothing to do.
+    if state.get('commit') == head and not _git(workspace, 'status', '--short', '--', '.', ':!atlas'):
         print('Knowledge map is current; nothing to do.')
         return
 
