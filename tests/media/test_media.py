@@ -345,6 +345,40 @@ class TestExternalizeRestoreWalker:
         restored = await restore_media(externalized, media_store=store)
         assert restored == node
 
+    async def test_non_part_dict_with_content_is_left_alone(self, tmp_path: Path) -> None:
+        """A dict with a string `content` but no `part_kind` is not a message part.
+
+        Its own `uri` field must survive untouched -- treating it as a part
+        would overwrite `uri` with a media URI and drop it on restore.
+        """
+        store = DiskMediaStore(tmp_path)
+        node = {'content': 'x' * 70_000, 'uri': 'source-id'}
+        externalized = await externalize_media(node, media_store=store, threshold_bytes=64 * 1024)
+        assert externalized == node
+        assert list(tmp_path.glob('*.bin')) == []
+
+    async def test_text_part_externalizes_nested_binary(self, tmp_path: Path) -> None:
+        """A large text part with a nested large binary externalizes both and round-trips."""
+        import base64
+        import json as _json
+
+        store = DiskMediaStore(tmp_path)
+        big_text = 'x' * 70_000
+        big_bin_b64 = base64.b64encode(b'\x01' * 70_000).decode('ascii')
+        node = {
+            'part_kind': 'tool-return',
+            'content': big_text,
+            'metadata': {'kind': 'binary', 'data': big_bin_b64, 'media_type': 'image/png'},
+        }
+        externalized = await externalize_media(node, media_store=store, threshold_bytes=64 * 1024)
+        dumped = _json.dumps(externalized)
+        assert big_text not in dumped
+        assert big_bin_b64 not in dumped  # nested binary went external too
+        assert len(list(tmp_path.glob('*.bin'))) == 2  # one text blob, one binary blob
+
+        restored = await restore_media(externalized, media_store=store)
+        assert restored == node  # both fields re-inlined
+
 
 class TestSigV4Signer:
     def test_produces_required_headers(self) -> None:

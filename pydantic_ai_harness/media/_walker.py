@@ -55,14 +55,19 @@ def _is_binary_part(node: dict[str, object]) -> bool:
 
 
 def _is_text_part(node: dict[str, object]) -> bool:
-    """A part carrying inline text -- any dict with a string `content` field.
+    """A serialized message part carrying inline text.
 
+    Requires a string `part_kind` -- the discriminator every `pydantic_ai`
+    message part serializes -- as well as a string `content`. Gating on
+    `part_kind` keeps arbitrary nested data that merely happens to carry a
+    string `content` key (e.g. a tool-return payload with its own `content`
+    field) from being mistaken for a part and having its fields rewritten.
     Covers `TextPart`, `ToolReturnPart` with a string return, and
     string-valued `UserPromptPart`. A bare string element inside a
     `UserPromptPart.content` list is not a dict, so it is never a candidate
     (replacing it with a marker dict would break `UserContent` validation).
     """
-    return isinstance(node.get('content'), str)
+    return isinstance(node.get('part_kind'), str) and isinstance(node.get('content'), str)
 
 
 def _is_external_marker(node: dict[str, object]) -> bool:
@@ -112,8 +117,9 @@ async def _maybe_externalize_binary(
     media_type = media_type_value if isinstance(media_type_value, str) else None
     uri = await media_store.put(raw, context=MediaContext(media_type=media_type))
     # Preserve every field except the externalized `data`, so the round-trip
-    # survives new `BinaryContent` fields added by pydantic_ai upstream.
-    marker = {key: value for key, value in node.items() if key != 'data'}
+    # survives new `BinaryContent` fields added by pydantic_ai upstream. Fields
+    # are recursively walked so any nested externalizable payload still goes out.
+    marker = await _preserve_fields(node, 'data', media_store, threshold_bytes)
     marker[_EXTERNAL_MARKER] = True
     marker['uri'] = uri
     return marker
@@ -131,14 +137,30 @@ async def _maybe_externalize_text(
     if len(raw) < threshold_bytes:
         return None
     uri = await media_store.put(raw, context=MediaContext(media_type='text/plain'))
-    # Preserve every field except the externalized `content`. `_TEXT_MARKER`
-    # tells `restore_media` to decode UTF-8 back into `content` rather than
-    # base64 into `data`.
-    marker = {key: value for key, value in node.items() if key != 'content'}
+    # Preserve every field except the externalized `content`, recursively walked
+    # so a nested payload (e.g. binary in `metadata`) still goes external too.
+    # `_TEXT_MARKER` tells `restore_media` to decode UTF-8 back into `content`
+    # rather than base64 into `data`.
+    marker = await _preserve_fields(node, 'content', media_store, threshold_bytes)
     marker[_EXTERNAL_MARKER] = True
     marker[_TEXT_MARKER] = True
     marker['uri'] = uri
     return marker
+
+
+async def _preserve_fields(
+    node: dict[str, object],
+    externalized_key: str,
+    media_store: MediaStore,
+    threshold_bytes: int,
+) -> dict[str, object]:
+    """Recursively externalize every field of `node` except `externalized_key`."""
+    out: dict[str, object] = {}
+    for key, value in node.items():
+        if key == externalized_key:
+            continue
+        out[key] = await externalize_media(value, media_store=media_store, threshold_bytes=threshold_bytes)
+    return out
 
 
 async def restore_media(node: object, *, media_store: MediaStore) -> object:
@@ -170,7 +192,13 @@ async def _restore_external(node: dict[str, object], media_store: MediaStore) ->
     raw = await media_store.get(uri_value)
     # Inverse of `_maybe_externalize_*`: drop the marker keys, restore the
     # externalized field, keep every other field the original part carried.
-    restored = {key: value for key, value in node.items() if key not in (_EXTERNAL_MARKER, _TEXT_MARKER, 'uri')}
+    # Preserved fields are recursively restored so a nested marker (from the
+    # externalize-side recursion) is re-inlined too.
+    restored: dict[str, object] = {}
+    for key, value in node.items():
+        if key in (_EXTERNAL_MARKER, _TEXT_MARKER, 'uri'):
+            continue
+        restored[key] = await restore_media(value, media_store=media_store)
     if node.get(_TEXT_MARKER) is True:
         restored['content'] = raw.decode('utf-8')
     else:
