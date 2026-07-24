@@ -1225,14 +1225,20 @@ async def test_unlimited_runs_without_a_backstop() -> None:
     assert out == 2
 
 
-@pytest.mark.parametrize('unknown_key', ['max_durations_secs', 'max_allocations'])
-def test_unknown_resource_limit_key_raises_at_construction(unknown_key: str) -> None:
-    # Unknown and removed keys must not be silently dropped, which would disable the intended cap.
-    # Validate them eagerly rather than at the first call.
+def test_unknown_resource_limit_key_raises_at_construction() -> None:
+    # Unknown keys must not be silently dropped, which would disable the intended cap.
     with pytest.raises(UserError, match='Unknown `resource_limits` key'):
         DynamicWorkflowToolset[object](
             agents=[_wf_agent()],
-            resource_limits={unknown_key: 5},  # pyright: ignore[reportArgumentType]
+            resource_limits={'max_durations_secs': 5},  # pyright: ignore[reportArgumentType]
+        )
+
+
+def test_removed_allocation_limit_has_migration_error() -> None:
+    with pytest.raises(UserError, match='Use `max_memory`'):
+        DynamicWorkflowToolset[object](
+            agents=[_wf_agent()],
+            resource_limits={'max_allocations': 5},  # pyright: ignore[reportArgumentType]
         )
 
 

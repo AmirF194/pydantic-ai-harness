@@ -82,6 +82,7 @@ def _default_resource_limits() -> ResourceLimits:
 # runtime, so a typo (e.g. `max_durations_secs`) would otherwise merge through and be silently
 # dropped -- quietly disabling the only guard against a pure-CPU `while True`. We reject unknowns.
 _RESOURCE_LIMIT_KEYS = frozenset(WorkflowResourceLimits.__annotations__)
+_REMOVED_RESOURCE_LIMIT_KEYS = frozenset({'max_allocations'})
 _MODEL_SAFE_EXCEPTION_MESSAGE_TYPES = (UsageLimitExceeded,)
 _MAX_COMPLETED_DISPATCHES = 20
 _MAX_TASK_PREVIEW_CHARS = 120
@@ -99,6 +100,12 @@ def _resolve_resource_limits(limits: WorkflowResourceLimits | Literal['unlimited
         return _default_resource_limits()
     if limits == 'unlimited':
         return {}
+    removed = set(limits) & _REMOVED_RESOURCE_LIMIT_KEYS
+    if removed:
+        raise UserError(
+            '`resource_limits.max_allocations` was removed because Monty 0.0.19 no longer supports '
+            'allocation limits. Use `max_memory` to bound sandbox memory.'
+        )
     unknown = set(limits) - _RESOURCE_LIMIT_KEYS
     if unknown:
         raise UserError(

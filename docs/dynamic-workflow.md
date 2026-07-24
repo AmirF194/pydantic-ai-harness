@@ -148,13 +148,13 @@ A hard, host-enforced ceiling on the number of sub-agent runs in one parent run.
 
 ### `resource_limits` -- guarding the script itself
 
-These limits guard the orchestration script's own memory, not the sub-agents it calls. The default backstop is 256 MB with no time limit. Printed output is collected separately with Monty's 10 MiB default cap.
+These limits guard the orchestration script's own memory, not the sub-agents it calls. The default backstop is 256 MB with no time limit. Printed output is collected separately with Monty's 10 MiB default cap. Monty 0.0.19 removed allocation-count limits; replace `max_allocations` with `max_memory`.
 
 ```python
 DynamicWorkflow(agents=[...], resource_limits={'max_duration_secs': 30})
 ```
 
-`max_duration_secs` measures the time your script spends running sandbox code, not wall-clock time. While the script waits on a sub-agent it is suspended and that time does not count, so the cap will not fire on a normal workflow no matter how long the sub-agents take. Its one job is catching a pure-CPU runaway -- a `while True:` loop that never awaits, which none of the sub-agent budgets can stop because it never calls a sub-agent. Pass `'unlimited'` to remove every limit, or a partial dict that merges onto the backstop so you override only the caps you name.
+`max_duration_secs` measures the time your script spends running sandbox code, not wall-clock time. While the script waits on a sub-agent it is suspended and that time does not count, so the cap will not fire on a normal workflow no matter how long the sub-agents take. Its one job is catching a pure-CPU runaway -- a `while True:` loop that never awaits, which none of the sub-agent budgets can stop because it never calls a sub-agent. Pass `'unlimited'` to remove every sandbox resource limit; the separate 10 MiB print cap remains. A partial dict merges onto the backstop so you override only the caps you name.
 
 ### Workflows do not nest
 

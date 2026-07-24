@@ -352,7 +352,8 @@ gives depends on `forward_usage`, which controls whether the whole tree shares o
 
 These limits guard the orchestration script's own memory, not the sub-agents it calls. The default
 backstop is 256 MB with no time limit. Printed output is collected separately with Monty's 10 MiB
-default cap.
+default cap. Monty 0.0.19 removed allocation-count limits; replace `max_allocations` with
+`max_memory`.
 
 ```python
 DynamicWorkflow(agents=[...], resource_limits={'max_duration_secs': 30})
@@ -375,9 +376,9 @@ There is no default duration cap. To see why, it helps to know what the timer ac
 > (`max_agent_calls`, `sub_agent_usage_limits`) can stop it, because it never calls a sub-agent. If
 > you want that guard, set `max_duration_secs` yourself.
 >
-> Two more knobs. Pass `'unlimited'` to remove every limit. Pass a partial dict like
-> `{'max_memory': ...}` and it merges onto the backstop, so you override only the caps you name and
-> the rest keep their defaults.
+> Two more knobs. Pass `'unlimited'` to remove every sandbox resource limit; the separate 10 MiB
+> print cap remains. Pass a partial dict like `{'max_memory': ...}` and it merges onto the backstop,
+> so you override only the caps you name and the rest keep their defaults.
 
 ### Workflows do not nest
 
