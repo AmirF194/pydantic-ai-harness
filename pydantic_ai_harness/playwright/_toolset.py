@@ -73,10 +73,16 @@ class _Page(Protocol):
     async def inner_text(self, selector: str, *, timeout: float | None = None) -> str: ...  # pragma: no cover
     async def click(self, selector: str, *, timeout: float | None = None) -> None: ...  # pragma: no cover
     async def fill(self, selector: str, value: str, *, timeout: float | None = None) -> None: ...  # pragma: no cover
-    async def screenshot(self, *, full_page: bool = False) -> bytes: ...  # pragma: no cover
+    async def screenshot(
+        self, *, full_page: bool = False, timeout: float | None = None
+    ) -> bytes: ...  # pragma: no cover
     async def evaluate(self, expression: str) -> object: ...  # pragma: no cover
     async def go_back(self, *, timeout: float | None = None) -> object: ...  # pragma: no cover
     async def go_forward(self, *, timeout: float | None = None) -> object: ...  # pragma: no cover
+    async def wait_for_selector(self, selector: str, *, timeout: float | None = None) -> object: ...  # pragma: no cover
+    async def aria_snapshot(
+        self, *, mode: Literal['ai', 'default'] = 'default', timeout: float | None = None
+    ) -> str: ...  # pragma: no cover
 
 
 def _to_idna(host: str) -> str:
@@ -217,6 +223,8 @@ class PlaywrightBrowserToolset(FunctionToolset[AgentDepsT]):
         self.add_function(self.go_back, name='go_back')
         self.add_function(self.go_forward, name='go_forward')
         self.add_function(self.execute_js, name='execute_js')
+        self.add_function(self.wait_for, name='wait_for')
+        self.add_function(self.snapshot, name='snapshot')
 
     @asynccontextmanager
     async def _serialize_operation(self) -> AsyncGenerator[None]:
@@ -253,6 +261,18 @@ class PlaywrightBrowserToolset(FunctionToolset[AgentDepsT]):
             )
         return f'Error: {action} failed: {exc}'
 
+    def _resolve_timeout(self, timeout_ms: int | None) -> int:
+        """Return the per-call timeout override in milliseconds, or the capability default."""
+        if timeout_ms is None:
+            return self._timeout_ms
+        return timeout_ms
+
+    def _timeout_error(self, timeout_ms: int | None) -> str | None:
+        """Return a bounded error when a per-call timeout override is negative, else `None`."""
+        if timeout_ms is not None and timeout_ms < 0:
+            return self._truncate_output('Error: timeout_ms must be greater than or equal to 0.')
+        return None
+
     async def _enforce_allowed_domain(self, page: _Page, action: str) -> str | None:
         """After an action, bounce to `about:blank` if the page left the allowlist.
 
@@ -270,22 +290,25 @@ class PlaywrightBrowserToolset(FunctionToolset[AgentDepsT]):
         await page.goto('about:blank')
         return self._truncate_output(f'Error: {action} reached a domain not in allowed_domains: {blocked}')
 
-    async def navigate(self, url: str) -> str | ToolReturn[str]:
+    async def navigate(self, url: str, timeout_ms: int | None = None) -> str | ToolReturn[str]:
         """Navigate to a URL and return the page's title and visible text.
 
         Args:
             url: Full URL to navigate to (e.g. `https://example.com`).
+            timeout_ms: Override the default action timeout for this call, in milliseconds.
 
         Returns:
             The page URL, title, and visible text. When `screenshot_on_navigate`
             is set, a screenshot is attached as image content for vision models.
         """
         async with self._serialize_operation():
+            if (error := self._timeout_error(timeout_ms)) is not None:
+                return error
             if not check_allowed_domain(url, self._allowed_domains):
                 return self._truncate_output(f'Error: domain not in allowed_domains: {url}')
             page = await self._state.ensure_page()
             try:
-                await page.goto(url, timeout=self._timeout_ms)
+                await page.goto(url, timeout=self._resolve_timeout(timeout_ms))
                 await page.wait_for_load_state('domcontentloaded')
                 blocked = await self._enforce_allowed_domain(page, 'navigate')
                 if blocked is not None:
@@ -300,17 +323,21 @@ class PlaywrightBrowserToolset(FunctionToolset[AgentDepsT]):
             except PlaywrightError as exc:
                 return self._truncate_output(self._playwright_error('navigate', exc))
 
-    async def click(self, selector: str) -> str:
+    async def click(self, selector: str, timeout_ms: int | None = None) -> str:
         """Click an element on the current page.
 
         Args:
-            selector: A CSS selector (e.g. `button#submit`) or pixel coordinates
-                as `'x,y'` (e.g. `'450,300'`).
+            selector: A CSS selector (e.g. `button#submit`), an `aria-ref=` handle
+                from `snapshot` (the most reliable way to target an element), or
+                pixel coordinates as `'x,y'` (e.g. `'450,300'`).
+            timeout_ms: Override the default action timeout for this call, in milliseconds.
 
         Returns:
             The page's visible text after the click.
         """
         async with self._serialize_operation():
+            if (error := self._timeout_error(timeout_ms)) is not None:
+                return error
             page = await self._state.ensure_page()
             parts = selector.split(',', 1)
             coordinates: tuple[int, int] | None = None
@@ -323,7 +350,7 @@ class PlaywrightBrowserToolset(FunctionToolset[AgentDepsT]):
                 if coordinates is not None:
                     await page.mouse.click(*coordinates)
                 else:
-                    await page.click(selector, timeout=self._timeout_ms)
+                    await page.click(selector, timeout=self._resolve_timeout(timeout_ms))
                 await page.wait_for_load_state('domcontentloaded')
                 blocked = await self._enforce_allowed_domain(page, 'click')
                 if blocked is not None:
@@ -332,39 +359,46 @@ class PlaywrightBrowserToolset(FunctionToolset[AgentDepsT]):
             except PlaywrightError as exc:
                 return self._truncate_output(self._playwright_error('click', exc))
 
-    async def type_text(self, selector: str, text: str) -> str:
+    async def type_text(self, selector: str, text: str, timeout_ms: int | None = None) -> str:
         """Type text into an input field, replacing any existing value.
 
         Args:
-            selector: CSS selector for the target input element.
+            selector: CSS selector for the target input element, or an `aria-ref=`
+                handle from `snapshot`.
             text: Text to type into the field.
+            timeout_ms: Override the default action timeout for this call, in milliseconds.
 
         Returns:
             The page's visible text after typing.
         """
         async with self._serialize_operation():
+            if (error := self._timeout_error(timeout_ms)) is not None:
+                return error
             page = await self._state.ensure_page()
             try:
-                await page.fill(selector, text, timeout=self._timeout_ms)
+                await page.fill(selector, text, timeout=self._resolve_timeout(timeout_ms))
                 return self._truncate_output(f"Typed into '{selector}'.\n\n{await self._page_text()}")
             except PlaywrightError as exc:
                 return self._truncate_output(self._playwright_error('type_text', exc))
 
-    async def screenshot(self, full_page: bool = False) -> str | ToolReturn[str]:
+    async def screenshot(self, full_page: bool = False, timeout_ms: int | None = None) -> str | ToolReturn[str]:
         """Capture a screenshot of the current page.
 
         Args:
             full_page: Capture the full scrollable page when `True`, else the
                 current viewport.
+            timeout_ms: Override the default action timeout for this call, in milliseconds.
 
         Returns:
             A short note with the page URL, and the PNG as image content so
             vision models can see it.
         """
         async with self._serialize_operation():
+            if (error := self._timeout_error(timeout_ms)) is not None:
+                return error
             page = await self._state.ensure_page()
             try:
-                png = await page.screenshot(full_page=full_page)
+                png = await page.screenshot(full_page=full_page, timeout=self._resolve_timeout(timeout_ms))
             except PlaywrightError as exc:
                 return self._truncate_output(self._playwright_error('screenshot', exc))
             return ToolReturn(
@@ -372,21 +406,24 @@ class PlaywrightBrowserToolset(FunctionToolset[AgentDepsT]):
                 content=[BinaryContent(data=png, media_type='image/png')],
             )
 
-    async def get_text(self, selector: str | None = None) -> str:
+    async def get_text(self, selector: str | None = None, timeout_ms: int | None = None) -> str:
         """Extract text from the page or a specific element.
 
         Args:
             selector: CSS selector to read. Omit for the full page's visible text.
+            timeout_ms: Override the default action timeout for this call, in milliseconds.
 
         Returns:
             The element's text, or the full page's visible text when no selector
             is given.
         """
         async with self._serialize_operation():
+            if (error := self._timeout_error(timeout_ms)) is not None:
+                return error
             page = await self._state.ensure_page()
             if selector:
                 try:
-                    text = await page.inner_text(selector, timeout=self._timeout_ms)
+                    text = await page.inner_text(selector, timeout=self._resolve_timeout(timeout_ms))
                 except Exception as exc:
                     return self._truncate_output(f"Error getting text from '{selector}': {exc}")
                 return self._truncate_output(text)
@@ -424,16 +461,21 @@ class PlaywrightBrowserToolset(FunctionToolset[AgentDepsT]):
             except PlaywrightError as exc:
                 return self._truncate_output(self._playwright_error('scroll', exc))
 
-    async def go_back(self) -> str:
+    async def go_back(self, timeout_ms: int | None = None) -> str:
         """Navigate back in the browser history.
+
+        Args:
+            timeout_ms: Override the default action timeout for this call, in milliseconds.
 
         Returns:
             The previous page's visible text.
         """
         async with self._serialize_operation():
+            if (error := self._timeout_error(timeout_ms)) is not None:
+                return error
             page = await self._state.ensure_page()
             try:
-                await page.go_back(timeout=self._timeout_ms)
+                await page.go_back(timeout=self._resolve_timeout(timeout_ms))
                 await page.wait_for_load_state('domcontentloaded')
                 blocked = await self._enforce_allowed_domain(page, 'go_back')
                 if blocked is not None:
@@ -442,16 +484,21 @@ class PlaywrightBrowserToolset(FunctionToolset[AgentDepsT]):
             except PlaywrightError as exc:
                 return self._truncate_output(self._playwright_error('go_back', exc))
 
-    async def go_forward(self) -> str:
+    async def go_forward(self, timeout_ms: int | None = None) -> str:
         """Navigate forward in the browser history.
+
+        Args:
+            timeout_ms: Override the default action timeout for this call, in milliseconds.
 
         Returns:
             The next page's visible text.
         """
         async with self._serialize_operation():
+            if (error := self._timeout_error(timeout_ms)) is not None:
+                return error
             page = await self._state.ensure_page()
             try:
-                await page.go_forward(timeout=self._timeout_ms)
+                await page.go_forward(timeout=self._resolve_timeout(timeout_ms))
                 await page.wait_for_load_state('domcontentloaded')
                 blocked = await self._enforce_allowed_domain(page, 'go_forward')
                 if blocked is not None:
@@ -487,3 +534,64 @@ class PlaywrightBrowserToolset(FunctionToolset[AgentDepsT]):
                 return self._truncate_output(json.dumps(result, default=str))
             except TypeError:  # pragma: no cover
                 return self._truncate_output(str(result))
+
+    async def wait_for(
+        self, selector: str | None = None, text: str | None = None, timeout_ms: int | None = None
+    ) -> str:
+        """Wait for dynamic content to appear, then return the page's visible text.
+
+        Pass exactly one of `selector` or `text`. Use this after an action that
+        loads content asynchronously, so a following read sees the settled page.
+
+        Args:
+            selector: CSS selector (or an `aria-ref=` handle) to wait for.
+            text: Visible text to wait for, matched with Playwright's text engine.
+            timeout_ms: Override the default action timeout for this call, in milliseconds.
+
+        Returns:
+            A short confirmation followed by the page's visible text, or a bounded
+            error string when neither/both arguments are given or the wait times out.
+        """
+        async with self._serialize_operation():
+            if (error := self._timeout_error(timeout_ms)) is not None:
+                return error
+            invalid = 'Error: wait_for requires exactly one of selector or text.'
+            if text is not None:
+                if selector is not None:
+                    return self._truncate_output(invalid)
+                query = f'text={text}'
+            elif selector is not None:
+                query = selector
+            else:
+                return self._truncate_output(invalid)
+            page = await self._state.ensure_page()
+            try:
+                await page.wait_for_selector(query, timeout=self._resolve_timeout(timeout_ms))
+            except PlaywrightError as exc:
+                return self._truncate_output(self._playwright_error('wait_for', exc))
+            return self._truncate_output(f"Found '{query}'.\n\n{await self._page_text()}")
+
+    async def snapshot(self, timeout_ms: int | None = None) -> str:
+        """Return the page's accessibility tree with `aria-ref` handles for targeting.
+
+        The snapshot is the structured, low-cost way to read the page and obtain
+        `aria-ref=eN` handles; pass one back to `click` or `type_text` to target an
+        element reliably. It includes iframe content that page-level selectors cannot
+        reach. Use `screenshot` only for visual checks (charts, layout).
+
+        Args:
+            timeout_ms: Override the default action timeout for this call, in milliseconds.
+
+        Returns:
+            The accessibility tree (truncated to the token budget), or a bounded
+            error string when the snapshot fails.
+        """
+        async with self._serialize_operation():
+            if (error := self._timeout_error(timeout_ms)) is not None:
+                return error
+            page = await self._state.ensure_page()
+            try:
+                tree = await page.aria_snapshot(mode='ai', timeout=self._resolve_timeout(timeout_ms))
+            except PlaywrightError as exc:
+                return self._truncate_output(self._playwright_error('snapshot', exc))
+            return self._truncate_output(tree)

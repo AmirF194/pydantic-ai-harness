@@ -47,15 +47,27 @@ manages the Chromium lifecycle for the run.
 
 | Tool | Signature | Returns |
 |---|---|---|
-| `navigate` | `(url)` | page URL, title, and visible text (truncated) |
-| `click` | `(selector)` | page text after the click; `selector` is a CSS selector or `'x,y'` pixel coordinates |
-| `type_text` | `(selector, text)` | page text after typing (replaces the field value) |
-| `screenshot` | `(full_page=False)` | a note with the page URL, plus the PNG as image content |
-| `get_text` | `(selector=None)` | the element's text, or the full page's visible text |
+| `navigate` | `(url, timeout_ms=None)` | page URL, title, and visible text (truncated) |
+| `snapshot` | `(timeout_ms=None)` | the accessibility tree with `aria-ref` handles (truncated) |
+| `click` | `(selector, timeout_ms=None)` | page text after the click; `selector` is a CSS selector, an `aria-ref=` handle, or `'x,y'` pixel coordinates |
+| `type_text` | `(selector, text, timeout_ms=None)` | page text after typing (replaces the field value) |
+| `wait_for` | `(selector=None, text=None, timeout_ms=None)` | page text once the element/text appears; pass exactly one of `selector`/`text` |
+| `screenshot` | `(full_page=False, timeout_ms=None)` | a note with the page URL, plus the PNG as image content |
+| `get_text` | `(selector=None, timeout_ms=None)` | the element's text, or the full page's visible text |
 | `scroll` | `(direction, x=None, y=None)` | page text after scrolling; `direction` is up/down/left/right |
-| `go_back` | `()` | the previous page's text |
-| `go_forward` | `()` | the next page's text |
+| `go_back` | `(timeout_ms=None)` | the previous page's text |
+| `go_forward` | `(timeout_ms=None)` | the next page's text |
 | `execute_js` | `(script)` | the JavaScript result (string as-is, objects as JSON, `null` as `undefined`) |
+
+Every page action accepts an optional `timeout_ms` to override the capability's
+default `timeout_ms` for that one call.
+
+`snapshot` returns the page's accessibility tree, the low-cost structured way for
+the model to read the page and obtain `aria-ref=eN` handles. Targeting an element
+by its `aria-ref=` handle (passed to `click` or `type_text`) is more reliable than
+a model-authored CSS selector. The snapshot includes iframe content, so it
+partially covers the iframe read limitation noted below. Reach for `screenshot`
+only when a visual check is needed (charts, layout).
 
 `screenshot` (and the optional `screenshot_on_navigate` attachment) return the
 image as [`BinaryContent`](/ai/api/messages/#pydantic_ai.messages.BinaryContent)
@@ -134,9 +146,10 @@ page and browser, so concurrent `agent.run()` calls never share a tab.
 - The browser is single-tab: popups are closed automatically, so flows that
   depend on a second window do not complete.
 - Page-level selectors cannot reach content inside iframes (payment widgets,
-  some CAPTCHAs).
+  some CAPTCHAs); `snapshot` does surface iframe content for reading.
 - Download-triggering clicks are not handled.
-- The model targets elements by CSS selector or pixel coordinates.
+- The model targets elements by `aria-ref=` handle (from `snapshot`), CSS
+  selector, or pixel coordinates.
 
 ## Egress and SSRF
 

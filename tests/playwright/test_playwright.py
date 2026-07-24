@@ -151,6 +151,9 @@ class _FakePage:
         screenshot_error: PlaywrightError | None = None,
         go_back_error: PlaywrightError | None = None,
         go_forward_error: PlaywrightError | None = None,
+        wait_for_error: PlaywrightError | None = None,
+        aria_snapshot_tree: str = '- heading "Example" [ref=e1]\n- button "Go" [ref=e2]',
+        aria_snapshot_error: PlaywrightError | None = None,
     ) -> None:
         self._url = url
         self._title = title
@@ -169,9 +172,13 @@ class _FakePage:
         self._screenshot_error = screenshot_error
         self._go_back_error = go_back_error
         self._go_forward_error = go_forward_error
+        self._wait_for_error = wait_for_error
+        self._aria_snapshot_tree = aria_snapshot_tree
+        self._aria_snapshot_error = aria_snapshot_error
         self._context: _FakeBrowserContext | None = None
         self._popup_on_screenshot: _FakePage | None = None
         self.mouse = _FakeMouse()
+        self.timeouts: dict[str, float | None] = {}
         self.goto_calls: list[str] = []
         self.load_states: list[str] = []
         self.filled: list[tuple[str, str]] = []
@@ -191,6 +198,7 @@ class _FakePage:
 
     async def goto(self, url: str, *, timeout: float | None = None) -> None:
         self.goto_calls.append(url)
+        self.timeouts['goto'] = timeout
         if self._goto_error is not None and url != 'about:blank':
             raise self._goto_error
         # A configured redirect lands the page on a different host than requested,
@@ -204,6 +212,7 @@ class _FakePage:
         return self._title
 
     async def inner_text(self, selector: str, *, timeout: float | None = None) -> str:
+        self.timeouts['inner_text'] = timeout
         if self._inner_text_error is not None:
             raise self._inner_text_error
         if selector == 'body':
@@ -213,16 +222,19 @@ class _FakePage:
         return self._element_text if self._element_text is not None else f'text:{selector}'
 
     async def click(self, selector: str, *, timeout: float | None = None) -> None:
+        self.timeouts['click'] = timeout
         if self._click_error is not None:
             raise self._click_error
         self.clicked.append(selector)
 
     async def fill(self, selector: str, value: str, *, timeout: float | None = None) -> None:
+        self.timeouts['fill'] = timeout
         if self._fill_error is not None:
             raise self._fill_error
         self.filled.append((selector, value))
 
-    async def screenshot(self, *, full_page: bool = False) -> bytes:
+    async def screenshot(self, *, full_page: bool = False, timeout: float | None = None) -> bytes:
+        self.timeouts['screenshot'] = timeout
         if self._screenshot_error is not None:
             raise self._screenshot_error
         if self._popup_on_screenshot is not None:
@@ -238,12 +250,26 @@ class _FakePage:
         return self._evaluate_result
 
     async def go_back(self, *, timeout: float | None = None) -> None:
+        self.timeouts['go_back'] = timeout
         if self._go_back_error is not None:
             raise self._go_back_error
 
     async def go_forward(self, *, timeout: float | None = None) -> None:
+        self.timeouts['go_forward'] = timeout
         if self._go_forward_error is not None:
             raise self._go_forward_error
+
+    async def wait_for_selector(self, selector: str, *, timeout: float | None = None) -> object:
+        self.timeouts['wait_for_selector'] = timeout
+        if self._wait_for_error is not None:
+            raise self._wait_for_error
+        return None
+
+    async def aria_snapshot(self, *, mode: str = 'default', timeout: float | None = None) -> str:
+        self.timeouts['aria_snapshot'] = timeout
+        if self._aria_snapshot_error is not None:
+            raise self._aria_snapshot_error
+        return self._aria_snapshot_tree
 
     async def close(self) -> None:
         self.closed = True
@@ -276,7 +302,7 @@ class _HangingScreenshotPage(_FakePage):
         super().__init__()
         self.screenshot_started = asyncio.Event()
 
-    async def screenshot(self, *, full_page: bool = False) -> bytes:
+    async def screenshot(self, *, full_page: bool = False, timeout: float | None = None) -> bytes:
         self.screenshot_started.set()
         await asyncio.Event().wait()
         return self._screenshot_bytes  # pragma: no cover -- unreachable; the wait is cancelled
@@ -758,6 +784,103 @@ class TestPlaywrightErrorHandling:
         page = _FakePage(go_forward_error=PlaywrightError('history unavailable'))
         result = await _toolset(page).go_forward()
         assert result == 'Error: go_forward failed: history unavailable'
+
+
+_NEGATIVE_TIMEOUT_CALLS: list[Callable[[PlaywrightBrowserToolset[None]], Awaitable[object]]] = [
+    lambda t: t.navigate('https://example.com/', timeout_ms=-1),
+    lambda t: t.click('button', timeout_ms=-1),
+    lambda t: t.type_text('input', 'x', timeout_ms=-1),
+    lambda t: t.get_text('h1', timeout_ms=-1),
+    lambda t: t.screenshot(timeout_ms=-1),
+    lambda t: t.go_back(timeout_ms=-1),
+    lambda t: t.go_forward(timeout_ms=-1),
+    lambda t: t.wait_for(selector='.x', timeout_ms=-1),
+    lambda t: t.snapshot(timeout_ms=-1),
+]
+
+
+class TestPerCallTimeout:
+    async def test_override_reaches_each_playwright_call(self) -> None:
+        page = _FakePage()
+        toolset = _toolset(page)
+        await toolset.navigate('https://example.com/', timeout_ms=1111)
+        assert page.timeouts['goto'] == 1111
+        await toolset.click('button#go', timeout_ms=2222)
+        assert page.timeouts['click'] == 2222
+        await toolset.type_text('input#q', 'hi', timeout_ms=3333)
+        assert page.timeouts['fill'] == 3333
+        await toolset.get_text('h1', timeout_ms=4444)
+        assert page.timeouts['inner_text'] == 4444
+        await toolset.screenshot(timeout_ms=5555)
+        assert page.timeouts['screenshot'] == 5555
+        await toolset.go_back(timeout_ms=6666)
+        assert page.timeouts['go_back'] == 6666
+        await toolset.go_forward(timeout_ms=7777)
+        assert page.timeouts['go_forward'] == 7777
+        await toolset.wait_for(selector='.ready', timeout_ms=8888)
+        assert page.timeouts['wait_for_selector'] == 8888
+        await toolset.snapshot(timeout_ms=9999)
+        assert page.timeouts['aria_snapshot'] == 9999
+
+    async def test_none_falls_back_to_capability_default(self) -> None:
+        page = _FakePage()
+        await _toolset(page).click('button#go')
+        assert page.timeouts['click'] == DEFAULT_TIMEOUT_MS
+
+    @pytest.mark.parametrize('call', _NEGATIVE_TIMEOUT_CALLS)
+    async def test_negative_override_returns_bounded_error(
+        self, call: Callable[[PlaywrightBrowserToolset[None]], Awaitable[object]]
+    ) -> None:
+        result = await call(_toolset(_FakePage()))
+        assert result == 'Error: timeout_ms must be greater than or equal to 0.'
+
+
+class TestWaitFor:
+    async def test_wait_for_selector_returns_page_text(self) -> None:
+        page = _FakePage(body='loaded content')
+        result = await _toolset(page).wait_for(selector='.ready')
+        assert result == "Found '.ready'.\n\nloaded content"
+
+    async def test_wait_for_text_uses_text_engine(self) -> None:
+        page = _FakePage(body='dynamic text')
+        result = await _toolset(page).wait_for(text='Submit')
+        assert result == "Found 'text=Submit'.\n\ndynamic text"
+
+    async def test_wait_for_requires_exactly_one_argument(self) -> None:
+        toolset = _toolset(_FakePage())
+        expected = 'Error: wait_for requires exactly one of selector or text.'
+        assert await toolset.wait_for() == expected
+        assert await toolset.wait_for(selector='.x', text='y') == expected
+
+    async def test_wait_for_timeout_returns_mapped_error(self) -> None:
+        page = _FakePage(wait_for_error=PlaywrightTimeoutError('Timeout 30000ms exceeded.'))
+        result = await _toolset(page).wait_for(selector='.never')
+        assert result == (
+            'Error: wait_for timed out after 30000ms. The element may not exist or the page may be slow; '
+            'try a different selector, or navigate again.'
+        )
+
+
+class TestSnapshot:
+    async def test_snapshot_returns_aria_tree(self) -> None:
+        result = await _toolset(_FakePage()).snapshot()
+        assert result == '- heading "Example" [ref=e1]\n- button "Go" [ref=e2]'
+
+    async def test_snapshot_truncated_to_budget(self) -> None:
+        page = _FakePage(aria_snapshot_tree='Z' * 40)
+        result = await _toolset(page, max_content_tokens=1).snapshot()
+        assert result == 'Z' * 4
+
+    async def test_snapshot_playwright_error_returns_error_string(self) -> None:
+        page = _FakePage(aria_snapshot_error=PlaywrightError('snapshot failed'))
+        result = await _toolset(page).snapshot()
+        assert result == 'Error: snapshot failed: snapshot failed'
+
+    async def test_click_aria_ref_uses_selector_path_not_coordinates(self) -> None:
+        page = _FakePage()
+        await _toolset(page).click('aria-ref=e2')
+        assert page.clicked == ['aria-ref=e2']
+        assert page.mouse.calls == []
 
 
 # --- State / ensure_page ----------------------------------------------------

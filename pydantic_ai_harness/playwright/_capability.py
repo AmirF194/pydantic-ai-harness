@@ -43,9 +43,14 @@ pages behind login or session cookies, JavaScript-heavy SPAs, interactive multi-
 filling forms), and dynamically loaded content. For looking up information or reading a static, public
 URL, prefer web search or web fetch.
 
-Tools: `navigate(url)`, `click(selector)` (CSS selector or 'x,y' pixel coordinates),
-`type_text(selector, text)`, `screenshot(full_page?)`, `get_text(selector?)`,
-`scroll(direction)`, `go_back()`, `go_forward()`, `execute_js(script)`.
+Tools: `navigate(url)`, `snapshot()`, `click(selector)` (CSS selector, 'x,y' pixel coordinates, or an
+`aria-ref=` handle from `snapshot`), `type_text(selector, text)`, `wait_for(selector?, text?)`,
+`screenshot(full_page?)`, `get_text(selector?)`, `scroll(direction)`, `go_back()`, `go_forward()`,
+`execute_js(script)`. Every page action takes an optional `timeout_ms` override.
+
+Prefer `snapshot` to read the page structure and obtain `aria-ref` handles, then target elements by
+`aria-ref=` for reliable clicks. Use `wait_for` for content that loads after an action, and `screenshot`
+only for visual checks (charts, layout).
 
 Textual tool results are truncated to roughly {max_content_tokens} tokens; use `get_text` with a CSS
 selector to read a specific section of a large page. The browser is single-tab. Allowed domains: {allowed_domains}.
@@ -79,11 +84,12 @@ async def _auto_install_chromium() -> str | None:  # pragma: no cover
 class PlaywrightBrowser(AbstractCapability[AgentDepsT]):
     """A real, stateful Chromium browser for an agent, via async Playwright.
 
-    Adds nine tools -- navigate, click, type_text, screenshot, get_text, scroll,
-    go_back, go_forward, execute_js -- backed by one Chromium page that persists
-    across tool calls within a run. Reach for it when the lighter web tools fall
-    short: pages behind login/session cookies, JavaScript-rendered SPAs, and
-    interactive multi-step flows. For query-based research prefer
+    Adds eleven tools -- navigate, snapshot, click, type_text, wait_for,
+    screenshot, get_text, scroll, go_back, go_forward, execute_js -- backed by one
+    Chromium page that persists across tool calls within a run. Reach for it when
+    the lighter web tools fall short: pages behind login/session cookies,
+    JavaScript-rendered SPAs, and interactive multi-step flows. For query-based
+    research prefer
     [`ExaSearch`][pydantic_ai_harness.exa.ExaSearch]; for a static URL prefer a
     web-fetch tool.
 
@@ -178,7 +184,7 @@ class PlaywrightBrowser(AbstractCapability[AgentDepsT]):
         return replace(self)
 
     def get_toolset(self) -> PlaywrightBrowserToolset[AgentDepsT]:
-        """Provide the nine browser tools."""
+        """Provide the eleven browser tools."""
         return self._toolset
 
     def get_instructions(self) -> Callable[[RunContext[AgentDepsT]], str | None]:
