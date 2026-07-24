@@ -35,7 +35,6 @@ from pydantic_monty import NOT_HANDLED, Monty, MountDir, OSAccess, OsFunction
 from typing_extensions import Never, TypedDict
 
 from pydantic_ai_harness import CodeMode
-from pydantic_ai_harness._monty_exec import PrintCapture
 from pydantic_ai_harness.code_mode import CodeModeToolset
 from pydantic_ai_harness.code_mode._toolset import (  # pyright: ignore[reportPrivateUsage]
     _SEARCH_TOOLS_MODIFIER,
@@ -479,6 +478,20 @@ class TestCodeMode:
 
         printed = await wrapper.call_tool('run_code', {'code': 'print("done")\nNone'}, ctx, tools['run_code'])
         assert printed.return_value == {'output': 'done\n'}
+
+    async def test_run_code_caps_printed_output(self) -> None:
+        wrapper = CodeMode[object]().get_wrapper_toolset(_build_function_toolset(add))
+        assert isinstance(wrapper, CodeModeToolset)
+        ctx = await build_ctx(None, wrapper)
+        tools = await wrapper.get_tools(ctx)
+
+        with pytest.raises(ModelRetry, match='memory limit exceeded'):
+            await wrapper.call_tool(
+                'run_code',
+                {'code': "print('x' * (10 * 1024 * 1024))"},
+                ctx,
+                tools['run_code'],
+            )
 
     async def test_run_code_syntax_error_becomes_model_retry(self) -> None:
         """A Python syntax error is surfaced as `ModelRetry` so the model can fix it."""
@@ -2112,24 +2125,6 @@ class TestCodeMode:
         # Retry without restart -- should still be type-checked (REPL was cleared).
         with pytest.raises(ModelRetry, match='Type error'):
             await wrapper.call_tool('run_code', {'code': "await add(a='bad', b=3)"}, ctx, run_code)
-
-    # ---------------------------------------------------------------------------
-    # Internal helpers
-    # ---------------------------------------------------------------------------
-
-    def test_print_capture_concatenates_chunks_in_order(self) -> None:
-        """`PrintCapture` accumulates print-callback chunks and joins them on read.
-
-        Lives in the production module rather than as a closure inside `call_tool` so
-        coverage.py sees it execute even when Monty's Rust-side worker thread bypasses
-        the per-thread tracer hooks. This unit test exercises it directly.
-        """
-        capture = PrintCapture()
-        assert capture.joined == ''
-        capture('stdout', 'hello')
-        capture('stdout', ' ')
-        capture('stdout', 'world\n')
-        assert capture.joined == 'hello world\n'
 
 
 class TestToolSearchIntegration:

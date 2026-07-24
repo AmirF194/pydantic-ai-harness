@@ -148,7 +148,7 @@ A hard, host-enforced ceiling on the number of sub-agent runs in one parent run.
 
 ### `resource_limits` -- guarding the script itself
 
-These limits guard the orchestration script's own memory and allocations, not the sub-agents it calls. The default backstop is 256 MB and 50 million allocations, with no time limit.
+These limits guard the orchestration script's own memory, not the sub-agents it calls. The default backstop is 256 MB with no time limit. Printed output is collected separately with Monty's 10 MiB default cap.
 
 ```python
 DynamicWorkflow(agents=[...], resource_limits={'max_duration_secs': 30})
@@ -237,7 +237,7 @@ DynamicWorkflow(                  # all parameters are keyword-only
     forward_usage=True,
     inherit_model=False,          # True -> sub-agents run with the parent run's resolved model
     sub_agent_usage_limits=None,  # UsageLimits per sub-agent run; None -> pydantic-ai default
-    resource_limits=None,         # None -> backstop (256 MB, 50M allocs, no time cap);
+    resource_limits=None,         # None -> backstop (256 MB, no time cap);
                                   # 'unlimited' -> off; a dict is merged onto the backstop
     id=None,                      # required when defer_loading=True
     description=None,             # one-line catalog entry shown while deferred

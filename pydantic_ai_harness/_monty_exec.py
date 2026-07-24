@@ -24,6 +24,7 @@ from typing import Any
 
 try:
     from pydantic_monty import (
+        CollectString,
         ExternalException,
         ExternalReturnValue,
         ExternalSettledResult,
@@ -60,17 +61,14 @@ def is_sandbox_panic(exc: BaseException) -> bool:
 
 
 class PrintCapture:
-    """Accumulates print-callback chunks from a Monty REPL."""
+    """Collects bounded print output from a Monty REPL."""
 
     def __init__(self) -> None:
-        self._chunks: list[str] = []
-
-    def __call__(self, _stream: str, text: str) -> None:
-        self._chunks.append(text)
+        self.callback = CollectString()
 
     @property
     def joined(self) -> str:
-        return ''.join(self._chunks)
+        return self.callback.output
 
     def prepend_to(self, error_message: str) -> str:
         """Prefix captured stdout to an error message, so the model sees what printed before the error."""

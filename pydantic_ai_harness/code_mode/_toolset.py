@@ -617,7 +617,7 @@ class CodeModeToolset(WrapperToolset[AgentDepsT]):
             try:
                 monty_state = session.feed_start(
                     code,
-                    print_callback=capture,
+                    print_callback=capture.callback,
                     os=self.os_access,
                     mount=self.mount,
                     skip_type_check=not type_check,

@@ -70,15 +70,11 @@ class WorkflowResourceLimits(TypedDict, total=False):
     max_memory: int
     """Maximum sandbox memory, in bytes."""
 
-    max_allocations: int
-    """Maximum number of sandbox allocations."""
-
 
 def _default_resource_limits() -> ResourceLimits:
     """Backstop sandbox limits; no duration cap -- see `WorkflowResourceLimits.max_duration_secs`."""
     return {
         'max_memory': 256 * 1024 * 1024,
-        'max_allocations': 50_000_000,
     }
 
 
@@ -96,8 +92,8 @@ _TRUNCATED_MARKER = ' ... [truncated]'
 def _resolve_resource_limits(limits: WorkflowResourceLimits | Literal['unlimited'] | None) -> ResourceLimits:
     """Resolve the public `resource_limits` value to the limits handed to the sandbox.
 
-    A partial mapping merges *onto* the backstop rather than replacing it, so `{'max_memory': ...}`
-    never silently drops the allocations backstop. Full semantics: `DynamicWorkflow.resource_limits`.
+    A partial mapping merges *onto* the backstop rather than replacing it. Full semantics:
+    `DynamicWorkflow.resource_limits`.
     """
     if limits is None:
         return _default_resource_limits()
@@ -453,7 +449,7 @@ class DynamicWorkflowToolset(AbstractToolset[AgentDepsT]):
     See `DynamicWorkflow.sub_agent_usage_limits` for the budgeting semantics."""
 
     resource_limits: WorkflowResourceLimits | Literal['unlimited'] | None = None
-    """Sandbox limits guarding the orchestration script's own memory/allocations (not sub-agents).
+    """Sandbox limits guarding the orchestration script's own memory (not sub-agents).
     See `DynamicWorkflow.resource_limits` for the `None`/`'unlimited'`/partial-dict semantics."""
 
     toolset_id: str | None = None
@@ -700,7 +696,7 @@ class DynamicWorkflowToolset(AbstractToolset[AgentDepsT]):
         try:
             with Monty() as monty_pool:
                 with monty_pool.checkout(limits=limits, type_check=True, type_check_stubs=type_check_stubs) as session:
-                    monty_state = session.feed_start(code, print_callback=capture)
+                    monty_state = session.feed_start(code, print_callback=capture.callback)
                     # `_by_name` is not mutated while a script executes (reveals land in `get_tools`,
                     # which does not interleave with `call_tool`), so it is a stable name registry for
                     # the whole script. Sub-agents always run concurrently (the executor's defaults);
