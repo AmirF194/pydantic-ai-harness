@@ -135,23 +135,26 @@ The sandbox uses Monty, a subset of Python. Key restrictions:
 - **Importable standard-library modules**: `sys`, `typing`, `asyncio`, `math`, `json`, `re`,
   `unicodedata`, `datetime`, `os`, and `pathlib`. Import what you use at the top of the script.
   Filesystem, environment, and clock operations are not configured for workflow scripts.
-- **No wall-clock or timing primitives** (`asyncio.sleep`, `datetime.now()`, the `time` module).
+- **No wall-clock or timing primitives** (`asyncio.sleep`, `datetime.datetime.now()`,
+  `datetime.date.today()`, the `time` module).
 
-Each sub-agent below is an async function. Call it with the `task` keyword argument -- write
-`reviewer(task="...")`, not `reviewer("...")`; all parameters are keyword-only. A sub-agent returns
-that agent's output: a string by default, or -- if it has a structured `output_type` -- a dict, whose
-fields you read by subscript (`r["field"]`), not attribute (`r.field`). Each sub-agent call is an
-independent run with no memory of earlier calls; include all needed context in `task`. Run several
-at once with `asyncio.gather` rather than awaiting each sequentially:
+Each sub-agent below is an async function. Await it and pass `task` by keyword:
+`result = await reviewer(task="...")`, not `reviewer("...")`; all parameters are keyword-only. A
+sub-agent returns that agent's output: a string by default, or -- if it has a structured
+`output_type` -- a dict, whose fields you read by subscript (`r["field"]`), not attribute
+(`r.field`). Each sub-agent call is an independent run with no memory of earlier calls; include all
+needed context in `task`. Run several at once with `asyncio.gather` rather than awaiting each
+sequentially:
 
 ```python
 import asyncio
 reviews = await asyncio.gather(reviewer(task="check auth"), reviewer(task="check parsing"))
 ```
 
-`asyncio.gather` does **not** support `return_exceptions=True`. A sub-agent that raises propagates as
-a normal exception: wrap the call in `try`/`except` to handle it, or let it abort the whole script
-and retry.
+`asyncio.gather` accepts positional awaitables but no keyword arguments, including
+`return_exceptions=True`. Other task creation and wait APIs are unavailable. A sub-agent failure
+surfaces as `RuntimeError`: catch it with `try`/`except RuntimeError`, or let it abort the whole
+script and retry.
 
 The last expression's value is captured as the result -- you do **not** need to `print()` it, and
 printing produces a string representation, not structured data. Use `print()` only for debug logging.

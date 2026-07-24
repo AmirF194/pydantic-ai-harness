@@ -121,7 +121,7 @@ Write and run Python code in a sandboxed environment.
 
 The sandbox uses Monty, a subset of Python. Key restrictions:
 - **No third-party libraries**: only the standard library modules listed below can be used
-- **Importable standard library modules**: `sys`, `typing`, `asyncio`, `math`, `json`, `re`, `unicodedata`, `datetime`, `os`, `pathlib`. These must be imported before use, just like in regular Python. For example: `import asyncio` then `await asyncio.gather(tool_one(...), tool_two(...))`."""
+- **Importable standard library modules**: `sys`, `typing`, `asyncio`, `math`, `json`, `re`, `unicodedata`, `datetime`, `os`, `pathlib`. These must be imported before use, just like in regular Python."""
 
 # Timing/OS restriction line, swapped depending on what host access the agent
 # configured. Three states, because `mount` and `os` enable different things:
@@ -205,6 +205,9 @@ def _functions_header(*, has_sync: bool, has_async: bool) -> str:
             ' All tool functions are async: invoke them with `await`,'
             ' e.g. `await tool_name(arg=value)`.'
             ' Calling without `await` returns an unresolved future, not the value.'
+            ' For concurrency, use `await asyncio.gather(...)` with positional awaitables.'
+            ' Monty does not support `asyncio.gather` keyword arguments or other task creation'
+            ' and wait APIs.'
         )
     if has_sync and not has_async:
         return base + (' All tool functions are synchronous: call them directly, e.g. `tool_name(arg=value)`.')
@@ -212,6 +215,9 @@ def _functions_header(*, has_sync: bool, has_async: bool) -> str:
         ' Async functions (`async def`) must be invoked with `await`,'
         ' e.g. `await tool_name(arg=value)`.'
         ' Sync functions (`def`) are called directly, e.g. `tool_name(arg=value)`.'
+        ' For concurrent async calls, use `await asyncio.gather(...)` with positional awaitables.'
+        ' Monty does not support `asyncio.gather` keyword arguments or other task creation'
+        ' and wait APIs.'
     )
 
 

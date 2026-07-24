@@ -274,19 +274,21 @@ class TestCodeMode:
 
     async def test_run_code_function_examples_are_expressions(self) -> None:
         """Async, sync, and mixed function examples do not end on assignments."""
-        cases: list[tuple[FunctionToolset[object], tuple[str, ...]]] = [
-            (_build_function_toolset(add), ('e.g. `await tool_name(arg=value)`.',)),
+        cases: list[tuple[FunctionToolset[object], tuple[str, ...], bool]] = [
+            (_build_function_toolset(add), ('e.g. `await tool_name(arg=value)`.',), True),
             (
                 FunctionToolset[object](tools=[Tool(add, sequential=True)]),
                 ('e.g. `tool_name(arg=value)`.',),
+                False,
             ),
             (
                 FunctionToolset[object](tools=[Tool(add, sequential=True), Tool(greet)]),
                 ('e.g. `await tool_name(arg=value)`.', 'e.g. `tool_name(arg=value)`.'),
+                True,
             ),
         ]
 
-        for toolset, expected_examples in cases:
+        for toolset, expected_examples, has_async in cases:
             wrapper = CodeMode[object]().get_wrapper_toolset(toolset)
             assert isinstance(wrapper, CodeModeToolset)
 
@@ -295,6 +297,10 @@ class TestCodeMode:
             assert description is not None
             assert all(example in description for example in expected_examples)
             assert 'e.g. `result =' not in description
+            if has_async:
+                assert 'use `await asyncio.gather(...)` with positional awaitables' in description
+            else:
+                assert 'asyncio.gather' not in description
 
     async def test_run_code_executes_call_through_monty(self) -> None:
         """End-to-end: `run_code` runs Python in Monty and dispatches to a sync wrapped tool."""

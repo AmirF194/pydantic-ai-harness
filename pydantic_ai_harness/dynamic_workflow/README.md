@@ -461,10 +461,10 @@ worth knowing where the edges are:
 - Importable standard-library modules include `sys`, `typing`, `asyncio`, `math`, `json`, `re`,
   `unicodedata`, `datetime`, `os`, and `pathlib`. Import what you use. Filesystem, environment, and
   clock operations are not configured for workflow scripts.
-- No wall-clock or timing primitives. There is no `asyncio.sleep`, no `datetime.now()`, and no
-  `time` module.
-- `asyncio.gather(...)` runs sub-agents concurrently, but it does not support
-  `return_exceptions=True`.
+- No wall-clock or timing primitives. There is no `asyncio.sleep`, no
+  `datetime.datetime.now()`, no `datetime.date.today()`, and no `time` module.
+- `asyncio.gather(...)` runs sub-agents concurrently with positional awaitables but no keyword
+  arguments, including `return_exceptions=True`. Other task creation and wait APIs are unavailable.
 
 Before a script runs, it is statically type-checked against the sub-agent signatures. An ordinary,
 statically provable mistake such as a misspelled function, a positional `task`, or a wrong-typed
@@ -473,11 +473,11 @@ reach runtime validation; they are still rejected before a sub-agent runs.
 
 > **Warning: an uncaught error aborts the whole script**
 >
-> A sub-agent that raises propagates as a normal exception. The script can catch it with
-> `try`/`except`; an uncaught failure aborts the whole script and the model retries it. If a script
-> does fail after some sub-agents already finished, the retry prompt lists bounded previews of up to
-> the 20 most recent completed results. The model can reuse an untruncated preview as a plain value
-> instead of paying for the same call again.
+> A sub-agent failure surfaces as `RuntimeError`. The script can catch it with
+> `try`/`except RuntimeError`; an uncaught failure aborts the whole script and the model retries it.
+> If a script does fail after some sub-agents already finished, the retry prompt lists bounded
+> previews of up to the 20 most recent completed results. The model can reuse an untruncated preview
+> as a plain value instead of paying for the same call again.
 
 ## What is coming
 
