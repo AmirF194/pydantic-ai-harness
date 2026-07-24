@@ -47,6 +47,8 @@ jobs:
             tests/localstack \
             integration_tests/localstack \
             Makefile \
+            pyproject.toml \
+            uv.lock \
             .github/workflows/main.yml
           then
             echo 'localstack=false' >> "$GITHUB_OUTPUT"

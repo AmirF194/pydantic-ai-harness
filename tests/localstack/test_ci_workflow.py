@@ -73,6 +73,8 @@ def test_changes_job_uses_owned_git_diff_with_read_only_checkout() -> None:
     assert '            tests/localstack \\' in changes_block
     assert '            integration_tests/localstack \\' in changes_block
     assert '            Makefile \\' in changes_block
+    assert '            pyproject.toml \\' in changes_block
+    assert '            uv.lock \\' in changes_block
     assert '            .github/workflows/main.yml' in changes_block
 
 
