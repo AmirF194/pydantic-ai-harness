@@ -57,7 +57,7 @@ selector to read a specific section of a large page. The browser is single-tab. 
 """
 
 
-async def _auto_install_chromium() -> str | None:  # pragma: no cover
+async def _auto_install_chromium() -> str | None:
     """Run `playwright install chromium` in this interpreter; `None` on success, else the installer output.
 
     Only invoked when `auto_install_chromium=True` and the binary is missing. It
@@ -74,7 +74,12 @@ async def _auto_install_chromium() -> str | None:  # pragma: no cover
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.STDOUT,
     )
-    stdout, _ = await proc.communicate()
+    try:
+        stdout, _ = await proc.communicate()
+    except asyncio.CancelledError:
+        proc.terminate()
+        await proc.wait()
+        raise
     if proc.returncode == 0:
         return None
     return stdout.decode(errors='replace')

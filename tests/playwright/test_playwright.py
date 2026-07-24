@@ -35,6 +35,8 @@ from pydantic_ai_harness.playwright import (
 
 pytestmark = pytest.mark.anyio
 
+_HISTORY_RESPONSE = object()
+
 
 @pytest.fixture
 def anyio_backend() -> str:
@@ -151,6 +153,8 @@ class _FakePage:
         screenshot_error: PlaywrightError | None = None,
         go_back_error: PlaywrightError | None = None,
         go_forward_error: PlaywrightError | None = None,
+        go_back_result: object | None = _HISTORY_RESPONSE,
+        go_forward_result: object | None = _HISTORY_RESPONSE,
         wait_for_error: PlaywrightError | None = None,
         aria_snapshot_tree: str = '- heading "Example" [ref=e1]\n- button "Go" [ref=e2]',
         aria_snapshot_error: PlaywrightError | None = None,
@@ -172,6 +176,8 @@ class _FakePage:
         self._screenshot_error = screenshot_error
         self._go_back_error = go_back_error
         self._go_forward_error = go_forward_error
+        self._go_back_result = go_back_result
+        self._go_forward_result = go_forward_result
         self._wait_for_error = wait_for_error
         self._aria_snapshot_tree = aria_snapshot_tree
         self._aria_snapshot_error = aria_snapshot_error
@@ -205,8 +211,9 @@ class _FakePage:
         # modelling a 3xx to a disallowed domain (but never for the bounce itself).
         self._url = self._redirect_to if self._redirect_to is not None and url != 'about:blank' else url
 
-    async def wait_for_load_state(self, state: str) -> None:
+    async def wait_for_load_state(self, state: str, *, timeout: float | None = None) -> None:
         self.load_states.append(state)
+        self.timeouts['wait_for_load_state'] = timeout
 
     async def title(self) -> str:
         return self._title
@@ -249,15 +256,17 @@ class _FakePage:
             raise self._evaluate_raises
         return self._evaluate_result
 
-    async def go_back(self, *, timeout: float | None = None) -> None:
+    async def go_back(self, *, timeout: float | None = None) -> object | None:
         self.timeouts['go_back'] = timeout
         if self._go_back_error is not None:
             raise self._go_back_error
+        return self._go_back_result
 
-    async def go_forward(self, *, timeout: float | None = None) -> None:
+    async def go_forward(self, *, timeout: float | None = None) -> object | None:
         self.timeouts['go_forward'] = timeout
         if self._go_forward_error is not None:
             raise self._go_forward_error
+        return self._go_forward_result
 
     async def wait_for_selector(self, selector: str, *, timeout: float | None = None) -> object:
         self.timeouts['wait_for_selector'] = timeout
@@ -306,6 +315,42 @@ class _HangingScreenshotPage(_FakePage):
         self.screenshot_started.set()
         await asyncio.Event().wait()
         return self._screenshot_bytes  # pragma: no cover -- unreachable; the wait is cancelled
+
+
+class _HangingTitlePage(_FakePage):
+    async def title(self) -> str:
+        await asyncio.Event().wait()
+        return self._title  # pragma: no cover -- unreachable; the wait is cancelled
+
+
+class _FakeInstallerProcess:
+    def __init__(self, *, returncode: int, output: bytes, hang: bool = False) -> None:
+        self.returncode = returncode
+        self.output = output
+        self.hang = hang
+        self.communicate_started = asyncio.Event()
+        self.terminated = False
+        self.waited = False
+
+    async def communicate(self) -> tuple[bytes, None]:
+        self.communicate_started.set()
+        if self.hang:
+            await asyncio.Event().wait()
+        return self.output, None
+
+    def terminate(self) -> None:
+        self.terminated = True
+
+    async def wait(self) -> int:
+        self.waited = True
+        return self.returncode
+
+
+def _install_fake_installer_process(monkeypatch: pytest.MonkeyPatch, process: _FakeInstallerProcess) -> None:
+    async def _create_subprocess_exec(*args: str, **kwargs: int) -> _FakeInstallerProcess:
+        return process
+
+    monkeypatch.setattr(asyncio, 'create_subprocess_exec', _create_subprocess_exec)
 
 
 class _FakePlaywrightBrowser:
@@ -438,6 +483,9 @@ class TestPlaywrightBrowserTools:
         # the userinfo, so `.hostname` resolves it correctly and the match fails.
         assert toolset_module.check_allowed_domain('https://allowed.com:pass@evil.com/', ['allowed.com']) is False
 
+    def test_check_allowed_domain_rejects_backslash_before_url_parsing(self) -> None:
+        assert toolset_module.check_allowed_domain(r'https://evil.com\@example.com/', ['example.com']) is False
+
     @pytest.mark.parametrize('host', ['evil-example.com', 'example.com.attacker.com'])
     def test_check_allowed_domain_rejects_sibling_domain_tricks(self, host: str) -> None:
         assert toolset_module.check_allowed_domain(f'https://{host}/', ['example.com']) is False
@@ -503,6 +551,13 @@ class TestPlaywrightBrowserTools:
         toolset = _toolset(page)
         result = await toolset.navigate('https://[::1')
         assert result == 'Error: domain not in allowed_domains: https://[::1'
+        assert page.goto_calls == []
+
+    async def test_navigate_rejects_backslash_url_without_opening_page(self) -> None:
+        page = _FakePage()
+        url = r'https://evil.com\@example.com/'
+        result = await _toolset(page, allowed_domains=['example.com']).navigate(url)
+        assert result == f'Error: domain not in allowed_domains: {url}'
         assert page.goto_calls == []
 
     async def test_navigate_attaches_screenshot_when_configured(self) -> None:
@@ -681,6 +736,10 @@ class TestPlaywrightBrowserTools:
         result = await toolset.go_back()
         assert result == 'Error: go_back reached a domain not in allowed_domains: https://evil.com/'
 
+    async def test_go_back_reports_empty_history(self) -> None:
+        result = await _toolset(_FakePage(go_back_result=None)).go_back()
+        assert result == 'No previous page in browser history.'
+
     async def test_go_forward(self) -> None:
         toolset = _toolset(_FakePage(url='https://example.com/next', body='next'))
         result = await toolset.go_forward()
@@ -691,6 +750,10 @@ class TestPlaywrightBrowserTools:
         toolset = _toolset(page, allowed_domains=['example.com'])
         result = await toolset.go_forward()
         assert result == 'Error: go_forward reached a domain not in allowed_domains: https://evil.com/'
+
+    async def test_go_forward_reports_empty_history(self) -> None:
+        result = await _toolset(_FakePage(go_forward_result=None)).go_forward()
+        assert result == 'No next page in browser history.'
 
     async def test_execute_js_string_result(self) -> None:
         toolset = _toolset(_FakePage(evaluate_result='the title'))
@@ -800,6 +863,29 @@ _NEGATIVE_TIMEOUT_CALLS: list[Callable[[PlaywrightBrowserToolset[None]], Awaitab
 
 
 class TestPerCallTimeout:
+    async def test_navigate_override_reaches_every_playwright_operation(self) -> None:
+        page = _FakePage()
+        result = await _toolset(page, screenshot_on_navigate=True).navigate('https://example.com/', timeout_ms=1111)
+        assert isinstance(result, ToolReturn)
+        assert page.timeouts == {
+            'goto': 1111,
+            'wait_for_load_state': 1111,
+            'inner_text': 1111,
+            'screenshot': 1111,
+        }
+
+    async def test_zero_timeout_disables_title_deadline(self) -> None:
+        result = await _toolset(_FakePage()).navigate('https://example.com/', timeout_ms=0)
+        assert isinstance(result, str)
+        assert result.startswith('URL:')
+
+    async def test_navigate_title_honors_timeout_override(self) -> None:
+        result = await _toolset(_HangingTitlePage()).navigate('https://example.com/', timeout_ms=1)
+        assert result == (
+            'Error: navigate timed out after 30000ms. The element may not exist or the page may be slow; '
+            'try a different selector, or navigate again.'
+        )
+
     async def test_override_reaches_each_playwright_call(self) -> None:
         page = _FakePage()
         toolset = _toolset(page)
@@ -1050,6 +1136,39 @@ class TestPlaywrightBrowserHooks:
         assert browser.allowed_domains is None
         assert browser.auto_install_chromium is False
         assert browser.storage_state is None
+
+
+class TestChromiumAutoInstall:
+    @pytest.mark.parametrize(
+        ('returncode', 'output', 'expected'),
+        [
+            (0, b'', None),
+            (1, b'download failed', 'download failed'),
+        ],
+    )
+    async def test_returns_installer_result(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        returncode: int,
+        output: bytes,
+        expected: str | None,
+    ) -> None:
+        process = _FakeInstallerProcess(returncode=returncode, output=output)
+        _install_fake_installer_process(monkeypatch, process)
+        assert await capability_module._auto_install_chromium() == expected
+        assert process.terminated is False
+        assert process.waited is False
+
+    async def test_cancellation_terminates_and_waits_for_installer(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        process = _FakeInstallerProcess(returncode=-15, output=b'', hang=True)
+        _install_fake_installer_process(monkeypatch, process)
+        task = asyncio.create_task(capability_module._auto_install_chromium())
+        await process.communicate_started.wait()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert process.terminated is True
+        assert process.waited is True
 
 
 # --- Lifecycle through Agent + wrap_run -------------------------------------

@@ -6,7 +6,7 @@ import asyncio
 import json
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Literal, Protocol
+from typing import TYPE_CHECKING, Literal, Protocol, TypeVar
 from urllib.parse import urlparse
 
 from pydantic_ai.messages import BinaryContent, ToolReturn
@@ -35,6 +35,8 @@ except ImportError as _import_error:  # pragma: no cover
 
 if TYPE_CHECKING:
     from collections.abc import AsyncGenerator, Awaitable, Callable
+
+_T = TypeVar('_T')
 
 DEFAULT_MAX_CONTENT_TOKENS: int = 4000
 """Default token budget for textual tool results injected into the agent context."""
@@ -68,7 +70,9 @@ class _Page(Protocol):
     @property
     def mouse(self) -> _Mouse: ...  # pragma: no cover
     async def goto(self, url: str, *, timeout: float | None = None) -> object: ...  # pragma: no cover
-    async def wait_for_load_state(self, state: Literal['domcontentloaded']) -> None: ...  # pragma: no cover
+    async def wait_for_load_state(
+        self, state: Literal['domcontentloaded'], *, timeout: float | None = None
+    ) -> None: ...  # pragma: no cover
     async def title(self) -> str: ...  # pragma: no cover
     async def inner_text(self, selector: str, *, timeout: float | None = None) -> str: ...  # pragma: no cover
     async def click(self, selector: str, *, timeout: float | None = None) -> None: ...  # pragma: no cover
@@ -107,6 +111,8 @@ def check_allowed_domain(url: str, allowed_domains: list[str] | None) -> bool:
     so a Unicode host and its `xn--` spelling get the same verdict. A URL without
     a host (e.g. `about:blank`, `mailto:`) is rejected.
     """
+    if '\\' in url:
+        return False
     try:
         host = urlparse(url).hostname
     except ValueError:
@@ -232,10 +238,10 @@ class PlaywrightBrowserToolset(FunctionToolset[AgentDepsT]):
         async with self._operation_lock:
             yield
 
-    async def _page_text(self) -> str:
+    async def _page_text(self, timeout_ms: int | None = None) -> str:
         """Return the current page's visible text, truncated to the token budget."""
         page = await self._state.ensure_page()
-        text = await page.inner_text('body')
+        text = await page.inner_text('body', timeout=timeout_ms)
         return self._truncate_output(text)
 
     def _truncate_output(self, text: str) -> str:
@@ -266,6 +272,15 @@ class PlaywrightBrowserToolset(FunctionToolset[AgentDepsT]):
         if timeout_ms is None:
             return self._timeout_ms
         return timeout_ms
+
+    async def _await_with_timeout(self, awaitable: Awaitable[_T], timeout_ms: int) -> _T:
+        """Bound an operation whose Playwright API has no `timeout` parameter."""
+        if timeout_ms == 0:
+            return await awaitable
+        try:
+            return await asyncio.wait_for(awaitable, timeout_ms / 1000)
+        except TimeoutError as exc:
+            raise PlaywrightTimeoutError(f'Timeout {timeout_ms}ms exceeded.') from exc
 
     def _timeout_error(self, timeout_ms: int | None) -> str | None:
         """Return a bounded error when a per-call timeout override is negative, else `None`."""
@@ -307,18 +322,19 @@ class PlaywrightBrowserToolset(FunctionToolset[AgentDepsT]):
             if not check_allowed_domain(url, self._allowed_domains):
                 return self._truncate_output(f'Error: domain not in allowed_domains: {url}')
             page = await self._state.ensure_page()
+            timeout = self._resolve_timeout(timeout_ms)
             try:
-                await page.goto(url, timeout=self._resolve_timeout(timeout_ms))
-                await page.wait_for_load_state('domcontentloaded')
+                await page.goto(url, timeout=timeout)
+                await page.wait_for_load_state('domcontentloaded', timeout=timeout)
                 blocked = await self._enforce_allowed_domain(page, 'navigate')
                 if blocked is not None:
                     return blocked
-                title = await page.title()
-                text = await self._page_text()
+                title = await self._await_with_timeout(page.title(), timeout)
+                text = await self._page_text(timeout)
                 result = self._truncate_output(f'URL: {page.url}\nTitle: {title}\n\n{text}')
                 if not self._screenshot_on_navigate:
                     return result
-                png = await page.screenshot()
+                png = await page.screenshot(timeout=timeout)
                 return ToolReturn(result, content=[BinaryContent(data=png, media_type='image/png')])
             except PlaywrightError as exc:
                 return self._truncate_output(self._playwright_error('navigate', exc))
@@ -475,7 +491,9 @@ class PlaywrightBrowserToolset(FunctionToolset[AgentDepsT]):
                 return error
             page = await self._state.ensure_page()
             try:
-                await page.go_back(timeout=self._resolve_timeout(timeout_ms))
+                response = await page.go_back(timeout=self._resolve_timeout(timeout_ms))
+                if response is None:
+                    return self._truncate_output('No previous page in browser history.')
                 await page.wait_for_load_state('domcontentloaded')
                 blocked = await self._enforce_allowed_domain(page, 'go_back')
                 if blocked is not None:
@@ -498,7 +516,9 @@ class PlaywrightBrowserToolset(FunctionToolset[AgentDepsT]):
                 return error
             page = await self._state.ensure_page()
             try:
-                await page.go_forward(timeout=self._resolve_timeout(timeout_ms))
+                response = await page.go_forward(timeout=self._resolve_timeout(timeout_ms))
+                if response is None:
+                    return self._truncate_output('No next page in browser history.')
                 await page.wait_for_load_state('domcontentloaded')
                 blocked = await self._enforce_allowed_domain(page, 'go_forward')
                 if blocked is not None:
