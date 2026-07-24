@@ -101,13 +101,23 @@ class MongoMediaStore:
         self._chunks_name = f'{collection}_chunks'
         self._chunk_size = chunk_size_bytes
         self._public_url_resolver = public_url
+        self._indexes_ready = False
 
     async def aclose(self) -> None:
         """Close the client if this store created it; no-op for a shared client."""
         if self._own_client:
             await self._client.close()
 
+    async def _ensure_indexes(self) -> None:
+        if self._indexes_ready:
+            return
+        # `get` reassembles a blob via `media_chunks.find({'files_id': ...}).sort('n')`;
+        # without this index that read is a full collection scan.
+        await self._db[self._chunks_name].create_index([('files_id', 1), ('n', 1)])
+        self._indexes_ready = True
+
     async def put(self, data: bytes, *, context: MediaContext = _EMPTY_CONTEXT) -> str:
+        await self._ensure_indexes()
         uri = media_uri_for(data)
         digest = parse_media_uri(uri)
         files = self._db[self._files_name]
@@ -138,6 +148,7 @@ class MongoMediaStore:
         return uri
 
     async def get(self, uri: str, *, context: MediaContext = _EMPTY_CONTEXT) -> bytes:
+        await self._ensure_indexes()
         digest = parse_media_uri(uri)
         if await self._db[self._files_name].find_one({'_id': digest}, {'_id': 1}) is None:
             raise FileNotFoundError(f'media not found: {uri}')
