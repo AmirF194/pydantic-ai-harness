@@ -2723,7 +2723,7 @@ class TestCodeModeOSAccess:
         assert isinstance(wrapper, CodeModeToolset)
         description = (await wrapper.get_tools(build_run_context(None)))['run_code'].tool_def.description
         assert description is not None
-        assert 'Host-backed OS access' in description
+        assert 'Configured OS access' in description
 
     async def test_description_mount_only_advertises_filesystem_not_env_or_clock(self, tmp_path: Path) -> None:
         """A `mount` without `os` advertises filesystem access only -- it must not tell the model
@@ -2748,7 +2748,7 @@ class TestCodeModeOSAccess:
         assert isinstance(wrapper, CodeModeToolset)
         description = (await wrapper.get_tools(build_run_context(None)))['run_code'].tool_def.description
         assert description is not None
-        assert 'Host-backed OS access' in description
+        assert 'Configured OS access' in description
 
     async def test_os_callback_dispatches_inside_run_code(self) -> None:
         """The `os` captured at `feed_start` answers OS-call snapshots via `resume_auto()`,

@@ -138,9 +138,10 @@ fan work out in parallel, chain one agent's output into the next, vote across se
 done -- instead of delegating to one sub-agent at a time.
 
 The sandbox uses Monty, a subset of Python. Key restrictions:
-- **No classes** and **no third-party libraries**.
-- **Useful standard-library modules**: `asyncio`, `math`, `json`, `re`, `typing`. Import what you use
-  at the top of the script. Other modules are unavailable or stubbed -- don't rely on them.
+- **No third-party libraries**.
+- **Importable standard-library modules**: `sys`, `typing`, `asyncio`, `math`, `json`, `re`,
+  `unicodedata`, `datetime`, `os`, and `pathlib`. Import what you use at the top of the script.
+  Filesystem, environment, and clock operations are not configured for workflow scripts.
 - **No wall-clock or timing primitives** (`asyncio.sleep`, `datetime.now()`, the `time` module).
 
 Each sub-agent below is an async function. Call it with the `task` keyword argument -- write
@@ -164,7 +165,8 @@ printing produces a string representation, not structured data. Use `print()` on
 Return shapes: no print returns the last expression value (or `{}` if it is `None`); print plus a
 non-`None` value returns `{"output": "<printed text>", "result": <last expression>}`; print plus
 `None` returns `{"output": "<printed text>"}`. If a script fails after some sub-agent calls complete,
-those completed results are reported back so a retry can reuse them.\
+bounded previews of up to the 20 most recent results are reported so a retry can reuse untruncated
+values.\
 """
 
 
@@ -316,7 +318,8 @@ def _completed_retry_section(completed: list[_CompletedDispatch]) -> str:
     listing = '\n'.join(f'- {line}' for line in lines)
     return (
         '\n\nCompleted sub-agent results from the failed script '
-        '(reuse these values instead of re-calling them; their budget was already spent):\n'
+        '(up to 20 bounded previews; reuse untruncated values instead of re-calling them; '
+        'their budget was already spent):\n'
         f'{listing}'
     )
 

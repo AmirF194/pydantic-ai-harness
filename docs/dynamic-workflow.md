@@ -14,8 +14,6 @@ description: Let an orchestrator agent coordinate a catalog of sub-agents by wri
     from pydantic_ai_harness.dynamic_workflow import DynamicWorkflow
     ```
 
-> The API may change between releases. Where practical, breaking changes ship with a deprecation warning.
-
 ## The idea
 
 The usual way to coordinate sub-agents is one tool call per step. The agent calls the reviewer and waits, reads the result, calls the reviewer again, waits again, and so on. Every intermediate result travels back into the agent's context, and every step that depends on the previous one is a separate model turn.
@@ -132,7 +130,7 @@ A sub-agent is non-deterministic, costs tokens, and can fan out into more sub-ag
 DynamicWorkflow(agents=[...], max_agent_calls=50)  # 50 is the default
 ```
 
-A hard, host-enforced ceiling on the number of sub-agent runs in one parent run. It is one budget shared across every `run_workflow` call in that run, and it holds exactly even when the script fans out with `asyncio.gather`. When the budget runs out, the workflow stops calling sub-agents and returns a terminal result that includes the sub-agent results that did complete, so nothing you already paid for is wasted. This is the only knob that bounds the number of runs exactly.
+A hard, host-enforced ceiling on the number of sub-agent runs in one parent run. It is one budget shared across every `run_workflow` call in that run, and it holds exactly even when the script fans out with `asyncio.gather`. When the budget runs out, the workflow stops calling sub-agents and returns a terminal result with bounded previews of up to the 20 most recent completed results. This is the only knob that bounds the number of runs exactly.
 
 ### `sub_agent_usage_limits` and `forward_usage` -- bounding cost
 
@@ -212,15 +210,15 @@ DynamicWorkflow(
 
 The script runs in Monty, a subset of Python. Knowing the edges matters:
 
-- No class definitions, and no third-party libraries.
-- Useful standard-library modules: `asyncio`, `math`, `json`, `re`, `typing`. Import what you use; other modules are unavailable or stubbed.
+- No third-party libraries.
+- Importable standard-library modules include `sys`, `typing`, `asyncio`, `math`, `json`, `re`, `unicodedata`, `datetime`, `os`, and `pathlib`. Import what you use. Filesystem, environment, and clock operations are not configured for workflow scripts.
 - No wall-clock or timing primitives -- no `asyncio.sleep`, no `datetime.now()`, no `time`.
 - `asyncio.gather(...)` runs sub-agents concurrently but does not support `return_exceptions=True`.
 
-Before a script runs it is statically type-checked against the sub-agent signatures. A misspelled function, a positional `task`, or a wrong-typed argument costs one retry, but no sub-agent budget and no sandbox execution.
+Before a script runs it is statically type-checked against the sub-agent signatures. An ordinary, statically provable mistake such as a misspelled function, a positional `task`, or a wrong-typed argument costs one retry but no sub-agent budget or sandbox execution. Values typed as `Any` can reach runtime validation; they are still rejected before a sub-agent runs.
 
 !!! warning "An uncaught error aborts the whole script"
-    A sub-agent that raises propagates as a normal exception. The script can catch it with `try`/`except`; an uncaught failure aborts the whole script and the model retries it. If a script fails after some sub-agents already finished, the retry prompt lists those completed results, so the model can reuse them as plain values instead of paying for the same calls again.
+    A sub-agent that raises propagates as a normal exception. The script can catch it with `try`/`except`; an uncaught failure aborts the whole script and the model retries it. If a script fails after some sub-agents already finished, the retry prompt lists bounded previews of up to the 20 most recent completed results. The model can reuse an untruncated preview as a plain value instead of paying for the same call again.
 
 ## Observability
 
@@ -238,7 +236,7 @@ DynamicWorkflow(                  # all parameters are keyword-only
     inherit_model=False,          # True -> sub-agents run with the parent run's resolved model
     sub_agent_usage_limits=None,  # UsageLimits per sub-agent run; None -> pydantic-ai default
     resource_limits=None,         # None -> backstop (256 MB, no time cap);
-                                  # 'unlimited' -> off; a dict is merged onto the backstop
+                                  # 'unlimited' -> sandbox limits off; a dict merges onto the backstop
     id=None,                      # required when defer_loading=True
     description=None,             # one-line catalog entry shown while deferred
     defer_loading=False,
@@ -247,7 +245,7 @@ DynamicWorkflow(                  # all parameters are keyword-only
 workflow.reveal(agent)            # AbstractAgent | WorkflowAgent; validates before appending
 
 WorkflowAgent(
-    agent,                        # Agent, required, positional
+    agent,                        # AbstractAgent, required, positional
     name=None,                    # sandbox function name; falls back to agent.name
     description=None,             # function docstring; falls back to agent.description
 )
