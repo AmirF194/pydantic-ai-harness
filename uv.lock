@@ -2436,8 +2436,8 @@ lint = [
 
 [[package]]
 name = "pydantic-ai-slim"
-version = "2.16.1.dev3+d27fe0c0"
-source = { git = "https://github.com/pydantic/pydantic-ai.git?subdirectory=pydantic_ai_slim&branch=claude%2Fdurable-base-declarative#d27fe0c09ee5422f7c87a4ee4712d1c513b4f641" }
+version = "2.16.1.dev6+5f018a4b"
+source = { git = "https://github.com/pydantic/pydantic-ai.git?subdirectory=pydantic_ai_slim&branch=claude%2Fdurable-base-declarative#5f018a4bbbd7ea081e3c57ac83c2ecb7ae22312f" }
 dependencies = [
     { name = "exceptiongroup", marker = "python_full_version < '3.11'" },
     { name = "genai-prices" },
@@ -2582,8 +2582,8 @@ wheels = [
 
 [[package]]
 name = "pydantic-graph"
-version = "2.16.1.dev3+d27fe0c0"
-source = { git = "https://github.com/pydantic/pydantic-ai.git?subdirectory=pydantic_graph&branch=claude%2Fdurable-base-declarative#d27fe0c09ee5422f7c87a4ee4712d1c513b4f641" }
+version = "2.16.1.dev6+5f018a4b"
+source = { git = "https://github.com/pydantic/pydantic-ai.git?subdirectory=pydantic_graph&branch=claude%2Fdurable-base-declarative#5f018a4bbbd7ea081e3c57ac83c2ecb7ae22312f" }
 dependencies = [
     { name = "httpx" },
     { name = "logfire-api" },

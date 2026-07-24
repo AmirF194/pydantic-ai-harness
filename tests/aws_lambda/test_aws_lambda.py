@@ -6,6 +6,7 @@ import re
 from typing import Any
 
 import pytest
+from aws_durable_execution_sdk_python.exceptions import ExecutionError
 from pydantic_ai import Agent, RunContext
 from pydantic_ai.exceptions import ApprovalRequired, CallDeferred, ModelRetry, UserError
 from pydantic_ai.messages import (
@@ -179,6 +180,15 @@ class TestToolResultSerialization:
 
         assert result.output == 'done'
         assert ctx.failed == []
+
+    def test_non_serializable_tool_result_fails_without_retry(self) -> None:
+        agent = build_agent(lambda: object())
+        ctx = FakeDurableContext()
+
+        with pytest.raises(ExecutionError, match='Unable to serialize unknown type'):
+            run_durable(lambda: agent.run('go'), context=ctx)
+
+        assert len(ctx.failed) == 1
 
 
 class TestCrashMidRunRetry:

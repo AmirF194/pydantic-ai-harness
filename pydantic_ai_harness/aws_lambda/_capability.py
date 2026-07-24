@@ -25,6 +25,7 @@ from dataclasses import dataclass, fields
 from typing import Any, ClassVar
 
 from aws_durable_execution_sdk_python.config import StepConfig
+from aws_durable_execution_sdk_python.exceptions import ExecutionError
 from pydantic_ai.agent import EventStreamHandler
 from pydantic_ai.durable_exec._base import BaseDurabilityCapability, ToolsetKind
 from pydantic_ai.durable_exec._codec import JSON_CODEC
@@ -179,3 +180,10 @@ class AWSLambdaDurability(BaseDurabilityCapability[AgentDepsT]):
 
     def _normalize_unit_config(self, config: Any) -> StepConfig | None:
         return _step_config(config)
+
+    def _serialization_failure(self, exc: Exception) -> BaseException:
+        """Map serialization failures to the SDK's non-retryable execution error.
+
+        This fails invalid checkpoint values without consuming SDK step retries.
+        """
+        return ExecutionError(str(exc))
