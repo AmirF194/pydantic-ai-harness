@@ -35,6 +35,7 @@ from pydantic_ai.exceptions import UserError
 from pydantic_ai.models import Model
 from pydantic_ai.tools import AgentDepsT
 from restate.context import RunOptions
+from restate.exceptions import TerminalError
 from restate.extensions import current_context
 from restate.serde import JsonSerde
 
@@ -65,7 +66,8 @@ class RestateDurability(BaseDurabilityCapability[AgentDepsT]):
 
     The capability discovers the agent's model, name, and toolsets automatically when it is bound
     to the agent. Step results are written to the Restate journal as JSON bytes, so a journaled
-    tool's return value must be JSON-serializable. Control-flow signals (`ModelRetry`,
+    tool's return value must be JSON-serializable. Serialization failures are terminal so Restate
+    does not retry them as transient invocation failures. Control-flow signals (`ModelRetry`,
     `ApprovalRequired`, `CallDeferred`, `ToolFailed`) cross the journal as values rather than
     exceptions, with their metadata preserved, so approval and deferred-tool flows work inside a
     durable run.
@@ -150,3 +152,7 @@ class RestateDurability(BaseDurabilityCapability[AgentDepsT]):
         if config:
             raise UserError('Restate run steps take no per-tool options; remove the config.')
         return config
+
+    def _serialization_failure(self, exc: Exception) -> BaseException:
+        """Fail non-serializable step results without retrying the Restate invocation."""
+        return TerminalError(str(exc))

@@ -36,6 +36,7 @@ from pydantic_ai.messages import (
 from pydantic_ai.models.function import AgentInfo, DeltaToolCall, DeltaToolCalls, FunctionModel
 from pydantic_ai.tools import DeferredToolRequests
 from pydantic_ai.toolsets import ExternalToolset, FunctionToolset
+from restate.exceptions import TerminalError
 
 from pydantic_ai_harness.restate import RestateDurability
 
@@ -283,6 +284,21 @@ class TestControlFlowSignals:
 
 
 class TestToolResultSerialization:
+    async def test_non_serializable_tool_return_is_terminal(self) -> None:
+        toolset = FunctionToolset[object](id='tools')
+
+        @toolset.tool_plain
+        def act() -> object:
+            return object()
+
+        agent = Agent(
+            _tool_then_done_model('act', {}), name='bad', toolsets=[toolset], capabilities=[RestateDurability()]
+        )
+
+        ctx = FakeRestateContext()
+        with restate_context(ctx), pytest.raises(TerminalError):
+            await agent.run('go')
+
     async def test_tool_return_round_trips(self) -> None:
         toolset = FunctionToolset[object](id='tools')
 
