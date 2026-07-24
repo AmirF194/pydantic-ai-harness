@@ -65,6 +65,38 @@ def _validate_id(value: str, *, field: str) -> None:
         raise ValueError(f'invalid {field}: {value!r}')
 
 
+def _validate_max_snapshots(value: int | None) -> None:
+    """Reject a retention bound below the correctness floor.
+
+    `None` keeps every snapshot. `1` is the smallest bound the retain
+    invariant still serves both read modes at; `0` or negatives cannot.
+    """
+    if value is not None and value < 1:
+        raise ValueError(f'max_snapshots_per_run must be >= 1 or None, got {value!r}')
+
+
+def _retained_seqs(entries: list[tuple[int, SnapshotState]], keep: int) -> set[int]:
+    """Return the `seq` values to keep when bounding a run to `keep` snapshots.
+
+    The retain set is the newest `keep` by `seq`, plus the newest snapshot
+    overall and the newest `complete` snapshot. The last two hold the
+    invariant that both read modes stay served:
+    `latest_snapshot(include_interrupted=True)` needs the newest overall, and
+    the default read needs the newest `complete`. They survive the case where
+    the newest `keep` snapshots are all `interrupted` and the newest resumable
+    `complete` sits below that window. `entries` need not be sorted.
+    """
+    if not entries:  # pragma: no cover
+        return set()
+    by_seq = sorted(entries, key=lambda entry: entry[0])
+    retained = {seq for seq, _ in by_seq[-keep:]}
+    retained.add(by_seq[-1][0])
+    complete_seqs = [seq for seq, state in by_seq if state == 'complete']
+    if complete_seqs:
+        retained.add(complete_seqs[-1])
+    return retained
+
+
 @runtime_checkable
 class StepStore(Protocol):
     """Async protocol for step-persistence backends.
@@ -115,9 +147,15 @@ class StepStore(Protocol):
 
 
 class InMemoryStepStore:
-    """Process-local store, suitable for tests and single-process orchestrators."""
+    """Process-local store, suitable for tests and single-process orchestrators.
 
-    def __init__(self) -> None:
+    Pass `max_snapshots_per_run` to bound per-run snapshot growth (see
+    `save_snapshot`). `None` keeps every snapshot.
+    """
+
+    def __init__(self, *, max_snapshots_per_run: int | None = None) -> None:
+        _validate_max_snapshots(max_snapshots_per_run)
+        self._max_snapshots_per_run = max_snapshots_per_run
         self._runs: dict[str, RunRecord] = {}
         self._events: dict[str, list[StepEvent]] = defaultdict(list)
         self._snapshots: dict[str, list[ContinuableSnapshot]] = defaultdict(list)
@@ -150,7 +188,13 @@ class InMemoryStepStore:
         return list(self._events.get(run_id, ()))
 
     async def save_snapshot(self, snapshot: ContinuableSnapshot) -> None:
-        self._snapshots[snapshot.run_id].append(snapshot)
+        snaps = self._snapshots[snapshot.run_id]
+        snaps.append(snapshot)
+        if self._max_snapshots_per_run is None or len(snaps) <= self._max_snapshots_per_run:
+            return
+        entries: list[tuple[int, SnapshotState]] = [(index, snap.state) for index, snap in enumerate(snaps)]
+        retained = _retained_seqs(entries, self._max_snapshots_per_run)
+        self._snapshots[snapshot.run_id] = [snap for index, snap in enumerate(snaps) if index in retained]
 
     async def latest_snapshot(self, *, run_id: str, include_interrupted: bool = False) -> ContinuableSnapshot | None:
         snaps = self._snapshots.get(run_id)
@@ -351,6 +395,10 @@ class FileStepStore:
     small. The default backs onto `<root>/media/<sha256>.bin`. Pass
     `media_store=None` to keep bytes inline, or pass a custom `MediaStore`
     to redirect (e.g. `S3MediaStore(...)`).
+
+    `max_snapshots_per_run` (default `None`, unbounded) bounds per-run
+    snapshot growth: after each write, `{seq}.json` files outside the retain
+    set are unlinked (see `_sync_prune_snapshots`).
     """
 
     def __init__(
@@ -359,7 +407,10 @@ class FileStepStore:
         *,
         media_store: MediaStore | None | _AutoMedia = 'auto',
         media_threshold_bytes: int = _DEFAULT_MEDIA_THRESHOLD_BYTES,
+        max_snapshots_per_run: int | None = None,
     ) -> None:
+        _validate_max_snapshots(max_snapshots_per_run)
+        self._max_snapshots_per_run = max_snapshots_per_run
         self._root = Path(directory)
         resolved: MediaStore | None
         if media_store == 'auto':
@@ -468,6 +519,34 @@ class FileStepStore:
         }
         seq = self._next_snapshot_seq(snap_dir)
         (snap_dir / f'{seq}.json').write_text(json.dumps(payload), encoding='utf-8')
+        self._sync_prune_snapshots(snap_dir)
+
+    def _sync_prune_snapshots(self, snap_dir: Path) -> None:
+        """Drop snapshot files outside the retain set when bounded.
+
+        No-op when `max_snapshots_per_run` is `None`. Externalized media is
+        content-addressed and may be shared across snapshots and runs, so a
+        dropped `{seq}.json` never triggers a media delete -- orphaned-blob GC
+        is a separate concern (see the capability README non-goals).
+        """
+        if self._max_snapshots_per_run is None:
+            return
+        paths_by_seq: dict[int, Path] = {}
+        entries: list[tuple[int, SnapshotState]] = []
+        for path in snap_dir.glob('*.json'):
+            try:
+                seq = int(path.stem)
+            except ValueError:
+                continue
+            data = _load_json_object(path.read_text(encoding='utf-8'))
+            entries.append((seq, _snapshot_state(data.get('state'))))
+            paths_by_seq[seq] = path
+        if len(entries) <= self._max_snapshots_per_run:
+            return
+        retained = _retained_seqs(entries, self._max_snapshots_per_run)
+        for seq, path in paths_by_seq.items():
+            if seq not in retained:
+                path.unlink()
 
     @staticmethod
     def _next_snapshot_seq(snap_dir: Path) -> int:
@@ -662,6 +741,10 @@ class SqliteStepStore:
     contract -- `register_run` raises `sqlite3.IntegrityError` on reuse,
     which `StepPersistence.before_run` converts to a friendlier
     `ValueError` via its own pre-check.
+
+    `max_snapshots_per_run` (default `None`, unbounded) bounds per-run
+    snapshot growth: after each write, one indexed `DELETE` prunes rows
+    outside the retain set (see `_sync_prune_snapshots`).
     """
 
     def __init__(
@@ -671,9 +754,12 @@ class SqliteStepStore:
         connection: sqlite3.Connection | None = None,
         media_store: MediaStore | None | _AutoMedia = 'auto',
         media_threshold_bytes: int = _DEFAULT_MEDIA_THRESHOLD_BYTES,
+        max_snapshots_per_run: int | None = None,
     ) -> None:
         if (database is None) == (connection is None):
             raise ValueError('provide exactly one of `database=` or `connection=`')
+        _validate_max_snapshots(max_snapshots_per_run)
+        self._max_snapshots_per_run = max_snapshots_per_run
         self._database = Path(database) if database is not None else None
         self._connection = connection
         self._schema_ready = False
@@ -878,8 +964,31 @@ class SqliteStepStore:
                     json.dumps(messages_json),
                 ),
             )
+            self._sync_prune_snapshots(conn, snapshot.run_id)
         finally:
             self._maybe_close(conn)
+
+    def _sync_prune_snapshots(self, conn: sqlite3.Connection, run_id: str) -> None:
+        """Delete this run's snapshot rows outside the retain set when bounded.
+
+        No-op when `max_snapshots_per_run` is `None`. Externalized media in the
+        sibling `media` table is content-addressed and may be shared across
+        snapshots and runs, so a deleted snapshot row never removes a media row
+        -- orphaned-blob GC is a separate concern (see the capability README
+        non-goals).
+        """
+        if self._max_snapshots_per_run is None:
+            return
+        rows = conn.execute('SELECT seq, state FROM snapshots WHERE run_id = ?', (run_id,)).fetchall()
+        if len(rows) <= self._max_snapshots_per_run:
+            return
+        entries: list[tuple[int, SnapshotState]] = [(int(seq), _snapshot_state(state)) for seq, state in rows]
+        retained = _retained_seqs(entries, self._max_snapshots_per_run)
+        placeholders = ','.join('?' for _ in retained)
+        conn.execute(
+            f'DELETE FROM snapshots WHERE run_id = ? AND seq NOT IN ({placeholders})',
+            (run_id, *retained),
+        )
 
     async def latest_snapshot(self, *, run_id: str, include_interrupted: bool = False) -> ContinuableSnapshot | None:
         row = await anyio.to_thread.run_sync(self._sync_load_latest_snapshot, run_id, include_interrupted)

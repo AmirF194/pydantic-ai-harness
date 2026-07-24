@@ -1,0 +1,223 @@
+"""Tests for the opt-in `max_snapshots_per_run` retention bound.
+
+Covers the shared retain invariant through the public `save_snapshot` path on
+all three shipped stores, the per-backend pruning idioms (list rebuild,
+`unlink`, indexed `DELETE`), constructor validation, `from_spec` forwarding,
+and one end-to-end `Agent` run with the bound set.
+"""
+
+from __future__ import annotations
+
+import sqlite3
+from collections.abc import Callable
+from pathlib import Path
+
+import pytest
+from pydantic_ai import Agent
+from pydantic_ai.messages import (
+    ModelMessage,
+    ModelRequest,
+    ModelResponse,
+    TextPart,
+    ToolCallPart,
+    UserPromptPart,
+)
+from pydantic_ai.models.function import AgentInfo, FunctionModel
+
+from pydantic_ai_harness.step_persistence import (
+    ContinuableSnapshot,
+    FileStepStore,
+    InMemoryStepStore,
+    SqliteStepStore,
+    StepPersistence,
+    StepStore,
+    continue_run,
+)
+from pydantic_ai_harness.step_persistence._types import SnapshotState
+
+pytestmark = pytest.mark.anyio
+
+
+@pytest.fixture
+def anyio_backend() -> str:
+    return 'asyncio'
+
+
+BACKENDS = ['memory', 'file', 'sqlite']
+
+
+def _make_store(kind: str, tmp_path: Path, keep: int | None) -> tuple[StepStore, Callable[[str], int]]:
+    """Build a bounded store plus a callable that counts a run's stored snapshots."""
+    if kind == 'memory':
+        mem = InMemoryStepStore(max_snapshots_per_run=keep)
+        return mem, lambda run_id: len(mem._snapshots.get(run_id, []))
+    if kind == 'file':
+        root = tmp_path / 'runs'
+        return FileStepStore(root, max_snapshots_per_run=keep), lambda run_id: len(
+            list((root / run_id / 'snapshots').glob('*.json'))
+        )
+    db = tmp_path / 'runs.db'
+
+    def count(run_id: str) -> int:
+        conn = sqlite3.connect(db, check_same_thread=False)
+        try:
+            (total,) = conn.execute('SELECT COUNT(*) FROM snapshots WHERE run_id = ?', (run_id,)).fetchone()
+            return total
+        finally:
+            conn.close()
+
+    return SqliteStepStore(database=db, media_store=None, max_snapshots_per_run=keep), count
+
+
+async def _save(store: StepStore, run_id: str, step: int, state: SnapshotState = 'complete') -> None:
+    msgs: list[ModelMessage] = [
+        ModelRequest(parts=[UserPromptPart(content='hi')]),
+        ModelResponse(parts=[TextPart(content=f's{step}')]),
+    ]
+    await store.save_snapshot(ContinuableSnapshot(run_id=run_id, step_index=step, messages=msgs, state=state))
+
+
+class TestRetentionBound:
+    @pytest.mark.parametrize('kind', BACKENDS)
+    async def test_none_keeps_every_snapshot(self, kind: str, tmp_path: Path) -> None:
+        store, count = _make_store(kind, tmp_path, None)
+        for step in range(5):
+            await _save(store, 'r1', step)
+        assert count('r1') == 5
+
+    @pytest.mark.parametrize('kind', BACKENDS)
+    async def test_count_under_limit_keeps_all(self, kind: str, tmp_path: Path) -> None:
+        store, count = _make_store(kind, tmp_path, 5)
+        for step in range(3):
+            await _save(store, 'r1', step)
+        assert count('r1') == 3
+
+    @pytest.mark.parametrize('kind', BACKENDS)
+    async def test_count_over_limit_prunes_to_window(self, kind: str, tmp_path: Path) -> None:
+        store, count = _make_store(kind, tmp_path, 2)
+        for step in range(4):
+            await _save(store, 'r1', step)
+        # All complete: retain set collapses to the newest snapshot's window.
+        assert count('r1') == 2
+        latest = await store.latest_snapshot(run_id='r1')
+        assert latest is not None
+        assert latest.step_index == 3
+
+    @pytest.mark.parametrize('kind', BACKENDS)
+    async def test_tail_all_interrupted_retains_complete_below_window(self, kind: str, tmp_path: Path) -> None:
+        store, count = _make_store(kind, tmp_path, 2)
+        await _save(store, 'r1', 0, state='complete')
+        await _save(store, 'r1', 1, state='complete')
+        await _save(store, 'r1', 2, state='interrupted')
+        await _save(store, 'r1', 3, state='interrupted')
+        # top-2 = {step2, step3} (both interrupted); + newest overall (step3);
+        # + newest complete (step1, below the window). step0 is evicted.
+        assert count('r1') == 3
+
+        default = await store.latest_snapshot(run_id='r1')
+        assert default is not None
+        assert default.state == 'complete'
+        assert default.step_index == 1
+
+        frontier = await store.latest_snapshot(run_id='r1', include_interrupted=True)
+        assert frontier is not None
+        assert frontier.state == 'interrupted'
+        assert frontier.step_index == 3
+
+    @pytest.mark.parametrize('kind', BACKENDS)
+    async def test_keep_one_with_newest_interrupted_keeps_two(self, kind: str, tmp_path: Path) -> None:
+        store, count = _make_store(kind, tmp_path, 1)
+        await _save(store, 'r1', 0, state='complete')
+        await _save(store, 'r1', 1, state='interrupted')
+        # N=1 correctness floor: the window (step1) is interrupted, so the
+        # newest complete (step0) is still retained -- two rows, not one.
+        assert count('r1') == 2
+        default = await store.latest_snapshot(run_id='r1')
+        assert default is not None
+        assert default.step_index == 0
+
+    @pytest.mark.parametrize('kind', BACKENDS)
+    async def test_all_interrupted_no_complete_retained(self, kind: str, tmp_path: Path) -> None:
+        store, count = _make_store(kind, tmp_path, 2)
+        for step in range(3):
+            await _save(store, 'r1', step, state='interrupted')
+        assert count('r1') == 2
+        assert await store.latest_snapshot(run_id='r1') is None
+        frontier = await store.latest_snapshot(run_id='r1', include_interrupted=True)
+        assert frontier is not None
+        assert frontier.step_index == 2
+
+    @pytest.mark.parametrize('kind', BACKENDS)
+    def test_rejects_bound_below_one(self, kind: str, tmp_path: Path) -> None:
+        with pytest.raises(ValueError, match='max_snapshots_per_run must be >= 1'):
+            _make_store(kind, tmp_path, 0)
+
+
+class TestFileStorePruneEdgeCases:
+    async def test_non_numeric_snapshot_file_is_ignored(self, tmp_path: Path) -> None:
+        """A stray non-`{seq}.json` file in the snapshots dir is skipped, not deleted."""
+        root = tmp_path / 'runs'
+        store = FileStepStore(root, media_store=None, max_snapshots_per_run=1)
+        await _save(store, 'r1', 0)
+        stray = root / 'r1' / 'snapshots' / 'notanumber.json'
+        stray.write_text('{}', encoding='utf-8')
+        await _save(store, 'r1', 1)
+        await _save(store, 'r1', 2)
+
+        assert stray.exists()
+        latest = await store.latest_snapshot(run_id='r1')
+        assert latest is not None
+        assert latest.step_index == 2
+
+
+class TestFromSpecForwarding:
+    async def test_memory_backend_forwards_bound(self) -> None:
+        cap = StepPersistence.from_spec(max_snapshots_per_run=3)
+        assert isinstance(cap.store, InMemoryStepStore)
+        assert cap.store._max_snapshots_per_run == 3
+
+    async def test_file_backend_forwards_bound(self, tmp_path: Path) -> None:
+        cap = StepPersistence.from_spec(backend='file', directory=tmp_path, max_snapshots_per_run=4)
+        assert isinstance(cap.store, FileStepStore)
+        assert cap.store._max_snapshots_per_run == 4
+
+    async def test_sqlite_backend_forwards_bound(self, tmp_path: Path) -> None:
+        cap = StepPersistence.from_spec(backend='sqlite', database=str(tmp_path / 'runs.db'), max_snapshots_per_run=5)
+        assert isinstance(cap.store, SqliteStepStore)
+        assert cap.store._max_snapshots_per_run == 5
+
+
+class TestBoundedAgentRun:
+    async def test_multi_step_run_stays_bounded(self, tmp_path: Path) -> None:
+        """A run with several settled tool-call boundaries prunes to the bound."""
+
+        def model(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+            del info
+            calls = sum(
+                1
+                for m in messages
+                if isinstance(m, ModelResponse) and any(isinstance(p, ToolCallPart) for p in m.parts)
+            )
+            if calls < 3:
+                return ModelResponse(parts=[ToolCallPart('lookup', {}, tool_call_id=f'c{calls}')])
+            return ModelResponse(parts=[TextPart('done')])
+
+        store = InMemoryStepStore(max_snapshots_per_run=1)
+        agent: Agent[None, str] = Agent(
+            FunctionModel(model),
+            capabilities=[StepPersistence(store=store, agent_name='worker')],
+        )
+
+        @agent.tool_plain
+        def lookup() -> str:  # pyright: ignore[reportUnusedFunction]
+            return 'ok'
+
+        result = await agent.run('go')
+        assert result.output == 'done'
+
+        run_id = (await store.list_runs())[-1].run_id
+        # Three settled CallToolsNode boundaries produced multiple complete
+        # snapshots; the bound collapses them to the newest.
+        assert len(store._snapshots[run_id]) == 1
+        history = await continue_run(store, run_id=run_id)
+        assert history
