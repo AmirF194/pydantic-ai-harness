@@ -100,6 +100,9 @@ vcs = 'git'
 style = 'pep440'
 bump = true
 
+[tool.uv.sources]
+pydantic-ai-slim = { git = "https://github.com/pydantic/pydantic-ai.git", branch = "claude/durable-base-declarative", subdirectory = "pydantic_ai_slim" }
+
 
 [tool.hatch.build.targets.wheel]
 packages = ['pydantic_ai_harness']

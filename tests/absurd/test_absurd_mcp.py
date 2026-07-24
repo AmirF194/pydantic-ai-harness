@@ -197,7 +197,7 @@ class TestMcpInlineOptOutForbidden:
 
         ctx = FakeAsyncTaskContext()
         with absurd_task_context(ctx):
-            with pytest.raises(UserError, match='MCP tool .* cannot run outside a step'):
+            with pytest.raises(UserError, match='MCP tool .* cannot run outside a durable step'):
                 await agent.run('add 2 and 3')
 
     async def test_non_empty_dict_config_on_mcp_tool_raises(self) -> None:
