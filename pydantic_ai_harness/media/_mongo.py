@@ -150,13 +150,20 @@ class MongoMediaStore:
     async def get(self, uri: str, *, context: MediaContext = _EMPTY_CONTEXT) -> bytes:
         await self._ensure_indexes()
         digest = parse_media_uri(uri)
-        if await self._db[self._files_name].find_one({'_id': digest}, {'_id': 1}) is None:
+        files_doc = await self._db[self._files_name].find_one({'_id': digest}, {'size_bytes': 1})
+        if files_doc is None:
             raise FileNotFoundError(f'media not found: {uri}')
         buffer = bytearray()
         async for doc in self._db[self._chunks_name].find({'files_id': digest}).sort('n', 1):
             piece = doc['data']
             assert isinstance(piece, (bytes, bytearray))
             buffer.extend(piece)
+        # A chunk gone missing or truncated would silently return short bytes; the
+        # stored `size_bytes` is the reassembly checksum that turns that into a
+        # loud failure instead of a corrupt round-trip.
+        expected = files_doc.get('size_bytes')
+        if len(buffer) != expected:
+            raise ValueError(f'media reassembly mismatch for {uri}: expected {expected!r} bytes, got {len(buffer)}')
         return bytes(buffer)
 
     async def exists(self, uri: str, *, context: MediaContext = _EMPTY_CONTEXT) -> bool:

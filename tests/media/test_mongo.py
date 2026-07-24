@@ -91,6 +91,16 @@ class TestMongoMediaStoreRoundTrip:
         with pytest.raises(FileNotFoundError):
             await store.get(_MISSING_URI)
 
+    async def test_reassembly_mismatch_raises(self) -> None:
+        """A `size_bytes` that disagrees with the chunk bytes surfaces as a loud error."""
+        client = _mock_client()
+        store = MongoMediaStore(client=client, database='t')
+        uri = await store.put(b'twelve chars')
+        digest = parse_media_uri(uri)
+        await client['t']['media'].update_one({'_id': digest}, {'$set': {'size_bytes': 999}})
+        with pytest.raises(ValueError, match='reassembly mismatch'):
+            await store.get(uri)
+
     async def test_metadata_round_trips(self) -> None:
         store = MongoMediaStore(client=_mock_client(), database='t')
         uri = await store.put(
