@@ -142,7 +142,11 @@ async def _maybe_externalize_text(
     # `_is_text_part` already verified `content` is a string.
     content_value = node['content']
     assert isinstance(content_value, str)
-    raw = content_value.encode('utf-8')
+    # `surrogatepass`: a JSON string can decode to an unpaired surrogate (e.g.
+    # "\ud800"), which strict UTF-8 refuses to encode. Encoding it here would
+    # raise even for below-threshold content that should pass through untouched.
+    # `restore_media` decodes with the same handler, so the round-trip is exact.
+    raw = content_value.encode('utf-8', errors='surrogatepass')
     if len(raw) < threshold_bytes:
         return None
     uri = await media_store.put(raw, context=MediaContext(media_type='text/plain'))
@@ -196,21 +200,30 @@ async def restore_media(node: object, *, media_store: MediaStore) -> object:
 
 async def _restore_external(node: dict[str, object], media_store: MediaStore) -> dict[str, object]:
     uri_value = node.get(_URI_KEY)
+    ref_key = _URI_KEY
+    if not isinstance(uri_value, str):
+        # Markers written before `_URI_KEY` existed stored the blob reference
+        # under a plain `uri`. Fall back to it, but only when `_URI_KEY` is
+        # absent: a new-format marker's genuine `uri` is data, never a reference,
+        # so it must not be consumed here (that was the bug `_URI_KEY` fixed).
+        uri_value = node.get('uri')
+        ref_key = 'uri'
     if not isinstance(uri_value, str):
         raise ValueError(f'externalized media marker missing string uri: {node!r}')
     raw = await media_store.get(uri_value)
-    # Inverse of `_maybe_externalize_*`: drop the marker keys, restore the
-    # externalized field, keep every other field the original part carried
-    # (including a genuine `uri`, which the namespaced `_URI_KEY` never shadows).
-    # Preserved fields are recursively restored so a nested marker (from the
-    # externalize-side recursion) is re-inlined too.
+    # Inverse of `_maybe_externalize_*`: drop the marker keys and the reference
+    # key, restore the externalized field, keep every other field the original
+    # part carried (including a genuine `uri` on a new-format marker, which the
+    # namespaced `_URI_KEY` never shadows). Preserved fields are recursively
+    # restored so a nested marker (from the externalize-side recursion) is
+    # re-inlined too.
     restored: dict[str, object] = {}
     for key, value in node.items():
-        if key in (_EXTERNAL_MARKER, _TEXT_MARKER, _URI_KEY):
+        if key in (_EXTERNAL_MARKER, _TEXT_MARKER, ref_key):
             continue
         restored[key] = await restore_media(value, media_store=media_store)
     if node.get(_TEXT_MARKER) is True:
-        restored['content'] = raw.decode('utf-8')
+        restored['content'] = raw.decode('utf-8', errors='surrogatepass')
     else:
         restored['data'] = base64.b64encode(raw).decode('ascii')
     return restored

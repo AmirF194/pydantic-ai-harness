@@ -404,6 +404,56 @@ class TestExternalizeRestoreWalker:
         restored = await restore_media(externalized, media_store=store)
         assert restored == node  # original uri survives, content re-inlined
 
+    async def test_legacy_uri_marker_restores(self, tmp_path: Path) -> None:
+        """A marker in the pre-`_URI_KEY` format (blob ref under plain `uri`) restores.
+
+        Snapshots persisted by an earlier build stored the reference under `uri`.
+        Restore falls back to it when `_URI_KEY` is absent, so those snapshots
+        stay readable after the key rename.
+        """
+        store = DiskMediaStore(tmp_path)
+        big_text = 'x' * 70_000
+        uri = await store.put(big_text.encode('utf-8'), context=MediaContext(media_type='text/plain'))
+        legacy_marker = {
+            '__harness_external_media__': True,
+            '__harness_external_text__': True,
+            'uri': uri,  # legacy: the blob reference, not a genuine field
+            'tool_name': 'scrape',
+            'part_kind': 'tool-return',
+        }
+        restored = await restore_media(legacy_marker, media_store=store)
+        assert restored == {'content': big_text, 'tool_name': 'scrape', 'part_kind': 'tool-return'}
+
+        # A genuine `uri` on a normal (non-marker) part is never consumed as a
+        # reference: restore only treats `uri` as the blob ref inside an
+        # `_EXTERNAL_MARKER` node that lacks `_URI_KEY`.
+        normal = {'part_kind': 'tool-return', 'content': 'small', 'uri': 'source://original'}
+        assert await restore_media(normal, media_store=store) == normal
+
+    async def test_sub_threshold_surrogate_passes_through(self, tmp_path: Path) -> None:
+        """A below-threshold string with an unpaired surrogate passes through, not raising.
+
+        A JSON string can decode to a lone surrogate (`"\\ud800"`), which strict
+        UTF-8 refuses to encode. Below-threshold content must pass through
+        untouched rather than raising on an eager encode.
+        """
+        store = DiskMediaStore(tmp_path)
+        node = {'content': '\ud800' * 4, 'part_kind': 'text'}
+        externalized = await externalize_media(node, media_store=store, threshold_bytes=64 * 1024)
+        assert externalized == node
+        assert list(tmp_path.glob('*.bin')) == []
+
+    async def test_above_threshold_surrogate_round_trips(self, tmp_path: Path) -> None:
+        """A large string with an unpaired surrogate externalizes and restores exactly."""
+        store = DiskMediaStore(tmp_path)
+        content = '\ud800' + 'x' * 70_000
+        node = {'content': content, 'part_kind': 'tool-return'}
+        externalized = await externalize_media(node, media_store=store, threshold_bytes=64 * 1024)
+        assert externalized != node  # went external
+        assert list(tmp_path.glob('*.bin'))  # bytes on disk
+        restored = await restore_media(externalized, media_store=store)
+        assert restored == node  # lone surrogate survives the round-trip
+
 
 class TestSigV4Signer:
     def test_produces_required_headers(self) -> None:
