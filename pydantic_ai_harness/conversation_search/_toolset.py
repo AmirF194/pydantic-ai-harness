@@ -28,7 +28,7 @@ from pydantic_ai.messages import (
 from pydantic_ai.tools import AgentDepsT
 from pydantic_ai.toolsets import FunctionToolset
 
-from pydantic_ai_harness.conversation_search._source import HistorySource
+from pydantic_ai_harness.conversation_search._source import SUMMARY_PREFIX, HistorySource
 
 SEARCH_HISTORY_DESCRIPTION = """\
 Search all persisted conversation history: earlier turns of this conversation \
@@ -147,7 +147,7 @@ def _format_message(message: ModelMessage, *, truncate: bool) -> str:
                 content = part.content
                 # Defensive for sources that do not filter compaction artifacts;
                 # `SnapshotHistorySource` already excludes them from the corpus.
-                if content.startswith('Summary of previous conversation'):
+                if content.startswith(SUMMARY_PREFIX):
                     lines.append('[Compaction summary]')
                 else:
                     if truncate:
@@ -220,6 +220,15 @@ class ConversationSearchToolset(FunctionToolset[AgentDepsT]):
         bm25_b: float,
     ) -> None:
         super().__init__(id=tool_id)
+        if max_matches < 0:
+            raise ValueError(f'max_matches must be non-negative, got {max_matches!r}.')
+        if context_lines < 0:
+            raise ValueError(f'context_lines must be non-negative, got {context_lines!r}.')
+        # A negative k1 can zero `_bm25_score`'s denominator (k1=-1, b=0, tf=1).
+        if bm25_k1 < 0:
+            raise ValueError(f'bm25_k1 must be non-negative, got {bm25_k1!r}.')
+        if not 0.0 <= bm25_b <= 1.0:
+            raise ValueError(f'bm25_b must be between 0.0 and 1.0, got {bm25_b!r}.')
         self._source = source
         self._max_matches = max_matches
         self._context_lines = context_lines

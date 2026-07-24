@@ -59,7 +59,7 @@ The dedup keys off a content hash of each serialized message, not object identit
 | `source` | (required) | Where the corpus comes from. Use `SnapshotHistorySource(store)` over the store `StepPersistence` writes to. |
 | `max_matches` | `10` | Maximum matching excerpts the search tool returns. |
 | `context_lines` | `5` | Lines shown around each match (within the match's run). |
-| `bm25_k1` | `1.5` | BM25 term-frequency saturation (Lucene default). |
+| `bm25_k1` | `1.5` | BM25 term-frequency saturation. This capability's default; Lucene's `BM25Similarity` uses `1.2`. |
 | `bm25_b` | `0.75` | BM25 length normalization (Lucene default). |
 | `add_instructions` | `True` | Emit a short note telling the model the recall tool exists. |
 | `tool_id` | `conversation-search` | Toolset id for the search tool. |

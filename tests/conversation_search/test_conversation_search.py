@@ -9,6 +9,7 @@ and source edge cases are exercised through the public
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 import pytest
@@ -150,6 +151,20 @@ class TestSnapshotHistorySource:
 
         history = await SnapshotHistorySource(store).run_history(run_id='r1')
         assert history == [original]
+
+    async def test_user_authored_summary_lookalike_stays_in_the_corpus(self) -> None:
+        # The artifact marker is compaction's full literal, blank line included. A
+        # developer's own system prompt that merely opens with the same sentence is
+        # not an artifact and must stay searchable.
+        store = InMemoryStepStore()
+        lookalike = ModelRequest(
+            parts=[SystemPromptPart(content='Summary of previous conversation: the ONYX migration is done.')]
+        )
+        await _seed_run(store, 'r1', [lookalike, _user('carry on')])
+
+        history = await SnapshotHistorySource(store).run_history(run_id='r1')
+        assert history[0] == lookalike
+        assert 'ONYX' in await _search(SnapshotHistorySource(store), 'ONYX')
 
     async def test_interrupted_snapshots_stay_out_of_the_corpus(self) -> None:
         store = InMemoryStepStore()
@@ -524,3 +539,43 @@ class TestSearchTool:
         rendered = await _search(SnapshotHistorySource(store), 'needle', max_matches=2, context_lines=5)
         assert rendered.count('[score:') == 2
         assert 'run: r2' in rendered
+
+
+class TestConfigValidation:
+    """Out-of-range tuning is rejected where the toolset is built, not silently honored."""
+
+    def test_invalid_tuning_is_rejected(self) -> None:
+        source = SnapshotHistorySource(InMemoryStepStore())
+        with pytest.raises(ValueError, match=re.escape('max_matches must be non-negative, got -1.')):
+            ConversationSearch(source, max_matches=-1).get_toolset()
+        with pytest.raises(ValueError, match=re.escape('context_lines must be non-negative, got -1.')):
+            ConversationSearch(source, context_lines=-1).get_toolset()
+        with pytest.raises(ValueError, match=re.escape('bm25_k1 must be non-negative, got -1.0.')):
+            ConversationSearch(source, bm25_k1=-1.0).get_toolset()
+        with pytest.raises(ValueError, match=re.escape('bm25_b must be between 0.0 and 1.0, got 1.5.')):
+            ConversationSearch(source, bm25_b=1.5).get_toolset()
+        with pytest.raises(ValueError, match=re.escape('bm25_b must be between 0.0 and 1.0, got -0.5.')):
+            ConversationSearch(source, bm25_b=-0.5).get_toolset()
+
+    async def test_negative_k1_would_have_divided_by_zero(self) -> None:
+        # The guard's reason for existing: k1=-1 with b=0 zeroes the BM25 denominator
+        # for any single-occurrence term, so an unvalidated toolset raises mid-search.
+        store = InMemoryStepStore()
+        await _seed_run(store, 'r1', [_user('the needle target')])
+        with pytest.raises(ValueError, match='bm25_k1 must be non-negative'):
+            ConversationSearchToolset[None](
+                SnapshotHistorySource(store),
+                tool_id='conversation-search',
+                max_matches=10,
+                context_lines=5,
+                bm25_k1=-1.0,
+                bm25_b=0.0,
+            )
+
+    async def test_negative_max_matches_no_longer_uncaps_output(self) -> None:
+        # An unvalidated negative bound left `len(results) == max_matches` unsatisfiable,
+        # emitting every ranked excerpt instead of capping them.
+        store = InMemoryStepStore()
+        await _seed_run(store, 'r1', [_user(f'needle entry {i} filler') for i in range(5)])
+        with pytest.raises(ValueError, match='max_matches must be non-negative'):
+            await _search(SnapshotHistorySource(store), 'needle', max_matches=-1)

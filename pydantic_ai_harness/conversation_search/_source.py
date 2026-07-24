@@ -30,14 +30,19 @@ from pydantic_ai.messages import (
 
 from pydantic_ai_harness.step_persistence import ContinuableSnapshot, RunRecord
 
-_SUMMARY_PREFIX = 'Summary of previous conversation:'
-"""Prefix a `SummarizingCompaction` writes into the summary artifact it inserts.
+SUMMARY_PREFIX = 'Summary of previous conversation:\n\n'
+"""The exact prefix a `SummarizingCompaction` writes into the summary artifact it inserts.
 
-Mirrors `pydantic_ai_harness.compaction._summarizing_compaction._SUMMARY_PREFIX`.
-Kept as a local literal rather than an import so this capability does not couple to
-compaction internals: the corpus holds the originals a summary replaced, never the
-derived summary, so snapshots taken after compaction must contribute only what the
-earlier snapshots did not already carry.
+Byte-for-byte mirror of `pydantic_ai_harness.compaction._summarizing_compaction._SUMMARY_PREFIX`,
+including the blank line: that is the marker compaction itself matches on to recognize its own
+prior summaries (`_extract_previous_summary`), and `SystemPromptPart` carries no metadata field
+to mark artifacts with instead. Matching the full literal keeps a user-authored system prompt
+that merely opens with the same sentence inside the corpus.
+
+Kept as a local literal rather than an import so this capability does not couple to compaction
+internals: the corpus holds the originals a summary replaced, never the derived summary, so
+snapshots taken after compaction must contribute only what the earlier snapshots did not
+already carry.
 """
 
 
@@ -101,9 +106,7 @@ def is_summary_artifact(message: ModelMessage) -> bool:
     """Return whether a message is a compaction summary artifact (never indexed)."""
     if not isinstance(message, ModelRequest):
         return False
-    return any(
-        isinstance(part, SystemPromptPart) and part.content.startswith(_SUMMARY_PREFIX) for part in message.parts
-    )
+    return any(isinstance(part, SystemPromptPart) and part.content.startswith(SUMMARY_PREFIX) for part in message.parts)
 
 
 class SnapshotHistorySource:

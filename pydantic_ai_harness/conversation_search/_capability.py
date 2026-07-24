@@ -64,16 +64,17 @@ class ConversationSearch(AbstractCapability[AgentDepsT]):
     """Toolset id for the `search_conversation_history` tool."""
 
     max_matches: int = 10
-    """Maximum number of matching excerpts the search tool returns."""
+    """Maximum number of matching excerpts the search tool returns. Must be non-negative."""
 
     context_lines: int = 5
-    """Number of surrounding lines shown around each search match."""
+    """Number of surrounding lines shown around each search match. Must be non-negative."""
 
     bm25_k1: float = 1.5
-    """BM25 term-frequency saturation (Lucene/Elasticsearch default)."""
+    """BM25 term-frequency saturation, non-negative. This capability's default; Lucene's
+    `BM25Similarity` uses `1.2`."""
 
     bm25_b: float = 0.75
-    """BM25 length-normalization (Lucene/Elasticsearch default)."""
+    """BM25 length-normalization, between `0.0` and `1.0` (Lucene/Elasticsearch default)."""
 
     add_instructions: bool = True
     """Emit a short instruction telling the model the recall tool exists."""
