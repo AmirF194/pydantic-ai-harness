@@ -82,7 +82,6 @@ def _default_resource_limits() -> ResourceLimits:
 # runtime, so a typo (e.g. `max_durations_secs`) would otherwise merge through and be silently
 # dropped -- quietly disabling the only guard against a pure-CPU `while True`. We reject unknowns.
 _RESOURCE_LIMIT_KEYS = frozenset(WorkflowResourceLimits.__annotations__)
-_REMOVED_RESOURCE_LIMIT_KEYS = frozenset({'max_allocations'})
 _MODEL_SAFE_EXCEPTION_MESSAGE_TYPES = (UsageLimitExceeded,)
 _MAX_COMPLETED_DISPATCHES = 20
 _MAX_TASK_PREVIEW_CHARS = 120
@@ -100,12 +99,6 @@ def _resolve_resource_limits(limits: WorkflowResourceLimits | Literal['unlimited
         return _default_resource_limits()
     if limits == 'unlimited':
         return {}
-    removed = set(limits) & _REMOVED_RESOURCE_LIMIT_KEYS
-    if removed:
-        raise UserError(
-            '`resource_limits.max_allocations` was removed because Monty 0.0.19 no longer supports '
-            'allocation limits. Use `max_memory` to bound sandbox memory.'
-        )
     unknown = set(limits) - _RESOURCE_LIMIT_KEYS
     if unknown:
         raise UserError(
@@ -340,6 +333,25 @@ def _budget_terminal_result(
         'last_error': last_error,
         'completed': _completed_dispatch_lines(completed_dispatches),
     }
+
+
+def _worker_crash_result(
+    *,
+    crash: MontyCrashedError,
+    budget_exhausted: bool,
+    max_agent_calls: int,
+    completed_dispatches: list[_CompletedDispatch],
+) -> dict[str, object]:
+    if budget_exhausted:
+        return _budget_terminal_result(
+            max_agent_calls=max_agent_calls,
+            last_error='The workflow script crashed the sandbox worker after exhausting the sub-agent budget.',
+            completed_dispatches=completed_dispatches,
+        )
+    raise ModelRetry(
+        'The workflow script crashed the sandbox worker. Revise the script and try again.'
+        f'{_completed_retry_section(completed_dispatches)}'
+    ) from crash
 
 
 def _completed_workflow_result(
@@ -735,10 +747,12 @@ class DynamicWorkflowToolset(AbstractToolset[AgentDepsT]):
             # The worker died mid-script (e.g. resource exhaustion or request timeout);
             # the pool replaces it transparently. Completed sub-agent results are listed
             # so the retry can reuse them as plain values.
-            raise ModelRetry(
-                'The workflow script crashed the sandbox worker. Revise the script and try again.'
-                f'{_completed_retry_section(completed_dispatches)}'
-            ) from e
+            return _worker_crash_result(
+                crash=e,
+                budget_exhausted=budget_exhausted,
+                max_agent_calls=self.max_agent_calls,
+                completed_dispatches=completed_dispatches,
+            )
         except BaseException as e:
             # Convert a sandbox panic to a retry (see `is_sandbox_panic`);
             # anything else (CancelledError, ...) re-raises unchanged.

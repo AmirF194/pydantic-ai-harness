@@ -985,6 +985,35 @@ async def test_worker_crash_becomes_model_retry(monkeypatch: pytest.MonkeyPatch)
     assert 'sub(task="x") -> "ok"' in str(exc_info.value)
 
 
+async def test_worker_crash_after_budget_exhaustion_returns_terminal_result(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import functools
+
+    from pydantic_monty import Monty
+
+    monkeypatch.setattr(
+        'pydantic_ai_harness.dynamic_workflow._toolset.Monty', functools.partial(Monty, request_timeout=0.5)
+    )
+    ts = DynamicWorkflowToolset[object](agents=[_wf_agent('counted-result', 'counted')], max_agent_calls=1)
+    code = (
+        "await counted(task='first')\n"
+        'try:\n'
+        "    await counted(task='second')\n"
+        'except RuntimeError:\n'
+        '    pass\n'
+        'while True:\n'
+        '    pass'
+    )
+    out = await _run_script(ts, code)
+    assert isinstance(out, dict)
+    assert 'budget' in out['error']
+    assert out['last_error'] == (
+        'The workflow script crashed the sandbox worker after exhausting the sub-agent budget.'
+    )
+    assert out['completed'] == ['counted(task="first") -> "counted-result"']
+
+
 async def test_sandbox_panic_is_retryable(monkeypatch: pytest.MonkeyPatch) -> None:
     # A Rust-side sandbox panic (pyo3 PanicException) must surface as a retry that carries the
     # already-completed sub-agent results, not tear down the whole agent run. It is injected via
@@ -1076,6 +1105,12 @@ async def test_print_with_result_returns_both() -> None:
     assert out == {'output': 'log\n', 'result': 42}
 
 
+async def test_printed_output_over_limit_becomes_model_retry() -> None:
+    ts = DynamicWorkflowToolset[object](agents=[_wf_agent()])
+    with pytest.raises(ModelRetry, match='Runtime error in workflow'):
+        await _run_script(ts, "print('x' * (11 * 1024 * 1024))")
+
+
 async def test_no_result_returns_empty_dict() -> None:
     ts = DynamicWorkflowToolset[object](agents=[_wf_agent()])
     out = await _run_script(ts, 'x = 1')
@@ -1109,6 +1144,16 @@ async def test_sub_agent_failure_inside_gather_aborts_script() -> None:
     msg = str(exc_info.value)
     assert "'bad'" in msg
     assert 'ValueError' in msg
+
+
+async def test_sub_agent_failure_can_be_caught_in_sandbox() -> None:
+    def boom(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        raise ValueError('kaboom')
+
+    bad: Agent[object, str] = Agent(FunctionModel(boom), name='bad')
+    ts = DynamicWorkflowToolset[object](agents=[WorkflowAgent(agent=bad)])
+    code = "try:\n    await bad(task='x')\nexcept RuntimeError:\n    result = 'recovered'\nresult"
+    assert await _run_script(ts, code) == 'recovered'
 
 
 async def test_budget_guard_terminates_even_when_error_caught_in_sandbox() -> None:
@@ -1227,20 +1272,13 @@ async def test_unlimited_runs_without_a_backstop() -> None:
     assert out == 2
 
 
-def test_unknown_resource_limit_key_raises_at_construction() -> None:
+@pytest.mark.parametrize('unknown_key', ['max_durations_secs', 'max_allocations'])
+def test_unknown_resource_limit_key_raises_at_construction(unknown_key: str) -> None:
     # Unknown keys must not be silently dropped, which would disable the intended cap.
     with pytest.raises(UserError, match='Unknown `resource_limits` key'):
         DynamicWorkflowToolset[object](
             agents=[_wf_agent()],
-            resource_limits={'max_durations_secs': 5},  # pyright: ignore[reportArgumentType]
-        )
-
-
-def test_removed_allocation_limit_has_migration_error() -> None:
-    with pytest.raises(UserError, match='Use `max_memory`'):
-        DynamicWorkflowToolset[object](
-            agents=[_wf_agent()],
-            resource_limits={'max_allocations': 5},  # pyright: ignore[reportArgumentType]
+            resource_limits={unknown_key: 5},  # pyright: ignore[reportArgumentType]
         )
 
 

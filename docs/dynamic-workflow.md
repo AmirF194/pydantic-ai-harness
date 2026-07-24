@@ -146,7 +146,7 @@ A hard, host-enforced ceiling on the number of sub-agent runs in one parent run.
 
 ### `resource_limits` -- guarding the script itself
 
-These limits guard the orchestration script's own memory, not the sub-agents it calls. The default backstop is 256 MB with no time limit. Printed output is collected separately with Monty's 10 MiB default cap. Monty 0.0.19 removed allocation-count limits; replace `max_allocations` with `max_memory`.
+These limits guard the orchestration script's own memory, not the sub-agents it calls. The default backstop is 256 MB with no time limit. Printed output is collected separately with Monty's 10 MiB default cap.
 
 ```python
 DynamicWorkflow(agents=[...], resource_limits={'max_duration_secs': 30})
