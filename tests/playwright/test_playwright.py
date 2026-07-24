@@ -18,6 +18,9 @@ from playwright._impl._errors import TargetClosedError
 from playwright.async_api import Error as PlaywrightError
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 from pydantic_ai import Agent, AgentRunResult
+from pydantic_ai.capabilities import AbstractCapability
+from pydantic_ai.capabilities.abstract import CapabilityOrdering
+from pydantic_ai.exceptions import UserError
 from pydantic_ai.messages import BinaryContent, ToolReturn
 from pydantic_ai.models.test import TestModel
 from pydantic_ai.tools import RunContext, ToolDefinition
@@ -324,6 +327,14 @@ class _HangingTitlePage(_FakePage):
     async def title(self) -> str:
         await asyncio.Event().wait()
         return self._title  # pragma: no cover -- unreachable; the wait is cancelled
+
+
+class _HangingEvaluatePage(_FakePage):
+    """A page whose `evaluate` never returns, modelling a never-resolving promise."""
+
+    async def evaluate(self, expression: str) -> object:
+        await asyncio.Event().wait()
+        return None  # pragma: no cover -- unreachable; the wait is cancelled
 
 
 class _FakeInstallerProcess:
@@ -697,6 +708,21 @@ class TestPlaywrightBrowserTools:
         assert isinstance(image, BinaryContent)
         assert image.data == b'PNG-BYTES'
 
+    async def test_screenshot_over_size_limit_returns_error_not_image(self) -> None:
+        png = b'x' * (toolset_module._MAX_SCREENSHOT_BYTES + 1)
+        result = await _toolset(_FakePage(screenshot_bytes=png)).screenshot(full_page=True)
+        assert isinstance(result, str)
+        assert result.startswith(f'Error: screenshot is {len(png)} bytes')
+        assert 'full_page=False' in result
+
+    async def test_navigate_omits_oversized_screenshot_attachment(self) -> None:
+        png = b'x' * (toolset_module._MAX_SCREENSHOT_BYTES + 1)
+        toolset = _toolset(_FakePage(screenshot_bytes=png), screenshot_on_navigate=True)
+        result = await toolset.navigate('https://example.com/')
+        assert isinstance(result, str)  # no ToolReturn: the image is dropped, the text result survives
+        assert result.startswith('URL: https://example.com/')
+        assert 'Error: screenshot is' in result
+
     async def test_get_text_with_selector(self) -> None:
         toolset = _toolset(_FakePage())
         assert await toolset.get_text('h1') == 'text:h1'
@@ -958,6 +984,8 @@ _NEGATIVE_TIMEOUT_CALLS: list[Callable[[PlaywrightBrowserToolset[None]], Awaitab
     lambda t: t.go_forward(timeout_ms=-1),
     lambda t: t.wait_for(selector='.x', timeout_ms=-1),
     lambda t: t.snapshot(timeout_ms=-1),
+    lambda t: t.scroll('down', timeout_ms=-1),
+    lambda t: t.execute_js('1 + 1', timeout_ms=-1),
 ]
 
 
@@ -979,33 +1007,59 @@ class TestPerCallTimeout:
         assert result.startswith('URL:')
 
     async def test_navigate_title_honors_timeout_override(self) -> None:
+        # The reported deadline is the override the call actually ran under, not
+        # the capability default.
         result = await _toolset(_HangingTitlePage()).navigate('https://example.com/', timeout_ms=1)
         assert result == (
-            'Error: navigate timed out after 30000ms. The element may not exist or the page may be slow; '
+            'Error: navigate timed out after 1ms. The element may not exist or the page may be slow; '
             'try a different selector, or navigate again.'
         )
+
+    async def test_execute_js_bounds_unresolved_promise(self) -> None:
+        # `page.evaluate` waits on returned promises indefinitely; the external
+        # deadline turns that into a bounded error instead of a held lock.
+        result = await _toolset(_HangingEvaluatePage()).execute_js('new Promise(() => {})', timeout_ms=1)
+        assert isinstance(result, str)
+        assert result.startswith('Error: execute_js timed out after 1ms.')
+
+    async def test_scroll_bounds_hung_evaluate(self) -> None:
+        result = await _toolset(_HangingEvaluatePage()).scroll('down', timeout_ms=1)
+        assert result.startswith('Error: scroll timed out after 1ms.')
 
     async def test_override_reaches_each_playwright_call(self) -> None:
         page = _FakePage()
         toolset = _toolset(page)
         await toolset.navigate('https://example.com/', timeout_ms=1111)
         assert page.timeouts['goto'] == 1111
+        # Trailing operations (load wait, page-text read) run under the same
+        # override, not the capability default.
         await toolset.click('button#go', timeout_ms=2222)
         assert page.timeouts['click'] == 2222
+        assert page.timeouts['wait_for_load_state'] == 2222
+        assert page.timeouts['inner_text'] == 2222
         await toolset.type_text('input#q', 'hi', timeout_ms=3333)
         assert page.timeouts['fill'] == 3333
+        assert page.timeouts['inner_text'] == 3333
         await toolset.get_text('h1', timeout_ms=4444)
         assert page.timeouts['inner_text'] == 4444
+        await toolset.get_text(timeout_ms=4545)
+        assert page.timeouts['inner_text'] == 4545
         await toolset.screenshot(timeout_ms=5555)
         assert page.timeouts['screenshot'] == 5555
         await toolset.go_back(timeout_ms=6666)
         assert page.timeouts['go_back'] == 6666
+        assert page.timeouts['wait_for_load_state'] == 6666
+        assert page.timeouts['inner_text'] == 6666
         await toolset.go_forward(timeout_ms=7777)
         assert page.timeouts['go_forward'] == 7777
+        assert page.timeouts['wait_for_load_state'] == 7777
         await toolset.wait_for(selector='.ready', timeout_ms=8888)
         assert page.timeouts['wait_for_selector'] == 8888
+        assert page.timeouts['inner_text'] == 8888
         await toolset.snapshot(timeout_ms=9999)
         assert page.timeouts['aria_snapshot'] == 9999
+        await toolset.scroll('down', timeout_ms=1234)
+        assert page.timeouts['inner_text'] == 1234
 
     async def test_none_falls_back_to_capability_default(self) -> None:
         page = _FakePage()
@@ -1078,6 +1132,12 @@ class TestPlaywrightBrowserState:
             PlaywrightBrowserToolset[None](state=state, max_content_tokens=-1)
         PlaywrightBrowserToolset[None](state=state, max_content_tokens=0)
 
+    def test_toolset_validates_timeout_ms(self) -> None:
+        state = PlaywrightBrowserState()
+        with pytest.raises(ValueError, match='^timeout_ms must be greater than or equal to 0$'):
+            PlaywrightBrowserToolset[None](state=state, timeout_ms=-1)
+        PlaywrightBrowserToolset[None](state=state, timeout_ms=0)  # 0 = no deadline, accepted
+
     async def test_tool_raises_when_wrap_run_not_active(self) -> None:
         toolset = PlaywrightBrowserToolset[None](state=PlaywrightBrowserState())
         with pytest.raises(RuntimeError, match='PlaywrightBrowser is not running'):
@@ -1146,6 +1206,11 @@ class TestPlaywrightBrowserHooks:
         with pytest.raises(ValueError, match='^max_content_tokens must be greater than or equal to 0$'):
             PlaywrightBrowser[None](max_content_tokens=-1)
         PlaywrightBrowser[None](max_content_tokens=0)
+
+    def test_capability_validates_timeout_ms(self) -> None:
+        with pytest.raises(ValueError, match='^timeout_ms must be greater than or equal to 0$'):
+            PlaywrightBrowser[None](timeout_ms=-1)
+        PlaywrightBrowser[None](timeout_ms=0)
 
     def test_get_instructions_reports_allowlist(self) -> None:
         instructions = PlaywrightBrowser[None](allowed_domains=['a.com', 'b.com']).get_instructions()
@@ -1249,6 +1314,33 @@ class TestPlaywrightBrowserHooks:
         assert browser.block_private_addresses is True
         assert browser.auto_install_chromium is False
         assert browser.storage_state is None
+
+
+class TestDurabilityRejection:
+    def test_rejects_innermost_durability_capability(self) -> None:
+        # Durability capabilities are the `innermost` ordering tier; a live
+        # Chromium page cannot survive activity replay, so binding both to one
+        # agent must fail at construction, not deep inside the first tool call.
+        class _Durability(AbstractCapability[object]):
+            def get_ordering(self) -> CapabilityOrdering:
+                return CapabilityOrdering(position='innermost')
+
+        with pytest.raises(UserError, match='does not support durable execution'):
+            Agent(TestModel(), capabilities=[PlaywrightBrowser(), _Durability()])
+
+    def test_accepts_capability_with_non_durability_ordering(self) -> None:
+        class _Outermost(AbstractCapability[object]):
+            def get_ordering(self) -> CapabilityOrdering:
+                return CapabilityOrdering(position='outermost')
+
+        Agent(TestModel(), capabilities=[PlaywrightBrowser(), _Outermost()])
+
+    def test_rejects_temporal_durability_at_construction(self) -> None:
+        pytest.importorskip('temporalio')
+        from pydantic_ai.durable_exec.temporal import TemporalDurability
+
+        with pytest.raises(UserError, match='does not support durable execution'):
+            Agent(TestModel(), capabilities=[PlaywrightBrowser(), TemporalDurability()])
 
 
 class TestChromiumAutoInstall:

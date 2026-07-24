@@ -1,4 +1,9 @@
-"""Playwright capability -- a real, stateful Chromium browser for agents."""
+"""Playwright capability -- a real, stateful Chromium browser for agents.
+
+The dated external-service assumptions this package relies on (aria snapshots,
+selector engines, service-worker blocking, binary detection, timeouts) are
+recorded in the `_toolset` module docstring.
+"""
 
 from __future__ import annotations
 
@@ -10,6 +15,7 @@ from typing import TYPE_CHECKING
 
 from pydantic_ai import AgentRunResult, RunContext
 from pydantic_ai.capabilities import AbstractCapability, WrapRunHandler
+from pydantic_ai.exceptions import UserError
 from pydantic_ai.tools import AgentDepsT, ToolDefinition
 
 from pydantic_ai_harness.playwright._toolset import (
@@ -30,6 +36,7 @@ if TYPE_CHECKING:
     from playwright.async_api import Playwright as PlaywrightDriver
     from playwright.async_api import Request as PlaywrightRequest
     from playwright.async_api import Route as PlaywrightRoute
+    from pydantic_ai.agent import AbstractAgent
 
 _CHROMIUM_MISSING_MESSAGE = (
     'Chromium is not installed. Run `playwright install chromium` (on a fresh Linux or CI image use '
@@ -130,6 +137,11 @@ class PlaywrightBrowser(AbstractCapability[AgentDepsT]):
     hidden from the model and calling one raises with a `playwright install
     chromium` hint; set `auto_install_chromium=True` to fetch it automatically
     instead.
+
+    Durable execution (e.g. `TemporalDurability`) is not supported: durability
+    replays tool calls as activities and a live Chromium page cannot survive
+    replay or worker restart, so combining both on one agent raises `UserError`
+    at agent construction.
     """
 
     headless: bool = True
@@ -197,6 +209,29 @@ class PlaywrightBrowser(AbstractCapability[AgentDepsT]):
             max_content_tokens=self.max_content_tokens,
             timeout_ms=self.timeout_ms,
         )
+
+    def for_agent(self, agent: AbstractAgent[AgentDepsT, object]) -> AbstractCapability[AgentDepsT]:
+        """Refuse to bind to a durable-execution agent.
+
+        Durable execution (e.g. `TemporalDurability`) wraps the toolsets captured
+        at agent construction and replays tool calls as activities. A live
+        Chromium page cannot be checkpointed across activity boundaries or worker
+        restarts, so the composition cannot work; without this guard it fails
+        deep inside the first browser tool call instead. Durability capabilities
+        are the `innermost` ordering tier (see
+        `AbstractCapability.get_ordering`), which is what is detected here.
+        """
+        siblings: list[AbstractCapability[AgentDepsT]] = []
+        agent.root_capability.apply(siblings.append)
+        for sibling in siblings:
+            ordering = sibling.get_ordering()
+            if ordering is not None and ordering.position == 'innermost':
+                raise UserError(
+                    'PlaywrightBrowser does not support durable execution (e.g. TemporalDurability): '
+                    'a live Chromium browser cannot survive activity replay or worker restart. '
+                    'Run the browser agent outside the durable agent, or remove the durability capability.'
+                )
+        return self
 
     async def for_run(self, ctx: RunContext[AgentDepsT]) -> PlaywrightBrowser[AgentDepsT]:
         """Return a fresh instance per run so concurrent runs never share a page or browser."""

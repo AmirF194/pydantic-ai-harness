@@ -44,10 +44,10 @@ result = await agent.run('Open https://example.com and tell me the page title.')
 | `wait_for` | `(selector=None, text=None, timeout_ms=None)` | page text once the element/text appears; pass exactly one of `selector`/`text` |
 | `screenshot` | `(full_page=False, timeout_ms=None)` | a note with the page URL, plus the PNG as image content |
 | `get_text` | `(selector=None, timeout_ms=None)` | the element's text, or the full page's visible text |
-| `scroll` | `(direction, x=None, y=None)` | page text after scrolling; `direction` is up/down/left/right |
+| `scroll` | `(direction, x=None, y=None, timeout_ms=None)` | page text after scrolling; `direction` is up/down/left/right |
 | `go_back` | `(timeout_ms=None)` | the previous page's text |
 | `go_forward` | `(timeout_ms=None)` | the next page's text |
-| `execute_js` | `(script)` | the JavaScript result (string as-is, objects as JSON, `null` as `undefined`) |
+| `execute_js` | `(script, timeout_ms=None)` | the JavaScript result (string as-is, objects as JSON, `null` as `undefined`) |
 
 Every page action accepts an optional `timeout_ms` to override the capability's
 default `timeout_ms` for that one call.
@@ -62,7 +62,11 @@ only when a visual check is needed (charts, layout).
 `screenshot` (and the optional `screenshot_on_navigate` attachment) return the
 image as [`BinaryContent`](https://ai.pydantic.dev/api/messages/#pydantic_ai.messages.BinaryContent)
 rather than a base64 string, so vision models see the image natively instead of
-a wall of base64 in the text context.
+a wall of base64 in the text context. A capture over 5 MB (typically a full-page
+screenshot of a long page) is returned as a bounded error instead of image
+content, because model providers reject oversized images and the failure would
+otherwise abort the run; capture the viewport or scroll and capture sections
+instead.
 
 Browser tool failures -- a timeout, a selector that matches no element, a
 navigation error, or a browser that closed mid-run -- are returned to the model
@@ -139,6 +143,9 @@ page and browser, so concurrent `agent.run()` calls never share a tab.
 - Page-level selectors cannot reach content inside iframes (payment widgets,
   some CAPTCHAs); `snapshot` does surface iframe content for reading.
 - Download-triggering clicks are not handled.
+- Durable execution (e.g. `TemporalDurability`) is rejected at agent
+  construction: a live Chromium page cannot survive activity replay or worker
+  restart.
 - The model targets elements by `aria-ref=` handle (from `snapshot`), CSS
   selector, or pixel coordinates.
 
