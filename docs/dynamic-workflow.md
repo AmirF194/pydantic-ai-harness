@@ -14,6 +14,8 @@ description: Let an orchestrator agent coordinate a catalog of sub-agents by wri
     from pydantic_ai_harness.dynamic_workflow import DynamicWorkflow
     ```
 
+> The API may change between releases. Where practical, breaking changes ship with a deprecation warning.
+
 ## The idea
 
 The usual way to coordinate sub-agents is one tool call per step. The agent calls the reviewer and waits, reads the result, calls the reviewer again, waits again, and so on. Every intermediate result travels back into the agent's context, and every step that depends on the previous one is a separate model turn.

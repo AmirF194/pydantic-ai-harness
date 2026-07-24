@@ -9,6 +9,8 @@ Let one agent coordinate a whole team of sub-agents by writing a small Python sc
 > from pydantic_ai_harness.dynamic_workflow import DynamicWorkflow
 > ```
 
+> The API may change between releases. Where practical, breaking changes ship with a deprecation warning.
+
 [Source](https://github.com/pydantic/pydantic-ai-harness/tree/main/pydantic_ai_harness/dynamic_workflow/)
 
 ## The idea
