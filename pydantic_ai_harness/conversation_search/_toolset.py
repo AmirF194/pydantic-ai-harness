@@ -224,9 +224,12 @@ class ConversationSearchToolset(FunctionToolset[AgentDepsT]):
             raise ValueError(f'max_matches must be non-negative, got {max_matches!r}.')
         if context_lines < 0:
             raise ValueError(f'context_lines must be non-negative, got {context_lines!r}.')
-        # A negative k1 can zero `_bm25_score`'s denominator (k1=-1, b=0, tf=1).
-        if bm25_k1 < 0:
-            raise ValueError(f'bm25_k1 must be non-negative, got {bm25_k1!r}.')
+        # A negative k1 can zero `_bm25_score`'s denominator (k1=-1, b=0, tf=1); `nan`
+        # and `inf` slip past an ordering check (`nan < 0` is false) and turn every
+        # score into `nan`, which the `score > 0` filter then drops as a non-match.
+        # The `bm25_b` range check already excludes both.
+        if not math.isfinite(bm25_k1) or bm25_k1 < 0:
+            raise ValueError(f'bm25_k1 must be a non-negative finite number, got {bm25_k1!r}.')
         if not 0.0 <= bm25_b <= 1.0:
             raise ValueError(f'bm25_b must be between 0.0 and 1.0, got {bm25_b!r}.')
         self._source = source

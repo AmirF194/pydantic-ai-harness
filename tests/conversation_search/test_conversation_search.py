@@ -550,8 +550,15 @@ class TestConfigValidation:
             ConversationSearch(source, max_matches=-1).get_toolset()
         with pytest.raises(ValueError, match=re.escape('context_lines must be non-negative, got -1.')):
             ConversationSearch(source, context_lines=-1).get_toolset()
-        with pytest.raises(ValueError, match=re.escape('bm25_k1 must be non-negative, got -1.0.')):
+        with pytest.raises(ValueError, match=re.escape('bm25_k1 must be a non-negative finite number, got -1.0.')):
             ConversationSearch(source, bm25_k1=-1.0).get_toolset()
+        # `nan` and `inf` pass an ordering check and would poison every score instead.
+        with pytest.raises(ValueError, match='bm25_k1 must be a non-negative finite number'):
+            ConversationSearch(source, bm25_k1=float('nan')).get_toolset()
+        with pytest.raises(ValueError, match='bm25_k1 must be a non-negative finite number'):
+            ConversationSearch(source, bm25_k1=float('inf')).get_toolset()
+        with pytest.raises(ValueError, match=re.escape('bm25_b must be between 0.0 and 1.0, got nan.')):
+            ConversationSearch(source, bm25_b=float('nan')).get_toolset()
         with pytest.raises(ValueError, match=re.escape('bm25_b must be between 0.0 and 1.0, got 1.5.')):
             ConversationSearch(source, bm25_b=1.5).get_toolset()
         with pytest.raises(ValueError, match=re.escape('bm25_b must be between 0.0 and 1.0, got -0.5.')):
@@ -562,7 +569,7 @@ class TestConfigValidation:
         # for any single-occurrence term, so an unvalidated toolset raises mid-search.
         store = InMemoryStepStore()
         await _seed_run(store, 'r1', [_user('the needle target')])
-        with pytest.raises(ValueError, match='bm25_k1 must be non-negative'):
+        with pytest.raises(ValueError, match='bm25_k1 must be a non-negative finite number'):
             ConversationSearchToolset[None](
                 SnapshotHistorySource(store),
                 tool_id='conversation-search',
