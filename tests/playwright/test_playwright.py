@@ -698,6 +698,11 @@ class TestPlaywrightBrowserTools:
         result = await toolset.get_text('#missing')
         assert result.startswith("Error getting text from '#missing':")
 
+    async def test_get_text_surfaces_playwright_error(self) -> None:
+        toolset = _toolset(_FakePage(inner_text_error=PlaywrightTimeoutError('inner_text timed out')))
+        result = await toolset.get_text('h1')
+        assert result == "Error getting text from 'h1': inner_text timed out"
+
     async def test_get_text_full_page(self) -> None:
         toolset = _toolset(_FakePage(body='full page text'))
         assert await toolset.get_text() == 'full page text'
