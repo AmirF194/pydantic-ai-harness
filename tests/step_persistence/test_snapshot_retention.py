@@ -8,6 +8,7 @@ and one end-to-end `Agent` run with the bound set.
 
 from __future__ import annotations
 
+import asyncio
 import sqlite3
 from collections.abc import Callable
 from pathlib import Path
@@ -152,6 +153,13 @@ class TestRetentionBound:
         with pytest.raises(ValueError, match='max_snapshots_per_run must be >= 1'):
             _make_store(kind, tmp_path, 0)
 
+    @pytest.mark.parametrize('kind', BACKENDS)
+    def test_rejects_non_int_bound(self, kind: str, tmp_path: Path) -> None:
+        # A positive non-int passes the `< 1` floor but breaks pruning after a
+        # write (slice `TypeError` / bad SQL bind), so reject it at construction.
+        with pytest.raises(ValueError, match='max_snapshots_per_run must be an int'):
+            _make_store(kind, tmp_path, 1.5)  # pyright: ignore[reportArgumentType]
+
 
 class TestFileStorePruneEdgeCases:
     async def test_non_numeric_snapshot_file_is_ignored(self, tmp_path: Path) -> None:
@@ -186,6 +194,91 @@ class TestFileStorePruneEdgeCases:
         latest = await store.latest_snapshot(run_id='r1')
         assert latest is not None
         assert latest.step_index == 2
+
+    async def test_prune_skips_candidate_that_vanishes_during_parse(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A concurrent prune can unlink a candidate between this prune's glob and its read.
+
+        `_sync_prune_snapshots` enumerates every `{seq}.json`, then reads each
+        to learn its state. If an overlapping bounded save's prune unlinks a
+        non-retained candidate in that window, the parse must skip it rather
+        than let `FileNotFoundError` fail a save whose new snapshot already
+        landed.
+        """
+        root = tmp_path / 'runs'
+        store = FileStepStore(root, media_store=None, max_snapshots_per_run=1)
+        await _save(store, 'r1', 0)
+        await _save(store, 'r1', 1)
+
+        vanishing = root / 'r1' / 'snapshots' / '0.json'
+        original_read_text = Path.read_text
+
+        def racing_read_text(self: Path, encoding: str | None = None, errors: str | None = None) -> str:
+            if self == vanishing and vanishing.exists():
+                vanishing.unlink()
+                raise FileNotFoundError(vanishing)
+            return original_read_text(self, encoding=encoding, errors=errors)
+
+        monkeypatch.setattr(Path, 'read_text', racing_read_text)
+
+        # This save's prune parses siblings; 0.json vanishes mid-parse. Must not raise.
+        await _save(store, 'r1', 2)
+
+        latest = await store.latest_snapshot(run_id='r1')
+        assert latest is not None
+        assert latest.step_index == 2
+
+    async def test_prune_tolerates_candidate_unlinked_by_concurrent_prune(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A candidate can be deleted by a concurrent prune between enumeration and this prune's unlink.
+
+        Without `missing_ok`, the second prune's `unlink` on an already-removed
+        file raises `FileNotFoundError` after the new snapshot has been written.
+        """
+        root = tmp_path / 'runs'
+        store = FileStepStore(root, media_store=None, max_snapshots_per_run=1)
+        await _save(store, 'r1', 0)
+        await _save(store, 'r1', 1)
+
+        victim = root / 'r1' / 'snapshots' / '0.json'
+        original_unlink = Path.unlink
+
+        def racing_unlink(self: Path, missing_ok: bool = False) -> None:
+            if self == victim and victim.exists():
+                original_unlink(victim)  # a concurrent prune removed it first
+            return original_unlink(self, missing_ok=missing_ok)
+
+        monkeypatch.setattr(Path, 'unlink', racing_unlink)
+
+        # This save's prune unlinks 0.json (already gone) and 1.json. Must not raise.
+        await _save(store, 'r1', 2)
+
+        assert not victim.exists()
+        latest = await store.latest_snapshot(run_id='r1')
+        assert latest is not None
+        assert latest.step_index == 2
+
+    async def test_concurrent_bounded_saves_stay_bounded(self, tmp_path: Path) -> None:
+        """Overlapping saves against one bounded run: none raises and the bound holds.
+
+        Each `save_snapshot` dispatches its write+prune to a worker thread, so
+        the prunes run in parallel over a shared snapshots dir. This is the
+        prune-vs-prune race in the raw: one prune unlinking a candidate the
+        other has enumerated must not fail the second save.
+        """
+        root = tmp_path / 'runs'
+        store = FileStepStore(root, media_store=None, max_snapshots_per_run=1)
+        await _save(store, 'r1', 0)
+
+        await asyncio.gather(*(_save(store, 'r1', step) for step in range(1, 8)))
+
+        # Retain set upper bound: newest N + newest overall + newest complete.
+        remaining = list((root / 'r1' / 'snapshots').glob('*.json'))
+        assert len(remaining) <= 3
+        latest = await store.latest_snapshot(run_id='r1')
+        assert latest is not None
 
     async def test_read_skips_candidate_that_vanishes_mid_read(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch

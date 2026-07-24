@@ -322,6 +322,8 @@ store = FileStepStore('runs', max_snapshots_per_run=8)
 
 Pruning a snapshot never deletes its externalized media: blobs are content-addressed and may be shared across snapshots and runs, so orphaned-blob GC is out of scope (see the non-goals below). Age-based (TTL) expiry is out of scope too -- it belongs at whole-run granularity, not per snapshot.
 
+Bounded retention discards older per-step snapshots, including pre-compaction ones. Any downstream that reconstructs history by unioning a run's retained snapshots -- snapshot search or a "full transcript" receipt keyed on `run_id` -- can only see what is retained. With a tight bound (for example `max_snapshots_per_run=1`) the older, pre-compaction states are gone, so treat the bound as a hard limit on how far back such recovery can reach. Leave the bound at `None`, or set it high enough to cover the history you need to recover, when full-transcript reconstruction matters.
+
 ## Persisting media
 
 `BinaryContent` payloads (images, audio, documents, video) inlined as base64 inside a snapshot would balloon every file or row containing the message. Both `FileStepStore` and `SqliteStepStore` externalize any `BinaryContent.data` at or above **64 KiB** through a configured `MediaStore`, leaving a URI reference in the snapshot. Round-trip is transparent: `latest_snapshot(...).messages[*]` returns `BinaryContent` with the original bytes.

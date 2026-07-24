@@ -363,6 +363,15 @@ content-addressed and may be shared across snapshots and runs, so orphaned-blob
 GC is out of scope (see the non-goals below). Age-based (TTL) expiry is out of
 scope too -- it belongs at whole-run granularity, not per snapshot.
 
+Bounded retention discards older per-step snapshots, including pre-compaction
+ones. Any downstream that reconstructs history by unioning a run's retained
+snapshots -- snapshot search or a "full transcript" receipt keyed on `run_id`
+-- can only see what is retained. With a tight bound (for example
+`max_snapshots_per_run=1`) the older, pre-compaction states are gone, so treat
+the bound as a hard limit on how far back such recovery can reach. Leave the
+bound at `None`, or set it high enough to cover the history you need to recover,
+when full-transcript reconstruction matters.
+
 ## Persisting media
 
 `BinaryContent` payloads (images, audio, documents, video) inline as

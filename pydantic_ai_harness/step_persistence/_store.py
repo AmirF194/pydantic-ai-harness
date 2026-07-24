@@ -65,13 +65,19 @@ def _validate_id(value: str, *, field: str) -> None:
         raise ValueError(f'invalid {field}: {value!r}')
 
 
-def _validate_max_snapshots(value: int | None) -> None:
-    """Reject a retention bound below the correctness floor.
+def _validate_max_snapshots(value: object) -> None:
+    """Reject a retention bound below the correctness floor or of the wrong type.
 
     `None` keeps every snapshot. `1` is the smallest bound the retain
-    invariant still serves both read modes at; `0` or negatives cannot.
+    invariant still serves both read modes at; `0` or negatives cannot. A
+    non-`int` (e.g. `1.5`) passes the `< 1` check but breaks pruning later
+    with a slice `TypeError` or a bad SQL bind, so reject it at construction.
     """
-    if value is not None and value < 1:
+    if value is None:
+        return
+    if not isinstance(value, int):
+        raise ValueError(f'max_snapshots_per_run must be an int >= 1 or None, got {value!r}')
+    if value < 1:
         raise ValueError(f'max_snapshots_per_run must be >= 1 or None, got {value!r}')
 
 
@@ -534,6 +540,13 @@ class FileStepStore:
         older file must not turn every subsequent bounded save into a failure.
         The non-pruning read path is unchanged -- it only reads the newest
         parseable file.
+
+        A concurrent bounded save pruning on another worker thread can unlink a
+        non-retained candidate between this enumeration and either the parse or
+        the unlink below. Both tolerate the vanished file (skip / `missing_ok`),
+        mirroring how `_sync_load_latest_snapshot` skips a candidate that
+        disappears mid-read: the new snapshot has already landed, so a raced
+        delete must not fail the save.
         """
         if self._max_snapshots_per_run is None:
             return
@@ -547,6 +560,8 @@ class FileStepStore:
             try:
                 data = _load_json_object(path.read_text(encoding='utf-8'))
                 state = _snapshot_state(data.get('state'))
+            except FileNotFoundError:
+                continue
             except (ValueError, ValidationError):
                 continue
             entries.append((seq, state))
@@ -556,7 +571,7 @@ class FileStepStore:
         retained = _retained_seqs(entries, self._max_snapshots_per_run)
         for seq, path in paths_by_seq.items():
             if seq not in retained:
-                path.unlink()
+                path.unlink(missing_ok=True)
 
     @staticmethod
     def _next_snapshot_seq(snap_dir: Path) -> int:
