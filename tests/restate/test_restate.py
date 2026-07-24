@@ -8,7 +8,10 @@ stored entries without re-running the action -- are reproduced faithfully by the
 
 from __future__ import annotations
 
-from collections.abc import AsyncIterable, AsyncIterator
+import builtins
+import runpy
+from collections.abc import AsyncIterable, AsyncIterator, Mapping, Sequence
+from pathlib import Path
 
 import pytest
 
@@ -68,6 +71,25 @@ def _tool_then_done_model(tool_name: str, args: dict[str, object]) -> FunctionMo
 
 
 class TestTransparency:
+    def test_missing_restate_dependency_has_install_guidance(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        real_import = builtins.__import__
+
+        def import_without_restate(
+            name: str,
+            globals: Mapping[str, object] | None = None,
+            locals: Mapping[str, object] | None = None,
+            fromlist: Sequence[str] = (),
+            level: int = 0,
+        ) -> object:
+            if name == 'restate':
+                raise ImportError
+            return real_import(name, globals, locals, fromlist, level)
+
+        monkeypatch.setattr(builtins, '__import__', import_without_restate)
+        capability_path = Path(__file__).parents[2] / 'pydantic_ai_harness' / 'restate' / '_capability.py'
+        with pytest.raises(ImportError, match=r'pydantic-ai-harness\[restate\]'):
+            runpy.run_path(str(capability_path))
+
     async def test_run_outside_context_is_transparent(self) -> None:
         counter = {'calls': 0}
         agent = Agent(_text_model(counter), name='a', capabilities=[RestateDurability()])

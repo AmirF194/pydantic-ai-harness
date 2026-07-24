@@ -133,7 +133,7 @@ class TestMcpCheckpointing:
         assert server.tool_calls == [('add', {'a': 2, 'b': 3})]
         assert 'calc__mcp_server__calc.get_tools' in ctx.step_names
         assert 'calc__mcp_server__calc.get_instructions' in ctx.step_names
-        assert 'calc__mcp_server__calc.call_tool:add' in ctx.step_names
+        assert 'calc__mcp_server__calc.call_tool' in ctx.step_names
 
     async def test_replay_does_not_rehit_server(self) -> None:
         server = FakeMCPToolset(id='calc', instructions='Use the calculator.')
@@ -234,7 +234,7 @@ class TestMcpInlineOptOutForbidden:
 
         ctx = FakeRestateContext()
         with restate_context(ctx):
-            with pytest.raises(UserError, match='cannot run outside a step'):
+            with pytest.raises(UserError, match='cannot run outside a durable step'):
                 await agent.run('add 2 and 3')
 
     async def test_non_empty_dict_config_on_mcp_tool_raises(self) -> None:
