@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Literal, Protocol, runtime_checkable
 
 import anyio.to_thread
-from pydantic import TypeAdapter
+from pydantic import TypeAdapter, ValidationError
 from pydantic_ai.messages import ModelMessage, ModelMessagesTypeAdapter
 
 from pydantic_ai_harness.media import (
@@ -528,6 +528,12 @@ class FileStepStore:
         content-addressed and may be shared across snapshots and runs, so a
         dropped `{seq}.json` never triggers a media delete -- orphaned-blob GC
         is a separate concern (see the capability README non-goals).
+
+        A sibling file that fails to parse is skipped, not retained and not
+        deleted: the newly-written snapshot has already landed, so a corrupt
+        older file must not turn every subsequent bounded save into a failure.
+        The non-pruning read path is unchanged -- it only reads the newest
+        parseable file.
         """
         if self._max_snapshots_per_run is None:
             return
@@ -538,8 +544,12 @@ class FileStepStore:
                 seq = int(path.stem)
             except ValueError:
                 continue
-            data = _load_json_object(path.read_text(encoding='utf-8'))
-            entries.append((seq, _snapshot_state(data.get('state'))))
+            try:
+                data = _load_json_object(path.read_text(encoding='utf-8'))
+                state = _snapshot_state(data.get('state'))
+            except (ValueError, ValidationError):
+                continue
+            entries.append((seq, state))
             paths_by_seq[seq] = path
         if len(entries) <= self._max_snapshots_per_run:
             return
@@ -976,18 +986,22 @@ class SqliteStepStore:
         snapshots and runs, so a deleted snapshot row never removes a media row
         -- orphaned-blob GC is a separate concern (see the capability README
         non-goals).
+
+        The retain set is computed inside SQL rather than enumerated as bound
+        parameters: the newest `keep` by `seq` (which subsumes the newest
+        overall, since `keep >= 1`) plus the newest `complete`, mirroring
+        `_retained_seqs`. Binding one parameter per retained `seq` would trip
+        SQLite's variable limit once `keep` grows large.
         """
         if self._max_snapshots_per_run is None:
             return
-        rows = conn.execute('SELECT seq, state FROM snapshots WHERE run_id = ?', (run_id,)).fetchall()
-        if len(rows) <= self._max_snapshots_per_run:
-            return
-        entries: list[tuple[int, SnapshotState]] = [(int(seq), _snapshot_state(state)) for seq, state in rows]
-        retained = _retained_seqs(entries, self._max_snapshots_per_run)
-        placeholders = ','.join('?' for _ in retained)
         conn.execute(
-            f'DELETE FROM snapshots WHERE run_id = ? AND seq NOT IN ({placeholders})',
-            (run_id, *retained),
+            'DELETE FROM snapshots WHERE run_id = ? AND seq NOT IN ('
+            'SELECT seq FROM (SELECT seq FROM snapshots WHERE run_id = ? ORDER BY seq DESC LIMIT ?) '
+            'UNION '
+            "SELECT seq FROM (SELECT seq FROM snapshots WHERE run_id = ? AND state = 'complete' "
+            'ORDER BY seq DESC LIMIT 1))',
+            (run_id, run_id, self._max_snapshots_per_run, run_id),
         )
 
     async def latest_snapshot(self, *, run_id: str, include_interrupted: bool = False) -> ContinuableSnapshot | None:

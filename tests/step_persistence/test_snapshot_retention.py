@@ -169,6 +169,62 @@ class TestFileStorePruneEdgeCases:
         assert latest is not None
         assert latest.step_index == 2
 
+    async def test_corrupt_sibling_file_does_not_block_bounded_save(self, tmp_path: Path) -> None:
+        """A truncated `{seq}.json` sibling is skipped; the bounded save still succeeds and prunes."""
+        root = tmp_path / 'runs'
+        store = FileStepStore(root, media_store=None, max_snapshots_per_run=1)
+        await _save(store, 'r1', 0)
+        # Corrupt an existing numeric snapshot file: parseable filename, unparsable body.
+        (root / 'r1' / 'snapshots' / '0.json').write_text('{ truncated', encoding='utf-8')
+
+        # These would raise out of save_snapshot if prune let the parse error escape.
+        await _save(store, 'r1', 1)
+        await _save(store, 'r1', 2)
+
+        # The corrupt file is neither retained-counted nor deleted; parseable ones pruned to the bound.
+        assert (root / 'r1' / 'snapshots' / '0.json').exists()
+        latest = await store.latest_snapshot(run_id='r1')
+        assert latest is not None
+        assert latest.step_index == 2
+
+
+class TestSqliteStorePruneEdgeCases:
+    async def test_large_bound_does_not_exceed_sql_variable_limit(self, tmp_path: Path) -> None:
+        """Pruning with a large bound must not bind one parameter per retained seq.
+
+        SQLite caps host parameters (999 pre-3.32, 32766 after). A retain set
+        enumerated as `seq NOT IN (?, ?, ...)` trips that ceiling; the set-based
+        DELETE keeps the parameter count constant. Rows are seeded in bulk and a
+        single bounded save then triggers the prune that would have overflowed.
+        """
+        db = tmp_path / 'runs.db'
+        keep = 32_766
+        store = SqliteStepStore(database=db, media_store=None, max_snapshots_per_run=keep)
+        await _save(store, 'r1', 0)  # creates the schema and the first row
+
+        conn = sqlite3.connect(db, check_same_thread=False, isolation_level=None)
+        try:
+            conn.executemany(
+                'INSERT INTO snapshots (run_id, step_index, timestamp, state, messages) VALUES (?, ?, ?, ?, ?)',
+                [('r1', step, '2026-01-01T00:00:00+00:00', 'complete', '[]') for step in range(1, keep + 2)],
+            )
+        finally:
+            conn.close()
+
+        # r1 now holds keep+2 rows; this bounded save runs the DELETE that,
+        # under a per-seq-parameter scheme, would raise "too many SQL variables".
+        await _save(store, 'r1', keep + 2)
+
+        conn = sqlite3.connect(db, check_same_thread=False)
+        try:
+            (total,) = conn.execute('SELECT COUNT(*) FROM snapshots WHERE run_id = ?', ('r1',)).fetchone()
+        finally:
+            conn.close()
+        assert total == keep
+        latest = await store.latest_snapshot(run_id='r1')
+        assert latest is not None
+        assert latest.step_index == keep + 2
+
 
 class TestFromSpecForwarding:
     async def test_memory_backend_forwards_bound(self) -> None:
