@@ -32,7 +32,9 @@ if TYPE_CHECKING:
     from playwright.async_api import Route as PlaywrightRoute
 
 _CHROMIUM_MISSING_MESSAGE = (
-    'Chromium is not installed. Run `playwright install chromium` and restart the agent to enable browser tools.'
+    'Chromium is not installed. Run `playwright install chromium` (on a fresh Linux or CI image use '
+    '`playwright install --with-deps chromium` to also install the required system libraries) and restart '
+    'the agent to enable browser tools.'
 )
 
 _INSTRUCTIONS = """\
@@ -50,12 +52,13 @@ selector to read a specific section of a large page. The browser is single-tab. 
 """
 
 
-async def _auto_install_chromium() -> bool:  # pragma: no cover
-    """Run `playwright install chromium` in this interpreter; return whether it succeeded.
+async def _auto_install_chromium() -> str | None:  # pragma: no cover
+    """Run `playwright install chromium` in this interpreter; `None` on success, else the installer output.
 
     Only invoked when `auto_install_chromium=True` and the binary is missing. It
     shells out to a subprocess and downloads a browser, so it runs outside the
-    mocked test surface.
+    mocked test surface. On failure the merged stdout/stderr is returned so the
+    launch path can surface why the install failed instead of the generic hint.
     """
     proc = await asyncio.create_subprocess_exec(
         sys.executable,
@@ -64,10 +67,12 @@ async def _auto_install_chromium() -> bool:  # pragma: no cover
         'install',
         'chromium',
         stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.STDOUT,
     )
-    await proc.communicate()
-    return proc.returncode == 0
+    stdout, _ = await proc.communicate()
+    if proc.returncode == 0:
+        return None
+    return stdout.decode(errors='replace')
 
 
 @dataclass
@@ -144,6 +149,16 @@ class PlaywrightBrowser(AbstractCapability[AgentDepsT]):
     clear install hint. Set `True` to opt into the automatic download instead.
     """
 
+    storage_state: str | None = None
+    """Path to a Playwright storage state JSON file (cookies, localStorage).
+
+    Produced by `context.storage_state(path=...)` or
+    `playwright codegen --save-storage`, and loaded into the browser context at
+    launch so the agent starts with that session. The file is credential
+    material -- treat it as a secret: never commit it, and delete it when the
+    session expires.
+    """
+
     _state: PlaywrightBrowserState = field(default_factory=PlaywrightBrowserState, init=False, repr=False)
     _toolset: PlaywrightBrowserToolset[AgentDepsT] = field(init=False, repr=False)
     _browser: PlaywrightBrowserHandle | None = field(default=None, init=False, repr=False)
@@ -194,10 +209,17 @@ class PlaywrightBrowser(AbstractCapability[AgentDepsT]):
         return tool_defs
 
     async def _install_and_retry(self, pw: PlaywrightDriver) -> PlaywrightBrowserHandle | None:
-        """Fetch Chromium and relaunch once; `None` when the install itself failed."""
-        if not await _auto_install_chromium():
-            return None
-        return await pw.chromium.launch(headless=self.headless)  # pragma: no cover
+        """Fetch Chromium and relaunch once.
+
+        Returns the browser on success. On install failure it records a launch
+        error carrying a bounded tail of the installer output (so the failure is
+        diagnosable) and returns `None`.
+        """
+        install_output = await _auto_install_chromium()
+        if install_output is None:
+            return await pw.chromium.launch(headless=self.headless)  # pragma: no cover
+        self._state.launch_error = f'{_CHROMIUM_MISSING_MESSAGE}\nAuto-install failed:\n{install_output[-300:]}'
+        return None
 
     async def _route_guard(self, route: PlaywrightRoute, request: PlaywrightRequest) -> None:  # pragma: no cover
         """Network-layer allowlist: abort disallowed top-level navigations, pass the rest.
@@ -255,14 +277,16 @@ class PlaywrightBrowser(AbstractCapability[AgentDepsT]):
                 # error rather than being masked as "Chromium is not installed".
                 browser = await self._install_and_retry(pw) if self.auto_install_chromium else None
                 if browser is None:  # pragma: no branch
-                    self._state.launch_error = _CHROMIUM_MISSING_MESSAGE
+                    if self._state.launch_error is None:
+                        self._state.launch_error = _CHROMIUM_MISSING_MESSAGE
                     return
             else:
                 browser = await pw.chromium.launch(headless=self.headless)
             self._browser = browser
-            page = await browser.new_page()
+            context = await browser.new_context(storage_state=self.storage_state)
+            page = await context.new_page()
             if self.allowed_domains is not None:
-                await page.context.route('**/*', self._route_guard)
+                await context.route('**/*', self._route_guard)
             page.on('popup', self._on_popup)
             self._state.page = page
 
@@ -276,16 +300,23 @@ class PlaywrightBrowser(AbstractCapability[AgentDepsT]):
                     task.cancel()
                 await asyncio.gather(*self._popup_tasks, return_exceptions=True)
                 self._popup_tasks.clear()
-            browser = self._browser
-            if browser is not None:
-                self._state.page = None
-                self._browser = None
-                try:
-                    await browser.close()
-                finally:
+            run_failed = sys.exc_info()[0] is not None
+            try:
+                browser = self._browser
+                if browser is not None:
+                    self._state.page = None
+                    self._browser = None
+                    try:
+                        await browser.close()
+                    finally:
+                        await pw_cm.__aexit__(None, None, None)
+                elif entered:
                     await pw_cm.__aexit__(None, None, None)
-            elif entered:
-                await pw_cm.__aexit__(None, None, None)
+            except Exception:
+                # A teardown error must not mask the run's real exception. When the
+                # run already failed, drop the close/exit error; otherwise surface it.
+                if not run_failed:
+                    raise
 
     @classmethod
     def from_spec(
@@ -297,8 +328,13 @@ class PlaywrightBrowser(AbstractCapability[AgentDepsT]):
         max_content_tokens: int = DEFAULT_MAX_CONTENT_TOKENS,
         timeout_ms: int = DEFAULT_TIMEOUT_MS,
         auto_install_chromium: bool = False,
+        storage_state: str | None = None,
     ) -> PlaywrightBrowser[AgentDepsT]:
-        """Construct the capability from serializable spec options (all fields are plain scalars/lists)."""
+        """Construct the capability from serializable spec options (all fields are plain scalars/lists).
+
+        `storage_state` is a path string, which is spec-safe: the secret lives in
+        the referenced file, not in the spec.
+        """
         return cls(
             headless=headless,
             allowed_domains=list(allowed_domains) if allowed_domains is not None else None,
@@ -306,4 +342,5 @@ class PlaywrightBrowser(AbstractCapability[AgentDepsT]):
             max_content_tokens=max_content_tokens,
             timeout_ms=timeout_ms,
             auto_install_chromium=auto_install_chromium,
+            storage_state=storage_state,
         )

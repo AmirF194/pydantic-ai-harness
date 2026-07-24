@@ -16,7 +16,13 @@ from pydantic_ai.toolsets import FunctionToolset
 try:
     # Import-time gate (mirrors `pydantic_ai_harness.exa._toolset`): importing the
     # capability fails fast with an install hint when the optional dep is absent.
+    # `TargetClosedError` is not re-exported from `playwright.async_api`; the
+    # `playwright._impl._errors` module documents its own classes as stable public
+    # API, and a driver-raised instance only carries `.name` (so isinstance is the
+    # reliable discriminator, not the name attribute).
+    from playwright._impl._errors import TargetClosedError as TargetClosedError
     from playwright.async_api import Error as _PlaywrightError
+    from playwright.async_api import TimeoutError as PlaywrightTimeoutError
     from playwright.async_api import async_playwright as async_playwright
 
     PlaywrightError = _PlaywrightError
@@ -73,13 +79,27 @@ class _Page(Protocol):
     async def go_forward(self, *, timeout: float | None = None) -> object: ...  # pragma: no cover
 
 
+def _to_idna(host: str) -> str:
+    """Return `host` in its ASCII/IDNA form so Unicode and `xn--` spellings compare equal.
+
+    A host that cannot be IDNA-encoded (over-long or empty labels, IP literals)
+    falls back to the input unchanged, so IPv4/IPv6 literals are left alone.
+    """
+    try:
+        return host.encode('idna').decode('ascii')
+    except UnicodeError:
+        return host
+
+
 def check_allowed_domain(url: str, allowed_domains: list[str] | None) -> bool:
     """Return whether `url`'s host is permitted by the allowlist.
 
     `allowed_domains=None` means every domain is allowed (open egress). A host
     matches when it equals an allowed entry or is a subdomain of one. `hostname`
-    strips the port and brackets, so bracketed IPv6 literals compare correctly. A
-    URL without a host (e.g. `about:blank`, `mailto:`) is rejected.
+    strips the port and brackets, so bracketed IPv6 literals compare correctly.
+    Host and entries are normalized to their IDNA/ASCII form before comparison,
+    so a Unicode host and its `xn--` spelling get the same verdict. A URL without
+    a host (e.g. `about:blank`, `mailto:`) is rejected.
     """
     try:
         host = urlparse(url).hostname
@@ -89,8 +109,9 @@ def check_allowed_domain(url: str, allowed_domains: list[str] | None) -> bool:
         return False
     if allowed_domains is None:
         return True
+    host = _to_idna(host)
     for entry in allowed_domains:
-        domain = entry.strip().lower()
+        domain = _to_idna(entry.strip().lower())
         if domain and (host == domain or host.endswith('.' + domain)):
             return True
     return False
@@ -213,6 +234,25 @@ class PlaywrightBrowserToolset(FunctionToolset[AgentDepsT]):
         """Apply the configured token budget to a model-facing textual result."""
         return _truncate(text, self._max_content_tokens * _CHARS_PER_TOKEN)
 
+    def _playwright_error(self, action: str, exc: PlaywrightError) -> str:
+        """Map a Playwright error to a bounded, model-actionable string.
+
+        A timeout, strict-mode match count, `net::ERR_*` code, or closed target is
+        a routine event when a model drives a browser, so it is returned as a tool
+        result the model can react to rather than raised to abort the run.
+        """
+        if isinstance(exc, PlaywrightTimeoutError):
+            return (
+                f'Error: {action} timed out after {self._timeout_ms}ms. The element may not exist or '
+                'the page may be slow; try a different selector, or navigate again.'
+            )
+        if isinstance(exc, TargetClosedError):
+            return (
+                f'Error: {action} failed: the browser or page was closed unexpectedly. '
+                'Browser tools may be unavailable for the rest of this run.'
+            )
+        return f'Error: {action} failed: {exc}'
+
     async def _enforce_allowed_domain(self, page: _Page, action: str) -> str | None:
         """After an action, bounce to `about:blank` if the page left the allowlist.
 
@@ -244,18 +284,21 @@ class PlaywrightBrowserToolset(FunctionToolset[AgentDepsT]):
             if not check_allowed_domain(url, self._allowed_domains):
                 return self._truncate_output(f'Error: domain not in allowed_domains: {url}')
             page = await self._state.ensure_page()
-            await page.goto(url, timeout=self._timeout_ms)
-            await page.wait_for_load_state('domcontentloaded')
-            blocked = await self._enforce_allowed_domain(page, 'navigate')
-            if blocked is not None:
-                return blocked
-            title = await page.title()
-            text = await self._page_text()
-            result = self._truncate_output(f'URL: {page.url}\nTitle: {title}\n\n{text}')
-            if not self._screenshot_on_navigate:
-                return result
-            png = await page.screenshot()
-            return ToolReturn(result, content=[BinaryContent(data=png, media_type='image/png')])
+            try:
+                await page.goto(url, timeout=self._timeout_ms)
+                await page.wait_for_load_state('domcontentloaded')
+                blocked = await self._enforce_allowed_domain(page, 'navigate')
+                if blocked is not None:
+                    return blocked
+                title = await page.title()
+                text = await self._page_text()
+                result = self._truncate_output(f'URL: {page.url}\nTitle: {title}\n\n{text}')
+                if not self._screenshot_on_navigate:
+                    return result
+                png = await page.screenshot()
+                return ToolReturn(result, content=[BinaryContent(data=png, media_type='image/png')])
+            except PlaywrightError as exc:
+                return self._truncate_output(self._playwright_error('navigate', exc))
 
     async def click(self, selector: str) -> str:
         """Click an element on the current page.
@@ -276,15 +319,18 @@ class PlaywrightBrowserToolset(FunctionToolset[AgentDepsT]):
                     coordinates = (int(parts[0]), int(parts[1]))
                 except ValueError:
                     pass
-            if coordinates is not None:
-                await page.mouse.click(*coordinates)
-            else:
-                await page.click(selector, timeout=self._timeout_ms)
-            await page.wait_for_load_state('domcontentloaded')
-            blocked = await self._enforce_allowed_domain(page, 'click')
-            if blocked is not None:
-                return blocked
-            return self._truncate_output(f"Clicked '{selector}'. URL: {page.url}\n\n{await self._page_text()}")
+            try:
+                if coordinates is not None:
+                    await page.mouse.click(*coordinates)
+                else:
+                    await page.click(selector, timeout=self._timeout_ms)
+                await page.wait_for_load_state('domcontentloaded')
+                blocked = await self._enforce_allowed_domain(page, 'click')
+                if blocked is not None:
+                    return blocked
+                return self._truncate_output(f"Clicked '{selector}'. URL: {page.url}\n\n{await self._page_text()}")
+            except PlaywrightError as exc:
+                return self._truncate_output(self._playwright_error('click', exc))
 
     async def type_text(self, selector: str, text: str) -> str:
         """Type text into an input field, replacing any existing value.
@@ -298,10 +344,13 @@ class PlaywrightBrowserToolset(FunctionToolset[AgentDepsT]):
         """
         async with self._serialize_operation():
             page = await self._state.ensure_page()
-            await page.fill(selector, text, timeout=self._timeout_ms)
-            return self._truncate_output(f"Typed into '{selector}'.\n\n{await self._page_text()}")
+            try:
+                await page.fill(selector, text, timeout=self._timeout_ms)
+                return self._truncate_output(f"Typed into '{selector}'.\n\n{await self._page_text()}")
+            except PlaywrightError as exc:
+                return self._truncate_output(self._playwright_error('type_text', exc))
 
-    async def screenshot(self, full_page: bool = False) -> ToolReturn[str]:
+    async def screenshot(self, full_page: bool = False) -> str | ToolReturn[str]:
         """Capture a screenshot of the current page.
 
         Args:
@@ -314,7 +363,10 @@ class PlaywrightBrowserToolset(FunctionToolset[AgentDepsT]):
         """
         async with self._serialize_operation():
             page = await self._state.ensure_page()
-            png = await page.screenshot(full_page=full_page)
+            try:
+                png = await page.screenshot(full_page=full_page)
+            except PlaywrightError as exc:
+                return self._truncate_output(self._playwright_error('screenshot', exc))
             return ToolReturn(
                 self._truncate_output(f'Screenshot captured. URL: {page.url}'),
                 content=[BinaryContent(data=png, media_type='image/png')],
@@ -362,12 +414,15 @@ class PlaywrightBrowserToolset(FunctionToolset[AgentDepsT]):
             if delta is None:
                 return self._truncate_output(f'Error: invalid direction {direction!r}; use up/down/left/right')
             page = await self._state.ensure_page()
-            if x is not None and y is not None:
-                await page.mouse.move(x, y)
-                await page.mouse.wheel(*delta)
-            else:
-                await page.evaluate(f'window.scrollBy({delta[0]}, {delta[1]})')
-            return self._truncate_output(f'Scrolled {direction}.\n\n{await self._page_text()}')
+            try:
+                if x is not None and y is not None:
+                    await page.mouse.move(x, y)
+                    await page.mouse.wheel(*delta)
+                else:
+                    await page.evaluate(f'window.scrollBy({delta[0]}, {delta[1]})')
+                return self._truncate_output(f'Scrolled {direction}.\n\n{await self._page_text()}')
+            except PlaywrightError as exc:
+                return self._truncate_output(self._playwright_error('scroll', exc))
 
     async def go_back(self) -> str:
         """Navigate back in the browser history.
@@ -377,12 +432,15 @@ class PlaywrightBrowserToolset(FunctionToolset[AgentDepsT]):
         """
         async with self._serialize_operation():
             page = await self._state.ensure_page()
-            await page.go_back(timeout=self._timeout_ms)
-            await page.wait_for_load_state('domcontentloaded')
-            blocked = await self._enforce_allowed_domain(page, 'go_back')
-            if blocked is not None:
-                return blocked
-            return self._truncate_output(f'Went back. URL: {page.url}\n\n{await self._page_text()}')
+            try:
+                await page.go_back(timeout=self._timeout_ms)
+                await page.wait_for_load_state('domcontentloaded')
+                blocked = await self._enforce_allowed_domain(page, 'go_back')
+                if blocked is not None:
+                    return blocked
+                return self._truncate_output(f'Went back. URL: {page.url}\n\n{await self._page_text()}')
+            except PlaywrightError as exc:
+                return self._truncate_output(self._playwright_error('go_back', exc))
 
     async def go_forward(self) -> str:
         """Navigate forward in the browser history.
@@ -392,12 +450,15 @@ class PlaywrightBrowserToolset(FunctionToolset[AgentDepsT]):
         """
         async with self._serialize_operation():
             page = await self._state.ensure_page()
-            await page.go_forward(timeout=self._timeout_ms)
-            await page.wait_for_load_state('domcontentloaded')
-            blocked = await self._enforce_allowed_domain(page, 'go_forward')
-            if blocked is not None:
-                return blocked
-            return self._truncate_output(f'Went forward. URL: {page.url}\n\n{await self._page_text()}')
+            try:
+                await page.go_forward(timeout=self._timeout_ms)
+                await page.wait_for_load_state('domcontentloaded')
+                blocked = await self._enforce_allowed_domain(page, 'go_forward')
+                if blocked is not None:
+                    return blocked
+                return self._truncate_output(f'Went forward. URL: {page.url}\n\n{await self._page_text()}')
+            except PlaywrightError as exc:
+                return self._truncate_output(self._playwright_error('go_forward', exc))
 
     async def execute_js(self, script: str) -> str:
         """Evaluate a JavaScript expression and return its result.

@@ -62,6 +62,11 @@ image as [`BinaryContent`](/ai/api/messages/#pydantic_ai.messages.BinaryContent)
 rather than a base64 string, so vision models see the image natively instead of
 a wall of base64 in the text context.
 
+Browser tool failures -- a timeout, a selector that matches no element, a
+navigation error, or a browser that closed mid-run -- are returned to the model
+as error strings it can act on (retry, try another selector, navigate again),
+not raised to abort the agent run.
+
 ## Options
 
 | Option | Default | Purpose |
@@ -72,6 +77,50 @@ a wall of base64 in the text context.
 | `max_content_tokens` | `4000` | Approximate token budget for every textual tool result. |
 | `timeout_ms` | `30000` | Default Playwright navigation/action timeout. |
 | `auto_install_chromium` | `False` | Fetch Chromium automatically when the binary is missing. |
+| `storage_state` | `None` | Path to a Playwright storage-state JSON file (cookies + localStorage) loaded at launch; see [Authenticated sites](#authenticated-sites). |
+
+## Authenticated sites
+
+Pass `storage_state` to start the browser already logged in. It is the path to a
+Playwright [storage state](https://playwright.dev/python/docs/auth) JSON file
+(cookies plus localStorage) loaded into the browser context at launch, so the
+first navigation is already authenticated.
+
+Produce the file once by logging in by hand, either with the Playwright CLI:
+
+```bash
+playwright codegen https://example.com --save-storage=auth.json
+```
+
+or from your own script with `context.storage_state(path='auth.json')`. Then
+point the capability at it:
+
+```python
+from pydantic_ai import Agent
+from pydantic_ai_harness.playwright import PlaywrightBrowser
+
+agent = Agent(
+    'anthropic:claude-sonnet-4-6',
+    capabilities=[
+        PlaywrightBrowser(storage_state='auth.json', allowed_domains=['example.com']),
+    ],
+)
+```
+
+The capability runs headless by default and does not drive the login flow
+itself: you produce the state file out of band. The usual pattern is to log in
+once with a visible browser (`playwright codegen`, or your own Playwright
+script) to write the file, then reuse it for headless runs.
+
+Treat the state file as credential material: it can impersonate the account.
+gitignore it, never commit it, store it with restrictive permissions, and delete
+it when the session expires. This mirrors Playwright's own
+[auth-guide](https://playwright.dev/python/docs/auth) warning. Prefer a
+minimal-scope file (log in to only the target site when producing it) over
+sharing a full browser profile. Attaching the agent to your real running Chrome
+(the browser-extension or connect-to-Chrome approach) is the higher-risk
+alternative: it exposes every session that browser is logged into, so prefer the
+scoped state file.
 
 ## Lifecycle
 
@@ -79,6 +128,15 @@ Chromium starts lazily on the first browser-tool call and is closed when the run
 ends -- on success, error, or cancellation. Runs that never call a browser tool
 pay no Playwright cost (no subprocess, no window). Each agent run gets its own
 page and browser, so concurrent `agent.run()` calls never share a tab.
+
+## Limitations
+
+- The browser is single-tab: popups are closed automatically, so flows that
+  depend on a second window do not complete.
+- Page-level selectors cannot reach content inside iframes (payment widgets,
+  some CAPTCHAs).
+- Download-triggering clicks are not handled.
+- The model targets elements by CSS selector or pixel coordinates.
 
 ## Egress and SSRF
 
@@ -91,9 +149,17 @@ top-level navigations (covering clicks, `execute_js`, and history moves, not jus
 `navigate`), and each tool re-checks the resulting URL and bounces to
 `about:blank` so disallowed content never reaches the model.
 
-The allowlist governs page navigation (top-level document requests), not requests
-initiated by in-page JavaScript (`fetch`/XHR via `execute_js`); constraining those
-is tracked in #415.
+`allowed_domains` constrains top-level navigation; it is not a general security
+boundary. Microsoft's own playwright-mcp disclaims its origin filter the same
+way. The allowlist governs page navigation (top-level document requests), not
+requests initiated by in-page JavaScript (`fetch`/XHR via `execute_js`);
+constraining those is tracked in #415. WebSocket connections and service-worker
+traffic are likewise not covered by the navigation allowlist.
+
+For untrusted-input scenarios, run the browser in a container or VM with an
+egress firewall, or front it with a proxy, and pair it with the harness's
+tool-approval hooks for consequential actions. Treat these as defense in depth,
+not a guarantee.
 
 Blocking private and link-local address ranges by default (so open egress is
 safe out of the box) is tracked in

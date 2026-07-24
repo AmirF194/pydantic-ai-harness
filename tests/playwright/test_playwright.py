@@ -14,8 +14,10 @@ from collections.abc import Awaitable, Callable
 from typing import Protocol
 
 import pytest
+from playwright._impl._errors import TargetClosedError
 from playwright.async_api import Error as PlaywrightError
-from pydantic_ai import Agent
+from playwright.async_api import TimeoutError as PlaywrightTimeoutError
+from pydantic_ai import Agent, AgentRunResult
 from pydantic_ai.messages import BinaryContent, ToolReturn
 from pydantic_ai.models.test import TestModel
 from pydantic_ai.tools import RunContext, ToolDefinition
@@ -108,9 +110,14 @@ class _FakeRouteHandler(Protocol):
 
 
 class _FakeBrowserContext:
-    def __init__(self) -> None:
+    def __init__(self, page: _FakePage, *, storage_state: str | None = None) -> None:
+        self.page = page
+        self.storage_state = storage_state
         self.routes: list[str] = []
         self.route_handler: _FakeRouteHandler | None = None
+
+    async def new_page(self) -> _FakePage:
+        return self.page
 
     async def route(self, url: str, handler: _FakeRouteHandler) -> None:
         self.routes.append(url)
@@ -137,6 +144,13 @@ class _FakePage:
         redirect_to: str | None = None,
         screenshot_bytes: bytes = b'PNG-BYTES',
         close_error: Exception | None = None,
+        goto_error: PlaywrightError | None = None,
+        click_error: PlaywrightError | None = None,
+        fill_error: PlaywrightError | None = None,
+        inner_text_error: PlaywrightError | None = None,
+        screenshot_error: PlaywrightError | None = None,
+        go_back_error: PlaywrightError | None = None,
+        go_forward_error: PlaywrightError | None = None,
     ) -> None:
         self._url = url
         self._title = title
@@ -148,10 +162,18 @@ class _FakePage:
         self._redirect_to = redirect_to
         self._screenshot_bytes = screenshot_bytes
         self._close_error = close_error
-        self._context = _FakeBrowserContext()
+        self._goto_error = goto_error
+        self._click_error = click_error
+        self._fill_error = fill_error
+        self._inner_text_error = inner_text_error
+        self._screenshot_error = screenshot_error
+        self._go_back_error = go_back_error
+        self._go_forward_error = go_forward_error
+        self._context: _FakeBrowserContext | None = None
         self._popup_on_screenshot: _FakePage | None = None
         self.mouse = _FakeMouse()
         self.goto_calls: list[str] = []
+        self.load_states: list[str] = []
         self.filled: list[tuple[str, str]] = []
         self.clicked: list[str] = []
         self.popup_events: list[str] = []
@@ -164,21 +186,26 @@ class _FakePage:
 
     @property
     def context(self) -> _FakeBrowserContext:
+        assert self._context is not None
         return self._context
 
     async def goto(self, url: str, *, timeout: float | None = None) -> None:
         self.goto_calls.append(url)
+        if self._goto_error is not None and url != 'about:blank':
+            raise self._goto_error
         # A configured redirect lands the page on a different host than requested,
         # modelling a 3xx to a disallowed domain (but never for the bounce itself).
         self._url = self._redirect_to if self._redirect_to is not None and url != 'about:blank' else url
 
     async def wait_for_load_state(self, state: str) -> None:
-        return None
+        self.load_states.append(state)
 
     async def title(self) -> str:
         return self._title
 
     async def inner_text(self, selector: str, *, timeout: float | None = None) -> str:
+        if self._inner_text_error is not None:
+            raise self._inner_text_error
         if selector == 'body':
             return self._body
         if self._selector_raises:
@@ -186,12 +213,18 @@ class _FakePage:
         return self._element_text if self._element_text is not None else f'text:{selector}'
 
     async def click(self, selector: str, *, timeout: float | None = None) -> None:
+        if self._click_error is not None:
+            raise self._click_error
         self.clicked.append(selector)
 
     async def fill(self, selector: str, value: str, *, timeout: float | None = None) -> None:
+        if self._fill_error is not None:
+            raise self._fill_error
         self.filled.append((selector, value))
 
     async def screenshot(self, *, full_page: bool = False) -> bytes:
+        if self._screenshot_error is not None:
+            raise self._screenshot_error
         if self._popup_on_screenshot is not None:
             for handler in self.popup_handlers:
                 handler(self._popup_on_screenshot)
@@ -205,10 +238,12 @@ class _FakePage:
         return self._evaluate_result
 
     async def go_back(self, *, timeout: float | None = None) -> None:
-        return None
+        if self._go_back_error is not None:
+            raise self._go_back_error
 
     async def go_forward(self, *, timeout: float | None = None) -> None:
-        return None
+        if self._go_forward_error is not None:
+            raise self._go_forward_error
 
     async def close(self) -> None:
         self.closed = True
@@ -234,14 +269,31 @@ class _ControlledNavigationPage(_FakePage):
             await self.release_first_navigation.wait()
 
 
+class _HangingScreenshotPage(_FakePage):
+    """A page whose `screenshot` blocks until cancelled, to drive mid-tool teardown."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.screenshot_started = asyncio.Event()
+
+    async def screenshot(self, *, full_page: bool = False) -> bytes:
+        self.screenshot_started.set()
+        await asyncio.Event().wait()
+        return self._screenshot_bytes  # pragma: no cover -- unreachable; the wait is cancelled
+
+
 class _FakePlaywrightBrowser:
     def __init__(self, page: _FakePage, *, close_error: Exception | None = None) -> None:
         self._page = page
         self._close_error = close_error
         self.closed = False
+        self.contexts: list[_FakeBrowserContext] = []
 
-    async def new_page(self) -> _FakePage:
-        return self._page
+    async def new_context(self, *, storage_state: str | None = None) -> _FakeBrowserContext:
+        context = _FakeBrowserContext(self._page, storage_state=storage_state)
+        self._page._context = context
+        self.contexts.append(context)
+        return context
 
     async def close(self) -> None:
         self.closed = True
@@ -355,6 +407,26 @@ class TestPlaywrightBrowserTools:
         assert toolset_module.check_allowed_domain(url, ['']) is False
         assert toolset_module.check_allowed_domain(url, [' \t ']) is False
 
+    def test_check_allowed_domain_rejects_userinfo_host_spoof(self) -> None:
+        # CVE-2025-47241 class: the real host is `evil.com`; `allowed.com` is only
+        # the userinfo, so `.hostname` resolves it correctly and the match fails.
+        assert toolset_module.check_allowed_domain('https://allowed.com:pass@evil.com/', ['allowed.com']) is False
+
+    @pytest.mark.parametrize('host', ['evil-example.com', 'example.com.attacker.com'])
+    def test_check_allowed_domain_rejects_sibling_domain_tricks(self, host: str) -> None:
+        assert toolset_module.check_allowed_domain(f'https://{host}/', ['example.com']) is False
+
+    def test_check_allowed_domain_matches_idn_against_punycode_allowlist(self) -> None:
+        # A Unicode host and its `xn--` spelling get the same verdict against an
+        # ASCII allowlist entry, in both directions.
+        assert toolset_module.check_allowed_domain('https://пример.рф/path', ['xn--e1afmkfd.xn--p1ai']) is True
+        assert toolset_module.check_allowed_domain('https://xn--e1afmkfd.xn--p1ai/path', ['пример.рф']) is True
+
+    def test_check_allowed_domain_falls_back_when_entry_not_idna_encodable(self) -> None:
+        # An over-long label cannot be IDNA-encoded; the entry falls back to its
+        # lowercased form rather than crashing, and simply does not match.
+        assert toolset_module.check_allowed_domain('https://example.com/', ['a' * 64]) is False
+
     async def test_navigate_returns_url_title_and_text(self) -> None:
         toolset = _toolset(_FakePage(title='Docs', body='Page text here'))
         result = await toolset.navigate('https://example.com/')
@@ -435,6 +507,26 @@ class TestPlaywrightBrowserTools:
         assert result == 'Error: navigate reached a domain not in allowed_domains: https://evil.com/landing'
         assert page.goto_calls == ['https://example.com/start', 'about:blank']
 
+    async def test_navigate_empty_allowlist_blocks_every_host(self) -> None:
+        page = _FakePage()
+        toolset = _toolset(page, allowed_domains=[])
+        result = await toolset.navigate('https://example.com/')
+        assert result == 'Error: domain not in allowed_domains: https://example.com/'
+        assert page.goto_calls == []
+
+    async def test_navigate_reports_landing_url_after_allowed_redirect(self) -> None:
+        page = _FakePage(redirect_to='https://docs.example.com/landing')
+        toolset = _toolset(page, allowed_domains=['example.com'])
+        result = await toolset.navigate('https://example.com/start')
+        assert isinstance(result, str)
+        assert result.startswith('URL: https://docs.example.com/landing')
+        assert page.goto_calls == ['https://example.com/start']
+
+    async def test_navigate_waits_for_domcontentloaded(self) -> None:
+        page = _FakePage()
+        await _toolset(page).navigate('https://example.com/')
+        assert page.load_states == ['domcontentloaded']
+
     async def test_concurrent_navigations_return_their_own_page_state(self) -> None:
         page = _ControlledNavigationPage()
         toolset = _toolset(page)
@@ -494,6 +586,7 @@ class TestPlaywrightBrowserTools:
     async def test_screenshot_returns_binary_content(self) -> None:
         toolset = _toolset(_FakePage(url='https://example.com/p'))
         result = await toolset.screenshot()
+        assert isinstance(result, ToolReturn)
         assert result.return_value == 'Screenshot captured. URL: https://example.com/p'
         assert result.content is not None
         image = result.content[0]
@@ -508,6 +601,7 @@ class TestPlaywrightBrowserTools:
     async def test_screenshot_bounds_text_without_dropping_image(self) -> None:
         page = _FakePage(url=f'https://example.com/{"u" * 40}')
         result = await _toolset(page, max_content_tokens=1).screenshot()
+        assert isinstance(result, ToolReturn)
         assert result.return_value == 'Scre'
         assert result.content is not None
         image = result.content[0]
@@ -612,6 +706,60 @@ class TestPlaywrightBrowserTools:
         assert result == 'Error: execute_js reached a domain not in allowed_domains: https://evil.com/'
 
 
+class TestPlaywrightErrorHandling:
+    async def test_navigate_timeout_returns_bounded_error(self) -> None:
+        page = _FakePage(goto_error=PlaywrightTimeoutError('Timeout 30000ms exceeded.'))
+        result = await _toolset(page).navigate('https://example.com/')
+        assert result == (
+            'Error: navigate timed out after 30000ms. The element may not exist or the page may be slow; '
+            'try a different selector, or navigate again.'
+        )
+
+    async def test_navigate_preserves_net_error_code(self) -> None:
+        page = _FakePage(goto_error=PlaywrightError('page.goto: net::ERR_NAME_NOT_RESOLVED at https://nope.invalid/'))
+        result = await _toolset(page).navigate('https://nope.invalid/')
+        assert isinstance(result, str)
+        assert 'net::ERR_NAME_NOT_RESOLVED' in result
+
+    async def test_click_preserves_strict_mode_match_count(self) -> None:
+        page = _FakePage(click_error=PlaywrightError('strict mode violation: locator resolved to 3 elements'))
+        result = await _toolset(page).click('button')
+        assert result == 'Error: click failed: strict mode violation: locator resolved to 3 elements'
+
+    async def test_click_timeout_returns_bounded_error(self) -> None:
+        page = _FakePage(click_error=PlaywrightTimeoutError('Timeout 30000ms exceeded.'))
+        result = await _toolset(page).click('button#missing')
+        assert result.startswith('Error: click timed out after 30000ms.')
+
+    async def test_type_text_timeout_returns_bounded_error(self) -> None:
+        page = _FakePage(fill_error=PlaywrightTimeoutError('Timeout 30000ms exceeded.'))
+        result = await _toolset(page).type_text('input#missing', 'hi')
+        assert result.startswith('Error: type_text timed out after 30000ms.')
+
+    async def test_scroll_playwright_error_returns_error_string(self) -> None:
+        page = _FakePage(evaluate_raises=PlaywrightError('scroll blew up'))
+        result = await _toolset(page).scroll('down')
+        assert result == 'Error: scroll failed: scroll blew up'
+
+    async def test_screenshot_playwright_error_returns_error_string(self) -> None:
+        page = _FakePage(screenshot_error=PlaywrightError('screenshot failed'))
+        result = await _toolset(page).screenshot()
+        assert result == 'Error: screenshot failed: screenshot failed'
+
+    async def test_go_back_target_closed_reports_crash(self) -> None:
+        page = _FakePage(go_back_error=TargetClosedError())
+        result = await _toolset(page).go_back()
+        assert result == (
+            'Error: go_back failed: the browser or page was closed unexpectedly. '
+            'Browser tools may be unavailable for the rest of this run.'
+        )
+
+    async def test_go_forward_playwright_error_returns_error_string(self) -> None:
+        page = _FakePage(go_forward_error=PlaywrightError('history unavailable'))
+        result = await _toolset(page).go_forward()
+        assert result == 'Error: go_forward failed: history unavailable'
+
+
 # --- State / ensure_page ----------------------------------------------------
 
 
@@ -648,6 +796,24 @@ class TestPlaywrightBrowserState:
         first, second = await asyncio.gather(state.ensure_page(), state.ensure_page())
         assert launches == [1]
         assert first is second
+
+    async def test_combined_operation_and_launch_lock_launches_once(self) -> None:
+        # Two first tool calls contend both the toolset operation lock and the
+        # lazy-launch lock. The operation lock is outer and the launch lock inner,
+        # so the launch runs once and both calls observe the same page state.
+        state = PlaywrightBrowserState()
+        launches: list[int] = []
+
+        async def _launch() -> None:
+            launches.append(1)
+            await asyncio.sleep(0)
+            state.page = _FakePage(body='shared body')
+
+        state.lazy_launcher = _launch
+        toolset = PlaywrightBrowserToolset[None](state=state)
+        first, second = await asyncio.gather(toolset.get_text(), toolset.get_text())
+        assert launches == [1]
+        assert first == second == 'shared body'
 
     async def test_concurrent_ensure_page_failed_launch_raises_once(self) -> None:
         state = PlaywrightBrowserState()
@@ -746,6 +912,7 @@ class TestPlaywrightBrowserHooks:
             max_content_tokens=100,
             timeout_ms=5000,
             auto_install_chromium=True,
+            storage_state='/tmp/state.json',
         )
         assert browser.headless is False
         assert browser.allowed_domains == ['x.com']
@@ -753,11 +920,13 @@ class TestPlaywrightBrowserHooks:
         assert browser.max_content_tokens == 100
         assert browser.timeout_ms == 5000
         assert browser.auto_install_chromium is True
+        assert browser.storage_state == '/tmp/state.json'
 
     def test_from_spec_defaults_to_open_egress(self) -> None:
         browser = PlaywrightBrowser[None].from_spec()
         assert browser.allowed_domains is None
         assert browser.auto_install_chromium is False
+        assert browser.storage_state is None
 
 
 # --- Lifecycle through Agent + wrap_run -------------------------------------
@@ -773,6 +942,50 @@ class TestPlaywrightBrowserLifecycle:
         assert chromium.launched == [True]
         assert page.popup_events == ['popup']
         assert page.context.routes == []  # no allowlist -> no route guard registered
+        assert chromium.browser is not None and chromium.browser.closed is True
+        assert cm.exited is True
+
+    async def test_storage_state_reaches_new_context(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        page = _FakePage()
+        cm = _install_fake_driver(monkeypatch, page)
+        agent = Agent(
+            TestModel(call_tools=['screenshot']),
+            capabilities=[PlaywrightBrowser(storage_state='/tmp/session.json')],
+        )
+        await agent.run('screenshot the page')
+        browser = cm._driver.chromium.browser
+        assert browser is not None
+        assert [c.storage_state for c in browser.contexts] == ['/tmp/session.json']
+
+    async def test_storage_state_defaults_to_none(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        page = _FakePage()
+        cm = _install_fake_driver(monkeypatch, page)
+        agent = Agent(TestModel(call_tools=['screenshot']), capabilities=[PlaywrightBrowser()])
+        await agent.run('screenshot the page')
+        browser = cm._driver.chromium.browser
+        assert browser is not None
+        assert [c.storage_state for c in browser.contexts] == [None]
+
+    async def test_only_popup_listener_registered_not_dialog(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        page = _FakePage()
+        _install_fake_driver(monkeypatch, page)
+        agent = Agent(TestModel(call_tools=['screenshot']), capabilities=[PlaywrightBrowser()])
+        await agent.run('screenshot the page')
+        # Only a 'popup' listener is registered, never a 'dialog' one: the capability
+        # deliberately relies on Playwright auto-dismissing dialogs (alert/confirm/
+        # beforeunload) when no handler is attached, rather than managing them.
+        assert page.popup_events == ['popup']
+
+    async def test_cancellation_mid_tool_call_tears_down_browser(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        page = _HangingScreenshotPage()
+        cm = _install_fake_driver(monkeypatch, page)
+        agent = Agent(TestModel(call_tools=['screenshot']), capabilities=[PlaywrightBrowser()])
+        run = asyncio.create_task(agent.run('screenshot the page'))
+        await page.screenshot_started.wait()
+        run.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await run
+        chromium = cm._driver.chromium
         assert chromium.browser is not None and chromium.browser.closed is True
         assert cm.exited is True
 
@@ -883,9 +1096,9 @@ class TestPlaywrightBrowserLifecycle:
     async def test_launch_failure_with_binary_present_surfaces_own_error(self, monkeypatch: pytest.MonkeyPatch) -> None:
         installs: list[bool] = []
 
-        async def _spy_install() -> bool:  # pragma: no cover -- asserted never called
+        async def _spy_install() -> str | None:  # pragma: no cover -- asserted never called
             installs.append(True)
-            return False
+            return None
 
         monkeypatch.setattr(capability_module, '_auto_install_chromium', _spy_install)
         page = _FakePage()
@@ -903,15 +1116,18 @@ class TestPlaywrightBrowserLifecycle:
         page = _FakePage()
         _install_fake_driver(monkeypatch, page, executable_missing=True)
 
-        async def _fake_install() -> bool:
-            return False
+        async def _fake_install() -> str | None:
+            return 'download error: HTTP 403 forbidden'
 
         monkeypatch.setattr(capability_module, '_auto_install_chromium', _fake_install)
         agent = Agent(
             TestModel(call_tools=['screenshot']), capabilities=[PlaywrightBrowser(auto_install_chromium=True)]
         )
-        with pytest.raises(RuntimeError, match='Chromium is not installed'):
+        # A failed auto-install carries the installer output tail so it is diagnosable,
+        # not just the generic missing-binary hint.
+        with pytest.raises(RuntimeError, match='HTTP 403 forbidden') as exc_info:
             await agent.run('screenshot the page')
+        assert 'Chromium is not installed' in str(exc_info.value)
 
     async def test_close_error_still_exits_driver(self, monkeypatch: pytest.MonkeyPatch) -> None:
         page = _FakePage()
@@ -920,6 +1136,25 @@ class TestPlaywrightBrowserLifecycle:
         with pytest.raises(RuntimeError, match='close failed'):
             await agent.run('screenshot the page')
         assert cm.exited is True  # driver exited despite the close error
+
+    async def test_teardown_error_does_not_mask_run_exception(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        page = _FakePage()
+        cm = _install_fake_driver(monkeypatch, page, close_error=RuntimeError('close failed'))
+        browser = PlaywrightBrowser()
+
+        class _RunFailure(Exception):
+            pass
+
+        async def _handler() -> AgentRunResult[None]:
+            await browser._state.ensure_page()
+            raise _RunFailure('run failed')
+
+        # The run's own exception wins; the close error raised during teardown is dropped.
+        with pytest.raises(_RunFailure, match='run failed'):
+            await browser.wrap_run(_ctx(), handler=_handler)
+        # cm.exited is set in the teardown finally after browser.close() raised, so the
+        # driver still tore down and only the masking close error was swallowed.
+        assert cm.exited is True
 
     async def test_pending_popup_tasks_cancelled_on_run_end(self, monkeypatch: pytest.MonkeyPatch) -> None:
         page = _FakePage()
