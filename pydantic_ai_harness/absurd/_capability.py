@@ -120,6 +120,9 @@ class AbsurdDurability(BaseDurabilityCapability[AgentDepsT]):
 
     engine_name = _ENGINE_NAME
     _codec: ClassVar = JSON_CODEC
+    # Absurd has no raise-time non-retryable exception equivalent to Lambda's `ExecutionError` or
+    # Restate's `TerminalError`. Serialization failures therefore use the base behavior: the task's
+    # `RetryStrategy`/`max_attempts` governs retries, and the task fails after those attempts are exhausted.
     _unsupported_runtime_toolset_kinds: ClassVar[frozenset[RuntimeToolsetKind]] = frozenset(
         {'function', 'mcp', 'dynamic'}
     )
