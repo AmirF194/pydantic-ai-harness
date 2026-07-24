@@ -329,8 +329,11 @@ fields when it writes the terminal `completed` / `failed` entry.
   (`pip install pydantic-ai-harness[mongodb]`); pass a shared
   `AsyncMongoClient` as `client=`, or a connection string as `db_url=` (the
   store then owns the client -- call `await store.aclose()` to release it).
-  Externalizes large payloads by default to a `MongoMediaStore` on the same
-  client so a single snapshot stays under MongoDB's 16MB BSON cap.
+  Externalizes individual parts at or above `media_threshold_bytes` by
+  default to a `MongoMediaStore` on the same client. That is a per-value
+  offload, not an aggregate cap: a snapshot of many below-threshold parts can
+  still exceed MongoDB's 16MB document limit and fail on insert -- lower the
+  threshold if that is a risk for your workload.
 
 All implement the same async `StepStore` protocol, so capability hooks never
 block the event loop on the file/sqlite backends (I/O is dispatched via
@@ -402,9 +405,11 @@ implementations are:
   only -- no multipart, lifecycle, or listing in v1.
 - `MongoMediaStore(client= or db_url=, database=...)` -- MongoDB, needs the
   `mongodb` extra. Stores each blob as sha256-addressed chunks across a
-  `media` document and a sibling `media_chunks` collection (manual chunking,
-  not GridFS -- see the [media docs](../media/) for why), so blobs of any
-  size stay under the 16MB BSON cap.
+  `media` manifest document and a sibling `media_chunks` collection (manual
+  chunking, not GridFS -- see the [media docs](../media/) for why), so the
+  blob payload never lands in one document regardless of size. The manifest
+  holds `MediaContext.metadata` inline and is not chunked, so keep per-blob
+  metadata small.
 
 ### Exposing externalized bytes as URLs
 

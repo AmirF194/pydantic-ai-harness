@@ -1,10 +1,13 @@
 """MongoDB-backed step-persistence store.
 
 Mirrors `SqliteStepStore`: an append-only event log, continuable snapshots,
-and a tool-effect ledger, keyed off one `AsyncMongoClient`. Large binary and
-text parts are externalized to a `MediaStore` (default: a `MongoMediaStore`
-sharing the same client) so a single snapshot document stays under MongoDB's
-16MB BSON cap.
+and a tool-effect ledger, keyed off one `AsyncMongoClient`. Binary and text
+parts at or above `media_threshold_bytes` are externalized to a `MediaStore`
+(default: a `MongoMediaStore` sharing the same client). This is a per-value
+offload, not an aggregate size cap: a snapshot made of many parts each below
+the threshold can still exceed MongoDB's 16MB BSON limit and fail on insert.
+Lower `media_threshold_bytes` if your snapshots accumulate many mid-sized
+parts.
 
 Collections (created lazily on first write):
 
@@ -152,8 +155,11 @@ class MongoStepStore:
             query['parent_run_id'] = parent_run_id
         if conversation_id is not None:
             query['conversation_id'] = conversation_id
-        cursor = self._db['runs'].find(query).sort('started_at', 1)
-        return [_run_from_dict(doc) async for doc in cursor]
+        # Sort by the parsed instant, not the stored ISO string: a lexicographic
+        # sort would misorder mixed-offset timestamps, and the `StepStore`
+        # contract (matching the in-memory/sqlite/file stores) is instant order.
+        records = [_run_from_dict(doc) async for doc in self._db['runs'].find(query)]
+        return sorted(records, key=lambda r: r.started_at)
 
     async def append_event(self, event: StepEvent) -> None:
         await self._ensure_indexes()

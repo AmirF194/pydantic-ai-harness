@@ -111,6 +111,19 @@ class TestMongoStepStoreProtocol:
         assert {r.run_id for r in await store.list_runs(parent_run_id='p')} == {'r1', 'r3'}
         assert [r.run_id for r in await store.list_runs(parent_run_id='p', conversation_id='a')] == ['r1']
 
+    async def test_list_runs_sorts_by_instant_not_iso_string(self) -> None:
+        """Mixed-offset timestamps sort by instant, matching the base stores' contract.
+
+        A lexicographic sort of the stored ISO string would put `late` first;
+        by instant `early` (an earlier moment behind a +05:00 offset) comes first.
+        """
+        store = MongoStepStore(client=_mock_client(), database='t', media_store=None)
+        early_instant = datetime(2024, 1, 1, 1, 0, 0, tzinfo=timezone(timedelta(hours=5)))  # 2023-12-31T20:00Z
+        late_instant = datetime(2024, 1, 1, 0, 30, 0, tzinfo=timezone.utc)
+        await store.register_run(RunRecord(run_id='late', started_at=late_instant))
+        await store.register_run(RunRecord(run_id='early', started_at=early_instant))
+        assert [r.run_id for r in await store.list_runs()] == ['early', 'late']
+
     async def test_append_and_list_events(self) -> None:
         store = MongoStepStore(client=_mock_client(), database='t', media_store=None)
         await store.register_run(RunRecord(run_id='r1'))
