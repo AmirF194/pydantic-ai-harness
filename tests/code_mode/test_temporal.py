@@ -11,8 +11,8 @@ Durability is attached via the `TemporalDurability` capability; pydantic-ai
 2.14 deprecated the `TemporalAgent` wrapper in its favor
 (pydantic/pydantic-ai#4977). The workflow calls the plain `Agent` directly and
 `AgentPlugin` finds the bound capability to register its activities on the
-worker. The durability capability goes last in `capabilities=[...]`, after
-CodeMode, matching the convention in pydantic-ai's Temporal docs.
+worker. Pydantic AI resolves CodeMode outside TemporalDurability through
+CodeMode's capability ordering metadata.
 
 These tests start a local Temporal dev server via
 `WorkflowEnvironment.start_local()` -- the Temporal SDK downloads and

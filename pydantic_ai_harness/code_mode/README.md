@@ -24,7 +24,7 @@ Pydantic AI to the host tools.
 | No local computation | Filter, transform, aggregate in code |
 | Large conversation history | Compact -- fewer messages |
 
-Durable execution integrations can serialize nested calls to preserve deterministic event ordering.
+Durable execution integrations can record nested calls for deterministic replay.
 
 ## Usage
 
@@ -188,6 +188,48 @@ Printed output is limited to 10 MiB. Exceeding the limit makes `run_code` return
 ## REPL state
 
 State persists between `run_code` calls within the same agent run -- variables, imports, and function definitions carry over. Pass `restart: true` in the tool call to reset state.
+
+## Temporal durability
+
+Install both integrations:
+
+```bash
+uv add "pydantic-ai-harness[codemode,temporal]"
+```
+
+Construct the named agent and its stable-ID toolsets outside the workflow, then attach
+`TemporalDurability` alongside `CodeMode`:
+
+```python
+from pydantic_ai import Agent
+from pydantic_ai.durable_exec.temporal import TemporalDurability
+from pydantic_ai_harness import CodeMode
+
+agent = Agent(
+    'openai:gpt-5.6-sol',
+    name='coding-agent',
+    capabilities=[CodeMode(), TemporalDurability()],
+)
+```
+
+Follow the [Pydantic AI Temporal guide](https://pydantic.dev/docs/ai/capabilities/durable_execution/temporal/)
+to call the plain agent from a workflow and register its activities with `PydanticAIPlugin` and
+either `__pydantic_ai_agents__` or `AgentPlugin`.
+
+`PydanticAIPlugin` passes `pydantic_monty` through Temporal's workflow sandbox. This makes Monty
+runnable there, but `run_code` still executes in workflow code and is re-executed during replay.
+Model requests and, by default, nested tool calls cross Temporal activity boundaries;
+`asyncio.gather` can schedule nested tool activities concurrently. The REPL is process-local state
+for one agent run, not durable storage. Replay reconstructs it by running the recorded snippets
+again against recorded activity results.
+
+Keep workflow-side code deterministic. `mount` reads and writes, `os_access` callbacks, and
+host-clock calls happen again during replay; changing their results can change which activities the
+workflow schedules and cause a `NondeterminismError`. Put external reads, writes, clock access, and
+other side effects in wrapped tools so Temporal records them as activities. Replay may not flag
+changed arguments when the same activity remains at the same history position, so replay validation
+is not a substitute for this boundary. Temporal activity timeouts apply to nested tools, not pure
+computation inside `run_code`, so keep sandbox loops bounded.
 
 ## Observability
 
