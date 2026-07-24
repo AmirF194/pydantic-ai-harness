@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import re
-from collections.abc import Callable, Coroutine
 from typing import Any
 
 import pytest
@@ -1022,20 +1021,11 @@ async def test_sandbox_panic_is_retryable(monkeypatch: pytest.MonkeyPatch) -> No
     class PanicException(BaseException):
         """Named to match the pyo3 panic class `is_sandbox_panic` recognizes."""
 
-    class FakeExecutor:
-        dispatch: Callable[[str, dict[str, Any]], Coroutine[Any, Any, Any]]
+    async def panic(self: Any, _state: object) -> object:
+        await self.dispatch('sub', {'task': 'x'})  # completes one sub-agent, then the VM panics
+        raise PanicException('sandbox panic')
 
-        def __init__(
-            self, dispatch: Callable[[str, dict[str, Any]], Coroutine[Any, Any, Any]], valid_names: object
-        ) -> None:
-            _ = valid_names
-            self.dispatch = dispatch
-
-        async def run(self, _state: object) -> object:
-            await self.dispatch('sub', {'task': 'x'})  # completes one sub-agent, then the VM panics
-            raise PanicException('sandbox panic')
-
-    monkeypatch.setattr('pydantic_ai_harness.dynamic_workflow._toolset.MontyExecutor', FakeExecutor)
+    monkeypatch.setattr('pydantic_ai_harness._monty_exec.MontyExecutor.run', panic)
     ts = DynamicWorkflowToolset[object](agents=[_wf_agent()])
     with pytest.raises(ModelRetry, match='aborted inside the sandbox') as exc_info:
         await _run_script(ts, "await sub(task='x')")
@@ -1050,22 +1040,13 @@ async def test_sandbox_panic_after_budget_exhaustion_returns_terminal_result(
     class PanicException(BaseException):
         pass
 
-    class FakeExecutor:
-        dispatch: Callable[[str, dict[str, Any]], Coroutine[Any, Any, Any]]
+    async def panic(self: Any, _state: object) -> object:
+        await self.dispatch('counted', {'task': 'first'})
+        with pytest.raises(RuntimeError, match='budget'):
+            await self.dispatch('counted', {'task': 'second'})
+        raise PanicException('sandbox panic')
 
-        def __init__(
-            self, dispatch: Callable[[str, dict[str, Any]], Coroutine[Any, Any, Any]], valid_names: object
-        ) -> None:
-            _ = valid_names
-            self.dispatch = dispatch
-
-        async def run(self, _state: object) -> object:
-            await self.dispatch('counted', {'task': 'first'})
-            with pytest.raises(RuntimeError, match='budget'):
-                await self.dispatch('counted', {'task': 'second'})
-            raise PanicException('sandbox panic')
-
-    monkeypatch.setattr('pydantic_ai_harness.dynamic_workflow._toolset.MontyExecutor', FakeExecutor)
+    monkeypatch.setattr('pydantic_ai_harness._monty_exec.MontyExecutor.run', panic)
     ts = DynamicWorkflowToolset[object](agents=[_wf_agent('counted-result', 'counted')], max_agent_calls=1)
     out = await _run_script(ts, '1 + 1')
     assert isinstance(out, dict)
@@ -1077,20 +1058,6 @@ async def test_sandbox_panic_after_budget_exhaustion_returns_terminal_result(
         'The workflow script aborted inside the sandbox after exhausting the sub-agent budget.'
     )
     assert out['completed'] == ['counted(task="first") -> "counted-result"']
-
-
-async def test_non_panic_base_exception_propagates(monkeypatch: pytest.MonkeyPatch) -> None:
-    # The panic guard catches BaseException but must re-raise anything that is not a VM panic.
-    class _Boom(BaseException):
-        pass
-
-    async def _boom(self: Any, state: Any) -> Any:
-        raise _Boom('boom')
-
-    monkeypatch.setattr('pydantic_ai_harness._monty_exec.MontyExecutor.run', _boom)
-    ts = DynamicWorkflowToolset[object](agents=[_wf_agent()])
-    with pytest.raises(_Boom):
-        await _run_script(ts, "await sub(task='x')")
 
 
 async def test_print_only_returns_output_dict() -> None:

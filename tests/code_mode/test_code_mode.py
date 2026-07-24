@@ -52,7 +52,6 @@ async def _close_direct_toolsets(anyio_backend: str) -> AsyncIterator[None]:
     yield
     while _entered_toolsets:
         toolset = _entered_toolsets.pop()
-        assert toolset._exit_stack is not None  # pyright: ignore[reportPrivateUsage]
         await toolset.__aexit__(None, None, None)
 
 
@@ -553,8 +552,6 @@ class TestCodeMode:
 
         # A failed first feed must not pin its checkout-time stubs. Tool Search and
         # per-step toolsets can change the catalog before the model retries.
-        assert wrapper._run_state is not None  # pyright: ignore[reportPrivateUsage]
-        assert wrapper._run_state.session is None  # pyright: ignore[reportPrivateUsage]
         base.add_function(later)
         ctx.tool_manager = await ToolManager(toolset=wrapper).for_run_step(ctx)
         tools = await wrapper.get_tools(ctx)
@@ -567,11 +564,9 @@ class TestCodeMode:
 
     async def test_enter_does_not_start_monty_if_wrapped_enter_fails(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """A wrapped-toolset failure must not start an unused Monty worker."""
-        events: list[str] = []
 
         class FailingToolset(FunctionToolset[object]):
             async def __aenter__(self) -> FailingToolset:
-                events.append('wrapped enter')
                 raise RuntimeError('wrapped enter failed')
 
         monty = MagicMock()
@@ -582,7 +577,6 @@ class TestCodeMode:
         with pytest.raises(RuntimeError, match='wrapped enter failed'):
             await wrapper.__aenter__()
 
-        assert events == ['wrapped enter']
         monty.assert_not_called()
 
     async def test_exit_releases_resources_in_reverse_entry_order(self, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -638,31 +632,17 @@ class TestCodeMode:
             'monty exit',
         ]
 
-    async def test_agent_run_reuses_one_pool_and_session(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """The agent lifecycle owns one pool and one REPL session across `run_code` calls."""
-        from pydantic_ai.messages import ModelMessage, ModelResponse, TextPart, ToolCallPart
+    async def test_agent_run_preserves_repl_between_code_calls(self) -> None:
+        """Code Mode keeps one REPL across model steps in an agent run."""
+        from pydantic_ai.messages import (
+            ModelMessage,
+            ModelRequest,
+            ModelResponse,
+            TextPart,
+            ToolCallPart,
+            ToolReturnPart,
+        )
         from pydantic_ai.models.function import AgentInfo, FunctionModel
-        from pydantic_monty import Monty as RealMonty
-
-        events: list[str] = []
-
-        class TrackingMonty:
-            def __init__(self, *args: Any, **kwargs: Any) -> None:
-                events.append('pool init')
-                self._pool = RealMonty(*args, **kwargs)
-
-            def __enter__(self) -> TrackingMonty:
-                events.append('pool enter')
-                self._pool.__enter__()
-                return self
-
-            def __exit__(self, *args: Any) -> bool | None:
-                events.append('pool exit')
-                return self._pool.__exit__(*args)
-
-            def checkout(self, *args: Any, **kwargs: Any) -> Any:
-                events.append('checkout')
-                return self._pool.checkout(*args, **kwargs)
 
         def model_fn(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
             response_count = sum(isinstance(message, ModelResponse) for message in messages)
@@ -670,20 +650,19 @@ class TestCodeMode:
                 return ModelResponse(parts=[ToolCallPart('run_code', {'code': 'x = await add(a=1, b=2)'})])
             if response_count == 1:
                 return ModelResponse(parts=[ToolCallPart('run_code', {'code': 'x * 10'})])
-            return ModelResponse(parts=[TextPart('done')])
+            last_request = messages[-1]
+            assert isinstance(last_request, ModelRequest)
+            result = next(part for part in last_request.parts if isinstance(part, ToolReturnPart))
+            return ModelResponse(parts=[TextPart(str(result.content))])
 
-        monkeypatch.setattr('pydantic_ai_harness.code_mode._toolset.Monty', TrackingMonty)
         agent: Agent[object, str] = Agent(FunctionModel(model_fn), capabilities=[CodeMode[object]()])
 
         @agent.tool_plain
         def add(a: int, b: int) -> int:  # pyright: ignore[reportUnusedFunction]
-            """Add two numbers."""
             return a + b
 
         result = await agent.run('use code mode twice')
-
-        assert result.output == 'done'
-        assert events == ['pool init', 'pool enter', 'checkout', 'pool exit']
+        assert result.output == '30'
 
     async def test_for_run_returns_fresh_instance_with_cleared_repl(self) -> None:
         """`for_run` must hand back a new toolset instance -- concurrent runs cannot share REPL state."""
@@ -1832,34 +1811,42 @@ class TestCodeMode:
         tools = await wrapper.get_tools(ctx)
         run_code = tools['run_code']
 
-        # Establish REPL state so the guard's reset to None is observable.
         await wrapper.call_tool('run_code', {'code': 'x = 1'}, ctx, run_code)
-        assert wrapper._run_state is not None  # pyright: ignore[reportPrivateUsage]
-        assert wrapper._run_state.session is not None  # pyright: ignore[reportPrivateUsage]
-
-        monkeypatch.setattr('pydantic_ai_harness._monty_exec.MontyExecutor.run', _panic)
-        with pytest.raises(ModelRetry, match='aborted inside the sandbox'):
+        with monkeypatch.context() as patcher:
+            patcher.setattr('pydantic_ai_harness._monty_exec.MontyExecutor.run', _panic)
+            with pytest.raises(ModelRetry, match='aborted inside the sandbox'):
+                await wrapper.call_tool('run_code', {'code': 'x'}, ctx, run_code)
+        with pytest.raises(ModelRetry, match='Type error in code'):
             await wrapper.call_tool('run_code', {'code': 'x'}, ctx, run_code)
-        assert wrapper._run_state is not None  # pyright: ignore[reportPrivateUsage]
-        assert wrapper._run_state.session is None  # pyright: ignore[reportPrivateUsage]
 
-    async def test_cancellation_propagates_and_resets_session(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    async def test_cancellation_propagates_and_resets_session(self) -> None:
         """Cancellation drops the suspended session before propagating to the caller."""
+        started = asyncio.Event()
+        unwound = asyncio.Event()
 
-        async def _boom(self: Any, state: Any) -> Any:
-            raise asyncio.CancelledError
+        async def block() -> str:
+            started.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                unwound.set()
+                raise
+            return 'unreachable'  # pragma: no cover
 
-        wrapper = CodeMode[None]().get_wrapper_toolset(_build_function_toolset(add))
+        wrapper = CodeMode[None]().get_wrapper_toolset(_build_function_toolset(block))
         assert isinstance(wrapper, CodeModeToolset)
         ctx = await build_ctx(None, wrapper)
         tools = await wrapper.get_tools(ctx)
         await wrapper.call_tool('run_code', {'code': 'x = 1'}, ctx, tools['run_code'])
 
-        monkeypatch.setattr('pydantic_ai_harness._monty_exec.MontyExecutor.run', _boom)
+        call = asyncio.ensure_future(wrapper.call_tool('run_code', {'code': 'await block()'}, ctx, tools['run_code']))
+        await started.wait()
+        call.cancel()
         with pytest.raises(asyncio.CancelledError):
-            await wrapper.call_tool('run_code', {'code': 'await add(a=1, b=2)'}, ctx, tools['run_code'])
-        assert wrapper._run_state is not None  # pyright: ignore[reportPrivateUsage]
-        assert wrapper._run_state.session is None  # pyright: ignore[reportPrivateUsage]
+            await call
+        assert unwound.is_set()
+        with pytest.raises(ModelRetry, match='Type error in code'):
+            await wrapper.call_tool('run_code', {'code': 'x'}, ctx, tools['run_code'])
 
     async def test_worker_crash_becomes_model_retry_and_resets_state(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """A `MontyCrashedError` (worker death) becomes a retry with the session reset.

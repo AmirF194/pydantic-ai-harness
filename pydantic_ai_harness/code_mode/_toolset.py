@@ -7,7 +7,7 @@ import keyword
 import re
 import warnings
 from collections.abc import Callable, Sequence
-from contextlib import AsyncExitStack, ExitStack
+from contextlib import ExitStack
 from dataclasses import dataclass, field, replace
 from typing import Annotated, Any
 
@@ -342,10 +342,6 @@ class CodeModeToolset(WrapperToolset[AgentDepsT]):
     # instance can close it. `for_run` leaves this unset, giving concurrent runs isolated state.
     _run_state: _MontyRunState | None = field(default=None, init=False, repr=False, compare=False)
 
-    # Owns both the synchronous Monty pool and asynchronous wrapped toolset. It is populated
-    # only after every resource enters successfully, then unwound in reverse entry order.
-    _exit_stack: AsyncExitStack | None = field(default=None, init=False, repr=False, compare=False)
-
     # Catalog string stashed during `get_tools` (when `dynamic_catalog`) and read back by
     # `get_instructions` in the same step. Empty when there's nothing to surface.
     _last_catalog: str = field(default='', init=False, repr=False)
@@ -372,21 +368,20 @@ class CodeModeToolset(WrapperToolset[AgentDepsT]):
 
     async def __aenter__(self) -> Self:
         """Enter the wrapped toolset and prepare lazy Monty resources for this run."""
-        async with AsyncExitStack() as stack:
-            run_state = _MontyRunState()
-            stack.callback(run_state.close)
-            await stack.enter_async_context(self.wrapped)
-            self._run_state = run_state
-            self._exit_stack = stack.pop_all()
+        run_state = _MontyRunState()
+        await self.wrapped.__aenter__()
+        self._run_state = run_state
         return self
 
     async def __aexit__(self, *args: Any) -> bool | None:
         """Exit the wrapped toolset, then tear down the worker pool."""
-        exit_stack = self._exit_stack
-        assert exit_stack is not None
-        self._exit_stack = None
+        run_state = self._run_state
+        assert run_state is not None
         self._run_state = None
-        return await exit_stack.__aexit__(*args)
+        try:
+            return await self.wrapped.__aexit__(*args)
+        finally:
+            run_state.close()
 
     async def get_instructions(
         self, ctx: RunContext[AgentDepsT]
