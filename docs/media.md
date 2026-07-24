@@ -24,7 +24,7 @@ A conversation that carries images, audio, or other `BinaryContent` inlines thos
 
 ## Building blocks, not a capability
 
-These are building blocks. There is no class you add to `Agent(capabilities=[...])` yet. [`StepPersistence`](step-persistence.md) already uses them to keep snapshots small when messages carry `BinaryContent`, and a forthcoming `MediaExternalizer` capability will reuse the same stores to rewrite `BinaryContent` into URL parts before the model sees them.
+These are building blocks. There is no class you add to `Agent(capabilities=[...])` yet. [`StepPersistence`](step-persistence.md) already uses them to keep snapshots small when messages carry `BinaryContent` or large text (e.g. a big tool-return string), and a forthcoming `MediaExternalizer` capability ([#254](https://github.com/pydantic/pydantic-ai-harness/issues/254)) will reuse the same stores to rewrite `BinaryContent` into URL parts before the model sees them.
 
 ## Why content-addressing
 
@@ -39,8 +39,20 @@ Every store implements the `MediaStore` protocol -- `put`, `get`, `exists`, `pub
 | `DiskMediaStore(directory=...)` | A directory on disk | Local runs and tests |
 | `SqliteMediaStore(database=...)` | A SQLite database | A single-file store that travels with the data |
 | `S3MediaStore(bucket=, endpoint=, region=, ...)` | S3 or an S3-compatible bucket | Shared or production storage |
+| `MongoMediaStore(client= or db_url=, database=, ...)` | MongoDB (sha256-addressed manual chunking) | A MongoDB deployment; blobs of any size |
 
 `S3MediaStore` uses path-style URLs plus handrolled SigV4, so it is compatible with AWS S3, Cloudflare R2 (`region='auto'`), MinIO, and other S3-compatible providers. `SqliteMediaStore` also accepts `connection=` instead of `database=` to share a `sqlite3.Connection`.
+
+`MongoMediaStore` needs the `mongodb` extra (`pip install pydantic-ai-harness[mongodb]`). Pass a shared `AsyncMongoClient` as `client=`, or a connection string as `db_url=` (the store then owns the client -- call `await store.aclose()` to release it); `database=` is always required. Each blob is stored as sha256-addressed chunks across a `media` document (`_id = <digest>`) and a sibling `media_chunks` collection, so no single document nears MongoDB's 16MB BSON cap regardless of blob size (`chunk_size_bytes` defaults to 8MB). Manual chunking is used rather than the GridFS driver on purpose: the digest is the files `_id`, so identical bytes deduplicate (GridFS keys files by `ObjectId` and does no dedup), and the plain-collection surface stays fully testable in-memory.
+
+```python
+from pymongo import AsyncMongoClient
+
+from pydantic_ai_harness.media import MongoMediaStore
+
+client = AsyncMongoClient('mongodb://localhost:27017')
+store = MongoMediaStore(client=client, database='agent_media')
+```
 
 ## Walker helpers
 
@@ -58,7 +70,7 @@ lean = await externalize_media(message, media_store=store, threshold_bytes=32_00
 full = await restore_media(lean, media_store=store)
 ```
 
-`externalize_media` only externalizes payloads over `threshold_bytes`; smaller ones stay inline. Round-trip is transparent -- `restore_media` returns `BinaryContent` with the original bytes. If you need to key media yourself, `media_uri_for` and `parse_media_uri` give you the raw URI round-trip.
+`externalize_media` externalizes both large `BinaryContent` and large text parts (a part whose string `content` reaches `threshold_bytes` UTF-8 bytes, such as a big tool-return string); the same `threshold_bytes` governs both, and payloads below it stay inline. Round-trip is transparent -- `restore_media` re-inlines binary bytes and text symmetrically. If you need to key media yourself, `media_uri_for` and `parse_media_uri` give you the raw URI round-trip.
 
 ## Public URLs
 
@@ -137,11 +149,11 @@ If your strategy depends on `ctx.media_type`, the same context must be supplied 
 | Symbol | Purpose |
 |---|---|
 | `MediaStore` | Async content-addressed store protocol (`put` / `get` / `exists` / `public_url` / `get_metadata`) |
-| `DiskMediaStore`, `SqliteMediaStore`, `S3MediaStore` | Concrete stores |
+| `DiskMediaStore`, `SqliteMediaStore`, `S3MediaStore`, `MongoMediaStore` | Concrete stores (`MongoMediaStore` needs the `mongodb` extra) |
 | `MediaContext` | Per-operation context (media type, filename, tags) threaded through store operations |
 | `KeyStrategy`, `default_key_strategy` | On-store key layout |
 | `PublicUrlResolver`, `make_static_public_url` | Resolve a stored URI to a public URL |
-| `externalize_media`, `restore_media` | Walk a message node to externalize / rehydrate payloads |
+| `externalize_media`, `restore_media` | Walk a message node to externalize / rehydrate large binary and text payloads |
 | `media_uri_for`, `parse_media_uri` | Compute and parse a `media+sha256://` URI |
 
 Source: [`pydantic_ai_harness/media/`](https://github.com/pydantic/pydantic-ai-harness/tree/main/pydantic_ai_harness/media/).

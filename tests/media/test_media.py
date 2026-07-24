@@ -295,6 +295,56 @@ class TestExternalizeRestoreWalker:
             assert await externalize_media(value, media_store=store, threshold_bytes=1) == value
             assert await restore_media(value, media_store=store) == value
 
+    async def test_large_text_part_round_trips(self, tmp_path: Path) -> None:
+        """A part carrying a large string `content` externalizes to text and restores.
+
+        Closes #440: large tool-return strings would otherwise stay inline and
+        push a snapshot past MongoDB's 16MB document cap.
+        """
+        import json as _json
+
+        store = DiskMediaStore(tmp_path)
+        big_text = 'x' * 70_000
+        node: object = {
+            'parts': [{'content': big_text, 'tool_name': 'scrape', 'tool_call_id': 'c1', 'part_kind': 'tool-return'}]
+        }
+        externalized = await externalize_media(node, media_store=store, threshold_bytes=64 * 1024)
+        externalized_text = _json.dumps(externalized)
+        assert '__harness_external_text__' in externalized_text
+        assert 'media+sha256://' in externalized_text
+        assert big_text not in externalized_text  # text really went external
+        assert list(tmp_path.glob('*.bin'))  # bytes on disk
+
+        restored = await restore_media(externalized, media_store=store)
+        assert restored == node  # content re-inlined, every other field preserved
+
+    async def test_small_text_part_stays_inline(self, tmp_path: Path) -> None:
+        store = DiskMediaStore(tmp_path)
+        node = {'content': 'short', 'part_kind': 'text', 'id': None}
+        externalized = await externalize_media(node, media_store=store, threshold_bytes=64 * 1024)
+        assert externalized == node
+        assert list(tmp_path.glob('*.bin')) == []
+
+    async def test_non_string_content_is_not_externalized(self, tmp_path: Path) -> None:
+        """A structured (non-string) `content` is walked, not treated as text."""
+        store = DiskMediaStore(tmp_path)
+        node = {'content': ['a', 'b'], 'part_kind': 'user-prompt'}
+        externalized = await externalize_media(node, media_store=store, threshold_bytes=1)
+        assert externalized == node
+        assert list(tmp_path.glob('*.bin')) == []
+
+    async def test_text_measured_in_utf8_bytes_not_characters(self, tmp_path: Path) -> None:
+        """A multi-byte string below the char count but above the byte threshold externalizes."""
+        import json as _json
+
+        store = DiskMediaStore(tmp_path)
+        # 'é' is 2 UTF-8 bytes: 40 chars, 80 bytes.
+        node = {'content': 'é' * 40, 'part_kind': 'text'}
+        externalized = await externalize_media(node, media_store=store, threshold_bytes=64)
+        assert '__harness_external_text__' in _json.dumps(externalized)
+        restored = await restore_media(externalized, media_store=store)
+        assert restored == node
+
 
 class TestSigV4Signer:
     def test_produces_required_headers(self) -> None:

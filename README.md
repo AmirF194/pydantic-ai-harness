@@ -32,6 +32,7 @@ uv add "pydantic-ai-harness[modal]"             # ModalSandbox (adds the Modal S
 uv add "pydantic-ai-harness[logfire]"           # ManagedPrompt (Logfire-managed prompts)
 uv add "pydantic-ai-harness[exa]"               # ExaSearch + ExaAgent (web research via the Exa API)
 uv add "pydantic-ai-harness[acp]"               # ACP (serve an agent to editors over the Agent Client Protocol)
+uv add "pydantic-ai-harness[mongodb]"           # MongoStepStore + MongoMediaStore (adds pymongo)
 ```
 
 The `code-mode` extra is also supported as an alias.

@@ -15,9 +15,9 @@
 >
 > The API may change between releases. Where practical, breaking changes ship with a deprecation warning.
 
-Content-addressed stores and walker helpers that move large binary payloads out of message history and put them back on demand.
+Content-addressed stores and walker helpers that move large binary and text payloads out of message history and put them back on demand.
 
-These are building blocks, not a capability. There is no class you add to `Agent(capabilities=[...])` yet. [`StepPersistence`](../step_persistence/) uses them to keep snapshots small when messages carry `BinaryContent`. A forthcoming `MediaExternalizer` capability will reuse the same stores to rewrite `BinaryContent` into URL parts before the model sees them.
+These are building blocks, not a capability. There is no class you add to `Agent(capabilities=[...])` yet. [`StepPersistence`](../step_persistence/) uses them to keep snapshots small when messages carry `BinaryContent` or large text (e.g. a big tool-return string). A forthcoming `MediaExternalizer` capability ([#254](https://github.com/pydantic/pydantic-ai-harness/issues/254)) will reuse the same stores to rewrite `BinaryContent` into URL parts before the model sees them.
 
 [Source](https://github.com/pydantic/pydantic-ai-harness/tree/main/pydantic_ai_harness/media/)
 
@@ -34,6 +34,9 @@ Every store implements the `MediaStore` protocol: `put`, `get`, `exists`, `publi
 | `DiskMediaStore(directory=...)` | A directory on disk | Local runs and tests |
 | `SqliteMediaStore(...)` | A SQLite database | A single-file store that travels with the data |
 | `S3MediaStore(...)` | S3 or an S3-compatible bucket | Shared or production storage |
+| `MongoMediaStore(...)` | MongoDB (sha256-addressed manual chunking) | A MongoDB deployment; blobs of any size, chunked under the 16MB BSON cap |
+
+`MongoMediaStore` needs the `mongodb` extra (`pip install pydantic-ai-harness[mongodb]`) and is imported the same way (`from pydantic_ai_harness.media import MongoMediaStore`). It stores each blob as sha256-addressed chunks across a `media` document and a sibling `media_chunks` collection, so no single document approaches MongoDB's 16MB limit. Manual chunking is used instead of GridFS: it keeps content-addressed dedup (GridFS keys files by `ObjectId` and does none) and stays fully testable in-memory.
 
 A `KeyStrategy` controls the on-store layout, and a `PublicUrlResolver` (or `make_static_public_url`) turns a stored URI into a public URL when the store is served over HTTP.
 
@@ -51,16 +54,16 @@ lean = await externalize_media(message, media_store=store, threshold_bytes=32_00
 full = await restore_media(lean, media_store=store)
 ```
 
-`externalize_media` only externalizes payloads over `threshold_bytes`; smaller ones stay inline. `media_uri_for` and `parse_media_uri` give you the raw URI round-trip if you need to key media yourself.
+`externalize_media` externalizes both large `BinaryContent` and large text parts (a part whose string `content` is at least `threshold_bytes` UTF-8 bytes -- e.g. a big tool-return string). The same `threshold_bytes` governs both; there is no separate text knob. Payloads below the threshold stay inline, and `restore_media` re-inlines binary and text symmetrically. `media_uri_for` and `parse_media_uri` give you the raw URI round-trip if you need to key media yourself.
 
 ## API
 
 | Symbol | Purpose |
 |---|---|
 | `MediaStore` | Async content-addressed store protocol (`put` / `get` / `exists` / `public_url` / `get_metadata`) |
-| `DiskMediaStore`, `SqliteMediaStore`, `S3MediaStore` | Concrete stores |
+| `DiskMediaStore`, `SqliteMediaStore`, `S3MediaStore`, `MongoMediaStore` | Concrete stores (`MongoMediaStore` needs the `mongodb` extra) |
 | `MediaContext` | Per-call context (e.g. tenant) threaded through store operations |
 | `KeyStrategy`, `default_key_strategy` | On-store key layout |
 | `PublicUrlResolver`, `make_static_public_url` | Resolve a stored URI to a public URL |
-| `externalize_media`, `restore_media` | Walk a message node to externalize / rehydrate payloads |
+| `externalize_media`, `restore_media` | Walk a message node to externalize / rehydrate large binary and text payloads |
 | `media_uri_for`, `parse_media_uri` | Compute and parse a `media://` URI |

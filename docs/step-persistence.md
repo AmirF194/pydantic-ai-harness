@@ -297,20 +297,22 @@ The helper reads the active `run_id` from the `StepPersistence` `ContextVar` and
     - `tool_effects.jsonl` -- append-only `ToolEffectRecord`s, scoped to this run
     - `snapshots/{seq}.json` -- `ContinuableSnapshot`s, named by a per-run monotonic counter (not `step_index`, which would collide when the same `run_id` is reused across `Agent.run` calls, since `ctx.run_step` resets to 0 each call).
 - `SqliteStepStore(database='runs.db')` -- single SQLite file with tables `runs`, `events`, `snapshots`, `tool_effects`, and a sibling `media` table for externalized blobs (see [Persisting media](#persisting-media) below). WAL mode is enabled; `tool_effects` upserts per `(run_id, tool_call_id)` so the latest state wins; snapshots use `AUTOINCREMENT seq` to mirror `FileStepStore._next_snapshot_seq`. Databases created before the snapshot `state` column existed gain it automatically on open (existing rows read as `complete`). Pass `connection=` instead of `database=` to share a `sqlite3.Connection` with the rest of your application; the connection must be opened with `check_same_thread=False` because hook calls are dispatched onto a worker thread.
+- `MongoStepStore(client= or db_url=, database=...)` -- MongoDB collections `runs`, `events`, `snapshots`, `tool_effects`, and `counters` (atomic `$inc` allocates the monotonic `seq`). `runs._id = run_id` enforces the single-shot `run_id` contract. Needs the `mongodb` extra (`pip install pydantic-ai-harness[mongodb]`); pass a shared `AsyncMongoClient` as `client=`, or a connection string as `db_url=` (the store then owns the client -- call `await store.aclose()` to release it). Large payloads externalize by default to a `MongoMediaStore` on the same client, so a single snapshot stays under MongoDB's 16MB BSON cap.
 
-All three implement the same async `StepStore` protocol, so capability hooks never block the event loop on the file/sqlite backends (I/O is dispatched via `anyio.to_thread`).
+All implement the same async `StepStore` protocol, so capability hooks never block the event loop on the file/sqlite backends (I/O is dispatched via `anyio.to_thread`); the Mongo backend is natively async.
 
 `FileStepStore` validates `run_id` against `[A-Za-z0-9_.-]{1,200}` (and rejects `..`) to prevent path traversal. Callers passing user-controlled IDs should still sanitise first.
 
 ## Persisting media
 
-`BinaryContent` payloads (images, audio, documents, video) inlined as base64 inside a snapshot would balloon every file or row containing the message. Both `FileStepStore` and `SqliteStepStore` externalize any `BinaryContent.data` at or above **64 KiB** through a configured `MediaStore`, leaving a URI reference in the snapshot. Round-trip is transparent: `latest_snapshot(...).messages[*]` returns `BinaryContent` with the original bytes.
+`BinaryContent` payloads (images, audio, documents, video) inlined as base64 inside a snapshot would balloon every file or row containing the message; a large text part (e.g. a big tool-return string) does the same and can push a `MongoStepStore` snapshot past MongoDB's 16MB document cap ([#440](https://github.com/pydantic/pydantic-ai-harness/issues/440)). The file, sqlite, and mongo backends externalize any `BinaryContent.data` -- and any part whose string `content` -- at or above **64 KiB** through a configured `MediaStore`, leaving a URI reference in the snapshot. The same `media_threshold_bytes` governs binary and text alike; there is no separate text knob. Round-trip is transparent: `latest_snapshot(...).messages[*]` returns the original `BinaryContent` bytes and text.
 
 | StepStore           | Default `media_store`                  | Where blobs live                      |
 | ------------------- | --------------------------------------- | ------------------------------------- |
 | `InMemoryStepStore` | not applicable                         | bytes stay in the in-memory snapshot  |
 | `FileStepStore`     | `DiskMediaStore(<root>/media/)`        | `<root>/media/<sha256>.bin`           |
 | `SqliteStepStore`   | `SqliteMediaStore(database=<same db>)` | sibling `media` table in the same DB  |
+| `MongoStepStore`    | `MongoMediaStore(client=<same client>)` | sibling `media` + `media_chunks` collections |
 
 Override the destination by passing your own `MediaStore`:
 
@@ -345,6 +347,7 @@ URIs are `media+sha256://<hex>`, content-addressed. The same blob written throug
 - `DiskMediaStore(directory)` -- one file per blob at `<directory>/<sha256>.bin`.
 - `SqliteMediaStore(database=...)` or `SqliteMediaStore(connection=...)` -- one row per blob (`INSERT OR IGNORE` for content-addressed dedup).
 - `S3MediaStore(bucket=, endpoint=, region=, access_key_id=, secret_access_key=)` -- path-style URLs plus handrolled SigV4. Compatible with AWS S3, Cloudflare R2 (`region='auto'`), MinIO, and other S3-compatible providers. PUT/GET/HEAD only -- no multipart, lifecycle, or listing in v1.
+- `MongoMediaStore(client= or db_url=, database=...)` -- MongoDB, needs the `mongodb` extra. Each blob is sha256-addressed chunks across a `media` document and a sibling `media_chunks` collection (manual chunking rather than GridFS, so dedup is preserved -- see the [media page](media.md)), keeping blobs of any size under the 16MB BSON cap.
 
 ### Exposing externalized bytes as URLs
 

@@ -1,14 +1,23 @@
-"""JSON walkers that swap inline `BinaryContent` for externalized markers.
+"""JSON walkers that swap inline large parts for externalized markers.
 
-Used by step-persistence backends to keep large media out of snapshot
-payloads. The walkers operate on JSON-shaped trees (`list`/`dict`/scalars)
+Used by step-persistence backends to keep large payloads out of snapshot
+records. The walkers operate on JSON-shaped trees (`list`/`dict`/scalars)
 so they never need to know about `pydantic_ai.messages` types directly --
-they recognize the serialized shape (`{"kind": "binary", "data": "<b64>"}`)
-emitted by `ModelMessagesTypeAdapter.dump_json`.
+they recognize the serialized shapes emitted by
+`ModelMessagesTypeAdapter.dump_json`:
+
+- `BinaryContent`: `{"kind": "binary", "data": "<b64>", ...}`.
+- Any part carrying a string `content` (`TextPart`, `ToolReturnPart`,
+  a string-valued `UserPromptPart`, ...): `{"content": "<text>", ...}`.
+
+Both kinds go to the same content-addressed `MediaStore`; the marker records
+which field was externalized so `restore_media` re-inlines the right one.
+Externalizing large text (not just binary) keeps a single snapshot below
+MongoDB's 16MB document cap when a tool returns a large string.
 
 Round-trip: `externalize_media` (pre-write) and `restore_media` (post-read)
-are inverses for bytes ≥ threshold. Bytes below the threshold pass through
-unchanged.
+are inverses for payloads whose byte length is >= threshold. Payloads below
+the threshold pass through unchanged.
 """
 
 from __future__ import annotations
@@ -19,6 +28,7 @@ from typing import TypeGuard
 from pydantic_ai_harness.media._store import MediaContext, MediaStore
 
 _EXTERNAL_MARKER = '__harness_external_media__'
+_TEXT_MARKER = '__harness_external_text__'
 
 
 def _is_json_dict(node: object) -> TypeGuard[dict[str, object]]:
@@ -44,12 +54,23 @@ def _is_binary_part(node: dict[str, object]) -> bool:
     return node.get('kind') == 'binary' and isinstance(node.get('data'), str)
 
 
+def _is_text_part(node: dict[str, object]) -> bool:
+    """A part carrying inline text -- any dict with a string `content` field.
+
+    Covers `TextPart`, `ToolReturnPart` with a string return, and
+    string-valued `UserPromptPart`. A bare string element inside a
+    `UserPromptPart.content` list is not a dict, so it is never a candidate
+    (replacing it with a marker dict would break `UserContent` validation).
+    """
+    return isinstance(node.get('content'), str)
+
+
 def _is_external_marker(node: dict[str, object]) -> bool:
     return node.get(_EXTERNAL_MARKER) is True
 
 
 async def externalize_media(node: object, *, media_store: MediaStore, threshold_bytes: int) -> object:
-    """Walk `node` and replace inline `BinaryContent` parts ≥ threshold.
+    """Walk `node` and replace inline binary/text parts >= threshold.
 
     Each qualifying part becomes a marker dict carrying the canonical
     `media+sha256://` URI; the raw bytes are written to `media_store`.
@@ -63,6 +84,10 @@ async def externalize_media(node: object, *, media_store: MediaStore, threshold_
     if _is_json_dict(node):
         if _is_binary_part(node):
             replaced = await _maybe_externalize_binary(node, media_store, threshold_bytes)
+            if replaced is not None:
+                return replaced
+        elif _is_text_part(node):
+            replaced = await _maybe_externalize_text(node, media_store, threshold_bytes)
             if replaced is not None:
                 return replaced
         out_dict: dict[str, object] = {}
@@ -94,12 +119,34 @@ async def _maybe_externalize_binary(
     return marker
 
 
+async def _maybe_externalize_text(
+    node: dict[str, object],
+    media_store: MediaStore,
+    threshold_bytes: int,
+) -> dict[str, object] | None:
+    # `_is_text_part` already verified `content` is a string.
+    content_value = node['content']
+    assert isinstance(content_value, str)
+    raw = content_value.encode('utf-8')
+    if len(raw) < threshold_bytes:
+        return None
+    uri = await media_store.put(raw, context=MediaContext(media_type='text/plain'))
+    # Preserve every field except the externalized `content`. `_TEXT_MARKER`
+    # tells `restore_media` to decode UTF-8 back into `content` rather than
+    # base64 into `data`.
+    marker = {key: value for key, value in node.items() if key != 'content'}
+    marker[_EXTERNAL_MARKER] = True
+    marker[_TEXT_MARKER] = True
+    marker['uri'] = uri
+    return marker
+
+
 async def restore_media(node: object, *, media_store: MediaStore) -> object:
     """Inverse of `externalize_media`. Walks `node` and re-inlines external refs.
 
-    Each marker dict's `uri` is resolved via `media_store.get` and the bytes
-    are re-encoded as a `kind=binary` part so the result round-trips
-    through `ModelMessagesTypeAdapter.validate_python`.
+    Each marker dict's `uri` is resolved via `media_store.get`; a text marker
+    re-inlines `content`, a binary marker re-inlines base64 `data`, so the
+    result round-trips through `ModelMessagesTypeAdapter.validate_python`.
     """
     if _is_json_list(node):
         out_list: list[object] = []
@@ -121,8 +168,11 @@ async def _restore_external(node: dict[str, object], media_store: MediaStore) ->
     if not isinstance(uri_value, str):
         raise ValueError(f'externalized media marker missing string uri: {node!r}')
     raw = await media_store.get(uri_value)
-    # Inverse of `_maybe_externalize_binary`: drop the marker keys, restore `data`,
-    # keep every other field the original part carried.
-    restored = {key: value for key, value in node.items() if key not in (_EXTERNAL_MARKER, 'uri')}
-    restored['data'] = base64.b64encode(raw).decode('ascii')
+    # Inverse of `_maybe_externalize_*`: drop the marker keys, restore the
+    # externalized field, keep every other field the original part carried.
+    restored = {key: value for key, value in node.items() if key not in (_EXTERNAL_MARKER, _TEXT_MARKER, 'uri')}
+    if node.get(_TEXT_MARKER) is True:
+        restored['content'] = raw.decode('utf-8')
+    else:
+        restored['data'] = base64.b64encode(raw).decode('ascii')
     return restored
