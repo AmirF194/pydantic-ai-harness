@@ -169,6 +169,10 @@ def load_skill_libraries(
             raise ValueError(f'Skill library directory does not exist: {root}')
         if not root.is_dir():
             raise ValueError(f'Skill library path is not a directory: {root}')
+        if (root / 'SKILL.md').is_file():
+            raise ValueError(
+                f'Skill library path points to a skill package: {root}. Pass its parent directory instead.'
+            )
         seen_roots.add(resolved)
         roots.append(root)
 

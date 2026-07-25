@@ -246,9 +246,10 @@ Skills(
 - `include` exposes only the named skills.
 - `exclude` omits the named skills from the catalog.
 
-Malformed frontmatter, invalid or mismatched names, duplicate selected names,
-unknown selections, missing libraries, and non-directory library paths fail
-during construction.
+Pass at least one library directory, not the path of an individual skill
+package. Malformed frontmatter, invalid or mismatched names, duplicate selected
+names, unknown selections, missing libraries, and non-directory library paths
+fail during construction.
 
 Every selected skill is deferred. This is part of the `Skills` behavior and is
 not configurable.

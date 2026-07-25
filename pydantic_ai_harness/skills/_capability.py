@@ -102,7 +102,10 @@ class Skills(AbstractCapability[AgentDepsT]):
     ) -> tuple[str | Path, ...]:
         if isinstance(directories, (str, Path)):
             return (directories,)
-        return tuple(directories)
+        normalized = tuple(directories)
+        if not normalized:
+            raise ValueError('Skills requires at least one skill-library directory.')
+        return normalized
 
     @staticmethod
     def _normalize_selection(name: str, values: Collection[object]) -> frozenset[str]:
@@ -121,6 +124,8 @@ class Skills(AbstractCapability[AgentDepsT]):
             capability.apply(visitor)
 
     def _to_capability(self, skill: SkillDefinition) -> Capability[AgentDepsT]:
+        # TODO: Pydantic AI core should render multiline deferred-capability descriptions without making
+        # continuation lines look like separate catalog entries. Keep valid SKILL.md descriptions unchanged here.
         return Capability[AgentDepsT](
             id=skill.name,
             description=skill.description,

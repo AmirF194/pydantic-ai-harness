@@ -202,11 +202,10 @@ import logfire
 from pydantic_ai import Agent
 from pydantic_ai.capabilities import MCP, Thinking, ToolSearch, WebSearch
 from pydantic_ai_harness import CodeMode
-from pydantic_ai_harness.filesystem import FileSystem
-from pydantic_ai_harness.shell import Shell
 from pydantic_ai_harness.skills import Skills
 
 # Community packages, alphabetical:
+from pydantic_ai_backends import ConsoleCapability
 from pydantic_ai_shields import CostTracking, InputGuard, SecretRedaction, ToolGuard
 from pydantic_ai_summarization import ContextManagerCapability
 from pydantic_ai_todo import TodoCapability
@@ -246,9 +245,8 @@ agent = Agent(
         # Provider-adaptive web search; falls back to a local DuckDuckGo implementation.
         WebSearch(),
 
-        # Filesystem + shell with a shared workspace root.
-        FileSystem(root_dir='.'),
-        Shell(cwd='.'),
+        # Filesystem + shell. By @vstorm-co: https://github.com/vstorm-co/pydantic-ai-backend
+        ConsoleCapability(),
 
         # --- Memory & persistence ---
         # Persistent ./MEMORY.md per agent name. By @vstorm-co:

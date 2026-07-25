@@ -373,6 +373,17 @@ class TestSkillValidation:
 
         assert [leaf.id for leaf in _leaves(Skills([library, library.resolve()]))] == ['once']
 
+    def test_at_least_one_library_is_required(self) -> None:
+        with pytest.raises(ValueError, match='requires at least one skill-library directory'):
+            Skills([])
+
+    def test_skill_package_path_is_rejected(self, tmp_path: Path) -> None:
+        library = tmp_path / 'skills'
+        _write_skill(library, 'alpha')
+
+        with pytest.raises(ValueError, match='points to a skill package.*Pass its parent directory'):
+            Skills(library / 'alpha')
+
     def test_missing_root_is_rejected(self, tmp_path: Path) -> None:
         with pytest.raises(ValueError, match='does not exist'):
             Skills(tmp_path / 'missing')
