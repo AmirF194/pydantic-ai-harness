@@ -96,7 +96,7 @@ _EXPERIMENTAL_MARKERS = ('HarnessExperimentalWarning', 'removed in any release',
 # Lifecycle hook names must not lead a page -- mechanism goes below the purpose.
 _LEAD_HOOK_NAMES = ('before_model_request', 'after_model_request', 'before_tool_execute', 'after_tool_execute')
 # ClassName-style headings are a smell, except where the class name IS the name.
-_ALLOWED_CLASSNAME_HEADINGS = {'FileSystem'}
+_ALLOWED_CLASSNAME_HEADINGS = {'FileSystem', 'LocalStack'}
 _FORBIDDEN_HEADINGS = {'overflow', 'authoring', 'overflow capability', 'compaction capabilities'}
 
 
@@ -112,6 +112,7 @@ _CAPABILITY_DOC_PAGES = _capability_doc_pages()
 # or empty heading, fails instead of passing on a substring match.
 _CAPABILITY_PAGE_META = {
     'code-mode.md': ('code_mode', 'Code Mode'),
+    'skills.md': ('skills', 'Skills'),
     'filesystem.md': ('filesystem', 'FileSystem'),
     'shell.md': ('shell', 'Shell'),
     'managed-prompt.md': ('logfire', 'Managed Prompt'),
@@ -132,6 +133,7 @@ _CAPABILITY_PAGE_META = {
     'planning.md': ('planning', 'Planning'),
     'runtime-authoring.md': ('runtime_authoring', 'Runtime Authoring'),
     'guardrails.md': ('guardrails', 'Input & Output Guardrails'),
+    'localstack.md': ('localstack', 'LocalStack'),
     'acp.md': ('experimental/acp', 'ACP (Agent Client Protocol)'),
 }
 
