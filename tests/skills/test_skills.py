@@ -14,11 +14,9 @@ from pydantic_ai.messages import (
     ModelResponse,
     TextPart,
     ToolCallPart,
-    ToolReturnPart,
 )
 from pydantic_ai.models.function import AgentInfo, FunctionModel
 
-from pydantic_ai_harness.filesystem import FileSystem
 from pydantic_ai_harness.skills import Skills
 
 pytestmark = pytest.mark.anyio
@@ -120,76 +118,46 @@ class TestSkills:
         assert '- alpha:' not in initial
         assert '- beta: Beta help.' in initial
 
-    async def test_skill_body_is_exposed_with_its_directory(self, tmp_path: Path) -> None:
+    async def test_skill_body_is_exposed_without_its_source_path(self, tmp_path: Path) -> None:
         library = tmp_path / 'skills'
         directory = _write_skill(library, 'knowledge', body='Answer from this embedded guidance.')
 
         _, _, loaded = await _activate([Skills(directories=[library])], 'knowledge')
 
-        assert f'Skill directory: `{directory.resolve()}`.' in loaded
-        assert 'Files referenced by this skill are relative to that directory.' in loaded
-        assert 'Answer from this embedded guidance.' in loaded
+        assert loaded == '# Skill: knowledge\n\nAnswer from this embedded guidance.'
+        assert str(directory.resolve()) not in loaded
 
-    async def test_empty_skill_body_still_loads_the_directory_line(self, tmp_path: Path) -> None:
+    async def test_empty_skill_body_loads_only_the_skill_heading(self, tmp_path: Path) -> None:
         library = tmp_path / 'skills'
-        directory = _write_skill(library, 'empty', body='')
+        _write_skill(library, 'empty', body='')
 
         _, _, loaded = await _activate([Skills(directories=[library])], 'empty')
 
-        assert '# Skill: empty' in loaded
-        assert f'Skill directory: `{directory.resolve()}`.' in loaded
-        assert loaded.endswith('Access them only through filesystem tools provided by the application.')
+        assert loaded == '# Skill: empty'
 
-    async def test_claude_skill_dir_is_expanded(self, tmp_path: Path) -> None:
+    async def test_skill_directory_placeholder_is_not_resolved_to_a_host_path(self, tmp_path: Path) -> None:
         library = tmp_path / 'skills'
         directory = _write_skill(library, 'portable', body='Read ${CLAUDE_SKILL_DIR}/guide.md.')
 
         _, _, loaded = await _activate([Skills(directories=[library])], 'portable')
 
-        assert f'Read {directory.resolve()}/guide.md.' in loaded
+        assert loaded == '# Skill: portable\n\nRead ${CLAUDE_SKILL_DIR}/guide.md.'
+        assert str(directory.resolve()) not in loaded
 
-    async def test_bundled_file_can_be_read_when_application_grants_access(self, tmp_path: Path) -> None:
+    async def test_bundled_files_are_not_enumerated_or_loaded(self, tmp_path: Path) -> None:
         library = tmp_path / 'skills'
-        directory = _write_skill(
+        _write_skill(
             library,
             'portable',
-            body='Read ${CLAUDE_SKILL_DIR}/references/guide.md.',
+            body='Follow the portable workflow.',
             files={'references/guide.md': 'Use the documented workflow.'},
         )
-        observed_content = ''
 
-        def model_fn(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
-            nonlocal observed_content
-            returns = [
-                part for message in messages for part in message.parts if isinstance(part, LoadCapabilityReturnPart)
-            ]
-            tool_returns = [
-                part
-                for message in messages
-                for part in message.parts
-                if isinstance(part, ToolReturnPart) and part.tool_name == 'read_file'
-            ]
-            if not returns:
-                return ModelResponse(parts=[ToolCallPart(tool_name='load_capability', args={'id': 'portable'})])
-            if not tool_returns:
-                return ModelResponse(
-                    parts=[
-                        ToolCallPart(
-                            tool_name='read_file',
-                            args={'path': str(directory / 'references' / 'guide.md')},
-                        )
-                    ]
-                )
-            observed_content = str(tool_returns[-1].content)
-            return ModelResponse(parts=[TextPart('done')])
+        _, _, loaded = await _activate([Skills(library)], 'portable')
 
-        agent = Agent(
-            FunctionModel(model_fn),
-            capabilities=[FileSystem(root_dir=library, protected_patterns=['**']), Skills(library)],
-        )
-        await agent.run('use the skill')
-
-        assert 'Use the documented workflow.' in observed_content
+        assert loaded == '# Skill: portable\n\nFollow the portable workflow.'
+        assert 'references/guide.md' not in loaded
+        assert 'Use the documented workflow.' not in loaded
 
     async def test_construction_is_a_snapshot(self, tmp_path: Path) -> None:
         library = tmp_path / 'skills'
@@ -241,7 +209,22 @@ class TestSkillValidation:
         _write_skill(library, 'alpha')
 
         with pytest.raises(ValueError, match='include and exclude cannot be used together'):
-            Skills(library, include=['alpha'], exclude=['alpha'])
+            Skills(  # pyright: ignore[reportCallIssue]
+                library,
+                include=['alpha'],
+                exclude=['alpha'],  # pyright: ignore[reportArgumentType]
+            )
+
+    def test_empty_include_and_exclude_are_still_mutually_exclusive(self, tmp_path: Path) -> None:
+        library = tmp_path / 'skills'
+        library.mkdir()
+
+        with pytest.raises(ValueError, match='include and exclude cannot be used together'):
+            Skills(  # pyright: ignore[reportCallIssue]
+                library,
+                include=[],
+                exclude=[],  # pyright: ignore[reportArgumentType]
+            )
 
     @pytest.mark.parametrize('selector', ['include', 'exclude'])
     def test_unknown_selected_skill_is_rejected(self, tmp_path: Path, selector: str) -> None:
@@ -305,6 +288,14 @@ class TestSkillValidation:
         agent = Agent(FunctionModel(model_fn), capabilities=[Skills(library, include=[])])
         result = await agent.run('go')
         assert result.output == 'done'
+
+    async def test_empty_exclude_exposes_all_skills(self, tmp_path: Path) -> None:
+        library = tmp_path / 'skills'
+        _write_skill(library, 'alpha', description='Alpha help.')
+
+        initial, _, _ = await _activate([Skills(library, exclude=[])], 'alpha')
+
+        assert '- alpha: Alpha help.' in initial
 
     def test_name_can_be_derived_from_directory(self, tmp_path: Path) -> None:
         library = tmp_path / 'skills'

@@ -6,6 +6,7 @@ import warnings
 from collections.abc import Callable, Collection, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import overload
 
 from pydantic_ai.capabilities import AbstractCapability, Capability
 from pydantic_ai.tools import AgentDepsT
@@ -23,9 +24,8 @@ class Skills(AbstractCapability[AgentDepsT]):
     discovery, activation, and message-history replay. Every discovered skill is
     deferred by design; there is no option to change this.
 
-    v1 exposes instructions only. It does not read supporting files or run
-    bundled scripts. Applications can grant access to bundled files separately
-    through a filesystem capability whose root contains the skill directory.
+    v1 exposes instructions only. It does not read supporting files, resolve
+    resource paths, or run bundled scripts.
     """
 
     id: str | None = field(init=False, default=None, repr=False, compare=False)
@@ -39,25 +39,43 @@ class Skills(AbstractCapability[AgentDepsT]):
     """Exact skill names to expose, or `None` to expose every discovered skill."""
 
     exclude: frozenset[str]
-    """Exact skill names to hide."""
+    """Exact skill names to omit from the deferred capability catalog."""
 
     _skill_capabilities: tuple[Capability[AgentDepsT], ...] = field(init=False, repr=False, compare=False)
+
+    @overload
+    def __init__(  # pragma: no cover - overload is enforced by static type checking
+        self,
+        directories: str | Path | Sequence[str | Path],
+        *,
+        include: Collection[str],
+        exclude: None = None,
+    ) -> None: ...
+
+    @overload
+    def __init__(  # pragma: no cover - overload is enforced by static type checking
+        self,
+        directories: str | Path | Sequence[str | Path],
+        *,
+        include: None = None,
+        exclude: Collection[str] | None = None,
+    ) -> None: ...
 
     def __init__(
         self,
         directories: str | Path | Sequence[str | Path],
         *,
         include: Collection[str] | None = None,
-        exclude: Collection[str] = (),
+        exclude: Collection[str] | None = None,
     ) -> None:
         """Build an immutable snapshot of selected Agent Skills.
 
         Args:
             directories: One skill-library path, or a sequence of paths.
-            include: Exact skill names to expose. Omit to expose all discovered skills.
-            exclude: Exact skill names to hide. Cannot be combined with `include`.
+            include: Exact skill names to expose in the catalog. Omit to expose all discovered skills.
+            exclude: Exact skill names to omit from the catalog. Cannot be combined with `include`.
         """
-        if include is not None and exclude:
+        if include is not None and exclude is not None:
             raise ValueError('include and exclude cannot be used together.')
 
         self.id = None
@@ -65,7 +83,7 @@ class Skills(AbstractCapability[AgentDepsT]):
         self.defer_loading = False
         self.directories = self._normalize_directories(directories)
         self.include = self._normalize_selection('include', include) if include is not None else None
-        self.exclude = self._normalize_selection('exclude', exclude)
+        self.exclude = self._normalize_selection('exclude', exclude) if exclude is not None else frozenset()
 
         definitions = load_skill_libraries(self.directories, include=self.include, exclude=self.exclude)
         ignored = [
@@ -109,20 +127,6 @@ class Skills(AbstractCapability[AgentDepsT]):
         return Capability[AgentDepsT](
             id=skill.name,
             description=skill.description,
-            instructions=self._render_instructions(skill),
+            instructions=f'# Skill: {skill.name}\n\n{skill.body}' if skill.body else f'# Skill: {skill.name}',
             defer_loading=True,
         )
-
-    def _render_instructions(self, skill: SkillDefinition) -> str:
-        absolute_directory = str(skill.directory)
-        lines = [
-            f'# Skill: {skill.name}',
-            '',
-            f'Skill directory: `{absolute_directory}`.',
-            'Files referenced by this skill are relative to that directory.',
-            'Access them only through filesystem tools provided by the application.',
-        ]
-        body = skill.body.replace('${CLAUDE_SKILL_DIR}', absolute_directory)
-        if body:
-            lines.extend(['', body])
-        return '\n'.join(lines)

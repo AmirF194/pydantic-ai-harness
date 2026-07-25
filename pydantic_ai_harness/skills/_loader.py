@@ -56,12 +56,11 @@ class _SkillFrontmatter(BaseModel):
 
 @dataclass(frozen=True)
 class SkillDefinition:
-    """Validated skill metadata and rendered body from a single `SKILL.md`."""
+    """Validated skill metadata and body from a single `SKILL.md`."""
 
     name: str
     description: str
     body: str
-    directory: Path
     ignored_behavioral_fields: tuple[str, ...]
 
 
@@ -126,7 +125,6 @@ def load_skill(skill_file: Path) -> SkillDefinition:
         name=name,
         description=frontmatter.description,
         body=body,
-        directory=skill_file.parent.resolve(),
         ignored_behavioral_fields=ignored_fields,
     )
 

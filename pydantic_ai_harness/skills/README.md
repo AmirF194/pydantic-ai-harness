@@ -12,10 +12,12 @@ The model initially sees each skill's name and description. When it calls the co
 ## Scope
 
 v1 exposes instructions only. Each skill is its `SKILL.md` frontmatter (`name`,
-`description`) plus the Markdown body, rendered as a deferred capability. Skills
-reads `SKILL.md` when it is constructed. It does not read other bundled files,
-run scripts, or grant filesystem permissions. Behavioral frontmatter fields that
-other clients act on are accepted but ignored with a warning (see below).
+`description`) plus the Markdown body, rendered as a deferred capability. In
+this release, Skills reads `SKILL.md` from the configured local paths when it is
+constructed. This does not grant the model access to those paths. Skills does
+not inspect other bundled files, resolve paths in the body, run scripts, or
+grant filesystem permissions. Behavioral frontmatter fields that other clients
+act on are accepted but ignored with a warning (see below).
 
 ## Installation
 
@@ -107,13 +109,16 @@ support_agent = Agent(
 )
 ```
 
-`include` and `exclude` match exact skill names and cannot be combined. Unknown
-names fail during construction. An empty `include` exposes no skills. Selection
-happens before `SKILL.md` is parsed, so unselected skills do not add validation
-or prompt context to that agent.
+`include` and `exclude` are mutually exclusive catalog-selection modes, enforced
+by the typed constructor and validated at runtime for agent specs and untyped
+callers. Passing both is invalid even when either collection is empty. Unknown
+names fail during construction. An empty `include` exposes no skills; an empty
+`exclude` has the same effect as omitting it. Selection happens before
+`SKILL.md` is parsed, so unselected skills do not add validation or prompt
+context to that agent.
 
-Use `include` when the set is an access or workload policy. A skill added to the
-shared directory is not exposed until the agent's allowlist includes it.
+These options control which skills appear in the deferred capability catalog.
+They are not filesystem permissions or an access-control boundary.
 
 ## Bundled files and filesystem access
 
@@ -123,51 +128,23 @@ Agent Skills may bundle files next to `SKILL.md`:
 - `assets/` commonly contains templates or files used in generated output;
 - `scripts/` commonly contains executable helpers.
 
-Skills does not enumerate, read, or execute these files. Loaded instructions
-include the absolute skill directory and expand `${CLAUDE_SKILL_DIR}` to that
-path. If a body references `references/guide.md`, the model can resolve it
-relative to the displayed skill directory.
+Skills does not enumerate, read, or execute these files. Relative references and
+placeholders such as `${CLAUDE_SKILL_DIR}` remain unchanged in the loaded
+instructions. v1 does not provide a path that the model can use to resolve them.
 
-The application decides whether the agent can access that path. For example,
-compose Skills with `FileSystem` and choose a root that contains the skill
-library:
-
-```python
-from pathlib import Path
-
-from pydantic_ai import Agent
-from pydantic_ai_harness.filesystem import FileSystem
-from pydantic_ai_harness.skills import Skills
-
-skill_library = Path('.agents/skills').resolve()
-
-agent = Agent(
-    'anthropic:claude-sonnet-4-6',
-    capabilities=[
-        FileSystem(
-            root_dir=skill_library,
-            protected_patterns=['**'],
-        ),
-        Skills(skill_library),
-    ],
-)
-```
-
-`FileSystem` includes write, edit, and create tools. Setting
-`protected_patterns=['**']` makes every path under this root read-only, so those
-tools reject changes while read and search operations remain available.
-
-Without an application-provided tool that authorizes the path, the skill
-receives its instructions but cannot read bundled files. Skills does not inspect
-other tools or infer filesystem authority from tool names.
+Future resource, asset, and script support should perform its I/O through
+`RunContext.sandbox`. That keeps execution authority in the sandbox instead of
+coupling Skills to model-facing filesystem or shell tools. Moving initial skill
+discovery behind the sandbox also requires Pydantic AI core to make the sandbox
+available before capability hooks need it.
 
 ## Claude Code compatibility
 
 The loader keeps the parts of the portable format that carry into an
-instructions-only capability:
-
-- `${CLAUDE_SKILL_DIR}` is replaced with the skill's absolute directory;
-- `name` may be omitted and derived from the directory.
+instructions-only capability. `name` may be omitted and derived from the
+directory. Resource-relative paths and placeholders such as
+`${CLAUDE_SKILL_DIR}` remain unchanged because v1 does not resolve bundled
+files.
 
 Only metadata that changes instructions is implemented. The following behavioral
 frontmatter fields are accepted but ignored with one aggregated `UserWarning` during
@@ -206,6 +183,24 @@ agent = Agent.from_file('agent.yaml', custom_capability_types=[Skills])
 
 The `[skills]` extra provides the same PyYAML parser used for direct construction.
 
+## Code-defined capabilities
+
+Use Pydantic AI's core `Capability` for instructions or tools defined in Python:
+
+```python
+from pydantic_ai.capabilities import Capability
+
+refunds = Capability(
+    id='refunds',
+    description='Use for refund policy questions.',
+    instructions='Check the refund policy before answering.',
+    defer_loading=True,
+)
+```
+
+`Skills` is the package loader for portable `SKILL.md` libraries. It does not
+replace the core API for code-defined capabilities.
+
 ## API
 
 ```python {test="skip"}
@@ -213,14 +208,14 @@ Skills(
     directories: str | Path | Sequence[str | Path],
     *,
     include: Collection[str] | None = None,
-    exclude: Collection[str] = (),
+    exclude: Collection[str] | None = None,
 )
 ```
 
 - `directories` accepts one skill-library path or a sequence of paths and scans
   immediate child skill packages.
 - `include` exposes only the named skills.
-- `exclude` hides the named skills.
+- `exclude` omits the named skills from the catalog.
 
 Malformed required metadata, invalid or mismatched names, duplicate skill names,
 unknown selections, missing roots, and non-directory roots fail during
