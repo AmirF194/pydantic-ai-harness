@@ -256,7 +256,7 @@ agent = Agent(
         MemoryCapability(agent_name='harness-example'),
 
         # --- Orchestration ---
-        # Filesystem Agent Skills load through Pydantic AI's on-demand capability mechanism.
+        # Load Agent Skill instructions only when the model needs them.
         Skills(directories=['./skills']),
 
         # Spawn sub-agents with their own toolsets and instructions. By @vstorm-co:

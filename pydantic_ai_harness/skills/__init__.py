@@ -1,4 +1,4 @@
-"""Filesystem Agent Skills loaded through Pydantic AI deferred capabilities."""
+"""Load Agent Skill instructions as deferred Pydantic AI capabilities."""
 
 from pydantic_ai_harness.skills._capability import Skills
 

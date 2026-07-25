@@ -5,7 +5,7 @@ Pydantic AI Harness provides optional, reusable agent behaviors built on Pydanti
 ## Language
 
 **Agent Skill**:
-A filesystem package that follows the Agent Skills format, with instructions and metadata in `SKILL.md` and optional bundled resources.
+A package in the Agent Skills format. Its `SKILL.md` contains metadata and instructions; the package may also contain bundled files.
 _Avoid_: Programmatic skill
 
 **Capability**:
@@ -13,5 +13,5 @@ A reusable unit of agent behavior defined through the Pydantic AI capabilities A
 _Avoid_: Programmatic skill
 
 **Skill Library**:
-A collection of validated Agent Skills made available to an agent as a unit.
+A directory whose immediate child packages can be loaded by `Skills`.
 _Avoid_: Skill registry

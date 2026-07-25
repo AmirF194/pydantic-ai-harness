@@ -1,4 +1,4 @@
-"""Agent Skills exposed as deferred Pydantic AI capabilities."""
+"""Load Agent Skill instructions as deferred Pydantic AI capabilities."""
 
 from __future__ import annotations
 
@@ -16,16 +16,15 @@ from pydantic_ai_harness.skills._loader import SkillDefinition, load_skill_libra
 
 @dataclass(init=False)
 class Skills(AbstractCapability[AgentDepsT]):
-    """Load filesystem Agent Skills as deferred instructions.
+    """Load a library of Agent Skill instructions on demand.
 
-    Every immediate child directory containing `SKILL.md` becomes an independent
-    deferred capability whose description and body come from the skill's
-    frontmatter and Markdown. Pydantic AI's `load_capability` tool handles
-    discovery, activation, and message-history replay. Every discovered skill is
-    deferred by design; there is no option to change this.
+    Each selected `SKILL.md` becomes a deferred capability. The model sees its
+    name and description in the initial catalog, then receives its Markdown body
+    after calling Pydantic AI's `load_capability` tool.
 
-    v1 exposes instructions only. It does not read supporting files, resolve
-    resource paths, or run bundled scripts.
+    Libraries are scanned once when this class is constructed. Only immediate
+    child directories are discovered. This release reads `SKILL.md` only; it
+    does not load bundled files, resolve resource paths, or run scripts.
     """
 
     id: str | None = field(init=False, default=None, repr=False, compare=False)
@@ -33,10 +32,10 @@ class Skills(AbstractCapability[AgentDepsT]):
     defer_loading: bool = field(init=False, default=False, repr=False, compare=False)
 
     directories: tuple[str | Path, ...]
-    """Skill-library roots whose immediate child directories are scanned."""
+    """Skill-library paths scanned during construction."""
 
     include: frozenset[str] | None
-    """Exact skill names to expose, or `None` to expose every discovered skill."""
+    """Exact skill names to expose, or `None` to expose all discovered skills."""
 
     exclude: frozenset[str]
     """Exact skill names to omit from the deferred capability catalog."""
@@ -68,12 +67,12 @@ class Skills(AbstractCapability[AgentDepsT]):
         include: Collection[str] | None = None,
         exclude: Collection[str] | None = None,
     ) -> None:
-        """Build an immutable snapshot of selected Agent Skills.
+        """Build a snapshot of the selected Agent Skills.
 
         Args:
-            directories: One skill-library path, or a sequence of paths.
-            include: Exact skill names to expose in the catalog. Omit to expose all discovered skills.
-            exclude: Exact skill names to omit from the catalog. Cannot be combined with `include`.
+            directories: One skill-library path or a sequence of paths.
+            include: Exact names to expose. Omit to expose all discovered skills.
+            exclude: Exact names to omit. Cannot be combined with `include`.
         """
         if include is not None and exclude is not None:
             raise ValueError('include and exclude cannot be used together.')

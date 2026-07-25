@@ -1,4 +1,4 @@
-"""Discover and parse filesystem Agent Skills."""
+"""Discover and parse Agent Skill packages from local libraries."""
 
 from __future__ import annotations
 

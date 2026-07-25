@@ -1,44 +1,36 @@
 # Skills
 
-Load filesystem [Agent Skills](https://agentskills.io/specification) as
-[on-demand Pydantic AI capabilities](https://pydantic.dev/docs/ai/capabilities/on-demand/).
-The model initially sees each skill's name and description. When it calls the core
-`load_capability` tool, it receives that skill's instructions.
+Use [Agent Skills](https://agentskills.io/specification) to give an agent
+specialized instructions without putting every instruction in its initial
+prompt.
+
+Point `Skills` at one or more skill libraries. The model first sees each
+skill's name and description. When a skill is useful, the model can call
+Pydantic AI's `load_capability` tool to receive that skill's instructions.
 
 [Source](https://github.com/pydantic/pydantic-ai-harness/tree/main/pydantic_ai_harness/skills/)
 
 > The API may change between releases. Where practical, breaking changes ship with a deprecation warning.
 
-## Scope
-
-v1 exposes instructions only. Each skill is its `SKILL.md` frontmatter (`name`,
-`description`) plus the Markdown body, rendered as a deferred capability. In
-this release, Skills reads `SKILL.md` from the configured local paths when it is
-constructed. This does not grant the model access to those paths. Skills does
-not inspect other bundled files, resolve paths in the body, run scripts, or
-grant filesystem permissions. Behavioral frontmatter fields that other clients
-act on are accepted but ignored with a warning (see below).
-
 ## Installation
 
-Skills uses PyYAML for frontmatter parsing:
+Install the `skills` extra for YAML frontmatter support:
 
 ```bash
 uv add "pydantic-ai-harness[skills]"
 ```
 
-## Skill layout
+## Quick start
 
-Pass one explicit skill-library directory or a sequence of directories. Each
-immediate child directory containing `SKILL.md` is a skill:
+Create a skill library:
 
 ```text
 .agents/skills/
   code-review/
     SKILL.md
-  release-notes/
-    SKILL.md
 ```
+
+Add the skill's description and instructions:
 
 ```markdown
 ---
@@ -49,15 +41,7 @@ description: Review a change for correctness and repository conventions.
 Inspect the change and report findings by severity.
 ```
 
-`name` may be omitted, in which case the parent directory name is used. If present,
-it must match the directory name. `description` is required. A `SKILL.md` nested
-deeper than an immediate child directory (for example inside a `scripts/` folder) is
-not a skill.
-
-Skills are discovered once when `Skills(...)` is constructed. The skill catalog and
-parsed `SKILL.md` instructions are a snapshot. Construct a new instance to rescan.
-
-## Usage
+Then add the library to your agent:
 
 ```python
 from pydantic_ai import Agent
@@ -69,86 +53,127 @@ agent = Agent(
 )
 ```
 
-Skills does not discover `.agents`, `.claude`, or home-directory libraries implicitly.
-Pass every library the application intends to expose.
+`Skills` does not search `.agents`, `.claude`, or your home directory
+automatically. Pass each library you want it to load.
 
-## Select skills per agent
+> **Note:** This release loads instructions from `SKILL.md`. It does not load
+> bundled resources or run scripts.
 
-Use `include` when several agents share a library but each workload should see a
-specific set:
+## How it works
+
+When `Skills(...)` is constructed, it:
+
+1. Scans the immediate child directories of each configured library.
+2. Validates the selected `SKILL.md` files.
+3. Creates one deferred Pydantic AI capability for each selected skill.
+
+The model initially sees only the skill names and descriptions. Loading a skill
+adds instructions headed `# Skill: <name>`, followed by its Markdown body, to
+the run through the same `load_capability` flow as other
+[on-demand capabilities](https://pydantic.dev/docs/ai/capabilities/on-demand/).
+
+Discovery happens once at construction. The catalog and parsed instructions are
+a snapshot. Construct a new `Skills` instance to rescan the libraries.
+
+## Choose which skills to expose
+
+By default, all discovered skills are included. Use `include` or `exclude` to
+change the catalog for a particular agent:
 
 ```python
-from pydantic_ai import Agent
 from pydantic_ai_harness.skills import Skills
 
-invoice_agent = Agent(
-    'anthropic:claude-sonnet-4-6',
-    capabilities=[
-        Skills(
-            '.agents/skills',
-            include=['invoice-review', 'vat-policy'],
-        )
-    ],
+billing_skills = Skills(
+    '.agents/skills',
+    include=['invoice-review', 'vat-policy'],
+)
+
+support_skills = Skills(
+    '.agents/skills',
+    exclude=['deployment', 'incident-response'],
 )
 ```
 
-Use `exclude` when an agent should see all but a small number of skills:
+| Configuration | Skills in the catalog |
+|---|---|
+| Neither option | All discovered skills |
+| `include=['a', 'b']` | Only `a` and `b` |
+| `include=[]` | No skills |
+| `exclude=['a', 'b']` | All except `a` and `b` |
+| `exclude=[]` | All discovered skills |
 
-```python
-from pydantic_ai import Agent
-from pydantic_ai_harness.skills import Skills
+`include` and `exclude` cannot be used together. The constructor overloads catch
+this in typed code, and runtime validation covers agent specs and untyped
+callers. Unknown names also fail during construction.
 
-support_agent = Agent(
-    'anthropic:claude-sonnet-4-6',
-    capabilities=[
-        Skills(
-            '.agents/skills',
-            exclude=['deployment', 'incident-response'],
-        )
-    ],
-)
+Selection happens before frontmatter is parsed. An unselected skill does not add
+instructions or frontmatter validation errors to that `Skills` instance.
+
+These options control catalog exposure. They are not filesystem permissions or
+an access-control boundary.
+
+## Skill format
+
+Each immediate child directory containing `SKILL.md` is a skill:
+
+```text
+.agents/skills/
+  code-review/
+    SKILL.md
+  release-notes/
+    SKILL.md
 ```
 
-`include` and `exclude` are mutually exclusive catalog-selection modes, enforced
-by the typed constructor and validated at runtime for agent specs and untyped
-callers. Passing both is invalid even when either collection is empty. Unknown
-names fail during construction. An empty `include` exposes no skills; an empty
-`exclude` has the same effect as omitting it. Selection happens before
-`SKILL.md` is parsed, so unselected skills do not add validation or prompt
-context to that agent.
+The loader uses these parts of `SKILL.md`:
 
-These options control which skills appear in the deferred capability catalog.
-They are not filesystem permissions or an access-control boundary.
+| Part | Requirement |
+|---|---|
+| `name` | Optional. Defaults to the parent directory name. If provided, it must match the directory. |
+| `description` | Required, non-blank, and at most 1,024 characters. This appears in the initial catalog. |
+| Markdown body | Optional. This is loaded under a generated `# Skill: <name>` heading. |
 
-## Bundled files and filesystem access
+Skill names can contain at most 64 characters. Use lowercase letters, numbers,
+and single hyphens. A name cannot start or end with a hyphen or contain
+consecutive hyphens.
 
-Agent Skills may bundle files next to `SKILL.md`:
+Only immediate children are discovered. For example,
+`code-review/references/SKILL.md` does not create another skill. Ordinary files
+and child directories without `SKILL.md` are ignored.
 
-- `references/` commonly contains documentation or data to read when needed;
-- `assets/` commonly contains templates or files used in generated output;
-- `scripts/` commonly contains executable helpers.
+You can pass several libraries:
 
-Skills does not enumerate, read, or execute these files. Relative references and
-placeholders such as `${CLAUDE_SKILL_DIR}` remain unchanged in the loaded
-instructions. v1 does not provide a path that the model can use to resolve them.
+```python
+from pydantic_ai_harness.skills import Skills
 
-Future resource, asset, and script support should perform its I/O through
-`RunContext.sandbox`. That keeps execution authority in the sandbox instead of
-coupling Skills to model-facing filesystem or shell tools. Moving initial skill
-discovery behind the sandbox also requires Pydantic AI core to make the sandbox
-available before capability hooks need it.
+skills = Skills([
+    '.agents/skills',
+    'company/skills',
+])
+```
 
-## Claude Code compatibility
+Selected skill names must be unique across those libraries. Repeated references
+to the same resolved library are scanned once.
 
-The loader keeps the parts of the portable format that carry into an
-instructions-only capability. `name` may be omitted and derived from the
-directory. Resource-relative paths and placeholders such as
-`${CLAUDE_SKILL_DIR}` remain unchanged because v1 does not resolve bundled
-files.
+## Bundled files are not loaded
 
-Only metadata that changes instructions is implemented. The following behavioral
-frontmatter fields are accepted but ignored with one aggregated `UserWarning` during
-construction:
+Agent Skill packages can contain directories such as `references/`, `assets/`,
+and `scripts/`. This release does not enumerate, read, or execute those files.
+
+Relative paths and placeholders such as `${CLAUDE_SKILL_DIR}` remain unchanged
+in the loaded instructions. `Skills` does not provide a model-visible path that
+resolves them.
+
+`Skills` also does not infer access from model-facing `FileSystem` or `Shell`
+capabilities. Adding either capability does not change which files `Skills`
+reads.
+
+## Compatibility with existing skill libraries
+
+The portable `name`, `description`, and Markdown instructions are supported.
+`name` may be omitted and derived from the directory.
+
+The following behavioral fields are accepted for compatibility, but their
+behavior is not implemented:
 
 ```text
 agent, allowed-tools, argument-hint, arguments, context, dependencies,
@@ -156,13 +181,14 @@ disable-model-invocation, disallowed-tools, effort, hooks, model, paths, shell,
 tools, user-invocable, when_to_use
 ```
 
-Fields such as `license`, `compatibility`, and `metadata` are accepted as valid
-frontmatter but do not change runtime behavior. Unknown non-behavioral fields are also
-accepted.
+If a selected skill uses any of these fields, construction emits one aggregated
+`UserWarning`. Fields such as `license`, `compatibility`, and `metadata` are
+accepted without changing runtime behavior. Other unknown, non-behavioral fields
+are also accepted.
 
-## Agent spec
+## Use an agent spec
 
-Skills works with Pydantic AI's YAML/JSON agent spec:
+`Skills` works with Pydantic AI's YAML and JSON agent specs:
 
 ```yaml
 model: anthropic:claude-sonnet-4-6
@@ -174,6 +200,8 @@ capabilities:
         - vat-policy
 ```
 
+Register `Skills` when loading the spec:
+
 ```python
 from pydantic_ai import Agent
 from pydantic_ai_harness.skills import Skills
@@ -181,11 +209,13 @@ from pydantic_ai_harness.skills import Skills
 agent = Agent.from_file('agent.yaml', custom_capability_types=[Skills])
 ```
 
-The `[skills]` extra provides the same PyYAML parser used for direct construction.
+The `skills` extra installs PyYAML. It parses `SKILL.md` frontmatter and YAML
+agent specs.
 
-## Code-defined capabilities
+## Define capabilities in Python
 
-Use Pydantic AI's core `Capability` for instructions or tools defined in Python:
+Use Pydantic AI's core `Capability` when your instructions or tools are defined
+in Python instead of a `SKILL.md` package:
 
 ```python
 from pydantic_ai.capabilities import Capability
@@ -198,8 +228,8 @@ refunds = Capability(
 )
 ```
 
-`Skills` is the package loader for portable `SKILL.md` libraries. It does not
-replace the core API for code-defined capabilities.
+`Skills` loads portable Agent Skill packages. It does not replace the core API
+for code-defined capabilities.
 
 ## API
 
@@ -212,20 +242,16 @@ Skills(
 )
 ```
 
-- `directories` accepts one skill-library path or a sequence of paths and scans
-  immediate child skill packages.
+- `directories` accepts one library path or a sequence of paths.
 - `include` exposes only the named skills.
 - `exclude` omits the named skills from the catalog.
 
-Malformed required metadata, invalid or mismatched names, duplicate skill names,
-unknown selections, missing roots, and non-directory roots fail during
-construction. Ordinary files and child directories without `SKILL.md` are
-ignored.
+Malformed frontmatter, invalid or mismatched names, duplicate selected names,
+unknown selections, missing libraries, and non-directory library paths fail
+during construction.
 
-Every selected skill uses its frontmatter `description` and is always deferred
-individually. This is part of the Skills design, not a configurable option: the
-model sees the skill catalog first and loads a skill's full instructions only
-when needed.
+Every selected skill is deferred. This is part of the `Skills` behavior and is
+not configurable.
 
 ## Further reading
 
