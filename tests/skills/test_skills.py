@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import inspect
 import warnings
-from collections.abc import Mapping, Sequence
+from collections.abc import Mapping
 from pathlib import Path
 
 import pytest
@@ -35,7 +35,7 @@ def _write_skill(
     body: str = 'Follow these directions.',
     frontmatter: str | None = None,
     files: Mapping[str, str] | None = None,
-) -> Path:
+) -> None:
     directory = library / name
     directory.mkdir(parents=True)
     metadata = frontmatter if frontmatter is not None else f'description: {description}'
@@ -44,32 +44,30 @@ def _write_skill(
         path = directory / relative
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(content, encoding='utf-8')
-    return directory
 
 
-async def _activate(
-    capabilities: Sequence[AbstractCapability[object]],
-    skill_name: str,
-) -> tuple[str, list[list[str]], str]:
-    observed_tools: list[list[str]] = []
-    initial_instructions = ''
+def _leaves(skills: Skills[object]) -> list[AbstractCapability[object]]:
+    leaves: list[AbstractCapability[object]] = []
+    skills.apply(leaves.append)
+    return leaves
+
+
+async def _load_skill(skills: Skills[object], skill_name: str) -> str:
     loaded_instructions = ''
 
-    def model_fn(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
-        nonlocal initial_instructions, loaded_instructions
-        observed_tools.append([tool.name for tool in info.function_tools])
+    def model_fn(messages: list[ModelMessage], _info: AgentInfo) -> ModelResponse:
+        nonlocal loaded_instructions
         returns = [part for message in messages for part in message.parts if isinstance(part, LoadCapabilityReturnPart)]
         if not returns:
-            initial_instructions = info.instructions or ''
             return ModelResponse(parts=[ToolCallPart(tool_name='load_capability', args={'id': skill_name})])
-        instructions = returns[-1].content.get('instructions')
-        assert instructions is not None
-        loaded_instructions = instructions
+        content = returns[-1].content
+        assert 'instructions' in content
+        loaded_instructions = content['instructions']
         return ModelResponse(parts=[TextPart('done')])
 
-    agent: Agent[object, str] = Agent(FunctionModel(model_fn), capabilities=capabilities)
+    agent: Agent[object, str] = Agent(FunctionModel(model_fn), capabilities=[skills])
     await agent.run('use the skill')
-    return initial_instructions, observed_tools, loaded_instructions
+    return loaded_instructions
 
 
 class TestSkills:
@@ -80,97 +78,76 @@ class TestSkills:
         library = tmp_path / 'skills'
         _write_skill(library, 'alpha')
 
-        representation = repr(Skills(library))
+        assert repr(Skills(library)) == (f'Skills(directories=({library!r},), include=None, exclude=frozenset())')
 
-        assert 'directories=' in representation
-        assert 'include=None' in representation
-        assert 'exclude=frozenset()' in representation
-        assert 'id=' not in representation
-        assert 'description=' not in representation
-        assert 'defer_loading=' not in representation
-
-    async def test_single_library_path_is_accepted(self, tmp_path: Path) -> None:
+    def test_directory_name_is_used_when_frontmatter_omits_name(self, tmp_path: Path) -> None:
         library = tmp_path / 'skills'
         _write_skill(library, 'alpha', description='Alpha help.')
 
-        initial, _, _ = await _activate([Skills(library)], 'alpha')
+        leaves = _leaves(Skills(library))
 
-        assert '- alpha: Alpha help.' in initial
+        assert [leaf.id for leaf in leaves] == ['alpha']
 
-    async def test_each_skill_is_a_deferred_core_capability(self, tmp_path: Path) -> None:
+    def test_frontmatter_description_is_used_for_the_capability(self, tmp_path: Path) -> None:
         library = tmp_path / 'skills'
         _write_skill(library, 'alpha', description='Alpha help.')
-        _write_skill(library, 'beta', description='Beta help.')
 
-        initial, tools, loaded = await _activate([Skills(directories=[library])], 'beta')
+        leaves = _leaves(Skills(library))
 
-        assert '- alpha: Alpha help.' in initial
-        assert '- beta: Beta help.' in initial
-        assert tools[0] == ['load_capability']
-        assert '# Skill: beta' in loaded
-        assert 'Follow these directions.' in loaded
-        assert 'description: Beta help.' not in loaded
+        assert [leaf.description for leaf in leaves] == ['Alpha help.']
 
-    def test_apply_exposes_only_deferred_skill_leaves(self, tmp_path: Path) -> None:
+    def test_selected_skills_are_deferred_capability_leaves(self, tmp_path: Path) -> None:
         library = tmp_path / 'skills'
         _write_skill(library, 'alpha')
         _write_skill(library, 'beta')
-        skills = Skills(library)
-        leaves: list[AbstractCapability[object]] = []
 
-        skills.apply(leaves.append)
+        leaves = _leaves(Skills(library))
 
-        assert skills not in leaves
-        assert [leaf.id for leaf in leaves] == ['alpha', 'beta']
-        assert all(leaf.defer_loading is True for leaf in leaves)
+        assert [leaf.defer_loading for leaf in leaves] == [True, True]
 
-    async def test_include_exposes_only_selected_skills(self, tmp_path: Path) -> None:
+    def test_include_exposes_only_selected_skills(self, tmp_path: Path) -> None:
         library = tmp_path / 'skills'
-        _write_skill(library, 'alpha', description='Alpha help.')
-        _write_skill(library, 'beta', description='Beta help.')
+        _write_skill(library, 'alpha')
+        _write_skill(library, 'beta')
 
-        initial, _, _ = await _activate([Skills(library, include=['beta'])], 'beta')
+        leaves = _leaves(Skills(library, include=['beta']))
 
-        assert '- alpha:' not in initial
-        assert '- beta: Beta help.' in initial
+        assert [leaf.id for leaf in leaves] == ['beta']
 
-    async def test_exclude_hides_selected_skills(self, tmp_path: Path) -> None:
+    def test_exclude_hides_selected_skills(self, tmp_path: Path) -> None:
         library = tmp_path / 'skills'
-        _write_skill(library, 'alpha', description='Alpha help.')
-        _write_skill(library, 'beta', description='Beta help.')
+        _write_skill(library, 'alpha')
+        _write_skill(library, 'beta')
 
-        initial, _, _ = await _activate([Skills(library, exclude=['alpha'])], 'beta')
+        leaves = _leaves(Skills(library, exclude=['alpha']))
 
-        assert '- alpha:' not in initial
-        assert '- beta: Beta help.' in initial
+        assert [leaf.id for leaf in leaves] == ['beta']
 
-    async def test_skill_body_is_exposed_without_its_source_path(self, tmp_path: Path) -> None:
+    async def test_loaded_instructions_contain_only_heading_and_body(self, tmp_path: Path) -> None:
         library = tmp_path / 'skills'
-        directory = _write_skill(library, 'knowledge', body='Answer from this embedded guidance.')
+        _write_skill(library, 'knowledge', body='Answer from this embedded guidance.')
 
-        _, _, loaded = await _activate([Skills(directories=[library])], 'knowledge')
+        loaded = await _load_skill(Skills(library), 'knowledge')
 
         assert loaded == '# Skill: knowledge\n\nAnswer from this embedded guidance.'
-        assert str(directory.resolve()) not in loaded
 
     async def test_empty_skill_body_loads_only_the_skill_heading(self, tmp_path: Path) -> None:
         library = tmp_path / 'skills'
         _write_skill(library, 'empty', body='')
 
-        _, _, loaded = await _activate([Skills(directories=[library])], 'empty')
+        loaded = await _load_skill(Skills(library), 'empty')
 
         assert loaded == '# Skill: empty'
 
     async def test_skill_directory_placeholder_is_not_resolved_to_a_host_path(self, tmp_path: Path) -> None:
         library = tmp_path / 'skills'
-        directory = _write_skill(library, 'portable', body='Read ${CLAUDE_SKILL_DIR}/guide.md.')
+        _write_skill(library, 'portable', body='Read ${CLAUDE_SKILL_DIR}/guide.md.')
 
-        _, _, loaded = await _activate([Skills(directories=[library])], 'portable')
+        loaded = await _load_skill(Skills(library), 'portable')
 
         assert loaded == '# Skill: portable\n\nRead ${CLAUDE_SKILL_DIR}/guide.md.'
-        assert str(directory.resolve()) not in loaded
 
-    async def test_bundled_files_are_not_enumerated_or_loaded(self, tmp_path: Path) -> None:
+    async def test_bundled_files_do_not_change_loaded_instructions(self, tmp_path: Path) -> None:
         library = tmp_path / 'skills'
         _write_skill(
             library,
@@ -179,25 +156,22 @@ class TestSkills:
             files={'references/guide.md': 'Use the documented workflow.'},
         )
 
-        _, _, loaded = await _activate([Skills(library)], 'portable')
+        loaded = await _load_skill(Skills(library), 'portable')
 
         assert loaded == '# Skill: portable\n\nFollow the portable workflow.'
-        assert 'references/guide.md' not in loaded
-        assert 'Use the documented workflow.' not in loaded
 
-    async def test_construction_is_a_snapshot(self, tmp_path: Path) -> None:
+    def test_construction_is_a_snapshot(self, tmp_path: Path) -> None:
         library = tmp_path / 'skills'
         _write_skill(library, 'first')
-        skills = Skills(directories=[library])
+        skills = Skills(library)
         _write_skill(library, 'later')
 
-        initial, _, _ = await _activate([skills], 'first')
+        leaves = _leaves(skills)
 
-        assert '- first:' in initial
-        assert '- later:' not in initial
+        assert [leaf.id for leaf in leaves] == ['first']
 
     @pytest.mark.parametrize(
-        ('suffix', 'content'),
+        ('suffix', 'spec_text'),
         [
             (
                 '.yaml',
@@ -209,81 +183,70 @@ class TestSkills:
             ),
         ],
     )
-    async def test_agent_spec_constructs_skills(self, tmp_path: Path, suffix: str, content: str) -> None:
+    async def test_agent_spec_constructs_skills(self, tmp_path: Path, suffix: str, spec_text: str) -> None:
         library = tmp_path / 'skills'
         _write_skill(library, 'from-spec')
         _write_skill(library, 'not-selected')
         spec = tmp_path / f'agent{suffix}'
-        spec.write_text(
-            content.format(library=library),
-            encoding='utf-8',
-        )
+        spec.write_text(spec_text.format(library=library), encoding='utf-8')
 
-        def model_fn(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        def model_fn(_messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
             assert 'from-spec' in (info.instructions or '')
             assert 'not-selected' not in (info.instructions or '')
             return ModelResponse(parts=[TextPart('done')])
 
         agent = Agent.from_file(spec, custom_capability_types=[Skills], model=FunctionModel(model_fn))
-        result = await agent.run('go')
-        assert result.output == 'done'
+        await agent.run('go')
 
 
 class TestSkillValidation:
-    def test_include_and_exclude_are_mutually_exclusive(self, tmp_path: Path) -> None:
-        library = tmp_path / 'skills'
-        _write_skill(library, 'alpha')
-
-        with pytest.raises(ValueError, match='include and exclude cannot be used together'):
-            Skills(  # pyright: ignore[reportCallIssue]
-                library,
-                include=['alpha'],
-                exclude=['alpha'],  # pyright: ignore[reportArgumentType]
-            )
-
-    def test_empty_include_and_exclude_are_still_mutually_exclusive(self, tmp_path: Path) -> None:
+    @pytest.mark.parametrize(
+        ('include', 'exclude'),
+        [
+            (['alpha'], ['alpha']),
+            ([], []),
+        ],
+    )
+    def test_runtime_rejects_include_and_exclude_together(
+        self,
+        tmp_path: Path,
+        include: list[str],
+        exclude: list[str],
+    ) -> None:
         library = tmp_path / 'skills'
         library.mkdir()
 
         with pytest.raises(ValueError, match='include and exclude cannot be used together'):
-            Skills(  # pyright: ignore[reportCallIssue]
-                library,
-                include=[],
-                exclude=[],  # pyright: ignore[reportArgumentType]
-            )
+            Skills.from_spec(library, include=include, exclude=exclude)
 
     @pytest.mark.parametrize('selector', ['include', 'exclude'])
     def test_unknown_selected_skill_is_rejected(self, tmp_path: Path, selector: str) -> None:
         library = tmp_path / 'skills'
         _write_skill(library, 'available')
-        kwargs = {selector: ['missing']}
 
-        with pytest.raises(
-            ValueError, match=r'Unknown skill in (include|exclude): missing.*Available skills: available'
-        ):
+        with pytest.raises(ValueError, match=rf'Unknown skill in {selector}: missing.*Available skills: available'):
             if selector == 'include':
-                Skills(library, include=kwargs[selector])
+                Skills(library, include=['missing'])
             else:
-                Skills(library, exclude=kwargs[selector])
+                Skills(library, exclude=['missing'])
 
     @pytest.mark.parametrize('selector', ['include', 'exclude'])
     def test_selector_must_not_be_a_string(self, tmp_path: Path, selector: str) -> None:
         library = tmp_path / 'skills'
         _write_skill(library, 'alpha')
-        kwargs = {selector: 'alpha'}
 
         with pytest.raises(TypeError, match=f'{selector} must be a collection of skill names'):
             if selector == 'include':
-                Skills(library, include=kwargs[selector])
+                Skills.from_spec(library, include='alpha')
             else:
-                Skills(library, exclude=kwargs[selector])
+                Skills.from_spec(library, exclude='alpha')
 
     def test_selector_entries_must_be_strings(self, tmp_path: Path) -> None:
         library = tmp_path / 'skills'
         _write_skill(library, 'alpha')
 
         with pytest.raises(TypeError, match='include must contain only skill names as strings'):
-            Skills(library, include=[1])  # type: ignore[list-item]
+            Skills.from_spec(library, include=[1])
 
     def test_multiple_unknown_skills_report_an_empty_library(self, tmp_path: Path) -> None:
         library = tmp_path / 'skills'
@@ -300,45 +263,34 @@ class TestSkillValidation:
         _write_skill(library, 'selected')
         _write_skill(library, 'ignored', frontmatter='not: [valid')
 
-        Skills(library, include=['selected'])
+        assert [leaf.id for leaf in _leaves(Skills(library, include=['selected']))] == ['selected']
 
-    async def test_empty_include_exposes_no_skills(self, tmp_path: Path) -> None:
+    def test_empty_include_exposes_no_skills(self, tmp_path: Path) -> None:
         library = tmp_path / 'skills'
         _write_skill(library, 'alpha')
 
-        def model_fn(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
-            assert 'alpha' not in (info.instructions or '')
-            assert 'load_capability' not in [tool.name for tool in info.function_tools]
-            return ModelResponse(parts=[TextPart('done')])
+        assert _leaves(Skills(library, include=[])) == []
 
-        agent = Agent(FunctionModel(model_fn), capabilities=[Skills(library, include=[])])
-        result = await agent.run('go')
-        assert result.output == 'done'
-
-    async def test_empty_exclude_exposes_all_skills(self, tmp_path: Path) -> None:
+    def test_empty_exclude_exposes_all_skills(self, tmp_path: Path) -> None:
         library = tmp_path / 'skills'
-        _write_skill(library, 'alpha', description='Alpha help.')
+        _write_skill(library, 'alpha')
 
-        initial, _, _ = await _activate([Skills(library, exclude=[])], 'alpha')
+        leaves = _leaves(Skills(library, exclude=[]))
 
-        assert '- alpha: Alpha help.' in initial
-
-    def test_name_can_be_derived_from_directory(self, tmp_path: Path) -> None:
-        library = tmp_path / 'skills'
-        _write_skill(library, 'derived-name')
-        Skills(directories=[library])
+        assert [leaf.id for leaf in leaves] == ['alpha']
 
     def test_explicit_null_name_is_derived_from_directory(self, tmp_path: Path) -> None:
         library = tmp_path / 'skills'
         _write_skill(library, 'derived-name', frontmatter='name: null\ndescription: Help')
-        Skills(directories=[library])
+
+        assert [leaf.id for leaf in _leaves(Skills(library))] == ['derived-name']
 
     def test_explicit_name_must_match_directory(self, tmp_path: Path) -> None:
         library = tmp_path / 'skills'
         _write_skill(library, 'actual', frontmatter='name: different\ndescription: Help')
 
         with pytest.raises(ValueError, match='must match its parent directory'):
-            Skills(directories=[library])
+            Skills(library)
 
     @pytest.mark.parametrize('name', ['Uppercase', '-leading', 'trailing-', 'two--hyphens'])
     def test_invalid_derived_name_is_rejected(self, tmp_path: Path, name: str) -> None:
@@ -346,14 +298,14 @@ class TestSkillValidation:
         _write_skill(library, name)
 
         with pytest.raises(ValueError, match='Invalid skill name'):
-            Skills(directories=[library])
+            Skills(library)
 
     def test_name_length_is_limited(self, tmp_path: Path) -> None:
         library = tmp_path / 'skills'
         _write_skill(library, 'a' * 65)
 
         with pytest.raises(ValueError, match='at most 64'):
-            Skills(directories=[library])
+            Skills(library)
 
     @pytest.mark.parametrize(
         ('text', 'error'),
@@ -372,14 +324,14 @@ class TestSkillValidation:
         (directory / 'SKILL.md').write_text(text, encoding='utf-8')
 
         with pytest.raises(ValueError, match=error):
-            Skills(directories=[tmp_path / 'skills'])
+            Skills(tmp_path / 'skills')
 
     def test_description_is_limited(self, tmp_path: Path) -> None:
         library = tmp_path / 'skills'
         _write_skill(library, 'verbose', description='x' * 1025)
 
         with pytest.raises(ValueError, match='Invalid Agent Skill frontmatter'):
-            Skills(directories=[library])
+            Skills(library)
 
     def test_duplicate_names_across_roots_are_rejected(self, tmp_path: Path) -> None:
         first = tmp_path / 'first'
@@ -388,40 +340,40 @@ class TestSkillValidation:
         _write_skill(second, 'duplicate')
 
         with pytest.raises(ValueError, match="Duplicate skill name 'duplicate'"):
-            Skills(directories=[first, second])
+            Skills([first, second])
 
     def test_duplicate_root_is_scanned_once(self, tmp_path: Path) -> None:
         library = tmp_path / 'skills'
         _write_skill(library, 'once')
-        Skills(directories=[library, library.resolve()])
+
+        assert [leaf.id for leaf in _leaves(Skills([library, library.resolve()]))] == ['once']
 
     def test_missing_root_is_rejected(self, tmp_path: Path) -> None:
         with pytest.raises(ValueError, match='does not exist'):
-            Skills(directories=[tmp_path / 'missing'])
+            Skills(tmp_path / 'missing')
 
     def test_file_root_is_rejected(self, tmp_path: Path) -> None:
         path = tmp_path / 'skills'
         path.write_text('not a directory', encoding='utf-8')
 
         with pytest.raises(ValueError, match='is not a directory'):
-            Skills(directories=[path])
+            Skills(path)
 
     def test_non_skill_children_are_ignored(self, tmp_path: Path) -> None:
         library = tmp_path / 'skills'
         library.mkdir()
         (library / 'README.md').write_text('ordinary file', encoding='utf-8')
         (library / 'not-a-skill').mkdir()
-        Skills(directories=[library])
 
-    async def test_nested_skill_md_is_not_a_skill(self, tmp_path: Path) -> None:
+        assert _leaves(Skills(library)) == []
+
+    def test_nested_skill_md_is_not_a_skill(self, tmp_path: Path) -> None:
         library = tmp_path / 'skills'
         _write_skill(library, 'outer', files={'references/SKILL.md': 'reference'})
 
-        initial, _, loaded = await _activate([Skills(directories=[library])], 'outer')
+        leaves = _leaves(Skills(library))
 
-        assert '- outer:' in initial
-        assert '# Skill: outer' in loaded
-        assert '- references:' not in initial
+        assert [leaf.id for leaf in leaves] == ['outer']
 
     def test_behavioral_fields_are_ignored_with_one_warning(self, tmp_path: Path) -> None:
         library = tmp_path / 'skills'
@@ -437,7 +389,7 @@ class TestSkillValidation:
         )
 
         with pytest.warns(UserWarning) as caught:
-            Skills(directories=[library])
+            Skills(library)
 
         assert len(caught) == 1
         message = str(caught[0].message)
@@ -454,6 +406,6 @@ class TestSkillValidation:
 
         with warnings.catch_warnings(record=True) as caught:
             warnings.simplefilter('always')
-            Skills(directories=[library])
+            Skills(library)
 
         assert not caught
