@@ -64,21 +64,6 @@ def test_capability_has_readme(package: Path) -> None:
     )
 
 
-@pytest.mark.parametrize('package', _CAPABILITY_PACKAGES, ids=lambda p: str(p.relative_to(_ROOT)))
-def test_capability_has_unified_doc(package: Path) -> None:
-    module = package.relative_to(_PACKAGE).as_posix()
-    source_link = f'github.com/pydantic/pydantic-ai-harness/tree/main/pydantic_ai_harness/{module}/'
-    matching_pages = [
-        page
-        for page in (_ROOT / 'docs').glob('*.md')
-        if any(source_link in target for target in _markdown_link_targets(page.read_text(encoding='utf-8')))
-    ]
-    assert len(matching_pages) == 1, (
-        f'{package.relative_to(_ROOT)} must have exactly one unified docs page that links its source module; '
-        f'found {[page.relative_to(_ROOT).as_posix() for page in matching_pages]}.'
-    )
-
-
 # --- Unified-docs page checks (docs/*.md) -----------------------------------
 #
 # The flat pages under `docs/` render on the unified site. These mechanical
@@ -140,6 +125,27 @@ _CAPABILITY_PAGE_META = {
 def _markdown_link_targets(text: str) -> list[str]:
     """Every `](target)` destination in the text -- so a bare path mention is not a link."""
     return re.findall(r'\]\(([^)\s]+)\)', text)
+
+
+@pytest.mark.parametrize('package', _CAPABILITY_PACKAGES, ids=lambda p: str(p.relative_to(_ROOT)))
+def test_capability_has_unified_doc(package: Path) -> None:
+    module = package.relative_to(_PACKAGE).as_posix()
+    designated_pages = [name for name, (source_module, _) in _CAPABILITY_PAGE_META.items() if source_module == module]
+    assert len(designated_pages) == 1, (
+        f'{package.relative_to(_ROOT)} must map to exactly one unified docs page in _CAPABILITY_PAGE_META; '
+        f'found {designated_pages}.'
+    )
+
+    page = _DOCS_DIR / designated_pages[0]
+    assert page.exists(), (
+        f'{package.relative_to(_ROOT)} is missing its designated docs page: {page.relative_to(_ROOT)}.'
+    )
+
+    expected = f'{_SOURCE_LINK}{module}/'
+    targets = _markdown_link_targets(page.read_text(encoding='utf-8'))
+    assert any(expected in target for target in targets), (
+        f'{page.relative_to(_ROOT)} must link its own source module (a Markdown link containing `{expected}`).'
+    )
 
 
 def _strip_frontmatter(text: str) -> str:
