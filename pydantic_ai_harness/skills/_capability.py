@@ -16,18 +16,12 @@ from pydantic_ai_harness.skills._loader import SkillDefinition, load_skill_libra
 
 @dataclass(init=False, repr=False)
 class Skills(AbstractCapability[AgentDepsT]):
-    """Load a library of Agent Skill instructions on demand.
+    """Load Agent Skill instructions as deferred capabilities.
 
-    Each selected `SKILL.md` becomes a deferred capability. The model sees its
-    name and description in the initial catalog, then receives its Markdown body
-    after calling Pydantic AI's `load_capability` tool.
-
-    Libraries are scanned once when this class is constructed. Only immediate
-    child directories are discovered. This release reads `SKILL.md` only; it
-    does not load bundled files, resolve resource paths, or run scripts.
-
-    The `Skills` container is not registered as a leaf capability. Each
-    capability generated from a selected skill is always deferred.
+    Libraries are scanned once during construction. Each selected immediate
+    child containing `SKILL.md` becomes a deferred capability using the skill's
+    name, description, and Markdown body. Bundled files are not loaded or
+    executed.
     """
 
     directories: tuple[str | Path, ...]
