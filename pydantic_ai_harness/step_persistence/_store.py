@@ -242,6 +242,20 @@ def _snapshot_state(value: object) -> SnapshotState:
     raise ValueError(f'unknown snapshot state: {value!r}')
 
 
+def _snapshot_fields_ok(data: dict[str, object]) -> bool:
+    """Whether a parsed snapshot file has the fields the loader reads.
+
+    Checks presence of `messages`, `timestamp`, and `step_index` -- the fields
+    `_sync_load_latest_snapshot` needs to rebuild a `ContinuableSnapshot`. A
+    file that is valid JSON but omits them (e.g. `{"state": "complete"}`) is not
+    a snapshot; the prune and the read path skip it so it is never retained
+    over, nor returned instead of, a valid snapshot -- matching how they skip a
+    file that fails to parse. A file that has the fields but with wrong types is
+    a distinct corruption the loader still rejects loudly.
+    """
+    return 'messages' in data and 'timestamp' in data and 'step_index' in data
+
+
 _STR_STR_DICT_ADAPTER: TypeAdapter[dict[str, str]] = TypeAdapter(dict[str, str])
 _OBJECT_DICT_ADAPTER: TypeAdapter[dict[str, object]] = TypeAdapter(dict[str, object])
 
@@ -535,11 +549,12 @@ class FileStepStore:
         dropped `{seq}.json` never triggers a media delete -- orphaned-blob GC
         is a separate concern (see the capability README non-goals).
 
-        A sibling file that fails to parse is skipped, not retained and not
-        deleted: the newly-written snapshot has already landed, so a corrupt
-        older file must not turn every subsequent bounded save into a failure.
-        The non-pruning read path is unchanged -- it only reads the newest
-        parseable file.
+        A sibling file that fails to parse, or that parses but lacks the fields
+        a snapshot needs (`_snapshot_fields_ok`), is skipped: not retained and
+        not deleted. The newly-written snapshot has already landed, so a corrupt
+        or structurally-incomplete older file must neither turn a bounded save
+        into a failure nor be trusted as the newest `complete` snapshot and
+        retained over a valid one. The read path skips the same files.
 
         A concurrent bounded save pruning on another worker thread can unlink a
         non-retained candidate between this enumeration and either the parse or
@@ -563,6 +578,8 @@ class FileStepStore:
             except FileNotFoundError:
                 continue
             except (ValueError, ValidationError):
+                continue
+            if not _snapshot_fields_ok(data):
                 continue
             entries.append((seq, state))
             paths_by_seq[seq] = path
@@ -636,6 +653,10 @@ class FileStepStore:
             try:
                 data = _load_json_object(path.read_text(encoding='utf-8'))
             except FileNotFoundError:
+                continue
+            # Skip a JSON-valid but structurally-incomplete file so it never
+            # masks the newest loadable snapshot below it (see the prune).
+            if not _snapshot_fields_ok(data):
                 continue
             if include_interrupted or _snapshot_state(data.get('state')) == 'complete':
                 return data, data['messages']

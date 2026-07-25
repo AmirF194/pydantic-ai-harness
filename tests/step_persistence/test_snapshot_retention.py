@@ -195,6 +195,32 @@ class TestFileStorePruneEdgeCases:
         assert latest is not None
         assert latest.step_index == 2
 
+    async def test_malformed_sibling_does_not_evict_valid_complete_snapshot(self, tmp_path: Path) -> None:
+        """A JSON-valid but fieldless sibling must not be trusted as the newest complete snapshot.
+
+        `{"state": "complete"}` parses and reads as `complete`, but lacks
+        `messages`/`timestamp`/`step_index`. If the prune trusted it, it would
+        become the retained newest `complete` and evict the real older complete
+        snapshot, after which `latest_snapshot()` would fail on the retained
+        malformed file instead of returning the valid one. Both the prune and
+        the read path must skip it.
+        """
+        root = tmp_path / 'runs'
+        store = FileStepStore(root, media_store=None, max_snapshots_per_run=1)
+        await _save(store, 'r1', 0, state='complete')  # valid complete, seq 0
+        snap_dir = root / 'r1' / 'snapshots'
+        # Higher-seq malformed sibling: valid JSON, `complete`, but no fields.
+        (snap_dir / '1.json').write_text('{"state": "complete"}', encoding='utf-8')
+        # A valid interrupted snapshot (seq 2) becomes the newest overall, so the
+        # malformed file would be the highest-seq `complete` if it were trusted.
+        await _save(store, 'r1', 2, state='interrupted')  # triggers the prune
+
+        assert (snap_dir / '0.json').exists()
+        latest = await store.latest_snapshot(run_id='r1')
+        assert latest is not None
+        assert latest.state == 'complete'
+        assert latest.step_index == 0
+
     async def test_prune_skips_candidate_that_vanishes_during_parse(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -245,10 +271,11 @@ class TestFileStorePruneEdgeCases:
         await _save(store, 'r1', 0)
         # Seed a second non-retained sibling so the next save's prune unlinks two
         # files: the raced victim (0.json) and one survivor of the race (1.json).
-        # The prune only reads `state` during its parse, so a minimal payload is
-        # enough to make 1.json a live candidate.
         snap_dir = root / 'r1' / 'snapshots'
-        (snap_dir / '1.json').write_text('{"state": "complete"}', encoding='utf-8')
+        (snap_dir / '1.json').write_text(
+            '{"state": "complete", "step_index": 1, "timestamp": "2026-01-01T00:00:00+00:00", "messages": []}',
+            encoding='utf-8',
+        )
 
         victim = snap_dir / '0.json'
         original_unlink = Path.unlink
