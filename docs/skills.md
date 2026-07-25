@@ -118,6 +118,12 @@ instructions or frontmatter validation errors to that `Skills` instance.
 These options control catalog exposure. They are not filesystem permissions or
 an access-control boundary.
 
+`Skills` reads configured paths through the process filesystem. Relative paths
+resolve from the process working directory. Directory paths choose where
+discovery starts; they do not create a containment boundary, and normal
+filesystem symlink resolution applies. Run the agent in an appropriately
+restricted environment if filesystem containment is required.
+
 A selected `SKILL.md` body becomes model instructions. Load libraries only from
 sources you trust, and review repository-provided skills before exposing them.
 
