@@ -127,6 +127,14 @@ def _markdown_link_targets(text: str) -> list[str]:
     return re.findall(r'\]\(([^)\s]+)\)', text)
 
 
+def _assert_page_links_source(page: Path, module: str) -> None:
+    expected = f'{_SOURCE_LINK}{module}/'
+    targets = _markdown_link_targets(page.read_text(encoding='utf-8'))
+    assert any(expected in target for target in targets), (
+        f'{page.relative_to(_ROOT)} must link its own source module (a Markdown link containing `{expected}`).'
+    )
+
+
 @pytest.mark.parametrize('package', _CAPABILITY_PACKAGES, ids=lambda p: str(p.relative_to(_ROOT)))
 def test_capability_has_unified_doc(package: Path) -> None:
     module = package.relative_to(_PACKAGE).as_posix()
@@ -140,12 +148,7 @@ def test_capability_has_unified_doc(package: Path) -> None:
     assert page.exists(), (
         f'{package.relative_to(_ROOT)} is missing its designated docs page: {page.relative_to(_ROOT)}.'
     )
-
-    expected = f'{_SOURCE_LINK}{module}/'
-    targets = _markdown_link_targets(page.read_text(encoding='utf-8'))
-    assert any(expected in target for target in targets), (
-        f'{page.relative_to(_ROOT)} must link its own source module (a Markdown link containing `{expected}`).'
-    )
+    _assert_page_links_source(page, module)
 
 
 def _strip_frontmatter(text: str) -> str:
@@ -258,12 +261,7 @@ def test_capability_doc_pages_discovered() -> None:
 @pytest.mark.parametrize('page', _CAPABILITY_DOC_PAGES, ids=lambda p: p.name)
 def test_doc_page_links_its_source(page: Path) -> None:
     module, _ = _CAPABILITY_PAGE_META[page.name]
-    expected = f'{_SOURCE_LINK}{module}/'
-    targets = _markdown_link_targets(page.read_text(encoding='utf-8'))
-    assert any(expected in t for t in targets), (
-        f'{page.relative_to(_ROOT)} must link its own source module as a Markdown link '
-        f'(target containing `{expected}`), not just mention the prefix or link a different module.'
-    )
+    _assert_page_links_source(page, module)
 
 
 @pytest.mark.parametrize('page', _CAPABILITY_DOC_PAGES, ids=lambda p: p.name)
