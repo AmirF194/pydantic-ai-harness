@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import re
-from collections.abc import Collection, Sequence
+from collections.abc import Collection, Hashable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -66,10 +66,10 @@ class SkillDefinition:
 
 def _extract_frontmatter(text: str, source: Path) -> tuple[str, str]:
     lines = text.splitlines()
-    if not lines or lines[0].strip() != '---':
+    if not lines or lines[0] != '---':
         raise ValueError(f'{source} must start with YAML frontmatter delimited by `---`.')
 
-    closing = next((index for index, line in enumerate(lines[1:], start=1) if line.strip() == '---'), None)
+    closing = next((index for index, line in enumerate(lines[1:], start=1) if line == '---'), None)
     if closing is None:
         raise ValueError(f'{source} has unclosed YAML frontmatter.')
 
@@ -86,8 +86,30 @@ def _parse_yaml(frontmatter: str, source: Path) -> dict[str, object]:
             'PyYAML is required to load Agent Skills. Install it with: pip install "pydantic-ai-harness[skills]"'
         ) from None
 
+    class UniqueKeyLoader(yaml.SafeLoader):
+        def construct_mapping(self, node: yaml.MappingNode, deep: bool = False) -> dict[Hashable, object]:
+            keys: set[str] = set()
+            for key_node, _ in node.value:
+                if not isinstance(key_node, yaml.ScalarNode):
+                    raise yaml.constructor.ConstructorError(
+                        'while constructing a mapping',
+                        node.start_mark,
+                        'found a non-scalar key',
+                        key_node.start_mark,
+                    )
+                key: str = key_node.value
+                if key in keys:
+                    raise yaml.constructor.ConstructorError(
+                        'while constructing a mapping',
+                        node.start_mark,
+                        f'found duplicate key {key!r}',
+                        key_node.start_mark,
+                    )
+                keys.add(key)
+            return super().construct_mapping(node, deep=deep)
+
     try:
-        parsed = yaml.safe_load(frontmatter)
+        parsed = yaml.load(frontmatter, Loader=UniqueKeyLoader)
     except yaml.YAMLError as exc:
         raise ValueError(f'Invalid YAML frontmatter in {source}: {exc}') from exc
 

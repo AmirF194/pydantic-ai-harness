@@ -311,8 +311,10 @@ class TestSkillValidation:
         ('text', 'error'),
         [
             ('description: no delimiters', 'must start with YAML frontmatter'),
+            ('  ---\ndescription: indented opening\n---', 'must start with YAML frontmatter'),
             ('---\ndescription: unclosed', 'unclosed YAML frontmatter'),
             ('---\ndescription: [invalid\n---', 'Invalid YAML frontmatter'),
+            ('---\n? [complex, key]\n: value\n---', 'Invalid YAML frontmatter'),
             ('---\n- description\n---', 'must be a mapping'),
             ('---\nname: okay\n---', 'Invalid Agent Skill frontmatter'),
             ('---\ndescription: "   "\n---', 'must not be empty'),
@@ -325,6 +327,29 @@ class TestSkillValidation:
 
         with pytest.raises(ValueError, match=error):
             Skills(tmp_path / 'skills')
+
+    def test_indented_separator_is_not_a_frontmatter_delimiter(self, tmp_path: Path) -> None:
+        library = tmp_path / 'skills'
+        _write_skill(
+            library,
+            'multiline',
+            frontmatter='description: |\n  First line.\n  ---\n  Last line.',
+        )
+
+        leaves = _leaves(Skills(library))
+
+        assert [leaf.description for leaf in leaves] == ['First line.\n---\nLast line.']
+
+    def test_duplicate_frontmatter_keys_are_rejected(self, tmp_path: Path) -> None:
+        library = tmp_path / 'skills'
+        _write_skill(
+            library,
+            'duplicate',
+            frontmatter='description: First\ndescription: Second',
+        )
+
+        with pytest.raises(ValueError, match="found duplicate key 'description'"):
+            Skills(library)
 
     def test_description_is_limited(self, tmp_path: Path) -> None:
         library = tmp_path / 'skills'

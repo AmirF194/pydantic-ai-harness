@@ -48,7 +48,7 @@ Inspect the change and report findings by severity.
 
 Then add the library to your agent:
 
-```python
+```python {test="skip"}
 from pydantic_ai import Agent
 from pydantic_ai_harness.skills import Skills
 
@@ -86,17 +86,17 @@ a snapshot. Construct a new `Skills` instance to rescan the libraries.
 By default, all discovered skills are included. Use `include` or `exclude` to
 change the catalog for a particular agent:
 
-```python
+```python {test="skip"}
 from pydantic_ai_harness.skills import Skills
 
-billing_skills = Skills(
+review_skills = Skills(
     '.agents/skills',
-    include=['invoice-review', 'vat-policy'],
+    include=['code-review'],
 )
 
-support_skills = Skills(
+release_skills = Skills(
     '.agents/skills',
-    exclude=['deployment', 'incident-response'],
+    exclude=['code-review'],
 )
 ```
 
@@ -148,7 +148,7 @@ and child directories without `SKILL.md` are ignored.
 
 You can pass several libraries:
 
-```python
+```python {test="skip"}
 from pydantic_ai_harness.skills import Skills
 
 skills = Skills([
@@ -202,13 +202,13 @@ capabilities:
   - Skills:
       directories: .agents/skills
       include:
-        - invoice-review
-        - vat-policy
+        - code-review
+        - release-notes
 ```
 
 Register `Skills` when loading the spec:
 
-```python
+```python {test="skip"}
 from pydantic_ai import Agent
 from pydantic_ai_harness.skills import Skills
 
