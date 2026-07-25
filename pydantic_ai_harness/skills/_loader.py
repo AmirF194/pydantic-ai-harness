@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import unicodedata
 from collections.abc import Collection, Hashable, Sequence
 from dataclasses import dataclass
@@ -128,6 +129,19 @@ def _normalize_name(name: str) -> str:
     return unicodedata.normalize('NFKC', name)
 
 
+def _discover_skills(libraries: Sequence[Path]) -> list[tuple[str, Path]]:
+    discovered: list[tuple[str, Path]] = []
+    for library in libraries:
+        with os.scandir(library) as children:
+            for child in sorted(children, key=lambda entry: entry.name):
+                if not child.is_dir():
+                    continue
+                skill_file = Path(child.path) / 'SKILL.md'
+                if skill_file.is_file():
+                    discovered.append((_normalize_name(child.name), skill_file))
+    return discovered
+
+
 def _validate_name(name: str, source: Path) -> str:
     normalized = _normalize_name(name)
     if (
@@ -191,14 +205,8 @@ def load_skill_libraries(
         seen_libraries.add(resolved)
         libraries.append(library)
 
-    skill_files: list[Path] = []
-    for library in libraries:
-        for child in sorted(library.iterdir(), key=lambda path: path.name):
-            skill_file = child / 'SKILL.md'
-            if child.is_dir() and skill_file.is_file():
-                skill_files.append(skill_file)
-
-    available_names = frozenset(_normalize_name(skill_file.parent.name) for skill_file in skill_files)
+    discovered = _discover_skills(libraries)
+    available_names = frozenset(name for name, _ in discovered)
     normalized_include = None if include is None else frozenset(_normalize_name(name) for name in include)
     normalized_exclude = frozenset(_normalize_name(name) for name in exclude)
     _validate_selection('include', normalized_include, available_names)
@@ -209,14 +217,12 @@ def load_skill_libraries(
 
     selected_files: list[Path] = []
     paths_by_name: dict[str, Path] = {}
-    for skill_file in skill_files:
-        name = _normalize_name(skill_file.parent.name)
+    for name, skill_file in discovered:
         if name not in selected_names:
             continue
-        resolved = skill_file.resolve()
         if previous := paths_by_name.get(name):
-            raise ValueError(f'Duplicate skill name {name!r}: {previous} and {resolved}.')
-        paths_by_name[name] = resolved
+            raise ValueError(f'Duplicate skill name {name!r}: {previous} and {skill_file}.')
+        paths_by_name[name] = skill_file
         selected_files.append(skill_file)
 
     return tuple(load_skill(skill_file) for skill_file in selected_files)
