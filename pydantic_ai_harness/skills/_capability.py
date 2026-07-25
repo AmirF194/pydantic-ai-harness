@@ -14,7 +14,7 @@ from pydantic_ai.tools import AgentDepsT
 from pydantic_ai_harness.skills._loader import SkillDefinition, load_skill_libraries
 
 
-@dataclass(init=False)
+@dataclass(init=False, repr=False)
 class Skills(AbstractCapability[AgentDepsT]):
     """Load a library of Agent Skill instructions on demand.
 
@@ -25,11 +25,10 @@ class Skills(AbstractCapability[AgentDepsT]):
     Libraries are scanned once when this class is constructed. Only immediate
     child directories are discovered. This release reads `SKILL.md` only; it
     does not load bundled files, resolve resource paths, or run scripts.
-    """
 
-    id: str | None = field(init=False, default=None, repr=False, compare=False)
-    description: str | None = field(init=False, default=None, repr=False, compare=False)
-    defer_loading: bool = field(init=False, default=False, repr=False, compare=False)
+    The `Skills` container is not registered as a leaf capability. Each
+    capability generated from a selected skill is always deferred.
+    """
 
     directories: tuple[str | Path, ...]
     """Skill-library paths scanned during construction."""
@@ -40,7 +39,8 @@ class Skills(AbstractCapability[AgentDepsT]):
     exclude: frozenset[str]
     """Exact skill names to omit from the deferred capability catalog."""
 
-    _skill_capabilities: tuple[Capability[AgentDepsT], ...] = field(init=False, repr=False, compare=False)
+    _deferred_capabilities: tuple[Capability[AgentDepsT], ...] = field(init=False, repr=False, compare=False)
+    """Deferred leaf capabilities generated from the selected skills."""
 
     @overload
     def __init__(  # pragma: no cover - overload is enforced by static type checking
@@ -77,9 +77,6 @@ class Skills(AbstractCapability[AgentDepsT]):
         if include is not None and exclude is not None:
             raise ValueError('include and exclude cannot be used together.')
 
-        self.id = None
-        self.description = None
-        self.defer_loading = False
         self.directories = self._normalize_directories(directories)
         self.include = self._normalize_selection('include', include) if include is not None else None
         self.exclude = self._normalize_selection('exclude', exclude) if exclude is not None else frozenset()
@@ -96,7 +93,14 @@ class Skills(AbstractCapability[AgentDepsT]):
                 UserWarning,
                 stacklevel=2,
             )
-        self._skill_capabilities = tuple(self._to_capability(skill) for skill in definitions)
+        self._deferred_capabilities = tuple(self._to_capability(skill) for skill in definitions)
+
+    def __repr__(self) -> str:
+        """Show only the `Skills` configuration that callers control."""
+        return (
+            f'{type(self).__name__}('
+            f'directories={self.directories!r}, include={self.include!r}, exclude={self.exclude!r})'
+        )
 
     @staticmethod
     def _normalize_directories(
@@ -118,8 +122,8 @@ class Skills(AbstractCapability[AgentDepsT]):
         return frozenset(normalized)
 
     def apply(self, visitor: Callable[[AbstractCapability[AgentDepsT]], None]) -> None:
-        """Expose each loaded skill as a leaf capability to Pydantic AI."""
-        for capability in self._skill_capabilities:
+        """Expose each selected skill as a deferred leaf capability."""
+        for capability in self._deferred_capabilities:
             capability.apply(visitor)
 
     def _to_capability(self, skill: SkillDefinition) -> Capability[AgentDepsT]:

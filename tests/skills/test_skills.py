@@ -76,6 +76,19 @@ class TestSkills:
     def test_public_constructor_only_exposes_skill_library_configuration(self) -> None:
         assert tuple(inspect.signature(Skills).parameters) == ('directories', 'include', 'exclude')
 
+    def test_repr_only_exposes_skill_library_configuration(self, tmp_path: Path) -> None:
+        library = tmp_path / 'skills'
+        _write_skill(library, 'alpha')
+
+        representation = repr(Skills(library))
+
+        assert 'directories=' in representation
+        assert 'include=None' in representation
+        assert 'exclude=frozenset()' in representation
+        assert 'id=' not in representation
+        assert 'description=' not in representation
+        assert 'defer_loading=' not in representation
+
     async def test_single_library_path_is_accepted(self, tmp_path: Path) -> None:
         library = tmp_path / 'skills'
         _write_skill(library, 'alpha', description='Alpha help.')
@@ -97,6 +110,19 @@ class TestSkills:
         assert '# Skill: beta' in loaded
         assert 'Follow these directions.' in loaded
         assert 'description: Beta help.' not in loaded
+
+    def test_apply_exposes_only_deferred_skill_leaves(self, tmp_path: Path) -> None:
+        library = tmp_path / 'skills'
+        _write_skill(library, 'alpha')
+        _write_skill(library, 'beta')
+        skills = Skills(library)
+        leaves: list[AbstractCapability[object]] = []
+
+        skills.apply(leaves.append)
+
+        assert skills not in leaves
+        assert [leaf.id for leaf in leaves] == ['alpha', 'beta']
+        assert all(leaf.defer_loading is True for leaf in leaves)
 
     async def test_include_exposes_only_selected_skills(self, tmp_path: Path) -> None:
         library = tmp_path / 'skills'
