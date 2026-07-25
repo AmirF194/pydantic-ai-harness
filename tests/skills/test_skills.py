@@ -8,14 +8,9 @@ from pathlib import Path
 import pytest
 from pydantic_ai import Agent
 from pydantic_ai.capabilities import AbstractCapability
-from pydantic_ai.messages import (
-    LoadCapabilityReturnPart,
-    ModelMessage,
-    ModelResponse,
-    TextPart,
-    ToolCallPart,
-)
-from pydantic_ai.models.function import AgentInfo, FunctionModel
+from pydantic_ai.messages import InstructionPart, LoadCapabilityReturnPart
+from pydantic_ai.models.test import TestModel
+from pydantic_ai.tools import ToolDefinition
 
 from pydantic_ai_harness.skills import Skills
 
@@ -53,21 +48,19 @@ def _leaves(skills: Skills[object]) -> list[AbstractCapability[object]]:
 
 
 async def _load_skill(skills: Skills[object], skill_name: str) -> str:
-    loaded_instructions = ''
+    class LoadSkillModel(TestModel):
+        def gen_tool_args(self, tool_def: ToolDefinition) -> dict[str, str]:
+            return {'id': skill_name}
 
-    def model_fn(messages: list[ModelMessage], _info: AgentInfo) -> ModelResponse:
-        nonlocal loaded_instructions
-        returns = [part for message in messages for part in message.parts if isinstance(part, LoadCapabilityReturnPart)]
-        if not returns:
-            return ModelResponse(parts=[ToolCallPart(tool_name='load_capability', args={'id': skill_name})])
-        content = returns[-1].content
-        assert 'instructions' in content
-        loaded_instructions = content['instructions']
-        return ModelResponse(parts=[TextPart('done')])
-
-    agent: Agent[object, str] = Agent(FunctionModel(model_fn), capabilities=[skills])
-    await agent.run('use the skill')
-    return loaded_instructions
+    agent: Agent[object, str] = Agent(LoadSkillModel(call_tools=['load_capability']), capabilities=[skills])
+    result = await agent.run(f'use the {skill_name} skill')
+    returns = [
+        part
+        for message in result.all_messages()
+        for part in message.parts
+        if isinstance(part, LoadCapabilityReturnPart)
+    ]
+    return returns[-1].content.get('instructions', '')
 
 
 class TestSkills:
@@ -99,11 +92,10 @@ class TestSkills:
     def test_selected_skills_are_deferred_capability_leaves(self, tmp_path: Path) -> None:
         library = tmp_path / 'skills'
         _write_skill(library, 'alpha')
-        _write_skill(library, 'beta')
 
         leaves = _leaves(Skills(library))
 
-        assert [leaf.defer_loading for leaf in leaves] == [True, True]
+        assert [leaf.defer_loading for leaf in leaves] == [True]
 
     def test_include_exposes_only_selected_skills(self, tmp_path: Path) -> None:
         library = tmp_path / 'skills'
@@ -138,6 +130,22 @@ class TestSkills:
         loaded = await _load_skill(Skills(library), 'empty')
 
         assert loaded == '# Skill: empty'
+
+    async def test_skill_body_preserves_markdown_indentation(self, tmp_path: Path) -> None:
+        library = tmp_path / 'skills'
+        _write_skill(library, 'code-example', body='    print("hello")')
+
+        loaded = await _load_skill(Skills(library), 'code-example')
+
+        assert loaded == '# Skill: code-example\n\n    print("hello")'
+
+    async def test_skill_body_omits_trailing_blank_lines(self, tmp_path: Path) -> None:
+        library = tmp_path / 'skills'
+        _write_skill(library, 'concise', body='Do the task.\n\n')
+
+        loaded = await _load_skill(Skills(library), 'concise')
+
+        assert loaded == '# Skill: concise\n\nDo the task.'
 
     async def test_skill_directory_placeholder_is_not_resolved_to_a_host_path(self, tmp_path: Path) -> None:
         library = tmp_path / 'skills'
@@ -190,13 +198,13 @@ class TestSkills:
         spec = tmp_path / f'agent{suffix}'
         spec.write_text(spec_text.format(library=library), encoding='utf-8')
 
-        def model_fn(_messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
-            assert 'from-spec' in (info.instructions or '')
-            assert 'not-selected' not in (info.instructions or '')
-            return ModelResponse(parts=[TextPart('done')])
-
-        agent = Agent.from_file(spec, custom_capability_types=[Skills], model=FunctionModel(model_fn))
+        model = TestModel(call_tools=[])
+        agent = Agent.from_file(spec, custom_capability_types=[Skills], model=model)
         await agent.run('go')
+        assert model.last_model_request_parameters is not None
+        instructions = InstructionPart.join(model.last_model_request_parameters.instruction_parts or [])
+        assert 'from-spec' in (instructions or '')
+        assert 'not-selected' not in (instructions or '')
 
 
 class TestSkillValidation:
@@ -279,11 +287,40 @@ class TestSkillValidation:
 
         assert [leaf.id for leaf in leaves] == ['alpha']
 
-    def test_explicit_null_name_is_derived_from_directory(self, tmp_path: Path) -> None:
+    @pytest.mark.parametrize('name', ['123', 'on', 'true', 'null'])
+    def test_yaml_like_skill_name_is_preserved_as_text(self, tmp_path: Path, name: str) -> None:
         library = tmp_path / 'skills'
-        _write_skill(library, 'derived-name', frontmatter='name: null\ndescription: Help')
+        _write_skill(library, name, frontmatter=f'name: {name}\ndescription: Help')
 
-        assert [leaf.id for leaf in _leaves(Skills(library))] == ['derived-name']
+        assert [leaf.id for leaf in _leaves(Skills(library))] == [name]
+
+    @pytest.mark.parametrize('name', ['技能', 'мой-навык'])
+    def test_unicode_skill_name_is_supported(self, tmp_path: Path, name: str) -> None:
+        library = tmp_path / 'skills'
+        _write_skill(library, name, frontmatter=f'name: {name}\ndescription: Help')
+
+        assert [leaf.id for leaf in _leaves(Skills(library))] == [name]
+
+    def test_skill_name_uses_nfkc_normalization(self, tmp_path: Path) -> None:
+        library = tmp_path / 'skills'
+        composed_name = 'café'
+        decomposed_name = 'cafe\u0301'
+        _write_skill(
+            library,
+            composed_name,
+            frontmatter=f'name: {decomposed_name}\ndescription: Help',
+        )
+
+        leaves = _leaves(Skills(library, include=[decomposed_name]))
+
+        assert [leaf.id for leaf in leaves] == [composed_name]
+
+    @pytest.mark.parametrize('description', ['123', 'yes', 'null'])
+    def test_yaml_like_description_is_preserved_as_text(self, tmp_path: Path, description: str) -> None:
+        library = tmp_path / 'skills'
+        _write_skill(library, 'alpha', frontmatter=f'name: alpha\ndescription: {description}')
+
+        assert [leaf.description for leaf in _leaves(Skills(library))] == [description]
 
     def test_explicit_name_must_match_directory(self, tmp_path: Path) -> None:
         library = tmp_path / 'skills'
@@ -292,7 +329,15 @@ class TestSkillValidation:
         with pytest.raises(ValueError, match='must match its parent directory'):
             Skills(library)
 
-    @pytest.mark.parametrize('name', ['Uppercase', '-leading', 'trailing-', 'two--hyphens'])
+    @pytest.mark.parametrize('name', ['', ' alpha '])
+    def test_invalid_explicit_name_is_not_normalized(self, tmp_path: Path, name: str) -> None:
+        library = tmp_path / 'skills'
+        _write_skill(library, 'alpha', frontmatter=f'name: "{name}"\ndescription: Help')
+
+        with pytest.raises(ValueError, match='Invalid skill name'):
+            Skills(library)
+
+    @pytest.mark.parametrize('name', ['Uppercase', '-leading', 'trailing-', 'two--hyphens', 'under_score'])
     def test_invalid_derived_name_is_rejected(self, tmp_path: Path, name: str) -> None:
         library = tmp_path / 'skills'
         _write_skill(library, name)
@@ -373,6 +418,13 @@ class TestSkillValidation:
 
         assert [leaf.id for leaf in _leaves(Skills([library, library.resolve()]))] == ['once']
 
+    def test_missing_duplicate_root_is_rejected(self, tmp_path: Path) -> None:
+        library = tmp_path / 'skills'
+        _write_skill(library, 'once')
+
+        with pytest.raises(ValueError, match='does not exist'):
+            Skills([library, library / 'missing' / '..'])
+
     def test_at_least_one_library_is_required(self) -> None:
         with pytest.raises(ValueError, match='requires at least one skill-library directory'):
             Skills([])
@@ -427,10 +479,10 @@ class TestSkillValidation:
         with pytest.warns(UserWarning) as caught:
             Skills(library)
 
-        assert len(caught) == 1
-        message = str(caught[0].message)
-        assert 'first: allowed-tools, model' in message
-        assert 'second: disable-model-invocation' in message
+        assert [str(warning.message) for warning in caught] == [
+            'Ignoring unsupported Agent Skill behavioral frontmatter fields: '
+            'first: allowed-tools, model; second: disable-model-invocation'
+        ]
 
     def test_standard_non_behavioral_fields_are_accepted(self, tmp_path: Path) -> None:
         library = tmp_path / 'skills'
@@ -440,8 +492,6 @@ class TestSkillValidation:
             frontmatter='description: Standard\nlicense: Apache-2.0\ncompatibility: Python\nmetadata:\n  owner: pydantic',
         )
 
-        with warnings.catch_warnings(record=True) as caught:
-            warnings.simplefilter('always')
+        with warnings.catch_warnings():
+            warnings.simplefilter('error')
             Skills(library)
-
-        assert not caught

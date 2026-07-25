@@ -31,6 +31,7 @@ uv add "pydantic-ai-harness[dynamic-workflow]"  # DynamicWorkflow (adds the Mont
 uv add "pydantic-ai-harness[modal]"             # ModalSandbox (adds the Modal SDK)
 uv add "pydantic-ai-harness[logfire]"           # ManagedPrompt (Logfire-managed prompts)
 uv add "pydantic-ai-harness[exa]"               # ExaSearch + ExaAgent (web research via the Exa API)
+uv add "pydantic-ai-harness[skills]"            # Skills (loads SKILL.md frontmatter)
 uv add "pydantic-ai-harness[acp]"               # ACP (serve an agent to editors over the Agent Client Protocol)
 ```
 

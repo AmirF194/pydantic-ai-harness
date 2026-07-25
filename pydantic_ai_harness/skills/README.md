@@ -56,7 +56,7 @@ agent = Agent(
 `Skills` does not search `.agents`, `.claude`, or your home directory
 automatically. Pass each library you want it to load.
 
-> **Note:** This release loads instructions from `SKILL.md`. It does not load
+> **Note:** `Skills` loads instructions from `SKILL.md`. It does not load
 > bundled resources or run scripts.
 
 ## How it works
@@ -112,6 +112,9 @@ instructions or frontmatter validation errors to that `Skills` instance.
 These options control catalog exposure. They are not filesystem permissions or
 an access-control boundary.
 
+A selected `SKILL.md` body becomes model instructions. Load libraries only from
+sources you trust, and review repository-provided skills before exposing them.
+
 ## Skill format
 
 Each immediate child directory containing `SKILL.md` is a skill:
@@ -128,13 +131,14 @@ The loader uses these parts of `SKILL.md`:
 
 | Part | Requirement |
 |---|---|
-| `name` | Optional. Defaults to the parent directory name. If provided, it must match the directory. |
+| `name` | Optional. Defaults to the parent directory name. If provided, it must match the directory after Unicode normalization. |
 | `description` | Required, non-blank, and at most 1,024 characters. This appears in the initial catalog. |
 | Markdown body | Optional. This is loaded under a generated `# Skill: <name>` heading. |
 
-Skill names can contain at most 64 characters. Use lowercase letters, numbers,
-and single hyphens. A name cannot start or end with a hyphen or contain
-consecutive hyphens.
+Skill names and `include` or `exclude` values are normalized with Unicode NFKC
+before matching. A normalized name can contain at most 64 lowercase Unicode
+letters or numbers, separated by single hyphens. It cannot start or end with a
+hyphen.
 
 Only immediate children are discovered. For example,
 `code-review/references/SKILL.md` does not create another skill. Ordinary files
@@ -157,7 +161,7 @@ to the same resolved library are scanned once.
 ## Bundled files are not loaded
 
 Agent Skill packages can contain directories such as `references/`, `assets/`,
-and `scripts/`. This release does not enumerate, read, or execute those files.
+and `scripts/`. `Skills` does not enumerate, read, or execute those files.
 
 Relative paths and placeholders such as `${CLAUDE_SKILL_DIR}` remain unchanged
 in the loaded instructions. `Skills` does not provide a model-visible path that
@@ -188,7 +192,8 @@ are also accepted.
 
 ## Use an agent spec
 
-`Skills` works with Pydantic AI's YAML and JSON agent specs:
+`Skills` works with Pydantic AI's
+[YAML and JSON agent specs](https://pydantic.dev/docs/ai/core-concepts/agent-spec/):
 
 ```yaml
 model: anthropic:claude-sonnet-4-6
@@ -231,7 +236,7 @@ refunds = Capability(
 `Skills` loads portable Agent Skill packages. It does not replace the core API
 for code-defined capabilities.
 
-## API
+## Configuration
 
 ```python {test="skip"}
 Skills(
@@ -259,3 +264,4 @@ not configurable.
 - [Agent Skills specification](https://agentskills.io/specification)
 - [Adding skills support to an agent](https://agentskills.io/client-implementation/adding-skills-support)
 - [Pydantic AI on-demand capabilities](https://pydantic.dev/docs/ai/capabilities/on-demand/)
+- [Pydantic AI capabilities overview](https://pydantic.dev/docs/ai/capabilities/overview/)

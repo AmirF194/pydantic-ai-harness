@@ -2,20 +2,17 @@
 
 from __future__ import annotations
 
-import re
+import unicodedata
 from collections.abc import Collection, Hashable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
-from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, ValidationError, field_validator
-
-_SKILL_NAME_PATTERN = re.compile(r'[a-z0-9]+(?:-[a-z0-9]+)*')
-_FRONTMATTER_TA = TypeAdapter(dict[str, object])
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
 # These fields affect invocation, permissions, model selection, execution, or
 # prompt rendering in clients that implement them. Skills accepts their files
 # for compatibility but reports that the behavior is not active.
-BEHAVIORAL_FRONTMATTER_FIELDS = frozenset(
+_BEHAVIORAL_FRONTMATTER_FIELDS = frozenset(
     {
         'agent',
         'allowed-tools',
@@ -43,11 +40,9 @@ class _SkillFrontmatter(BaseModel):
     name: str | None = None
     description: str = Field(min_length=1, max_length=1024)
 
-    @field_validator('name', 'description', mode='after')
+    @field_validator('description', mode='after')
     @classmethod
-    def _strip_scalar(cls, value: str | None) -> str | None:
-        if value is None:
-            return None
+    def _strip_description(cls, value: str) -> str:
         stripped = value.strip()
         if not stripped:
             raise ValueError('must not be empty')
@@ -74,11 +69,16 @@ def _extract_frontmatter(text: str, source: Path) -> tuple[str, str]:
         raise ValueError(f'{source} has unclosed YAML frontmatter.')
 
     frontmatter = '\n'.join(lines[1:closing])
-    body = '\n'.join(lines[closing + 1 :]).strip()
+    body_lines = lines[closing + 1 :]
+    while body_lines and not body_lines[0].strip():
+        body_lines.pop(0)
+    while body_lines and not body_lines[-1].strip():
+        body_lines.pop()
+    body = '\n'.join(body_lines)
     return frontmatter, body
 
 
-def _parse_yaml(frontmatter: str, source: Path) -> dict[str, object]:
+def _parse_frontmatter(frontmatter: str, source: Path) -> _SkillFrontmatter:
     try:
         import yaml
     except ImportError:  # pragma: no cover - exercised in an environment without the skills extra
@@ -86,7 +86,10 @@ def _parse_yaml(frontmatter: str, source: Path) -> dict[str, object]:
             'PyYAML is required to load Agent Skills. Install it with: pip install "pydantic-ai-harness[skills]"'
         ) from None
 
-    class UniqueKeyLoader(yaml.SafeLoader):
+    # Agent Skills frontmatter fields are strings. BaseLoader preserves valid
+    # scalar names such as `123` and `on` instead of applying YAML implicit types.
+    # PyYAML otherwise also accepts duplicate mapping keys and keeps the last value.
+    class UniqueKeyLoader(yaml.BaseLoader):
         def construct_mapping(self, node: yaml.MappingNode, deep: bool = False) -> dict[Hashable, object]:
             keys: set[str] = set()
             for key_node, _ in node.value:
@@ -109,42 +112,54 @@ def _parse_yaml(frontmatter: str, source: Path) -> dict[str, object]:
             return super().construct_mapping(node, deep=deep)
 
     try:
-        parsed = yaml.load(frontmatter, Loader=UniqueKeyLoader)
+        parsed: object = yaml.load(frontmatter, Loader=UniqueKeyLoader)
     except yaml.YAMLError as exc:
         raise ValueError(f'Invalid YAML frontmatter in {source}: {exc}') from exc
 
+    if not isinstance(parsed, dict):
+        raise ValueError(f'YAML frontmatter in {source} must be a mapping.')
     try:
-        return _FRONTMATTER_TA.validate_python(parsed)
+        return _SkillFrontmatter.model_validate(parsed)
     except ValidationError as exc:
-        raise ValueError(f'YAML frontmatter in {source} must be a mapping.') from exc
+        raise ValueError(f'Invalid Agent Skill frontmatter in {source}: {exc}') from exc
 
 
-def _validate_name(name: str, source: Path) -> None:
-    if len(name) > 64 or _SKILL_NAME_PATTERN.fullmatch(name) is None:
+def _normalize_name(name: str) -> str:
+    return unicodedata.normalize('NFKC', name)
+
+
+def _validate_name(name: str, source: Path) -> str:
+    normalized = _normalize_name(name)
+    if (
+        not normalized
+        or len(normalized) > 64
+        or normalized != normalized.lower()
+        or normalized.startswith('-')
+        or normalized.endswith('-')
+        or '--' in normalized
+        or not all(character.isalnum() or character == '-' for character in normalized)
+    ):
         raise ValueError(
-            f'Invalid skill name {name!r} in {source}; expected at most 64 lowercase letters, numbers, and '
-            'single hyphens, without a leading or trailing hyphen.'
+            f'Invalid skill name {name!r} in {source}; expected at most 64 lowercase Unicode letters or numbers '
+            'and single hyphens, without a leading or trailing hyphen.'
         )
+    return normalized
 
 
 def load_skill(skill_file: Path) -> SkillDefinition:
     """Load one `SKILL.md` into a validated construction-time definition."""
     frontmatter_text, body = _extract_frontmatter(skill_file.read_text(encoding='utf-8'), skill_file)
-    raw_frontmatter = _parse_yaml(frontmatter_text, skill_file)
-    try:
-        frontmatter = _SkillFrontmatter.model_validate(raw_frontmatter)
-    except ValidationError as exc:
-        raise ValueError(f'Invalid Agent Skill frontmatter in {skill_file}: {exc}') from exc
+    frontmatter = _parse_frontmatter(frontmatter_text, skill_file)
 
     directory_name = skill_file.parent.name
-    name = frontmatter.name or directory_name
-    _validate_name(name, skill_file)
-    if frontmatter.name is not None and name != directory_name:
+    name = frontmatter.name if frontmatter.name is not None else directory_name
+    normalized_name = _validate_name(name, skill_file)
+    if frontmatter.name is not None and normalized_name != _normalize_name(directory_name):
         raise ValueError(f'Skill name {name!r} in {skill_file} must match its parent directory {directory_name!r}.')
 
-    ignored_fields = tuple(sorted(BEHAVIORAL_FRONTMATTER_FIELDS.intersection(raw_frontmatter)))
+    ignored_fields = tuple(sorted(_BEHAVIORAL_FRONTMATTER_FIELDS.intersection(frontmatter.model_extra or {})))
     return SkillDefinition(
-        name=name,
+        name=normalized_name,
         description=frontmatter.description,
         body=body,
         ignored_behavioral_fields=ignored_fields,
@@ -157,49 +172,51 @@ def load_skill_libraries(
     include: Collection[str] | None,
     exclude: Collection[str],
 ) -> tuple[SkillDefinition, ...]:
-    """Discover immediate child skill packages under explicit library roots."""
-    roots: list[Path] = []
-    seen_roots: set[Path] = set()
+    """Discover immediate child skill packages under configured directories."""
+    libraries: list[Path] = []
+    seen_libraries: set[Path] = set()
     for configured in directories:
-        root = Path(configured)
-        resolved = root.resolve()
-        if resolved in seen_roots:
-            continue
-        if not root.exists():
-            raise ValueError(f'Skill library directory does not exist: {root}')
-        if not root.is_dir():
-            raise ValueError(f'Skill library path is not a directory: {root}')
-        if (root / 'SKILL.md').is_file():
+        library = Path(configured)
+        if not library.exists():
+            raise ValueError(f'Skill library directory does not exist: {library}')
+        if not library.is_dir():
+            raise ValueError(f'Skill library path is not a directory: {library}')
+        if (library / 'SKILL.md').is_file():
             raise ValueError(
-                f'Skill library path points to a skill package: {root}. Pass its parent directory instead.'
+                f'Skill library path points to a skill package: {library}. Pass its parent directory instead.'
             )
-        seen_roots.add(resolved)
-        roots.append(root)
+        resolved = library.resolve()
+        if resolved in seen_libraries:
+            continue
+        seen_libraries.add(resolved)
+        libraries.append(library)
 
     skill_files: list[Path] = []
-    for root in roots:
-        skill_files.extend(
-            sorted(
-                (child / 'SKILL.md' for child in root.iterdir() if child.is_dir() and (child / 'SKILL.md').is_file()),
-                key=lambda path: path.parent.name,
-            )
-        )
+    for library in libraries:
+        for child in sorted(library.iterdir(), key=lambda path: path.name):
+            skill_file = child / 'SKILL.md'
+            if child.is_dir() and skill_file.is_file():
+                skill_files.append(skill_file)
 
-    available = frozenset(skill_file.parent.name for skill_file in skill_files)
-    _validate_selection('include', include, available)
-    _validate_selection('exclude', exclude, available)
-    selected = include if include is not None else available.difference(exclude)
+    available_names = frozenset(_normalize_name(skill_file.parent.name) for skill_file in skill_files)
+    normalized_include = None if include is None else frozenset(_normalize_name(name) for name in include)
+    normalized_exclude = frozenset(_normalize_name(name) for name in exclude)
+    _validate_selection('include', normalized_include, available_names)
+    _validate_selection('exclude', normalized_exclude, available_names)
+    selected_names = (
+        normalized_include if normalized_include is not None else available_names.difference(normalized_exclude)
+    )
 
     selected_files: list[Path] = []
-    names: dict[str, Path] = {}
+    paths_by_name: dict[str, Path] = {}
     for skill_file in skill_files:
-        name = skill_file.parent.name
-        if name not in selected:
+        name = _normalize_name(skill_file.parent.name)
+        if name not in selected_names:
             continue
         resolved = skill_file.resolve()
-        if previous := names.get(name):
+        if previous := paths_by_name.get(name):
             raise ValueError(f'Duplicate skill name {name!r}: {previous} and {resolved}.')
-        names[name] = resolved
+        paths_by_name[name] = resolved
         selected_files.append(skill_file)
 
     return tuple(load_skill(skill_file) for skill_file in selected_files)

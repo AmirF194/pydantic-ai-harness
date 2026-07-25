@@ -37,6 +37,7 @@ uv add "pydantic-ai-harness[codemode]"          # Code Mode (adds the Monty sand
 uv add "pydantic-ai-harness[dynamic-workflow]"  # Dynamic Workflow (adds the Monty sandbox)
 uv add "pydantic-ai-harness[logfire]"           # Managed Prompt (Logfire-managed prompts)
 uv add "pydantic-ai-harness[exa]"               # Exa Search (web research via the Exa API)
+uv add "pydantic-ai-harness[skills]"            # Skills (loads SKILL.md frontmatter)
 uv add "pydantic-ai-harness[acp]"               # ACP (Agent Client Protocol SDK)
 ```
 
