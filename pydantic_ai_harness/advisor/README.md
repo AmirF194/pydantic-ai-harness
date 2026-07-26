@@ -65,12 +65,15 @@ Pydantic AI's resolved executor model profile makes the final support decision. 
 | `max_uses` | `None` | Maximum consultations in one executor model request. Must be at least `1`. |
 | `max_tokens` | `None` | Maximum output tokens for each consultation. Must be at least `1024`. |
 | `caching` | `None` | Anthropic-native prompt-cache TTL: `'5m'` or `'1h'`. |
+| `forward_history` | `False` | Forward completed executor message history to local consultations. |
 
 Use `mode='native'` when the consultation must stay inside the executor provider, or `mode='local'` when the configured advisor provider must receive a separate request. Native mode requires an `anthropic:<model>` or `openrouter:<model>` string and an executor on that same provider. It does not fall back when the executor lacks support.
 
 `max_uses` has the same per-request scope as Anthropic's native tool. Only calls whose arguments validate consume this allowance. It resets when the executor makes its next model request. OpenRouter ignores native `max_uses`, so `auto` mode selects the local fallback when this option is set. Combining OpenRouter, `mode='native'`, and `max_uses` is rejected.
 
 `caching` is an opportunistic Anthropic-native optimization. OpenRouter and the local fallback have no equivalent control.
+
+`forward_history` only affects the local execution path, whether selected explicitly or as the `auto` fallback. It does not alter native tool configuration or native-versus-local selection. When enabled, the local advisor receives the completed executor message history before the current response. The current response, including partial text and unresolved tool calls, is not forwarded, so the consultation prompt still needs to contain the complete current question.
 
 Configure `Advisor` in Python. It is not available in YAML or JSON agent specs because its model input can be a runtime `Model` instance.
 
@@ -82,7 +85,7 @@ The context depends on the execution path:
 |---|---|
 | Anthropic native | The provider supplies the full transcript, including system instructions, tool definitions, earlier turns and results, and executor text produced so far. |
 | OpenRouter native | The executor supplies a consultation prompt. Pydantic AI configures `forward_transcript=false`. |
-| Local fallback | The executor supplies a consultation prompt through the `advisor` function tool. |
+| Local fallback | The executor supplies a consultation prompt through the `advisor` function tool. With `forward_history=True`, the advisor also receives completed executor message history. |
 
 For portable behavior, tell the executor to put the question and all relevant evidence in its consultation prompt. The local tool description reinforces this requirement.
 
@@ -102,7 +105,7 @@ The advisor tool is always visible and is not deferred through Tool Search. It r
 
 During streaming, the executor stream pauses while an advisor consultation runs and resumes when the completed advice is available. The local fallback does not splice the advisor model's token deltas into the executor stream.
 
-Local consultations run sequentially, including when one executor response contains multiple advisor calls.
+Uncapped local consultations can run in parallel. Setting `max_uses` makes local consultations sequential so the first valid calls consume the allowance deterministically.
 
 Native advice is compatible with durable execution because it remains part of the executor model request. Local execution cannot yet preserve the same semantics across every durable backend. Temporal and Prefect can checkpoint the returned advice, but changes to the activity-local or task-local `RunUsage` do not merge back into the outer run. DBOS does not checkpoint ordinary function-tool calls, so a local advisor request could run again during workflow replay.
 

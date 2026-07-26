@@ -86,6 +86,7 @@ class TestAdvisor:
                     mode='native',
                     max_tokens=2048,
                     caching='5m',
+                    forward_history=True,
                 )
             ],
         )
@@ -124,7 +125,7 @@ class TestAdvisor:
         assert advisor_prompts == ['How should I deploy this?', 'How should I deploy this?']
         assert advisor_settings == [ModelSettings(max_tokens=2048), ModelSettings(max_tokens=2048)]
 
-    async def test_unsupported_native_profile_exposes_local_tool(self) -> None:
+    async def test_unsupported_native_profile_exposes_parallel_local_tool(self) -> None:
         seen: list[ModelRequestParameters] = []
 
         def executor(_messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
@@ -138,7 +139,45 @@ class TestAdvisor:
 
         assert seen[0].native_tools == []
         assert [tool.name for tool in seen[0].function_tools] == ['advisor']
-        assert seen[0].function_tools[0].sequential is True
+        assert seen[0].function_tools[0].sequential is False
+
+    @pytest.mark.parametrize(
+        ('forward_history', 'expected_prompts'),
+        [
+            (False, ['What should I do?']),
+            (True, ['Original request.', 'What should I do?']),
+        ],
+    )
+    async def test_local_advisor_optionally_forwards_history(
+        self,
+        forward_history: bool,
+        expected_prompts: list[str],
+    ) -> None:
+        advisor_prompts: list[str] = []
+
+        def advisor_model(messages: list[ModelMessage], _info: AgentInfo) -> ModelResponse:
+            advisor_prompts.extend(
+                part.content
+                for message in messages
+                for part in message.parts
+                if isinstance(part, UserPromptPart) and isinstance(part.content, str)
+            )
+            return ModelResponse(parts=[TextPart('advice')])
+
+        def executor(messages: list[ModelMessage], _info: AgentInfo) -> ModelResponse:
+            if not _has_tool_return(messages):
+                return ModelResponse(parts=[ToolCallPart('advisor', {'prompt': 'What should I do?'})])
+            return ModelResponse(parts=[TextPart('done')])
+
+        advisor = FunctionModel(advisor_model)
+        agent = Agent(
+            FunctionModel(executor),
+            capabilities=[Advisor(advisor, forward_history=forward_history)],
+        )
+
+        await agent.run('Original request.')
+
+        assert advisor_prompts == expected_prompts
 
     @pytest.mark.parametrize('prefix', [None, 'consult'])
     async def test_max_uses_is_deterministic_for_parallel_calls(self, prefix: str | None) -> None:
@@ -281,6 +320,7 @@ class TestAdvisor:
 
         assert seen[0].native_tools == []
         assert [tool.name for tool in seen[0].function_tools] == ['advisor']
+        assert seen[0].function_tools[0].sequential is True
 
     async def test_openrouter_without_max_uses_uses_native_advisor(self) -> None:
         seen: list[ModelRequestParameters] = []

@@ -24,7 +24,7 @@ _LOCAL_TOOL_NAME = 'advisor'
 _LOCAL_TOOL_DESCRIPTION = (
     'Consult a stronger model about a difficult or high-impact decision. '
     'Include the complete question and all relevant context in `prompt` because '
-    'the local advisor does not receive this conversation automatically.'
+    'conversation history may not be available to the advisor.'
 )
 _LIMIT_REACHED = 'Advisor consultation limit reached for this model request. Continue without further advice.'
 
@@ -45,6 +45,7 @@ class _AdvisorSubagentTool(Generic[AgentDepsT]):
 
     model: AdvisorModel
     max_tokens: int | None
+    forward_history: bool
 
     async def __call__(self, ctx: RunContext[AgentDepsT], prompt: str) -> str:
         """Consult the configured advisor model.
@@ -64,6 +65,7 @@ class _AdvisorSubagentTool(Generic[AgentDepsT]):
         )
         result = await advisor.run(
             prompt,
+            message_history=ctx.messages[:-1] if self.forward_history else None,
             usage=ctx.usage,
             usage_limits=ctx.usage_limits,
         )
@@ -127,6 +129,12 @@ class Advisor(NativeOrLocalTool[AgentDepsT]):
     not provide an equivalent cache control.
     """
 
+    forward_history: bool
+    """Whether local consultations receive the executor's completed message history.
+
+    Native execution keeps the provider's transcript behavior unchanged.
+    """
+
     _local_uses: ContextVar[int] = field(init=False, repr=False)
 
     def __init__(
@@ -137,6 +145,7 @@ class Advisor(NativeOrLocalTool[AgentDepsT]):
         max_uses: int | None = None,
         max_tokens: int | None = None,
         caching: Literal['5m', '1h'] | None = None,
+        forward_history: bool = False,
     ) -> None:
         if mode not in {'auto', 'native', 'local'}:
             raise ValueError("Advisor.mode must be 'auto', 'native', or 'local'")
@@ -150,6 +159,7 @@ class Advisor(NativeOrLocalTool[AgentDepsT]):
         self.max_uses = max_uses
         self.max_tokens = max_tokens
         self.caching = caching
+        self.forward_history = forward_history
         self._local_uses = ContextVar('advisor_local_uses', default=0)
         native_provider, _ = self._parse_native_model(model)
         if mode == 'native' and native_provider is None:
@@ -168,12 +178,13 @@ class Advisor(NativeOrLocalTool[AgentDepsT]):
             local_advisor = _AdvisorSubagentTool[AgentDepsT](
                 model=model,
                 max_tokens=max_tokens,
+                forward_history=forward_history,
             )
             local = Tool(
                 local_advisor.__call__,
                 name=_LOCAL_TOOL_NAME,
                 description=_LOCAL_TOOL_DESCRIPTION,
-                sequential=True,
+                sequential=max_uses is not None,
             )
             native = False if mode == 'local' else self._native_advisor
         super().__init__(
