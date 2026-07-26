@@ -60,7 +60,7 @@ SpendGuard(
 | `warn_at` | fraction past which `BudgetStatus.warning` is set; never blocks |
 | `name` | distinguishes budgets sharing a window and scope |
 
-A window rolls over by producing a different store key rather than by resetting a counter, so a new day is simply a new key and nothing has to run at midnight. `conversation` and `total` counters never expire, because their bucket does not roll over and dropping the counter would hand back the whole ceiling rather than start a new period.
+A window rolls over by producing a different store key rather than by resetting a counter, so a new day is simply a new key and nothing has to run at midnight. A `total` counter never expires. `run` and `conversation` buckets never roll over either, so expiry there hands back the ceiling rather than starting a new period -- but each mints a key per run or per conversation, so they carry a long horizon (24 hours and 30 days) instead, past which the counter is dropped rather than kept forever.
 
 Budgets that share a `name`, `window`, and `scope` share one counter, which is how a single window carries both a USD and a token ceiling. The response is added to that counter once, not once per budget.
 
@@ -76,7 +76,7 @@ SpendGuard(budgets=[Budget(window='month', scope=lambda ctx: ctx.deps.tenant_id,
 
 No request **starts** after a budget is exhausted.
 
-Not: that spend stays under the ceiling. The request that crosses the line completes, and concurrent runs can each pass the check before any of them records anything. Treat this as a brake on a runaway loop, not as an accounting ledger; reconcile against the provider's own numbers if you need the second thing.
+Not: that spend stays under the ceiling. The request that crosses the line completes, and concurrent runs can each pass the check before any of them records anything. Two further gaps are worth knowing rather than discovering: a stream the caller abandons part-way never reaches the accounting hook, so its tokens are billed by the provider and invisible here, and a capability that answers from a cache without calling a provider is charged the registry price for the response it returns. Treat this as a brake on a runaway loop, not as an accounting ledger; reconcile against the provider's own numbers if you need the second thing.
 
 ## Reading the numbers
 
@@ -124,7 +124,7 @@ store = RedisSpendStore(Redis.from_url('redis://localhost'))
 guard = SpendGuard(budgets=[Budget(usd=Decimal('100'), window='day')], store=store)
 ```
 
-It adds no dependency: `RedisClient` is a protocol of the three coroutines used, so any compatible client satisfies it. Amounts are stored as integer millionths of a dollar and incremented with `HINCRBY`, because `INCRBYFLOAT` accumulates rounding error over the tens of thousands of requests a busy day produces.
+It adds no dependency: `RedisClient` is a protocol of the three coroutines used, so any compatible client satisfies it. Amounts are stored as integer billionths of a dollar and incremented with `HINCRBY`, because `INCRBYFLOAT` accumulates rounding error over the tens of thousands of requests a busy day produces. Billionths rather than millionths because the residue does not average out: an agent repeats requests of near-identical shape, so the same fraction rounds the same way every time.
 
 The default store is built per capability, so two `SpendGuard` instances do not quietly share one counter. Pass the same store object to both when you want them to.
 
@@ -152,7 +152,7 @@ Returning `None` falls through to the registry. When nothing can price a respons
 
 State lives across runs deliberately, so `for_run` is not overridden: a daily budget that reset every run would not be a daily budget. Per-run isolation comes from `Budget(window='run')`, whose key carries the run id.
 
-No ordering is declared. The gate does not need the model, and pricing reads the model from the response, so a capability that routes requests to a different model does not affect either.
+The capability declares itself innermost. `after_model_request` runs innermost first, so anywhere else in the chain a capability listed after this one could raise `ModelRetry` on a response that was already generated and billed, and the counter would never see it. Being innermost is what makes "counted exactly once" true rather than dependent on the order you happened to write.
 
 **Durable execution.** The capability hooks run in the workflow; the model request itself is the activity. A store that talks over the network therefore reads and writes from workflow code, which Temporal replays -- so a shared store is not workflow-safe here. Use the in-process store inside the workflow, and enforce the shared budget before starting it:
 

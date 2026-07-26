@@ -11,14 +11,15 @@ from __future__ import annotations
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import timedelta
-from decimal import ROUND_HALF_UP, Decimal
+from decimal import ROUND_HALF_UP, Decimal, localcontext
 from typing import Protocol, runtime_checkable
 
 from pydantic_ai_harness.spend._snapshot import Spent
 
-_MICROS = Decimal(10) ** 6
+_SCALE = Decimal(10) ** 9
+_PRECISION = 40
 
-_USD_FIELD = 'usd_micros'
+_USD_FIELD = 'usd_nanos'
 _TOKENS_FIELD = 'tokens'
 _REQUESTS_FIELD = 'requests'
 _UNPRICED_FIELD = 'unpriced'
@@ -45,19 +46,32 @@ class RedisClient(Protocol):
         ...  # pragma: no cover
 
 
-def _to_micros(usd: Decimal) -> int:
-    """US dollars as whole millionths.
+def _to_nanos(usd: Decimal) -> int:
+    """US dollars as whole billionths.
 
     Counters are integers because `INCRBYFLOAT` accumulates binary rounding
     error over the tens of thousands of requests a busy day produces, while
     `HINCRBY` on integers is both exact and atomic.
+
+    Billionths rather than millionths because the residue does not average out:
+    an agent repeats requests of near-identical shape, so the same fraction is
+    rounded the same way every time. At a cheap model's per-request price,
+    rounding to a millionth drifts by tens of percent over a day; a billionth
+    keeps that under a part in ten thousand.
+
+    The local context is pinned so an application that lowered `Decimal`
+    precision for its own arithmetic cannot silently truncate money here.
     """
-    return int((usd * _MICROS).to_integral_value(rounding=ROUND_HALF_UP))
+    with localcontext() as context:
+        context.prec = _PRECISION
+        return int((usd * _SCALE).to_integral_value(rounding=ROUND_HALF_UP))
 
 
-def _from_micros(micros: int) -> Decimal:
-    """Whole millionths back to US dollars."""
-    return Decimal(micros) / _MICROS
+def _from_nanos(nanos: int) -> Decimal:
+    """Whole billionths back to US dollars."""
+    with localcontext() as context:
+        context.prec = _PRECISION
+        return Decimal(nanos) / _SCALE
 
 
 def _field(fields: Mapping[str | bytes, str | bytes], name: str) -> int:
@@ -100,7 +114,7 @@ class RedisSpendStore:
         """What `key` has accumulated. An absent hash reads as zero."""
         fields = await self.client.hgetall(self._name(key))
         return Spent(
-            usd=_from_micros(_field(fields, _USD_FIELD)),
+            usd=_from_nanos(_field(fields, _USD_FIELD)),
             tokens=_field(fields, _TOKENS_FIELD),
             requests=_field(fields, _REQUESTS_FIELD),
             unpriced_requests=_field(fields, _UNPRICED_FIELD),
@@ -123,14 +137,14 @@ class RedisSpendStore:
         decision compares these fields against each other.
         """
         name = self._name(key)
-        micros = await self.client.hincrby(name, _USD_FIELD, _to_micros(usd))
+        nanos = await self.client.hincrby(name, _USD_FIELD, _to_nanos(usd))
         total_tokens = await self.client.hincrby(name, _TOKENS_FIELD, tokens)
         total_requests = await self.client.hincrby(name, _REQUESTS_FIELD, requests)
         total_unpriced = await self.client.hincrby(name, _UNPRICED_FIELD, unpriced)
         if ttl is not None:
             await self.client.expire(name, int(ttl.total_seconds()))
         return Spent(
-            usd=_from_micros(micros),
+            usd=_from_nanos(nanos),
             tokens=total_tokens,
             requests=total_requests,
             unpriced_requests=total_unpriced,

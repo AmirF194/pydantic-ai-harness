@@ -32,12 +32,15 @@ _ANY_SCOPE = '*'
 WINDOWS: frozenset[str] = frozenset({'run', 'conversation', 'day', 'month', 'total'})
 """The accepted `window` values, for validating one that arrived as plain data."""
 
-# `run` counters are dead once the run ends, so they expire. `conversation` and
-# `total` never expire: their bucket does not roll over, so dropping the counter
-# would hand back the whole ceiling rather than start a new period.
+# A time window may expire freely: its bucket has already rolled over, so the
+# counter is obsolete anyway. `run` and `conversation` buckets never roll over,
+# so expiry there hands back the ceiling rather than starting a new period --
+# but a per-conversation budget mints a key per conversation, so never expiring
+# grows the store without bound. The compromise is a horizon long enough that a
+# conversation reaching it cannot practically be resumed.
 _TTLS: dict[Window, timedelta | None] = {
     'run': timedelta(hours=24),
-    'conversation': None,
+    'conversation': timedelta(days=30),
     'day': timedelta(hours=48),
     'month': timedelta(days=62),
     'total': None,

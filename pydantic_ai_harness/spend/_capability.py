@@ -21,7 +21,7 @@ from datetime import datetime
 from decimal import Decimal
 from typing import TYPE_CHECKING, Any, Literal, TypeGuard
 
-from pydantic_ai.capabilities import AbstractCapability
+from pydantic_ai.capabilities import AbstractCapability, CapabilityOrdering
 from pydantic_ai.exceptions import UserError
 from pydantic_ai.messages import ModelResponse
 from pydantic_ai.tools import AgentDepsT, RunContext
@@ -123,6 +123,23 @@ class SpendGuard(AbstractCapability[AgentDepsT]):
         Anything other than `'raise'` behaves as `'zero'`, so a typo in a spec
         would quietly turn unpriced responses free instead of failing the run.
         """
+        seen: dict[tuple[str, str], Budget] = {}
+        for budget in self.budgets:
+            # Budgets sharing a name, window and scope share a counter deliberately,
+            # which is how one window carries a USD and a token ceiling. Two ceilings
+            # of the SAME kind on one counter is not that: it reads as two independent
+            # limits and behaves as the smaller one.
+            for kind, ceiling in (('usd', budget.usd), ('tokens', budget.tokens)):
+                if ceiling is None:
+                    continue
+                slot = (budget.name, kind)
+                if slot in seen and seen[slot].window == budget.window and seen[slot].scope is budget.scope:
+                    raise UserError(
+                        f'Two budgets named {budget.name!r} both set a `{kind}` ceiling on the same window and '
+                        'scope, so they would share one counter and only the smaller would ever apply. '
+                        'Give them different `name`s.'
+                    )
+                seen[slot] = budget
         if self.on_unpriced not in _UNPRICED_POLICIES:
             raise UserError(
                 f'SpendGuard.on_unpriced must be one of {sorted(_UNPRICED_POLICIES)}; got {self.on_unpriced!r}.'
@@ -132,6 +149,17 @@ class SpendGuard(AbstractCapability[AgentDepsT]):
     def get_serialization_name(cls) -> str | None:
         """The name a spec refers to this capability by, pinned against a class rename."""
         return 'SpendGuard'
+
+    def get_ordering(self) -> CapabilityOrdering:
+        """Sit innermost, so no capability can reject a response before it is counted.
+
+        `after_model_request` runs innermost first. Anywhere else in the chain, a
+        capability listed after this one -- which is how anyone would write it --
+        can raise `ModelRetry` on a response that was already generated and
+        billed, and the counter never sees it. Being innermost is what makes
+        "counted exactly once" true rather than order-dependent.
+        """
+        return CapabilityOrdering(position='innermost')
 
     def get_toolset(self) -> AgentToolset[AgentDepsT] | None:
         """Offer `get_spend` when `expose_tools` is set."""
@@ -148,7 +176,7 @@ class SpendGuard(AbstractCapability[AgentDepsT]):
     ) -> ModelRequestContext:
         """Refuse the request if any budget with a ceiling is already spent."""
         read: dict[str, Spent] = {}
-        for budget, key in self._keyed(ctx, None):
+        for budget, key in self._keyed(ctx):
             if not budget.enforces:
                 continue
             if key not in read:
@@ -167,7 +195,7 @@ class SpendGuard(AbstractCapability[AgentDepsT]):
         usd, priced = self._price_of(response)
         accrued: dict[str, Spent] = {}
         statuses: list[BudgetStatus] = []
-        for budget, key in self._keyed(ctx, None):
+        for budget, key in self._keyed(ctx):
             # Budgets sharing a name, window, and scope share a counter, which is
             # how one window carries both a USD and a token ceiling. Adding the
             # response once per budget would double-count it and halve them both.
@@ -280,10 +308,10 @@ class SpendGuard(AbstractCapability[AgentDepsT]):
         ctx.tracer.start_span('spend budget exhausted', attributes=attributes).end()
         raise SpendLimitExceeded(f'Budget {budget.name!r} exhausted for this {budget.window}: {detail}')
 
-    def _keyed(self, ctx: RunContext[AgentDepsT] | None, scope: str | None) -> list[tuple[Budget, str]]:
+    def _keyed(self, ctx: RunContext[AgentDepsT]) -> list[tuple[Budget, str]]:
         """Each budget paired with the store key it accumulates under right now."""
         now = self.clock()
-        return [(budget, self._key(budget, ctx, now, scope)) for budget in self.budgets]
+        return [(budget, self._key(budget, ctx, now, None)) for budget in self.budgets]
 
     def _price_of(self, response: ModelResponse) -> tuple[Decimal, bool]:
         """What the response cost, and whether that number is real."""
@@ -299,7 +327,10 @@ class SpendGuard(AbstractCapability[AgentDepsT]):
         if response.model_name:
             try:
                 return response.cost().total_price, True
-            except LookupError:
+            except (LookupError, ValueError):
+                # LookupError: the registry has no entry. ValueError: it rejects the
+                # usage shape. Either way this is a pricing failure, and letting it
+                # escape would skip `on_unpriced` and drop the accrual with it.
                 pass
         return Decimal(0), False
 
@@ -346,6 +377,13 @@ def _budget_from_spec(entry: Any) -> Budget:
     fields = dict(entry)
     if 'scope' in fields:
         raise UserError('A SpendGuard budget scope is a callable and cannot be expressed in a spec.')
-    if 'usd' in fields:
-        fields['usd'] = Decimal(str(fields['usd']))
+    # Every number a spec can carry, not just `usd`: the others reached
+    # `Budget.__post_init__` as strings and compared str to int there, which
+    # surfaces as a bare TypeError naming no field.
+    for name, convert in (('usd', Decimal), ('tokens', int), ('warn_at', float)):
+        if name in fields:
+            try:
+                fields[name] = convert(str(fields[name]))
+            except (TypeError, ValueError) as error:
+                raise UserError(f'SpendGuard budget {name!r} is not a number: {fields[name]!r}.') from error
     return Budget(**fields)

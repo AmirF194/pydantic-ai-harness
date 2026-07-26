@@ -11,6 +11,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
+from threading import Lock
 from typing import Protocol, runtime_checkable
 
 from pydantic_ai_harness.spend._snapshot import Spent
@@ -68,12 +69,16 @@ class InMemorySpendStore:
     """Supplies the time expiry is measured against."""
 
     _entries: _Entries = field(default_factory=_Entries, init=False, repr=False)
+    _lock: Lock = field(default_factory=Lock, init=False, repr=False)
 
     def __len__(self) -> int:
         """How many windows are being held.
 
-        Bounded by the budgets and scopes still live, since a write sweeps the
-        rolled-over ones. Worth watching if scopes are high-cardinality.
+        A write sweeps the rolled-over ones, so this tracks the windows still
+        live. That is one entry per budget, scope and period -- and for a `run`
+        or `conversation` budget the period is an id, so the count grows with
+        traffic until those entries reach their horizon. Worth watching there
+        and wherever scopes are high-cardinality.
         """
         return len(self._entries)
 
@@ -93,19 +98,23 @@ class InMemorySpendStore:
     ) -> Spent:
         """Add to `key` and return the result.
 
-        The mutation spans no `await`, so concurrent runs in one event loop
-        cannot interleave halfway through it.
+        The mutation spans no `await`, so concurrent runs on one event loop
+        cannot interleave halfway through it. The lock covers the case that is
+        not free: `run_sync` called from a thread pool, or a free-threaded
+        interpreter, where a read-modify-write loses updates in the direction
+        that under-counts spend.
         """
-        self._sweep()
-        current = self._live(key)
-        updated = Spent(
-            usd=current.usd + usd,
-            tokens=current.tokens + tokens,
-            requests=current.requests + requests,
-            unpriced_requests=current.unpriced_requests + unpriced,
-        )
-        self._entries[key] = (updated, None if ttl is None else self.clock() + ttl)
-        return updated
+        with self._lock:
+            self._sweep()
+            current = self._live(key)
+            updated = Spent(
+                usd=current.usd + usd,
+                tokens=current.tokens + tokens,
+                requests=current.requests + requests,
+                unpriced_requests=current.unpriced_requests + unpriced,
+            )
+            self._entries[key] = (updated, None if ttl is None else self.clock() + ttl)
+            return updated
 
     def _sweep(self) -> None:
         """Drop every entry whose window has rolled over.

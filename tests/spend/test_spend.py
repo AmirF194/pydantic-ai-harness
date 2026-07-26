@@ -13,7 +13,8 @@ from opentelemetry.sdk.trace.export import SimpleSpanProcessor
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 from opentelemetry.trace import NoOpTracer, Tracer
 from pydantic_ai import Agent
-from pydantic_ai.exceptions import UsageLimitExceeded, UserError
+from pydantic_ai.capabilities import AbstractCapability, CapabilityOrdering
+from pydantic_ai.exceptions import ModelRetry, UsageLimitExceeded, UserError
 from pydantic_ai.messages import ModelMessage, ModelResponse, TextPart, ToolCallPart, ToolReturnPart
 from pydantic_ai.models import ModelRequestContext, ModelRequestParameters
 from pydantic_ai.models.function import AgentInfo, FunctionModel
@@ -125,6 +126,15 @@ def _only_span(exporter: InMemorySpanExporter) -> ReadableSpan:
     return spans[0]
 
 
+def _scripted_usage() -> FunctionModel:
+    """A model whose every response carries the same usage, for counting."""
+
+    def respond(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        return ModelResponse(parts=[TextPart(content='ok')], usage=RequestUsage(input_tokens=1000, output_tokens=100))
+
+    return FunctionModel(respond)
+
+
 def _agent(guard: SpendGuard[None], *, usage: RequestUsage | None = None) -> Agent[None, str]:
     def respond(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
         return ModelResponse(
@@ -196,6 +206,10 @@ class TestBudgetConfiguration:
     def test_only_a_lifetime_window_is_kept_forever(self):
         assert Budget(window='total').ttl is None
         assert Budget(window='day').ttl == timedelta(hours=48)
+
+    def test_a_conversation_counter_expires_on_a_long_horizon(self):
+        """Its bucket never rolls over, so it needs a horizon; unbounded would grow the store forever."""
+        assert Budget(window='conversation').ttl == timedelta(days=30)
 
 
 class TestWindows:
@@ -384,6 +398,34 @@ class TestEnforcement:
             await agent.run('hi')
 
 
+class TestOrdering:
+    """Nothing may reject a response before it is counted."""
+
+    async def test_a_response_rejected_by_a_later_capability_is_still_counted(self):
+        """`after_model_request` runs innermost first, so anywhere else the counter loses a paid response."""
+
+        class RejectFirst(AbstractCapability[None]):
+            seen: int = 0
+
+            async def after_model_request(
+                self, ctx: RunContext[None], *, request_context: ModelRequestContext, response: ModelResponse
+            ) -> ModelResponse:
+                self.seen += 1
+                if self.seen == 1:
+                    raise ModelRetry('try again')
+                return response
+
+        guard = SpendGuard(budgets=[Budget(window='total')], price=lambda r: Decimal('1'))
+        agent = Agent(_scripted_usage(), deps_type=type(None), capabilities=[guard, RejectFirst()])
+        result = await agent.run('hi')
+
+        assert result.usage.requests == 2
+        assert (await guard.status())[0].spent.requests == 2
+
+    def test_it_declares_innermost(self):
+        assert SpendGuard[None]().get_ordering() == CapabilityOrdering(position='innermost')
+
+
 class TestPricing:
     """What a response cost, and whether that number is real."""
 
@@ -419,6 +461,21 @@ class TestPricing:
         assert status.spent.usd == Decimal('0')
         assert status.spent.tokens == 1100
         assert status.spent.unpriced_requests == 1
+
+    async def test_a_usage_shape_the_registry_rejects_is_treated_as_unpriced(self):
+        """`genai-prices` raises ValueError on some shapes; letting it escape would skip `on_unpriced`."""
+        guard = SpendGuard(budgets=[Budget(window='total')])
+        response = ModelResponse(
+            parts=[TextPart(content='x')],
+            usage=RequestUsage(input_tokens=10, cache_read_tokens=500, output_tokens=5),
+            model_name='gpt-4.1',
+            provider_name='openai',
+        )
+        await guard.after_model_request(_run_ctx(), request_context=_request_context(), response=response)
+
+        spent = (await guard.status())[0].spent
+        assert spent.unpriced_requests == 1
+        assert spent.tokens == 15
 
     async def test_a_negative_price_is_refused(self):
         """A credit would move a budget away from its ceiling, so the gate would never close."""
@@ -623,10 +680,6 @@ class TestInMemoryStore:
 
         assert len(store) == 1
 
-    async def test_a_conversation_counter_is_not_expired(self):
-        """A conversation bucket never rolls over, so expiry would hand back the whole ceiling."""
-        assert Budget(window='conversation').ttl is None
-
     async def test_a_reconciler_may_post_a_negative_delta(self):
         store = InMemorySpendStore()
         await store.add('k', usd=Decimal('5'), tokens=10, requests=1, unpriced=0, ttl=None)
@@ -670,16 +723,18 @@ class TestRedisStore:
         client = FakeRedis(bytes_keys=bytes_keys)
         store = RedisSpendStore(client)
 
-        added = await store.add('k', usd=Decimal('0.000123'), tokens=7, requests=1, unpriced=1, ttl=None)
-        assert added == Spent(usd=Decimal('0.000123'), tokens=7, requests=1, unpriced_requests=1)
+        added = await store.add('k', usd=Decimal('0.000123456'), tokens=7, requests=1, unpriced=1, ttl=None)
+        assert added == Spent(usd=Decimal('0.000123456'), tokens=7, requests=1, unpriced_requests=1)
         assert await store.get('k') == added
 
     async def test_repeated_adds_do_not_drift(self):
+        """A price with a fractional sub-unit, since a whole one cannot detect rounding at all."""
         store = RedisSpendStore(FakeRedis())
-        for _ in range(10_000):
-            await store.add('k', usd=Decimal('0.0001'), tokens=0, requests=1, unpriced=0, ttl=None)
+        price = Decimal('0.000000675')  # a cheap model's real per-request cost
+        for _ in range(100_000):
+            await store.add('k', usd=price, tokens=0, requests=1, unpriced=0, ttl=None)
 
-        assert (await store.get('k')).usd == Decimal('1')
+        assert (await store.get('k')).usd == price * 100_000
 
     async def test_a_ttl_is_applied_and_the_key_is_namespaced(self):
         client = FakeRedis()
@@ -737,6 +792,27 @@ class TestToolset:
         assert await _call_get_spend(SpendGuard[None](expose_tools=True)) == 'No budgets are configured.'
 
 
+class TestDuplicateBudgets:
+    """Sharing a counter is a feature; two ceilings of one kind on it is not."""
+
+    def test_two_budgets_with_the_same_usd_ceiling_slot_are_refused(self):
+        """They read as independent limits and behave as the smaller one."""
+        with pytest.raises(UserError, match='would share one counter'):
+            SpendGuard[None](budgets=[Budget(usd=Decimal('5')), Budget(usd=Decimal('100'))])
+
+    def test_a_usd_and_a_token_ceiling_may_share_a_counter(self):
+        guard = SpendGuard[None](budgets=[Budget(usd=Decimal('5')), Budget(tokens=100)])
+
+        assert len(guard.budgets) == 2
+
+    def test_different_names_keep_them_apart(self):
+        guard = SpendGuard[None](
+            budgets=[Budget(usd=Decimal('5'), name='tight'), Budget(usd=Decimal('100'), name='loose')]
+        )
+
+        assert len(guard.budgets) == 2
+
+
 class TestSpec:
     """`Agent.from_spec` covers the fields a spec can express, and refuses the rest."""
 
@@ -761,6 +837,16 @@ class TestSpec:
     def test_a_budget_must_be_a_mapping(self):
         with pytest.raises(UserError, match='must be a mapping'):
             SpendGuard[None].from_spec(budgets=['100'])
+
+    def test_every_number_a_spec_carries_is_coerced(self):
+        """Only `usd` was converted, so the others reached `__post_init__` and compared str to int."""
+        guard = SpendGuard[None].from_spec(budgets=[{'usd': '1', 'tokens': '5000', 'warn_at': '0.8'}])
+
+        assert guard.budgets[0] == Budget(usd=Decimal('1'), tokens=5000, warn_at=0.8)
+
+    def test_a_number_that_is_not_a_number_is_named(self):
+        with pytest.raises(UserError, match="budget 'tokens' is not a number"):
+            SpendGuard[None].from_spec(budgets=[{'tokens': 'lots'}])
 
     def test_a_budget_scope_is_refused(self):
         with pytest.raises(UserError, match='cannot be expressed in a spec'):
