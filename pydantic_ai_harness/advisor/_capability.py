@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Generic, Literal, Protocol, runtime_checkable
+from typing import Any, Literal, Protocol, runtime_checkable
 
 from pydantic_ai import AdvisorTool, Agent, AgentRunResult
 from pydantic_ai.capabilities import NativeOrLocalTool, ValidatedToolArgs, WrapRunHandler
@@ -36,39 +36,6 @@ class _DurabilityCapability(Protocol):
 
     @property
     def in_durable_context(self) -> bool: ...  # pragma: no cover
-
-
-@dataclass(frozen=True)
-class _AdvisorSubagentTool(Generic[AgentDepsT]):
-    """Local advisor tool backed by a Pydantic AI subagent."""
-
-    model: AdvisorModel
-    max_tokens: int | None
-    forward_history: bool
-
-    async def __call__(self, ctx: RunContext[AgentDepsT], prompt: str) -> str:
-        """Consult the configured advisor model.
-
-        Args:
-            ctx: The executor run context.
-            prompt: A self-contained question with all context the advisor needs.
-        """
-        settings = ModelSettings(max_tokens=self.max_tokens) if self.max_tokens is not None else None
-        advisor = Agent(
-            self.model,
-            instructions=(
-                'You are an expert advisor. Give concise, actionable advice to the executor model '
-                'about the question it sends you. Do not address the end user.'
-            ),
-            model_settings=settings,
-        )
-        result = await advisor.run(
-            prompt,
-            message_history=ctx.messages[:-1] if self.forward_history else None,
-            usage=ctx.usage,
-            usage_limits=ctx.usage_limits,
-        )
-        return result.output
 
 
 @dataclass(init=False)
@@ -174,13 +141,27 @@ class Advisor(NativeOrLocalTool[AgentDepsT]):
             native = self._required_native_advisor
             local = False
         else:
-            local_advisor = _AdvisorSubagentTool[AgentDepsT](
-                model=model,
-                max_tokens=max_tokens,
-                forward_history=forward_history,
-            )
+
+            async def local_advisor(ctx: RunContext[AgentDepsT], prompt: str) -> str:
+                settings = ModelSettings(max_tokens=max_tokens) if max_tokens is not None else None
+                advisor = Agent(
+                    model,
+                    instructions=(
+                        'You are an expert advisor. Give concise, actionable advice to the executor model '
+                        'about the question it sends you. Do not address the end user.'
+                    ),
+                    model_settings=settings,
+                )
+                result = await advisor.run(
+                    prompt,
+                    message_history=ctx.messages[:-1] if forward_history else None,
+                    usage=ctx.usage,
+                    usage_limits=ctx.usage_limits,
+                )
+                return result.output
+
             local = Tool(
-                local_advisor.__call__,
+                local_advisor,
                 name=_LOCAL_TOOL_NAME,
                 description=_LOCAL_TOOL_DESCRIPTION,
             )
