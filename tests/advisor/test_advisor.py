@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import importlib.util
 from collections.abc import Sequence
 
 import pytest
@@ -55,6 +54,14 @@ class _ActiveDurability(AbstractCapability[None]):
     @property
     def in_durable_context(self) -> bool:
         return True
+
+
+class _InactiveDurability(AbstractCapability[None]):
+    engine_name = 'Test'
+
+    @property
+    def in_durable_context(self) -> bool:
+        return False
 
 
 def _has_tool_return(messages: Sequence[ModelMessage]) -> bool:
@@ -226,10 +233,6 @@ class TestAdvisor:
 
     @pytest.mark.parametrize('mode', ['auto', 'local'])
     async def test_local_capable_mode_runs_outside_durable_context(self, mode: AdvisorMode) -> None:
-        if importlib.util.find_spec('temporalio') is None:
-            pytest.skip('temporalio not installed')
-        from pydantic_ai.durable_exec.temporal import TemporalDurability
-
         advisor_calls = 0
 
         def advisor_model(_messages: list[ModelMessage], _info: AgentInfo) -> ModelResponse:
@@ -248,7 +251,8 @@ class TestAdvisor:
         agent = Agent(
             FunctionModel(executor),
             name='executor',
-            capabilities=[Advisor(model, mode=mode), TemporalDurability()],
+            deps_type=type(None),
+            capabilities=[Advisor(model, mode=mode), _InactiveDurability()],
         )
 
         result = await agent.run('Review this.')
@@ -357,7 +361,7 @@ class TestAdvisor:
         with pytest.raises(UserError, match=f'requires a {required_provider} executor'):
             await agent.run('Review this.')
 
-    def test_rejects_duplicate_capability_or_tool_name(self) -> None:
+    async def test_rejects_duplicate_capability_or_tool_name(self) -> None:
         model = FunctionModel(lambda _messages, _info: ModelResponse(parts=[TextPart('done')]))
 
         with pytest.raises(UserError, match="Capability id 'advisor' is used by multiple capabilities"):
@@ -368,7 +372,7 @@ class TestAdvisor:
 
         agent = Agent(model, capabilities=[Advisor(model)], tools=[advisor])
         with pytest.raises(UserError, match='tool whose name conflicts'):
-            agent.run_sync('Review this.')
+            await agent.run('Review this.')
 
     def test_rejects_invalid_limits(self) -> None:
         model = FunctionModel(lambda _messages, _info: ModelResponse(parts=[TextPart('done')]))
