@@ -132,6 +132,7 @@ _CAPABILITY_PAGE_META = {
     'planning.md': ('planning', 'Planning'),
     'runtime-authoring.md': ('runtime_authoring', 'Runtime Authoring'),
     'guardrails.md': ('guardrails', 'Input & Output Guardrails'),
+    'spend.md': ('spend', 'Spend'),
     'localstack.md': ('localstack', 'LocalStack'),
     'acp.md': ('experimental/acp', 'ACP (Agent Client Protocol)'),
 }
