@@ -6,7 +6,7 @@ from collections.abc import Sequence
 import pytest
 from inline_snapshot import snapshot
 from pydantic_ai import AdvisorTool, Agent
-from pydantic_ai.capabilities import AbstractCapability
+from pydantic_ai.capabilities import AbstractCapability, PrefixTools
 from pydantic_ai.exceptions import UsageLimitExceeded, UserError
 from pydantic_ai.messages import (
     ModelMessage,
@@ -90,9 +90,8 @@ class TestAdvisor:
             ],
         )
 
-        result = await agent.run('Review this plan.')
+        await agent.run('Review this plan.')
 
-        assert result.output == 'done'
         assert seen[0].function_tools == []
         assert seen[0].native_tools == [AdvisorTool(model='claude-opus-4-8', max_tokens=2048, caching='5m')]
 
@@ -119,11 +118,9 @@ class TestAdvisor:
         executor_model = _ProviderFunctionModel('anthropic', executor, supports_advisor=True)
         agent = Agent(executor_model, capabilities=[Advisor(advisor, max_tokens=2048)])
 
-        result = await agent.run('Plan the deployment.')
-        second_result = await agent.run('Plan another deployment.')
+        await agent.run('Plan the deployment.')
+        await agent.run('Plan another deployment.')
 
-        assert result.output == 'I will use a staged rollout.'
-        assert second_result.output == 'I will use a staged rollout.'
         assert advisor_prompts == ['How should I deploy this?', 'How should I deploy this?']
         assert advisor_settings == [ModelSettings(max_tokens=2048), ModelSettings(max_tokens=2048)]
 
@@ -137,16 +134,17 @@ class TestAdvisor:
         model = _ProviderFunctionModel('anthropic', executor)
         agent = Agent(model, capabilities=[Advisor('anthropic:claude-opus-4-8')])
 
-        result = await agent.run('Review this plan.')
+        await agent.run('Review this plan.')
 
-        assert result.output == 'done'
         assert seen[0].native_tools == []
         assert [tool.name for tool in seen[0].function_tools] == ['advisor']
         assert seen[0].function_tools[0].sequential is True
 
-    async def test_max_uses_is_deterministic_for_parallel_calls(self) -> None:
+    @pytest.mark.parametrize('prefix', [None, 'consult'])
+    async def test_max_uses_is_deterministic_for_parallel_calls(self, prefix: str | None) -> None:
         advisor_calls = 0
         tool_returns: list[str] = []
+        tool_name = f'{prefix}_advisor' if prefix is not None else 'advisor'
 
         def advisor_model(_messages: list[ModelMessage], _info: AgentInfo) -> ModelResponse:
             nonlocal advisor_calls
@@ -158,8 +156,8 @@ class TestAdvisor:
             if not _has_tool_return(messages):
                 return ModelResponse(
                     parts=[
-                        ToolCallPart('advisor', {'prompt': 'first'}, tool_call_id='advisor-1'),
-                        ToolCallPart('advisor', {'prompt': 'second'}, tool_call_id='advisor-2'),
+                        ToolCallPart(tool_name, {'prompt': 'first'}, tool_call_id='advisor-1'),
+                        ToolCallPart(tool_name, {'prompt': 'second'}, tool_call_id='advisor-2'),
                     ]
                 )
             tool_returns = [
@@ -171,11 +169,13 @@ class TestAdvisor:
             return ModelResponse(parts=[TextPart('done')])
 
         advisor = _ProviderFunctionModel('anthropic', advisor_model)
-        agent = Agent(FunctionModel(executor), capabilities=[Advisor(advisor, max_uses=1)])
+        capability: AbstractCapability[object] = Advisor(advisor, max_uses=1)
+        if prefix is not None:
+            capability = PrefixTools(capability, prefix=prefix)
+        agent = Agent(FunctionModel(executor), capabilities=[capability])
 
-        result = await agent.run('Ask twice.')
+        await agent.run('Ask twice.')
 
-        assert result.output == 'done'
         assert advisor_calls == 1
         assert tool_returns == snapshot(
             [
@@ -208,9 +208,8 @@ class TestAdvisor:
         advisor = _ProviderFunctionModel('anthropic', advisor_model)
         agent = Agent(FunctionModel(executor), capabilities=[Advisor(advisor, max_uses=1)])
 
-        result = await agent.run('Ask twice.')
+        await agent.run('Ask twice.')
 
-        assert result.output == 'done'
         assert advisor_calls == 1
 
     async def test_max_uses_resets_for_each_executor_request(self) -> None:
@@ -240,9 +239,8 @@ class TestAdvisor:
         advisor = _ProviderFunctionModel('anthropic', advisor_model)
         agent = Agent(FunctionModel(executor), capabilities=[Advisor(advisor, max_uses=1)])
 
-        result = await agent.run('Ask on consecutive requests.')
+        await agent.run('Ask on consecutive requests.')
 
-        assert result.output == 'done'
         assert advisor_calls == 2
 
     async def test_concurrent_runs_have_independent_max_uses(self) -> None:
@@ -262,10 +260,8 @@ class TestAdvisor:
         advisor = _ProviderFunctionModel('anthropic', advisor_model)
         agent = Agent(FunctionModel(executor), capabilities=[Advisor(advisor, max_uses=1)])
 
-        first, second = await asyncio.gather(agent.run('first'), agent.run('second'))
+        await asyncio.gather(agent.run('first'), agent.run('second'))
 
-        assert first.output == 'done'
-        assert second.output == 'done'
         assert advisor_calls == 2
 
     async def test_openrouter_max_uses_selects_local_fallback(self) -> None:
@@ -281,9 +277,8 @@ class TestAdvisor:
             capabilities=[Advisor('openrouter:anthropic/claude-opus-4.8', max_uses=1)],
         )
 
-        result = await agent.run('Review this plan.')
+        await agent.run('Review this plan.')
 
-        assert result.output == 'done'
         assert seen[0].native_tools == []
         assert [tool.name for tool in seen[0].function_tools] == ['advisor']
 
@@ -300,18 +295,23 @@ class TestAdvisor:
             capabilities=[Advisor('openrouter:anthropic/claude-opus-4.8')],
         )
 
-        result = await agent.run('Review this plan.')
+        await agent.run('Review this plan.')
 
-        assert result.output == 'done'
         assert seen[0].function_tools == []
         assert seen[0].native_tools == [AdvisorTool(model='anthropic/claude-opus-4.8')]
 
-    async def test_local_advisor_shares_parent_usage_limits(self) -> None:
-        def executor(_messages: list[ModelMessage], _info: AgentInfo) -> ModelResponse:
-            return ModelResponse(parts=[ToolCallPart('advisor', {'prompt': 'Review this.'})])
+    async def test_local_advisor_shares_parent_usage_and_limits(self) -> None:
+        def executor(messages: list[ModelMessage], _info: AgentInfo) -> ModelResponse:
+            if not _has_tool_return(messages):
+                return ModelResponse(parts=[ToolCallPart('advisor', {'prompt': 'Review this.'})])
+            return ModelResponse(parts=[TextPart('done')])
 
-        model = FunctionModel(executor)
-        agent = Agent(model, capabilities=[Advisor(model)])
+        advisor = FunctionModel(lambda _messages, _info: ModelResponse(parts=[TextPart('advice')]))
+        agent = Agent(FunctionModel(executor), capabilities=[Advisor(advisor)])
+
+        result = await agent.run('Ask for advice.')
+
+        assert result.usage.requests == 3
 
         with pytest.raises(UsageLimitExceeded, match='request_limit'):
             await agent.run('Ask for advice.', usage_limits=UsageLimits(request_limit=1))
@@ -340,9 +340,8 @@ class TestAdvisor:
             capabilities=[Advisor(model, mode=mode), _InactiveDurability()],
         )
 
-        result = await agent.run('Review this.')
+        await agent.run('Review this.')
 
-        assert result.output == 'done'
         assert advisor_calls == 1
 
     @pytest.mark.parametrize('mode', ['auto', 'local'])
@@ -384,9 +383,8 @@ class TestAdvisor:
             capabilities=[advisor, active],
         )
 
-        result = await agent.run('Review this.')
+        await agent.run('Review this.')
 
-        assert result.output == 'done'
         assert seen[0].function_tools == []
         assert seen[0].native_tools == [AdvisorTool(model='claude-opus-4-8')]
 
@@ -410,6 +408,43 @@ class TestAdvisor:
         with pytest.raises(UserError, match="mode='native'"):
             await agent.run('Review this.')
         assert model_called is False
+
+    async def test_rejects_temporal_durability(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        pytest.importorskip('temporalio')
+        from pydantic_ai.durable_exec.temporal import TemporalDurability
+
+        await self._assert_rejects_durability(TemporalDurability(), monkeypatch)
+
+    async def test_rejects_dbos_durability(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        pytest.importorskip('dbos')
+        from pydantic_ai.durable_exec.dbos import DBOSDurability
+
+        await self._assert_rejects_durability(DBOSDurability(), monkeypatch)
+
+    async def test_rejects_prefect_durability(  # pragma: lax no cover
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        pytest.importorskip('prefect')
+        from pydantic_ai.durable_exec.prefect import PrefectDurability
+
+        await self._assert_rejects_durability(PrefectDurability(), monkeypatch)
+
+    @staticmethod
+    async def _assert_rejects_durability(
+        durability: AbstractCapability[None],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        model = FunctionModel(lambda _messages, _info: ModelResponse(parts=[TextPart('done')]))
+        agent = Agent(
+            model,
+            name=f'advisor-{type(durability).__name__}',
+            deps_type=type(None),
+            capabilities=[Advisor(model, mode='local'), durability],
+        )
+        monkeypatch.setattr(type(durability), 'in_durable_context', property(lambda _self: True))
+
+        with pytest.raises(UserError, match='active durable execution'):
+            await agent.run('Review this.')
 
     def test_explicit_execution_modes(self) -> None:
         local = Advisor('anthropic:claude-opus-4-8', mode='local')

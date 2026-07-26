@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from copy import copy
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from typing import Generic, Literal, Protocol, runtime_checkable
 
@@ -31,7 +31,7 @@ _LIMIT_REACHED = 'Advisor consultation limit reached for this model request. Con
 
 @runtime_checkable
 class _DurabilityCapability(Protocol):
-    """Compatibility protocol for Pydantic AI's durability capabilities."""
+    """Structural view of core durability capabilities without importing optional integrations."""
 
     engine_name: str
 
@@ -127,7 +127,7 @@ class Advisor(NativeOrLocalTool[AgentDepsT]):
     not provide an equivalent cache control.
     """
 
-    _local_uses: int = field(init=False, repr=False, default=0)
+    _local_uses: ContextVar[int] = field(init=False, repr=False)
 
     def __init__(
         self,
@@ -150,7 +150,7 @@ class Advisor(NativeOrLocalTool[AgentDepsT]):
         self.max_uses = max_uses
         self.max_tokens = max_tokens
         self.caching = caching
-        self._local_uses = 0
+        self._local_uses = ContextVar('advisor_local_uses', default=0)
         native_provider, _ = self._parse_native_model(model)
         if mode == 'native' and native_provider is None:
             raise ValueError(
@@ -182,12 +182,6 @@ class Advisor(NativeOrLocalTool[AgentDepsT]):
             id='advisor',
         )
 
-    async def for_run(self, ctx: RunContext[AgentDepsT]) -> Advisor[AgentDepsT]:
-        """Return a fresh instance so concurrent runs do not share the local usage limit."""
-        run = copy(self)
-        run._local_uses = 0
-        return run
-
     async def after_model_request(
         self,
         ctx: RunContext[AgentDepsT],
@@ -196,7 +190,7 @@ class Advisor(NativeOrLocalTool[AgentDepsT]):
         response: ModelResponse,
     ) -> ModelResponse:
         """Reset the local consultation allowance for each executor response."""
-        self._local_uses = 0
+        self._local_uses.set(0)
         return response
 
     async def before_tool_execute(
@@ -208,10 +202,11 @@ class Advisor(NativeOrLocalTool[AgentDepsT]):
         args: ValidatedToolArgs,
     ) -> ValidatedToolArgs:
         """Enforce `max_uses` after argument validation."""
-        if call.tool_name == _LOCAL_TOOL_NAME and self.max_uses is not None:
-            if self._local_uses >= self.max_uses:
+        if tool_def.capability_id == self.id and self.max_uses is not None:
+            local_uses = self._local_uses.get()
+            if local_uses >= self.max_uses:
                 raise SkipToolExecution(_LIMIT_REACHED)
-            self._local_uses += 1
+            self._local_uses.set(local_uses + 1)
         return args
 
     def _native_unique_id(self) -> str:

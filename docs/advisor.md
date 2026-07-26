@@ -77,6 +77,8 @@ Use `mode='native'` when the consultation must stay inside the executor provider
 
 `caching` is an opportunistic Anthropic-native optimization. OpenRouter and the local fallback have no equivalent control.
 
+Configure `Advisor` in Python. It is not available in YAML or JSON agent specs because its model input can be a runtime `Model` instance.
+
 ## Context passed to the advisor
 
 The context depends on the execution path:
@@ -104,6 +106,8 @@ The capability needs no ordering constraint. It composes with other capabilities
 The advisor tool is always visible and is not deferred through [Tool Search](/ai/tools-toolsets/tools-advanced/#tool-search). It reserves the tool name and toolset ID `advisor`. One `Advisor` instance is supported per agent because the native tool has one stable identity.
 
 During streaming, the executor stream pauses while an advisor consultation runs and resumes when the completed advice is available. The local fallback does not splice the advisor model's token deltas into the executor stream.
+
+Local consultations run sequentially, including when one executor response contains multiple advisor calls.
 
 Native advice is compatible with durable execution because it remains part of the executor model request. Local execution cannot yet preserve the same semantics across every durable backend. Temporal and Prefect can checkpoint the returned advice, but changes to the activity-local or task-local [`RunUsage`](/ai/api/pydantic-ai/usage/#pydantic_ai.usage.RunUsage) do not merge back into the outer run. DBOS does not checkpoint ordinary function-tool calls, so a local advisor request could run again during workflow replay.
 
