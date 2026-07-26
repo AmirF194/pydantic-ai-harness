@@ -95,7 +95,7 @@ def show(snapshot: SpendSnapshot) -> None:
 SpendGuard(budgets=[Budget(usd=Decimal('100'))], on_spend=show)
 ```
 
-`on_spend` fires after each response, sync or async, with a `SpendSnapshot`. It carries the response's `usage` unchanged, so cache reads and writes are available without this capability modelling them.
+`on_spend` fires after every response, sync or async, with a `SpendSnapshot` -- including one that `on_unpriced='raise'` is about to reject, since a report that skipped exactly the unpriced responses would be missing the ones worth knowing about. It carries the response's `usage` unchanged, so cache reads and writes are available without this capability modelling them.
 
 `status()` reads the same numbers without a run, which is what a cost display in a UI wants:
 

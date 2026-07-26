@@ -445,6 +445,18 @@ class TestPricing:
         assert spent.requests == 1
         assert spent.unpriced_requests == 1
 
+    async def test_a_refused_response_still_reaches_on_spend(self):
+        """An audit that skipped exactly the unpriced responses would miss the ones that matter."""
+        seen: list[SpendSnapshot] = []
+        guard = SpendGuard(budgets=[Budget(window='total')], on_unpriced='raise', on_spend=seen.append)
+
+        with pytest.raises(UnpricedModelError):
+            await _record(guard, model_name=None)
+
+        assert len(seen) == 1
+        assert seen[0].priced is False
+        assert seen[0].usage.input_tokens == 1000
+
     async def test_raising_on_an_unpriceable_response(self):
         guard = SpendGuard(budgets=[Budget(window='total')], on_unpriced='raise')
 

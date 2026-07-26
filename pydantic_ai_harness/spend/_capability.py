@@ -182,15 +182,6 @@ class SpendGuard(AbstractCapability[AgentDepsT]):
                 )
             statuses.append(_status(budget, key, accrued[key]))
 
-        if not priced and self.on_unpriced == 'raise':
-            # Raised after the store is updated, not before: the request happened
-            # and its tokens were really spent, so dropping them would leave a
-            # token ceiling understating what the model was asked to do.
-            raise UnpricedModelError(
-                f'No price for model {response.model_name or "<unnamed>"}. Supply `SpendGuard.price`, '
-                "or set on_unpriced='zero' to count the request as free."
-            )
-
         if self.on_spend is not None:
             snapshot = SpendSnapshot(
                 model=response.model_name,
@@ -202,6 +193,17 @@ class SpendGuard(AbstractCapability[AgentDepsT]):
             result = self.on_spend(snapshot)
             if inspect.isawaitable(result):
                 await result
+
+        if not priced and self.on_unpriced == 'raise':
+            # Raised last, after the store is updated and `on_spend` has seen the
+            # response. The request happened and its tokens were really spent, so
+            # dropping them would leave a token ceiling understating what the
+            # model was asked to do, and an audit that skipped exactly the
+            # unpriced responses would be missing the ones worth knowing about.
+            raise UnpricedModelError(
+                f'No price for model {response.model_name or "<unnamed>"}. Supply `SpendGuard.price`, '
+                "or set on_unpriced='zero' to count the request as free."
+            )
         return response
 
     async def status(
