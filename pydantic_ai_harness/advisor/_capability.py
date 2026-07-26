@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import Generic, Literal
+from typing import Generic, Literal, Protocol, runtime_checkable
 
 from pydantic_ai import AdvisorTool, Agent
 from pydantic_ai.capabilities import NativeOrLocalTool
@@ -29,6 +29,16 @@ _LOCAL_TOOL_DESCRIPTION = (
 _LIMIT_REACHED = 'Advisor consultation limit reached for this model request. Continue without further advice.'
 
 
+@runtime_checkable
+class _DurabilityCapability(Protocol):
+    """Compatibility protocol for Pydantic AI's durability capabilities."""
+
+    engine_name: str
+
+    @property
+    def in_durable_context(self) -> bool: ...  # pragma: no cover
+
+
 @dataclass(frozen=True)
 class _AdvisorSubagentTool(Generic[AgentDepsT]):
     """Local advisor tool backed by a Pydantic AI subagent."""
@@ -44,15 +54,7 @@ class _AdvisorSubagentTool(Generic[AgentDepsT]):
             ctx: The executor run context.
             prompt: A self-contained question with all context the advisor needs.
         """
-        try:
-            messages = ctx.messages
-        except UserError as e:
-            raise UserError(
-                'Advisor local execution is not compatible with a serialized durable tool activity; '
-                "use mode='native' with a supported provider"
-            ) from e
-
-        if self.max_uses is not None and self._call_ordinal(messages, ctx.tool_call_id) > self.max_uses:
+        if self.max_uses is not None and self._call_ordinal(ctx.messages, ctx.tool_call_id) > self.max_uses:
             return _LIMIT_REACHED
 
         settings = ModelSettings(max_tokens=self.max_tokens) if self.max_tokens is not None else None
@@ -228,16 +230,13 @@ class Advisor(NativeOrLocalTool[AgentDepsT]):
         )
 
     async def before_run(self, ctx: RunContext[AgentDepsT]) -> None:
-        """Reject local-capable execution before a durable run starts."""
+        """Reject local-capable execution inside an active durable container."""
         if self.mode != 'native' and any(
-            any(
-                base.__module__ == 'pydantic_ai.durable_exec._base' and base.__name__ == 'BaseDurabilityCapability'
-                for base in type(capability).__mro__
-            )
+            isinstance(capability, _DurabilityCapability) and capability.in_durable_context
             for capability in ctx.capabilities.values()
         ):
             raise UserError(
-                "Advisor modes 'auto' and 'local' are not compatible with durable execution; "
+                "Advisor modes 'auto' and 'local' are not compatible with active durable execution; "
                 "use mode='native' with a supported provider"
             )
 

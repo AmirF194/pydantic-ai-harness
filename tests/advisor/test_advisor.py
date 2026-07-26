@@ -5,7 +5,8 @@ from collections.abc import Sequence
 import pytest
 from inline_snapshot import snapshot
 from pydantic_ai import AdvisorTool, Agent
-from pydantic_ai.durable_exec.temporal import TemporalDurability, TemporalRunContext
+from pydantic_ai.capabilities import AbstractCapability
+from pydantic_ai.durable_exec.temporal import TemporalDurability
 from pydantic_ai.exceptions import UsageLimitExceeded, UserError
 from pydantic_ai.messages import (
     ModelMessage,
@@ -21,7 +22,7 @@ from pydantic_ai.profiles import ModelProfile
 from pydantic_ai.settings import ModelSettings
 from pydantic_ai.usage import UsageLimits
 
-from pydantic_ai_harness.advisor import Advisor
+from pydantic_ai_harness.advisor import Advisor, AdvisorMode
 
 pytestmark = pytest.mark.anyio
 
@@ -46,6 +47,14 @@ class _ProviderFunctionModel(FunctionModel):
     @property
     def system(self) -> str:
         return self._system_name
+
+
+class _ActiveDurability(AbstractCapability[None]):
+    engine_name = 'Test'
+
+    @property
+    def in_durable_context(self) -> bool:
+        return True
 
 
 def _has_tool_return(messages: Sequence[ModelMessage]) -> bool:
@@ -215,21 +224,37 @@ class TestAdvisor:
         with pytest.raises(UsageLimitExceeded, match='request_limit'):
             await agent.run('Ask for advice.', usage_limits=UsageLimits(request_limit=1))
 
-    async def test_local_advisor_rejects_serialized_durable_context(self) -> None:
-        model = FunctionModel(lambda _messages, _info: ModelResponse(parts=[TextPart('done')]))
-        toolset = Advisor(model, mode='local').get_toolset()
-        assert toolset is not None
-        ctx = TemporalRunContext(None, retries={}, max_retries=1)
-        tools = await toolset.get_tools(ctx)
+    @pytest.mark.parametrize('mode', ['auto', 'local'])
+    async def test_local_capable_mode_runs_outside_durable_context(self, mode: AdvisorMode) -> None:
+        advisor_calls = 0
 
-        with pytest.raises(UserError, match='not compatible with a serialized durable tool activity'):
-            await toolset.call_tool('advisor', {'prompt': 'Review this.'}, ctx, tools['advisor'])
+        def advisor_model(_messages: list[ModelMessage], _info: AgentInfo) -> ModelResponse:
+            nonlocal advisor_calls
+            advisor_calls += 1
+            return ModelResponse(parts=[TextPart('Use a staged rollout.')])
 
-    async def test_local_capable_mode_rejects_durable_agent_before_model_request(self) -> None:
+        def executor(messages: list[ModelMessage], _info: AgentInfo) -> ModelResponse:
+            if not _has_tool_return(messages):
+                return ModelResponse(
+                    parts=[ToolCallPart('advisor', {'prompt': 'Review this.'}, tool_call_id='advisor-1')]
+                )
+            return ModelResponse(parts=[TextPart('done')])
+
+        model = FunctionModel(advisor_model)
+        agent = Agent(
+            FunctionModel(executor),
+            name='executor',
+            capabilities=[Advisor(model, mode=mode), TemporalDurability()],
+        )
+
+        result = await agent.run('Review this.')
+
+        assert result.output == 'done'
+        assert advisor_calls == 1
+
+    @pytest.mark.parametrize('mode', ['auto', 'local'])
+    async def test_local_capable_mode_rejects_active_durable_context(self, mode: AdvisorMode) -> None:
         model_called = False
-
-        class CustomTemporalDurability(TemporalDurability):
-            pass
 
         def executor(_messages: list[ModelMessage], _info: AgentInfo) -> ModelResponse:
             nonlocal model_called
@@ -237,13 +262,59 @@ class TestAdvisor:
             return ModelResponse(parts=[TextPart('done')])
 
         model = FunctionModel(executor)
-        agent = Agent(
+        advisor: Advisor[None] = Advisor(model, mode=mode)
+        active: AbstractCapability[None] = _ActiveDurability()
+        agent = Agent[None, str](
             model,
             name='executor',
-            capabilities=[Advisor(model), CustomTemporalDurability()],
+            deps_type=type(None),
+            capabilities=[advisor, active],
         )
 
-        with pytest.raises(UserError, match="modes 'auto' and 'local'.*durable execution"):
+        with pytest.raises(UserError, match="modes 'auto' and 'local'.*active durable execution"):
+            await agent.run('Review this.')
+        assert model_called is False
+
+    async def test_native_mode_runs_inside_active_durable_context(self) -> None:
+        seen: list[ModelRequestParameters] = []
+
+        def executor(_messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+            seen.append(info.model_request_parameters)
+            return ModelResponse(parts=[TextPart('done')])
+
+        model = _ProviderFunctionModel('anthropic', executor, supports_advisor=True)
+        advisor: Advisor[None] = Advisor('anthropic:claude-opus-4-8', mode='native')
+        active: AbstractCapability[None] = _ActiveDurability()
+        agent = Agent[None, str](
+            model,
+            deps_type=type(None),
+            capabilities=[advisor, active],
+        )
+
+        result = await agent.run('Review this.')
+
+        assert result.output == 'done'
+        assert seen[0].function_tools == []
+        assert seen[0].native_tools == [AdvisorTool(model='claude-opus-4-8')]
+
+    async def test_auto_mode_requires_explicit_native_opt_in_during_durable_execution(self) -> None:
+        model_called = False
+
+        def executor(_messages: list[ModelMessage], _info: AgentInfo) -> ModelResponse:
+            nonlocal model_called
+            model_called = True
+            return ModelResponse(parts=[TextPart('done')])
+
+        model = _ProviderFunctionModel('anthropic', executor, supports_advisor=True)
+        advisor: Advisor[None] = Advisor('anthropic:claude-opus-4-8')
+        active: AbstractCapability[None] = _ActiveDurability()
+        agent = Agent[None, str](
+            model,
+            deps_type=type(None),
+            capabilities=[advisor, active],
+        )
+
+        with pytest.raises(UserError, match="mode='native'"):
             await agent.run('Review this.')
         assert model_called is False
 

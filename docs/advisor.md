@@ -105,7 +105,11 @@ The advisor tool is always visible and is not deferred through [Tool Search](/ai
 
 During streaming, the executor stream pauses while an advisor consultation runs and resumes when the completed advice is available. The local fallback does not splice the advisor model's token deltas into the executor stream.
 
-Native advice is compatible with durable execution because it remains part of the executor model request. Local execution starts a nested model request whose usage and result are not represented by the parent durability capability. Modes `auto` and `local` therefore reject durable runs before the first model request. Use `mode='native'` with a supported provider for durable agents.
+Native advice is compatible with durable execution because it remains part of the executor model request. Local execution cannot yet preserve the same semantics across every durable backend. Temporal and Prefect can checkpoint the returned advice, but changes to the activity-local or task-local [`RunUsage`](/ai/api/pydantic-ai/usage/#pydantic_ai.usage.RunUsage) do not merge back into the outer run. DBOS does not checkpoint ordinary function-tool calls, so a local advisor request could run again during workflow replay.
+
+When using the `TemporalDurability`, `DBOSDurability`, or `PrefectDurability` capability, modes `auto` and `local` therefore reject runs inside an active durable workflow or flow. The same configured agent still works normally outside that durable container. Use `mode='native'` with a supported provider when running the agent durably.
+
+The deprecated `TemporalAgent`, `DBOSAgent`, and `PrefectAgent` wrappers do not expose their active durable state to capability hooks. Local-capable Advisor modes are not supported with those wrappers. Migrate to the corresponding durability capability, or use `mode='native'`.
 
 ## API reference
 
