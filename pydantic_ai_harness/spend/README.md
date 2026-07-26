@@ -36,6 +36,10 @@ Past $100 in a UTC day, the next request raises `SpendLimitExceeded`.
 A budget is a ceiling, a period, and optionally a partition. They compose, so several apply at once:
 
 ```python
+from decimal import Decimal
+
+from pydantic_ai_harness.spend import Budget, SpendGuard
+
 SpendGuard(
     budgets=[
         Budget(usd=Decimal('5'), window='run'),  # one runaway run
@@ -61,6 +65,8 @@ Budgets that share a `name`, `window`, and `scope` share one counter, which is h
 **A budget with no ceiling is a counter.** It accumulates and reports and never refuses anything, which is how per-tenant accounting with no cap is expressed:
 
 ```python
+from pydantic_ai_harness.spend import Budget, SpendGuard
+
 SpendGuard(budgets=[Budget(window='month', scope=lambda ctx: ctx.deps.tenant_id, name='chargeback')])
 ```
 
@@ -73,7 +79,12 @@ Not: that spend stays under the ceiling. The request that crosses the line compl
 ## Reading the numbers
 
 ```python
-def show(snapshot):
+from decimal import Decimal
+
+from pydantic_ai_harness.spend import Budget, SpendGuard, SpendSnapshot
+
+
+def show(snapshot: SpendSnapshot) -> None:
     print(f'{snapshot.model} cost ${snapshot.usd}')
     for status in snapshot.budgets:
         print(f'  {status.budget.name}: ${status.remaining_usd} left')
@@ -87,8 +98,9 @@ SpendGuard(budgets=[Budget(usd=Decimal('100'))], on_spend=show)
 `status()` reads the same numbers without a run, which is what a cost display in a UI wants:
 
 ```python
-for status in await guard.status(scope='acme'):
-    print(status.budget.name, status.spent.usd, status.exhausted)
+async def report(guard: SpendGuard[None]) -> None:
+    for status in await guard.status(scope='acme'):
+        print(status.budget.name, status.spent.usd, status.exhausted)
 ```
 
 Without a run context, budgets on a `run` or `conversation` window are omitted, and so is a budget declaring a `scope` unless `scope=` names the partition to read. Pass `ctx` inside a run and every budget resolves.
@@ -100,9 +112,11 @@ Set `expose_tools=True` to give the agent a `get_spend` tool. It is off by defau
 The default store keeps counters in the process, which catches a runaway loop inside one worker and does nothing for a budget spread across a queue. `RedisSpendStore` is the shared counter:
 
 ```python
+from decimal import Decimal
+
 from redis.asyncio import Redis
 
-from pydantic_ai_harness.spend import RedisSpendStore
+from pydantic_ai_harness.spend import Budget, RedisSpendStore, SpendGuard
 
 store = RedisSpendStore(Redis.from_url('redis://localhost'))
 guard = SpendGuard(budgets=[Budget(usd=Decimal('100'), window='day')], store=store)
@@ -123,6 +137,10 @@ Prices come from [genai-prices](https://github.com/pydantic/genai-prices) via `M
 A model the registry does not know -- a local deployment, a negotiated rate -- is handled by `price`:
 
 ```python
+from decimal import Decimal
+
+from pydantic_ai_harness.spend import SpendGuard
+
 SpendGuard(price=lambda response: Decimal('0.002') if response.model_name == 'internal-7b' else None)
 ```
 
@@ -137,9 +155,10 @@ No ordering is declared. The gate does not need the model, and pricing reads the
 **Durable execution.** The capability hooks run in the workflow; the model request itself is the activity. A store that talks over the network therefore reads and writes from workflow code, which Temporal replays -- so a shared store is not workflow-safe here. Use the in-process store inside the workflow, and enforce the shared budget before starting it:
 
 ```python
-if any(s.exhausted for s in await guard.status(scope=tenant_id)):
-    raise RuntimeError('daily budget exhausted')
-await workflow_handle.execute(...)
+async def start_if_funded(guard: SpendGuard[None], tenant_id: str) -> None:
+    if any(s.exhausted for s in await guard.status(scope=tenant_id)):
+        raise RuntimeError('daily budget exhausted')
+    await workflow_handle.execute(...)
 ```
 
 ## Tracing
