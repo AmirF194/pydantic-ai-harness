@@ -32,6 +32,7 @@ from pydantic_ai_harness.spend import (
     Spent,
     UnpricedModelError,
 )
+from pydantic_ai_harness.spend._store import _SWEEP_EVERY
 
 pytestmark = pytest.mark.anyio
 
@@ -191,10 +192,15 @@ class TestBudgetConfiguration:
 
     @pytest.mark.parametrize(
         ('kwargs', 'match'),
-        [({'usd': Decimal('-5')}, 'usd must not be negative'), ({'tokens': -100}, 'tokens must not be negative')],
+        [
+            ({'usd': Decimal('-5')}, 'usd must be positive'),
+            ({'tokens': -100}, 'tokens must be positive'),
+            ({'usd': Decimal('0')}, 'usd must be positive'),
+            ({'tokens': 0}, 'tokens must be positive'),
+        ],
     )
-    def test_a_negative_ceiling_is_refused(self, kwargs: Any, match: str):
-        """A negative ceiling reads as exhausted before anything is spent."""
+    def test_a_non_positive_ceiling_is_refused(self, kwargs: Any, match: str):
+        """Zero has the negative case's property, and in a spec it far more likely means "no limit"."""
         with pytest.raises(UserError, match=match):
             Budget(**kwargs)
 
@@ -680,6 +686,58 @@ class TestInMemoryStore:
 
         assert len(store) == 1
 
+    async def test_expiring_a_key_on_read_happens_under_the_lock(self):
+        """`get` deletes the key it finds expired, which unlocked races the sweep inside `add`.
+
+        Asserted through the lock rather than by racing threads: the interleaving that breaks
+        it is real (`RuntimeError: dictionary changed size during iteration`) but not
+        reproducible on demand, and a test that fails one run in fifty is not a regression test.
+        """
+        store = InMemorySpendStore(clock=(clock := Clock()))
+        await store.add('k', usd=Decimal('1'), tokens=1, requests=1, unpriced=0, ttl=timedelta(hours=1))
+        clock.advance(timedelta(hours=2))
+        held: list[bool] = []
+        real_lock = store._lock  # pyright: ignore[reportPrivateUsage]
+
+        class _RecordingLock:
+            def __enter__(self) -> None:
+                real_lock.acquire()
+                held.append(True)
+
+            def __exit__(self, *exc_info: object) -> None:
+                real_lock.release()
+
+        object.__setattr__(store, '_lock', _RecordingLock())
+
+        assert await store.get('k') == Spent()
+        assert held == [True], 'the expiring read ran outside the lock'
+
+    async def test_the_sweep_is_amortised_but_length_still_excludes_dead_keys(self):
+        """A full scan under the lock on every write blocks the loop once the dict is large."""
+        clock = Clock()
+        store = InMemorySpendStore(clock=clock)
+        await store.add('monday', usd=Decimal('1'), tokens=1, requests=1, unpriced=0, ttl=timedelta(hours=48))
+        clock.advance(timedelta(days=3))
+        await store.add('thursday', usd=Decimal('1'), tokens=1, requests=1, unpriced=0, ttl=timedelta(hours=48))
+
+        assert len(store) == 1
+        assert await store.get('monday') == Spent()
+
+    async def test_dead_entries_are_physically_dropped_once_the_sweep_runs(self):
+        """`__len__` hides them; only the resident dict shows whether memory is actually reclaimed."""
+        clock = Clock()
+        store = InMemorySpendStore(clock=clock)
+        for index in range(_SWEEP_EVERY):
+            await store.add(f'k{index}', usd=Decimal('1'), tokens=1, requests=1, unpriced=0, ttl=timedelta(hours=1))
+        clock.advance(timedelta(hours=2))
+        assert len(store._entries) == _SWEEP_EVERY  # pyright: ignore[reportPrivateUsage]
+
+        for index in range(_SWEEP_EVERY):
+            await store.add(f'n{index}', usd=Decimal('1'), tokens=1, requests=1, unpriced=0, ttl=timedelta(hours=1))
+
+        assert len(store._entries) == _SWEEP_EVERY  # pyright: ignore[reportPrivateUsage]
+        assert len(store) == _SWEEP_EVERY
+
     async def test_a_reconciler_may_post_a_negative_delta(self):
         store = InMemorySpendStore()
         await store.add('k', usd=Decimal('5'), tokens=10, requests=1, unpriced=0, ttl=None)
@@ -792,6 +850,85 @@ class TestToolset:
         assert await _call_get_spend(SpendGuard[None](expose_tools=True)) == 'No budgets are configured.'
 
 
+class TestExhaustedGate:
+    """The pre-flight check a durable workflow makes, which must not pass by inspecting nothing."""
+
+    async def test_it_refuses_to_answer_about_a_budget_it_cannot_read(self):
+        guard = SpendGuard(
+            budgets=[Budget(usd=Decimal('5'), scope=lambda ctx: str(ctx.deps), name='tenant')],
+            price=lambda r: Decimal('1'),
+        )
+
+        with pytest.raises(UserError, match='would pass having inspected nothing'):
+            await guard.exhausted()
+
+    async def test_it_answers_when_the_scope_is_named(self):
+        guard = SpendGuard(
+            budgets=[Budget(usd=Decimal('0.5'), scope=lambda ctx: str(ctx.deps), name='tenant')],
+            price=lambda r: Decimal('1'),
+        )
+        await _record(guard, ctx=_run_ctx(deps='acme'))
+
+        assert await guard.exhausted(scope='acme') is True
+        assert await guard.exhausted(scope='other') is False
+
+    async def test_status_still_reports_what_it_can(self):
+        """The lenient reading a cost display wants stays lenient."""
+        guard = SpendGuard(
+            budgets=[Budget(usd=Decimal('5'), scope=lambda ctx: str(ctx.deps), name='tenant')],
+            price=lambda r: Decimal('1'),
+        )
+
+        assert await guard.status() == ()
+
+
+class TestNegativeCells:
+    """Each of these asserted only its positive half, leaving the mutant that inverts it alive."""
+
+    async def test_raise_lets_a_priced_response_through(self):
+        """`on_unpriced='raise'` is about the unpriced ones; dropping `not priced` failed every run."""
+        guard = SpendGuard[None](
+            budgets=[Budget(usd=Decimal('100'))],
+            price=lambda response: Decimal('1'),
+            on_unpriced='raise',
+        )
+
+        result = await _agent(guard).run('hi')
+
+        assert result.output == 'ok'
+
+    async def test_a_scope_stays_out_of_the_span_without_content(self):
+        """Dropping the `trace_include_content` half puts a tenant id in every trace."""
+        tracer, exporter = _recording_tracer()
+        guard = SpendGuard(
+            budgets=[Budget(usd=Decimal('0.001'), scope=lambda ctx: str(ctx.deps))],
+            price=lambda r: Decimal('1'),
+        )
+        await _record(guard, ctx=_run_ctx(deps='acme'))
+
+        with pytest.raises(SpendLimitExceeded):
+            await _gate(guard, ctx=_run_ctx(deps='acme', tracer=tracer))
+
+        assert 'spend.scope' not in dict(_only_span(exporter).attributes or {})
+
+    async def test_a_budget_below_its_warning_fraction_does_not_warn(self):
+        """Only the crossed case was asserted, so `warning=True` for every budget also passed."""
+        guard = SpendGuard(budgets=[Budget(usd=Decimal('100'), warn_at=0.8)], price=lambda r: Decimal('1'))
+        await _record(guard)
+
+        [status] = await guard.status()
+
+        assert status.warning is False
+
+    async def test_a_budget_over_its_warning_fraction_warns(self):
+        guard = SpendGuard(budgets=[Budget(usd=Decimal('100'), warn_at=0.8)], price=lambda r: Decimal('90'))
+        await _record(guard)
+
+        [status] = await guard.status()
+
+        assert status.warning is True
+
+
 class TestDuplicateBudgets:
     """Sharing a counter is a feature; two ceilings of one kind on it is not."""
 
@@ -799,6 +936,30 @@ class TestDuplicateBudgets:
         """They read as independent limits and behave as the smaller one."""
         with pytest.raises(UserError, match='would share one counter'):
             SpendGuard[None](budgets=[Budget(usd=Decimal('5')), Budget(usd=Decimal('100'))])
+
+    def test_a_collision_a_later_budget_displaced_is_still_refused(self):
+        """Remembering one budget per slot missed any collision the next budget overwrote."""
+        with pytest.raises(UserError, match='would share one counter'):
+            SpendGuard[None](
+                budgets=[
+                    Budget(usd=Decimal('100'), window='day'),
+                    Budget(usd=Decimal('2000'), window='month'),
+                    Budget(usd=Decimal('5'), window='day'),
+                ]
+            )
+
+    async def test_two_scopes_that_resolve_alike_are_refused_when_the_keys_are_known(self):
+        """Two lambdas are two objects and one key, which construction cannot see."""
+        guard = SpendGuard[None](
+            budgets=[
+                Budget(usd=Decimal('5'), window='day', scope=lambda ctx: 'acme', name='tenant'),
+                Budget(usd=Decimal('100'), window='day', scope=lambda ctx: 'acme', name='tenant'),
+            ],
+            price=lambda response: Decimal('1'),
+        )
+
+        with pytest.raises(UserError, match='accumulate under the same key'):
+            await _agent(guard).run('hi')
 
     def test_a_usd_and_a_token_ceiling_may_share_a_counter(self):
         guard = SpendGuard[None](budgets=[Budget(usd=Decimal('5')), Budget(tokens=100)])

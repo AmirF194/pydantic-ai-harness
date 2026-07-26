@@ -123,23 +123,24 @@ class SpendGuard(AbstractCapability[AgentDepsT]):
         Anything other than `'raise'` behaves as `'zero'`, so a typo in a spec
         would quietly turn unpriced responses free instead of failing the run.
         """
-        seen: dict[tuple[str, str], Budget] = {}
+        # Budgets sharing a name, window and scope share a counter deliberately, which is how
+        # one window carries a USD and a token ceiling. Two ceilings of the SAME kind on one
+        # counter is not that: it reads as two independent limits and behaves as the smaller
+        # one. Comparing against a single remembered budget per slot missed any collision a
+        # later budget displaced, so the slot carries every attribute the counter key does.
+        seen: set[tuple[str, str, str, int]] = set()
         for budget in self.budgets:
-            # Budgets sharing a name, window and scope share a counter deliberately,
-            # which is how one window carries a USD and a token ceiling. Two ceilings
-            # of the SAME kind on one counter is not that: it reads as two independent
-            # limits and behaves as the smaller one.
             for kind, ceiling in (('usd', budget.usd), ('tokens', budget.tokens)):
                 if ceiling is None:
                     continue
-                slot = (budget.name, kind)
-                if slot in seen and seen[slot].window == budget.window and seen[slot].scope is budget.scope:
+                slot = (budget.name, kind, budget.window, id(budget.scope))
+                if slot in seen:
                     raise UserError(
                         f'Two budgets named {budget.name!r} both set a `{kind}` ceiling on the same window and '
                         'scope, so they would share one counter and only the smaller would ever apply. '
                         'Give them different `name`s.'
                     )
-                seen[slot] = budget
+                seen.add(slot)
         if self.on_unpriced not in _UNPRICED_POLICIES:
             raise UserError(
                 f'SpendGuard.on_unpriced must be one of {sorted(_UNPRICED_POLICIES)}; got {self.on_unpriced!r}.'
@@ -249,15 +250,51 @@ class SpendGuard(AbstractCapability[AgentDepsT]):
         meaning outside a run, and a budget declaring a `scope` is omitted
         unless `scope` names the partition to read, since its callable has no
         run context to resolve against.
+
+        Reach for [`exhausted`][pydantic_ai_harness.spend.SpendGuard.exhausted] when the
+        answer gates something: `any(s.exhausted for s in ...)` over a tuple that happens to
+        be empty is a brake that reads as enforcement and inspects nothing, and a guard whose
+        budgets are all scoped returns exactly that tuple.
         """
+        statuses, _ = await self._resolve(ctx, scope)
+        return statuses
+
+    async def _resolve(
+        self, ctx: RunContext[AgentDepsT] | None, scope: str | None
+    ) -> tuple[tuple[BudgetStatus, ...], tuple[str, ...]]:
+        """The readable budgets, and the names of the ones this call cannot resolve."""
         now = self.clock()
         statuses: list[BudgetStatus] = []
+        unresolved: list[str] = []
         for budget in self.budgets:
             if ctx is None and (budget.window in _RUN_SCOPED_WINDOWS or (budget.scope is not None and scope is None)):
+                unresolved.append(budget.name)
                 continue
             key = self._key(budget, ctx, now, scope)
             statuses.append(_status(budget, key, await self.store.get(key)))
-        return tuple(statuses)
+        return tuple(statuses), tuple(unresolved)
+
+    async def exhausted(
+        self,
+        ctx: RunContext[AgentDepsT] | None = None,
+        *,
+        scope: str | None = None,
+    ) -> bool:
+        """Whether any budget this call can read is exhausted, refusing to guess about the rest.
+
+        The pre-flight check a durable workflow makes before starting: its hooks cannot reach
+        a shared store mid-run, so the decision has to be made up front. `status()` omits what
+        it cannot resolve, and `any(...)` over the remainder is a brake that silently checks
+        nothing when every budget is scoped -- so this raises instead, naming the budgets that
+        need a `scope` or a `ctx`.
+        """
+        statuses, unresolved = await self._resolve(ctx, scope)
+        if unresolved:
+            raise UserError(
+                f'Cannot read budget(s) {sorted(unresolved)} without a run context or a `scope`, so this check '
+                'would pass having inspected nothing. Pass `scope=` for a scoped budget, or call it inside a run.'
+            )
+        return any(status.exhausted for status in statuses)
 
     @classmethod
     def from_spec(cls, *args: Any, **kwargs: Any) -> SpendGuard[Any]:
@@ -309,9 +346,29 @@ class SpendGuard(AbstractCapability[AgentDepsT]):
         raise SpendLimitExceeded(f'Budget {budget.name!r} exhausted for this {budget.window}: {detail}')
 
     def _keyed(self, ctx: RunContext[AgentDepsT]) -> list[tuple[Budget, str]]:
-        """Each budget paired with the store key it accumulates under right now."""
+        """Each budget paired with the store key it accumulates under right now.
+
+        The construction-time check compares the shapes a key is built from; here the keys
+        themselves are known, so two budgets whose scopes are different callables returning
+        the same string are caught as well. That is the common way it happens: a scope written
+        twice as `lambda ctx: ctx.deps.tenant` is two objects and one key.
+        """
         now = self.clock()
-        return [(budget, self._key(budget, ctx, now, None)) for budget in self.budgets]
+        keyed = [(budget, self._key(budget, ctx, now, None)) for budget in self.budgets]
+        claimed: dict[tuple[str, str], Budget] = {}
+        for budget, key in keyed:
+            for kind, ceiling in (('usd', budget.usd), ('tokens', budget.tokens)):
+                if ceiling is None:
+                    continue
+                prior = claimed.get((key, kind))
+                if prior is not None and prior is not budget:
+                    raise UserError(
+                        f'Budgets {prior.name!r} and {budget.name!r} accumulate under the same key {key!r} and '
+                        f'both set a `{kind}` ceiling, so only the smaller would ever apply. '
+                        'Give them different `name`s, or one scope.'
+                    )
+                claimed[(key, kind)] = budget
+        return keyed
 
     def _price_of(self, response: ModelResponse) -> tuple[Decimal, bool]:
         """What the response cost, and whether that number is real."""

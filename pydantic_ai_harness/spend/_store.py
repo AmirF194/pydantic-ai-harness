@@ -17,6 +17,13 @@ from typing import Protocol, runtime_checkable
 from pydantic_ai_harness.spend._snapshot import Spent
 
 _Entries = dict[str, tuple[Spent, 'datetime | None']]
+
+_SWEEP_EVERY = 256
+"""Writes between expiry sweeps in `InMemorySpendStore`.
+
+Large enough that the linear scan is amortised to nothing on the hot path, small enough that
+dead entries never accumulate beyond this many.
+"""
 """Each key's counter and the moment it stops counting, if it ever does."""
 
 
@@ -70,21 +77,34 @@ class InMemorySpendStore:
 
     _entries: _Entries = field(default_factory=_Entries, init=False, repr=False)
     _lock: Lock = field(default_factory=Lock, init=False, repr=False)
+    _writes_since_sweep: int = field(default=0, init=False, repr=False)
 
     def __len__(self) -> int:
-        """How many windows are being held.
+        """How many windows are still live.
 
-        A write sweeps the rolled-over ones, so this tracks the windows still
-        live. That is one entry per budget, scope and period -- and for a `run`
-        or `conversation` budget the period is an id, so the count grows with
-        traffic until those entries reach their horizon. Worth watching there
-        and wherever scopes are high-cardinality.
+        Rolled-over entries are excluded whether or not the amortised sweep has reached them
+        yet, so this counts what is being tracked rather than what happens to be resident.
+        That is one entry per budget, scope and period -- and for a `run` or `conversation`
+        budget the period is an id, so the count grows with traffic until those entries reach
+        their horizon. Worth watching there and wherever scopes are high-cardinality.
+
+        Defining `__len__` makes an empty store falsy, so write `if store is not None`.
         """
-        return len(self._entries)
+        now = self.clock()
+        with self._lock:
+            return sum(1 for _, expires_at in self._entries.values() if expires_at is None or now < expires_at)
 
     async def get(self, key: str) -> Spent:
-        """What `key` has accumulated, treating an expired key as absent."""
-        return self._live(key)
+        """What `key` has accumulated, treating an expired key as absent.
+
+        Under the lock, because `_live` deletes the key it finds expired: unlocked, that
+        `del` races the `_sweep` iteration inside `add` (`RuntimeError: dictionary changed
+        size during iteration`) and a second concurrent reader (`KeyError`). Reachable
+        whenever the guard is shared across threads -- `run_sync` from a pool, a sync
+        endpoint -- and any key is read past its horizon.
+        """
+        with self._lock:
+            return self._live(key)
 
     async def add(
         self,
@@ -105,7 +125,9 @@ class InMemorySpendStore:
         that under-counts spend.
         """
         with self._lock:
-            self._sweep()
+            self._writes_since_sweep += 1
+            if self._writes_since_sweep >= _SWEEP_EVERY:
+                self._sweep()
             current = self._live(key)
             updated = Spent(
                 usd=current.usd + usd,
@@ -119,11 +141,17 @@ class InMemorySpendStore:
     def _sweep(self) -> None:
         """Drop every entry whose window has rolled over.
 
-        Expiry cannot wait for the next read of a key: a day window produces a
-        new key each day, so yesterday's is never asked for again and would sit
-        in the dict forever. Sweeping on write keeps the dict to the windows
-        that are still live, which is a handful per budget and scope.
+        Expiry cannot wait for the next read of a key: a day window produces a new key each
+        day, so yesterday's is never asked for again and would sit in the dict forever.
+
+        Amortised over `_SWEEP_EVERY` writes rather than run on each one. The scan is linear
+        in live keys, and `run` and `conversation` budgets hold one key per run and per
+        conversation for a day and a month respectively -- a worker at ten runs a second
+        carries most of a million of them after a day, and a full scan under a
+        `threading.Lock` inside an `async def` would block the event loop for milliseconds on
+        every model request. The interval bounds the excess to that many dead entries.
         """
+        self._writes_since_sweep = 0
         now = self.clock()
         stale = [key for key, (_, expires_at) in self._entries.items() if expires_at is not None and now >= expires_at]
         for key in stale:

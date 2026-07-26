@@ -87,9 +87,10 @@ class Budget:
     def __post_init__(self) -> None:
         """Reject configurations that would quietly misbehave rather than fail.
 
-        A negative ceiling makes a budget exhausted before anything is spent, so
-        the first request is refused with no way to tell that from a real
-        overspend. A `warn_at` on a budget with no ceiling has nothing to be a
+        A ceiling of zero or less makes a budget exhausted before anything is
+        spent, so the first request is refused with no way to tell that from a
+        real overspend -- and `usd: 0` in a spec is far more likely to mean "no
+        limit", which is what `None` says. A `warn_at` on a budget with no ceiling has nothing to be a
         fraction of, so it can never fire. Both read as configuration and behave
         as breakage, which is why they are errors here rather than surprises
         later.
@@ -98,10 +99,10 @@ class Budget:
             raise UserError(f'Budget.window must be one of {sorted(WINDOWS)}; got {self.window!r}.')
         if not self.name or SEPARATOR in self.name:
             raise UserError(f'Budget.name must be non-empty and must not contain {SEPARATOR!r}; got {self.name!r}.')
-        if self.usd is not None and self.usd < 0:
-            raise UserError(f'Budget.usd must not be negative; got {self.usd}.')
-        if self.tokens is not None and self.tokens < 0:
-            raise UserError(f'Budget.tokens must not be negative; got {self.tokens}.')
+        if self.usd is not None and self.usd <= 0:
+            raise UserError(f'Budget.usd must be positive; got {self.usd}. Use `usd=None` for no ceiling.')
+        if self.tokens is not None and self.tokens <= 0:
+            raise UserError(f'Budget.tokens must be positive; got {self.tokens}. Use `tokens=None` for no ceiling.')
         if self.warn_at is not None:
             if not 0 < self.warn_at <= 1:
                 raise UserError(f'Budget.warn_at must be a fraction in (0, 1]; got {self.warn_at!r}.')

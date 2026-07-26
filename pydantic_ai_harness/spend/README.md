@@ -156,10 +156,16 @@ The capability declares itself innermost. `after_model_request` runs innermost f
 
 ```python
 async def start_if_funded(guard: SpendGuard[None], tenant_id: str) -> None:
-    if any(s.exhausted for s in await guard.status(scope=tenant_id)):
+    if await guard.exhausted(scope=tenant_id):
         raise RuntimeError('daily budget exhausted')
     await workflow_handle.execute(...)
 ```
+
+`exhausted` rather than `any(s.exhausted for s in await guard.status(...))`: `status` omits
+the budgets it cannot resolve, and `any()` over what is left is a brake that passes having
+inspected nothing -- which is exactly what a guard whose budgets are all scoped returns when
+the scope is missing. `exhausted` raises there instead, naming the budgets that need a
+`scope` or a run context. Use `status` for a reading, `exhausted` for a decision.
 
 ## Tracing
 
