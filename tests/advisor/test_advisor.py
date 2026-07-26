@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Sequence
 
 import pytest
@@ -182,6 +183,90 @@ class TestAdvisor:
                 'Advisor consultation limit reached for this model request. Continue without further advice.',
             ]
         )
+
+    async def test_invalid_call_does_not_consume_max_uses(self) -> None:
+        advisor_calls = 0
+        executor_calls = 0
+
+        def advisor_model(_messages: list[ModelMessage], _info: AgentInfo) -> ModelResponse:
+            nonlocal advisor_calls
+            advisor_calls += 1
+            return ModelResponse(parts=[TextPart('valid advice')])
+
+        def executor(_messages: list[ModelMessage], _info: AgentInfo) -> ModelResponse:
+            nonlocal executor_calls
+            executor_calls += 1
+            if executor_calls == 1:
+                return ModelResponse(
+                    parts=[
+                        ToolCallPart('advisor', {}, tool_call_id='invalid'),
+                        ToolCallPart('advisor', {'prompt': 'valid'}, tool_call_id='valid'),
+                    ]
+                )
+            return ModelResponse(parts=[TextPart('done')])
+
+        advisor = _ProviderFunctionModel('anthropic', advisor_model)
+        agent = Agent(FunctionModel(executor), capabilities=[Advisor(advisor, max_uses=1)])
+
+        result = await agent.run('Ask twice.')
+
+        assert result.output == 'done'
+        assert advisor_calls == 1
+
+    async def test_max_uses_resets_for_each_executor_request(self) -> None:
+        advisor_calls = 0
+        executor_calls = 0
+
+        def advisor_model(_messages: list[ModelMessage], _info: AgentInfo) -> ModelResponse:
+            nonlocal advisor_calls
+            advisor_calls += 1
+            return ModelResponse(parts=[TextPart(f'advice {advisor_calls}')])
+
+        def executor(_messages: list[ModelMessage], _info: AgentInfo) -> ModelResponse:
+            nonlocal executor_calls
+            executor_calls += 1
+            if executor_calls <= 2:
+                return ModelResponse(
+                    parts=[
+                        ToolCallPart(
+                            'advisor',
+                            {'prompt': f'question {executor_calls}'},
+                            tool_call_id=f'advisor-{executor_calls}',
+                        )
+                    ]
+                )
+            return ModelResponse(parts=[TextPart('done')])
+
+        advisor = _ProviderFunctionModel('anthropic', advisor_model)
+        agent = Agent(FunctionModel(executor), capabilities=[Advisor(advisor, max_uses=1)])
+
+        result = await agent.run('Ask on consecutive requests.')
+
+        assert result.output == 'done'
+        assert advisor_calls == 2
+
+    async def test_concurrent_runs_have_independent_max_uses(self) -> None:
+        advisor_calls = 0
+
+        async def advisor_model(_messages: list[ModelMessage], _info: AgentInfo) -> ModelResponse:
+            nonlocal advisor_calls
+            advisor_calls += 1
+            await asyncio.sleep(0)
+            return ModelResponse(parts=[TextPart('advice')])
+
+        def executor(messages: list[ModelMessage], _info: AgentInfo) -> ModelResponse:
+            if not _has_tool_return(messages):
+                return ModelResponse(parts=[ToolCallPart('advisor', {'prompt': 'question'})])
+            return ModelResponse(parts=[TextPart('done')])
+
+        advisor = _ProviderFunctionModel('anthropic', advisor_model)
+        agent = Agent(FunctionModel(executor), capabilities=[Advisor(advisor, max_uses=1)])
+
+        first, second = await asyncio.gather(agent.run('first'), agent.run('second'))
+
+        assert first.output == 'done'
+        assert second.output == 'done'
+        assert advisor_calls == 2
 
     async def test_openrouter_max_uses_selects_local_fallback(self) -> None:
         seen: list[ModelRequestParameters] = []

@@ -68,7 +68,7 @@ Pydantic AI's resolved executor model profile makes the final support decision. 
 
 Use `mode='native'` when the consultation must stay inside the executor provider, or `mode='local'` when the configured advisor provider must receive a separate request. Native mode requires an `anthropic:<model>` or `openrouter:<model>` string and an executor on that same provider. It does not fall back when the executor lacks support.
 
-`max_uses` has the same per-request scope as Anthropic's native tool. It resets when the executor makes its next model request. OpenRouter ignores native `max_uses`, so `auto` mode selects the local fallback when this option is set. Combining OpenRouter, `mode='native'`, and `max_uses` is rejected.
+`max_uses` has the same per-request scope as Anthropic's native tool. Only calls whose arguments validate consume this allowance. It resets when the executor makes its next model request. OpenRouter ignores native `max_uses`, so `auto` mode selects the local fallback when this option is set. Combining OpenRouter, `mode='native'`, and `max_uses` is rejected.
 
 `caching` is an opportunistic Anthropic-native optimization. OpenRouter and the local fallback have no equivalent control.
 

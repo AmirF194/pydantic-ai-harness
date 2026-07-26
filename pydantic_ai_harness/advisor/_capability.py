@@ -2,17 +2,17 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
-from dataclasses import dataclass
+from copy import copy
+from dataclasses import dataclass, field
 from typing import Generic, Literal, Protocol, runtime_checkable
 
 from pydantic_ai import AdvisorTool, Agent
-from pydantic_ai.capabilities import NativeOrLocalTool
-from pydantic_ai.exceptions import UserError
-from pydantic_ai.messages import ModelMessage, ModelResponse, ToolCallPart
-from pydantic_ai.models import KnownModelName, Model
+from pydantic_ai.capabilities import NativeOrLocalTool, ValidatedToolArgs
+from pydantic_ai.exceptions import SkipToolExecution, UserError
+from pydantic_ai.messages import ModelResponse, ToolCallPart
+from pydantic_ai.models import KnownModelName, Model, ModelRequestContext
 from pydantic_ai.settings import ModelSettings
-from pydantic_ai.tools import AgentDepsT, AgentNativeTool, RunContext, Tool
+from pydantic_ai.tools import AgentDepsT, AgentNativeTool, RunContext, Tool, ToolDefinition
 
 AdvisorModel = Model | KnownModelName | str
 """A Pydantic AI model instance or model name used for advisor consultations."""
@@ -44,7 +44,6 @@ class _AdvisorSubagentTool(Generic[AgentDepsT]):
     """Local advisor tool backed by a Pydantic AI subagent."""
 
     model: AdvisorModel
-    max_uses: int | None
     max_tokens: int | None
 
     async def __call__(self, ctx: RunContext[AgentDepsT], prompt: str) -> str:
@@ -54,9 +53,6 @@ class _AdvisorSubagentTool(Generic[AgentDepsT]):
             ctx: The executor run context.
             prompt: A self-contained question with all context the advisor needs.
         """
-        if self.max_uses is not None and self._call_ordinal(ctx.messages, ctx.tool_call_id) > self.max_uses:
-            return _LIMIT_REACHED
-
         settings = ModelSettings(max_tokens=self.max_tokens) if self.max_tokens is not None else None
         advisor = Agent(
             self.model,
@@ -72,21 +68,6 @@ class _AdvisorSubagentTool(Generic[AgentDepsT]):
             usage_limits=ctx.usage_limits,
         )
         return result.output
-
-    @staticmethod
-    def _call_ordinal(messages: Sequence[ModelMessage], tool_call_id: str | None) -> int:
-        """Return this advisor call's 1-based position in the current executor response."""
-        for message in reversed(messages):
-            if not isinstance(message, ModelResponse):  # pragma: no cover - the current response is last
-                continue
-            calls = [
-                part for part in message.parts if isinstance(part, ToolCallPart) and part.tool_name == _LOCAL_TOOL_NAME
-            ]
-            for index, call in enumerate(calls, start=1):
-                if call.tool_call_id == tool_call_id:
-                    return index
-            break  # pragma: no cover - every executing local tool has a matching call
-        return 1  # pragma: no cover - agent tool execution always follows a model response
 
 
 @dataclass(init=False)
@@ -146,6 +127,8 @@ class Advisor(NativeOrLocalTool[AgentDepsT]):
     not provide an equivalent cache control.
     """
 
+    _local_uses: int = field(init=False, repr=False, default=0)
+
     def __init__(
         self,
         model: AdvisorModel,
@@ -167,6 +150,7 @@ class Advisor(NativeOrLocalTool[AgentDepsT]):
         self.max_uses = max_uses
         self.max_tokens = max_tokens
         self.caching = caching
+        self._local_uses = 0
         native_provider, _ = self._parse_native_model(model)
         if mode == 'native' and native_provider is None:
             raise ValueError(
@@ -183,7 +167,6 @@ class Advisor(NativeOrLocalTool[AgentDepsT]):
         else:
             local_advisor = _AdvisorSubagentTool[AgentDepsT](
                 model=model,
-                max_uses=max_uses,
                 max_tokens=max_tokens,
             )
             local = Tool(
@@ -198,6 +181,38 @@ class Advisor(NativeOrLocalTool[AgentDepsT]):
             local=local,
             id='advisor',
         )
+
+    async def for_run(self, ctx: RunContext[AgentDepsT]) -> Advisor[AgentDepsT]:
+        """Return a fresh instance so concurrent runs do not share the local usage limit."""
+        run = copy(self)
+        run._local_uses = 0
+        return run
+
+    async def after_model_request(
+        self,
+        ctx: RunContext[AgentDepsT],
+        *,
+        request_context: ModelRequestContext,
+        response: ModelResponse,
+    ) -> ModelResponse:
+        """Reset the local consultation allowance for each executor response."""
+        self._local_uses = 0
+        return response
+
+    async def before_tool_execute(
+        self,
+        ctx: RunContext[AgentDepsT],
+        *,
+        call: ToolCallPart,
+        tool_def: ToolDefinition,
+        args: ValidatedToolArgs,
+    ) -> ValidatedToolArgs:
+        """Enforce `max_uses` after argument validation."""
+        if call.tool_name == _LOCAL_TOOL_NAME and self.max_uses is not None:
+            if self._local_uses >= self.max_uses:
+                raise SkipToolExecution(_LIMIT_REACHED)
+            self._local_uses += 1
+        return args
 
     def _native_unique_id(self) -> str:
         """Identify the native tool paired with the local fallback."""
