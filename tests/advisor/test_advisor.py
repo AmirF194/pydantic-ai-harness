@@ -320,7 +320,7 @@ class TestAdvisor:
 
         assert seen[0].native_tools == []
         assert [tool.name for tool in seen[0].function_tools] == ['advisor']
-        assert seen[0].function_tools[0].sequential is True
+        assert seen[0].function_tools[0].sequential is False
 
     async def test_openrouter_without_max_uses_uses_native_advisor(self) -> None:
         seen: list[ModelRequestParameters] = []

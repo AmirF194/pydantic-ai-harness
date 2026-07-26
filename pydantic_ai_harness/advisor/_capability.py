@@ -2,12 +2,11 @@
 
 from __future__ import annotations
 
-from contextvars import ContextVar
 from dataclasses import dataclass, field
-from typing import Generic, Literal, Protocol, runtime_checkable
+from typing import Any, Generic, Literal, Protocol, runtime_checkable
 
-from pydantic_ai import AdvisorTool, Agent
-from pydantic_ai.capabilities import NativeOrLocalTool, ValidatedToolArgs
+from pydantic_ai import AdvisorTool, Agent, AgentRunResult
+from pydantic_ai.capabilities import NativeOrLocalTool, ValidatedToolArgs, WrapRunHandler
 from pydantic_ai.exceptions import SkipToolExecution, UserError
 from pydantic_ai.messages import ModelResponse, ToolCallPart
 from pydantic_ai.models import KnownModelName, Model, ModelRequestContext
@@ -135,7 +134,7 @@ class Advisor(NativeOrLocalTool[AgentDepsT]):
     Native execution keeps the provider's transcript behavior unchanged.
     """
 
-    _local_uses: ContextVar[int] = field(init=False, repr=False)
+    _local_uses: dict[str, int] = field(init=False, repr=False)
 
     def __init__(
         self,
@@ -160,7 +159,7 @@ class Advisor(NativeOrLocalTool[AgentDepsT]):
         self.max_tokens = max_tokens
         self.caching = caching
         self.forward_history = forward_history
-        self._local_uses = ContextVar('advisor_local_uses', default=0)
+        self._local_uses = {}
         native_provider, _ = self._parse_native_model(model)
         if mode == 'native' and native_provider is None:
             raise ValueError(
@@ -184,7 +183,6 @@ class Advisor(NativeOrLocalTool[AgentDepsT]):
                 local_advisor.__call__,
                 name=_LOCAL_TOOL_NAME,
                 description=_LOCAL_TOOL_DESCRIPTION,
-                sequential=max_uses is not None,
             )
             native = False if mode == 'local' else self._native_advisor
         super().__init__(
@@ -201,7 +199,7 @@ class Advisor(NativeOrLocalTool[AgentDepsT]):
         response: ModelResponse,
     ) -> ModelResponse:
         """Reset the local consultation allowance for each executor response."""
-        self._local_uses.set(0)
+        self._local_uses[ctx.run_id or ''] = 0
         return response
 
     async def before_tool_execute(
@@ -214,11 +212,19 @@ class Advisor(NativeOrLocalTool[AgentDepsT]):
     ) -> ValidatedToolArgs:
         """Enforce `max_uses` after argument validation."""
         if tool_def.capability_id == self.id and self.max_uses is not None:
-            local_uses = self._local_uses.get()
+            run_id = ctx.run_id or ''
+            local_uses = self._local_uses.get(run_id, 0)
             if local_uses >= self.max_uses:
                 raise SkipToolExecution(_LIMIT_REACHED)
-            self._local_uses.set(local_uses + 1)
+            self._local_uses[run_id] = local_uses + 1
         return args
+
+    async def wrap_run(self, ctx: RunContext[AgentDepsT], *, handler: WrapRunHandler) -> AgentRunResult[Any]:
+        """Run the agent, then discard its local consultation count."""
+        try:
+            return await handler()
+        finally:
+            self._local_uses.pop(ctx.run_id or '', None)
 
     def _native_unique_id(self) -> str:
         """Identify the native tool paired with the local fallback."""
