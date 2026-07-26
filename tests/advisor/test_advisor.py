@@ -1,12 +1,12 @@
 from __future__ import annotations
 
+import importlib.util
 from collections.abc import Sequence
 
 import pytest
 from inline_snapshot import snapshot
 from pydantic_ai import AdvisorTool, Agent
 from pydantic_ai.capabilities import AbstractCapability
-from pydantic_ai.durable_exec.temporal import TemporalDurability
 from pydantic_ai.exceptions import UsageLimitExceeded, UserError
 from pydantic_ai.messages import (
     ModelMessage,
@@ -226,6 +226,10 @@ class TestAdvisor:
 
     @pytest.mark.parametrize('mode', ['auto', 'local'])
     async def test_local_capable_mode_runs_outside_durable_context(self, mode: AdvisorMode) -> None:
+        if importlib.util.find_spec('temporalio') is None:
+            pytest.skip('temporalio not installed')
+        from pydantic_ai.durable_exec.temporal import TemporalDurability
+
         advisor_calls = 0
 
         def advisor_model(_messages: list[ModelMessage], _info: AgentInfo) -> ModelResponse:
