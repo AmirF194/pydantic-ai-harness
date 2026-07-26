@@ -252,6 +252,55 @@ class TestWindows:
             await _record(guard, ctx=_run_ctx(**ctx_kwargs))
 
 
+class TestKeyCollisions:
+    """Two budgets share a counter only when they mean to."""
+
+    async def test_budgets_sharing_a_window_share_one_counter(self):
+        """A USD and a token ceiling on the same window are two limits on one counter."""
+        guard = SpendGuard(
+            budgets=[Budget(usd=Decimal('10'), window='day'), Budget(tokens=99_999, window='day')],
+            price=lambda r: Decimal('1'),
+        )
+        await _record(guard)
+
+        usd_budget, token_budget = await guard.status()
+        assert usd_budget.key == token_budget.key
+        assert usd_budget.spent.usd == Decimal('1')
+        assert usd_budget.spent.requests == 1
+
+    async def test_a_shared_counter_is_read_once_per_request(self):
+        """Two ceilings on one window are one round trip, which matters against a network store."""
+        reads: list[str] = []
+
+        class Counting(InMemorySpendStore):
+            async def get(self, key: str) -> Spent:
+                reads.append(key)
+                return await super().get(key)
+
+        guard = SpendGuard(
+            budgets=[Budget(usd=Decimal('10'), window='day'), Budget(tokens=99_999, window='day')],
+            store=Counting(),
+        )
+        await _gate(guard)
+
+        assert len(reads) == 1
+
+    async def test_a_run_id_cannot_impersonate_another_window(self):
+        """Bucket values are not drawn from disjoint sets, so the window is part of the key."""
+        guard = SpendGuard(budgets=[Budget(window='run'), Budget(window='total')])
+        ctx = _run_ctx(run_id='total')
+
+        run_budget, total_budget = await guard.status(ctx)
+        assert run_budget.key != total_budget.key
+
+    async def test_a_run_and_a_conversation_with_one_id_stay_apart(self):
+        guard = SpendGuard(budgets=[Budget(window='run'), Budget(window='conversation')])
+        ctx = _run_ctx(run_id='same', conversation_id='same')
+
+        run_budget, conversation_budget = await guard.status(ctx)
+        assert run_budget.key != conversation_budget.key
+
+
 class TestScope:
     """`scope` partitions one counter; it does not select a store."""
 
@@ -273,11 +322,12 @@ class TestScope:
 
         assert (await guard.status(scope='anything'))[0].spent.usd == Decimal('1')
 
-    @pytest.mark.parametrize('resolved', ['', 'a|b'])
+    @pytest.mark.parametrize('resolved', ['', 'a|b', '*'])
     async def test_a_scope_key_that_would_collide_is_refused(self, resolved: str):
+        """`'*'` included: it is how an unscoped budget is keyed, so it would share that counter."""
         guard = SpendGuard(budgets=[Budget(scope=lambda ctx: resolved)])
 
-        with pytest.raises(UserError, match='must be non-empty and must not contain'):
+        with pytest.raises(UserError, match='must be non-empty and must not be'):
             await _record(guard)
 
 
@@ -383,11 +433,39 @@ class TestPricing:
         with pytest.raises(UnpricedModelError, match='not-a-real-model'):
             await _record(guard, model_name='not-a-real-model', provider_name=None)
 
+    async def test_a_refused_response_is_still_counted(self):
+        """The tokens were really spent, so dropping them would understate a token ceiling."""
+        guard = SpendGuard(budgets=[Budget(tokens=5000, window='day')], on_unpriced='raise')
+
+        with pytest.raises(UnpricedModelError):
+            await _record(guard, model_name=None)
+
+        spent = (await guard.status())[0].spent
+        assert spent.tokens == 1100
+        assert spent.requests == 1
+        assert spent.unpriced_requests == 1
+
     async def test_raising_on_an_unpriceable_response(self):
         guard = SpendGuard(budgets=[Budget(window='total')], on_unpriced='raise')
 
         with pytest.raises(UnpricedModelError, match='<unnamed>'):
             await _record(guard, model_name=None)
+
+
+class TestConfigurationFromData:
+    """Values that arrive as plain data are checked, not trusted."""
+
+    @pytest.mark.parametrize('window', ['weekly', 'daily', ''])
+    def test_an_unknown_window_is_refused(self, window: str):
+        """A `Literal` is not enforced at runtime, so a spec typo would reach `assert_never`."""
+        with pytest.raises(UserError, match='window must be one of'):
+            SpendGuard[None].from_spec(budgets=[{'window': window}])
+
+    @pytest.mark.parametrize('policy', ['raises', 'Zero', ''])
+    def test_an_unknown_unpriced_policy_is_refused(self, policy: str):
+        """Anything but `'raise'` behaves as `'zero'`, so a typo would quietly make responses free."""
+        with pytest.raises(UserError, match='on_unpriced must be one of'):
+            SpendGuard[None](on_unpriced=policy)  # pyright: ignore[reportArgumentType]
 
 
 class TestObservability:
@@ -521,6 +599,21 @@ class TestInMemoryStore:
         clock.advance(timedelta(hours=2))
 
         assert await store.get('k') == Spent()
+
+    async def test_a_rolled_over_key_is_swept_rather_than_kept(self):
+        """A day key is never read again once the day turns, so only a sweep can drop it."""
+        clock = Clock()
+        store = InMemorySpendStore(clock=clock)
+        await store.add('monday', usd=Decimal('1'), tokens=1, requests=1, unpriced=0, ttl=timedelta(hours=48))
+        clock.advance(timedelta(days=3))
+
+        await store.add('thursday', usd=Decimal('1'), tokens=1, requests=1, unpriced=0, ttl=timedelta(hours=48))
+
+        assert len(store) == 1
+
+    async def test_a_conversation_counter_is_not_expired(self):
+        """A conversation bucket never rolls over, so expiry would hand back the whole ceiling."""
+        assert Budget(window='conversation').ttl is None
 
     async def test_a_reconciler_may_post_a_negative_delta(self):
         store = InMemorySpendStore()

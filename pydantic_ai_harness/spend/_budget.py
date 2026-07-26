@@ -29,9 +29,15 @@ identifiers.
 
 _ANY_SCOPE = '*'
 
+WINDOWS: frozenset[str] = frozenset({'run', 'conversation', 'day', 'month', 'total'})
+"""The accepted `window` values, for validating one that arrived as plain data."""
+
+# `run` counters are dead once the run ends, so they expire. `conversation` and
+# `total` never expire: their bucket does not roll over, so dropping the counter
+# would hand back the whole ceiling rather than start a new period.
 _TTLS: dict[Window, timedelta | None] = {
     'run': timedelta(hours=24),
-    'conversation': timedelta(hours=24),
+    'conversation': None,
     'day': timedelta(hours=48),
     'month': timedelta(days=62),
     'total': None,
@@ -85,6 +91,8 @@ class Budget:
         as breakage, which is why they are errors here rather than surprises
         later.
         """
+        if self.window not in WINDOWS:
+            raise UserError(f'Budget.window must be one of {sorted(WINDOWS)}; got {self.window!r}.')
         if not self.name or SEPARATOR in self.name:
             raise UserError(f'Budget.name must be non-empty and must not contain {SEPARATOR!r}; got {self.name!r}.')
         if self.usd is not None and self.usd < 0:
@@ -154,10 +162,11 @@ def scope_key(budget: Budget, ctx: RunContext[Any] | None, explicit: str | None)
     resolved = budget.scope(ctx) if ctx is not None else explicit
     if resolved is None:  # pragma: no cover - callers filter these budgets out first
         raise UserError(f'Budget {budget.name!r} declares a scope, which cannot be resolved without a run.')
-    if not resolved or SEPARATOR in resolved:
+    if not resolved or SEPARATOR in resolved or resolved == _ANY_SCOPE:
         raise UserError(
-            f'The scope of budget {budget.name!r} must be non-empty and must not contain '
-            f'{SEPARATOR!r}; got {resolved!r}.'
+            f'The scope of budget {budget.name!r} must be non-empty and must not be {_ANY_SCOPE!r} or '
+            f'contain {SEPARATOR!r}; got {resolved!r}. {_ANY_SCOPE!r} is how an unscoped budget is keyed, '
+            "so returning it would share that budget's counter."
         )
     return resolved
 
@@ -165,10 +174,15 @@ def scope_key(budget: Budget, ctx: RunContext[Any] | None, explicit: str | None)
 def store_key(budget: Budget, bucket_id: str, scope: str) -> str:
     """Join the parts of a budget's store key.
 
-    `name` and `scope` are checked to be free of `SEPARATOR`, which is what
-    makes a key identify exactly one `(name, scope, bucket)`: the first two
-    separators delimit unambiguously, so whatever follows is the bucket. That
-    is why `bucket_id` needs no check of its own even though a caller-supplied
-    conversation id may contain anything.
+    The window is part of the key because bucket values are not drawn from
+    disjoint sets: a run whose id happens to be `total` would otherwise share a
+    counter with a `total` budget, and a run and a conversation collide whenever
+    their ids match.
+
+    `name`, `window`, and `scope` are all free of `SEPARATOR` -- the first two
+    are checked in `Budget.__post_init__`, the third in `scope_key` -- so the
+    first three separators delimit unambiguously and whatever follows is the
+    bucket. That is why `bucket_id` needs no check of its own even though a
+    caller-supplied conversation id may contain anything.
     """
-    return f'{budget.name}{SEPARATOR}{scope}{SEPARATOR}{bucket_id}'
+    return f'{budget.name}{SEPARATOR}{budget.window}{SEPARATOR}{scope}{SEPARATOR}{bucket_id}'

@@ -43,6 +43,7 @@ PriceFunc = Callable[[ModelResponse], Decimal | None]
 """Prices a response. Return `None` to fall back to the `genai-prices` registry."""
 
 _RUN_SCOPED_WINDOWS = ('run', 'conversation')
+_UNPRICED_POLICIES = frozenset({'zero', 'raise'})
 
 
 @dataclass
@@ -116,6 +117,17 @@ class SpendGuard(AbstractCapability[AgentDepsT]):
     clock: Callable[[], datetime] = utc_now
     """Supplies the time that day and month windows are derived from."""
 
+    def __post_init__(self) -> None:
+        """Reject an `on_unpriced` that arrived as plain data and is not one of the two policies.
+
+        Anything other than `'raise'` behaves as `'zero'`, so a typo in a spec
+        would quietly turn unpriced responses free instead of failing the run.
+        """
+        if self.on_unpriced not in _UNPRICED_POLICIES:
+            raise UserError(
+                f'SpendGuard.on_unpriced must be one of {sorted(_UNPRICED_POLICIES)}; got {self.on_unpriced!r}.'
+            )
+
     @classmethod
     def get_serialization_name(cls) -> str | None:
         """The name a spec refers to this capability by, pinned against a class rename."""
@@ -135,13 +147,13 @@ class SpendGuard(AbstractCapability[AgentDepsT]):
         request_context: ModelRequestContext,
     ) -> ModelRequestContext:
         """Refuse the request if any budget with a ceiling is already spent."""
-        now = self.clock()
-        for budget in self.budgets:
+        read: dict[str, Spent] = {}
+        for budget, key in self._keyed(ctx, None):
             if not budget.enforces:
                 continue
-            key = self._key(budget, ctx, now, None)
-            spent = await self.store.get(key)
-            self._check(budget, spent, ctx)
+            if key not in read:
+                read[key] = await self.store.get(key)
+            self._check(budget, read[key], ctx)
         return request_context
 
     async def after_model_request(
@@ -152,20 +164,32 @@ class SpendGuard(AbstractCapability[AgentDepsT]):
         response: ModelResponse,
     ) -> ModelResponse:
         """Price the response, add it to every window, and report the result."""
-        usd, priced = self._resolve_price(response)
-        now = self.clock()
+        usd, priced = self._price_of(response)
+        accrued: dict[str, Spent] = {}
         statuses: list[BudgetStatus] = []
-        for budget in self.budgets:
-            key = self._key(budget, ctx, now, None)
-            spent = await self.store.add(
-                key,
-                usd=usd,
-                tokens=response.usage.total_tokens,
-                requests=1,
-                unpriced=0 if priced else 1,
-                ttl=budget.ttl,
+        for budget, key in self._keyed(ctx, None):
+            # Budgets sharing a name, window, and scope share a counter, which is
+            # how one window carries both a USD and a token ceiling. Adding the
+            # response once per budget would double-count it and halve them both.
+            if key not in accrued:
+                accrued[key] = await self.store.add(
+                    key,
+                    usd=usd,
+                    tokens=response.usage.total_tokens,
+                    requests=1,
+                    unpriced=0 if priced else 1,
+                    ttl=budget.ttl,
+                )
+            statuses.append(_status(budget, key, accrued[key]))
+
+        if not priced and self.on_unpriced == 'raise':
+            # Raised after the store is updated, not before: the request happened
+            # and its tokens were really spent, so dropping them would leave a
+            # token ceiling understating what the model was asked to do.
+            raise UnpricedModelError(
+                f'No price for model {response.model_name or "<unnamed>"}. Supply `SpendGuard.price`, '
+                "or set on_unpriced='zero' to count the request as free."
             )
-            statuses.append(_status(budget, key, spent))
 
         if self.on_spend is not None:
             snapshot = SpendSnapshot(
@@ -254,7 +278,12 @@ class SpendGuard(AbstractCapability[AgentDepsT]):
         ctx.tracer.start_span('spend budget exhausted', attributes=attributes).end()
         raise SpendLimitExceeded(f'Budget {budget.name!r} exhausted for this {budget.window}: {detail}')
 
-    def _resolve_price(self, response: ModelResponse) -> tuple[Decimal, bool]:
+    def _keyed(self, ctx: RunContext[AgentDepsT] | None, scope: str | None) -> list[tuple[Budget, str]]:
+        """Each budget paired with the store key it accumulates under right now."""
+        now = self.clock()
+        return [(budget, self._key(budget, ctx, now, scope)) for budget in self.budgets]
+
+    def _price_of(self, response: ModelResponse) -> tuple[Decimal, bool]:
         """What the response cost, and whether that number is real."""
         if self.price is not None:
             supplied = self.price(response)
@@ -270,11 +299,6 @@ class SpendGuard(AbstractCapability[AgentDepsT]):
                 return response.cost().total_price, True
             except LookupError:
                 pass
-        if self.on_unpriced == 'raise':
-            raise UnpricedModelError(
-                f'No price for model {response.model_name or "<unnamed>"}. Supply `SpendGuard.price`, '
-                "or set on_unpriced='zero' to count the request as free."
-            )
         return Decimal(0), False
 
 

@@ -69,6 +69,14 @@ class InMemorySpendStore:
 
     _entries: _Entries = field(default_factory=_Entries, init=False, repr=False)
 
+    def __len__(self) -> int:
+        """How many windows are being held.
+
+        Bounded by the budgets and scopes still live, since a write sweeps the
+        rolled-over ones. Worth watching if scopes are high-cardinality.
+        """
+        return len(self._entries)
+
     async def get(self, key: str) -> Spent:
         """What `key` has accumulated, treating an expired key as absent."""
         return self._live(key)
@@ -88,6 +96,7 @@ class InMemorySpendStore:
         The mutation spans no `await`, so concurrent runs in one event loop
         cannot interleave halfway through it.
         """
+        self._sweep()
         current = self._live(key)
         updated = Spent(
             usd=current.usd + usd,
@@ -98,11 +107,24 @@ class InMemorySpendStore:
         self._entries[key] = (updated, None if ttl is None else self.clock() + ttl)
         return updated
 
+    def _sweep(self) -> None:
+        """Drop every entry whose window has rolled over.
+
+        Expiry cannot wait for the next read of a key: a day window produces a
+        new key each day, so yesterday's is never asked for again and would sit
+        in the dict forever. Sweeping on write keeps the dict to the windows
+        that are still live, which is a handful per budget and scope.
+        """
+        now = self.clock()
+        stale = [key for key, (_, expires_at) in self._entries.items() if expires_at is not None and now >= expires_at]
+        for key in stale:
+            del self._entries[key]
+
     def _live(self, key: str) -> Spent:
         """The entry at `key`, dropping it first if its window has rolled over.
 
-        Expiry is applied on access rather than on a timer: a long-lived process
-        would otherwise keep one entry per elapsed day forever.
+        A read also expires the key it touches, so a rolled-over window reads as
+        zero even between writes.
         """
         entry = self._entries.get(key)
         if entry is None:

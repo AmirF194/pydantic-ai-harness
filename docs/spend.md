@@ -56,7 +56,9 @@ SpendGuard(
 | `warn_at` | fraction past which `BudgetStatus.warning` is set; never blocks |
 | `name` | distinguishes budgets sharing a window and scope |
 
-A window rolls over by producing a different store key rather than by resetting a counter, so a new day is simply a new key and nothing has to run at midnight.
+A window rolls over by producing a different store key rather than by resetting a counter, so a new day is simply a new key and nothing has to run at midnight. `conversation` and `total` counters never expire, because their bucket does not roll over and dropping the counter would hand back the whole ceiling rather than start a new period.
+
+Budgets that share a `name`, `window`, and `scope` share one counter, which is how a single window carries both a USD and a token ceiling. The response is added to that counter once, not once per budget.
 
 **A budget with no ceiling is a counter.** It accumulates and reports and never refuses anything, which is how per-tenant accounting with no cap is expressed:
 
@@ -126,7 +128,7 @@ A model the registry does not know -- a local deployment, a negotiated rate -- i
 SpendGuard(price=lambda response: Decimal('0.002') if response.model_name == 'internal-7b' else None)
 ```
 
-Returning `None` falls through to the registry. When nothing can price a response, `on_unpriced` decides: `'zero'` (the default) counts it as free and increments `Spent.unpriced_requests` so the gap is visible, and `'raise'` fails the run with `UnpricedModelError`. Tokens are counted either way, so a token ceiling still holds for a model with no price.
+Returning `None` falls through to the registry. When nothing can price a response, `on_unpriced` decides: `'zero'` (the default) counts it as free and increments `Spent.unpriced_requests` so the gap is visible, and `'raise'` fails the run with `UnpricedModelError`. Either way the response is recorded first and the tokens are counted, so a token ceiling still holds for a model with no price and an application that catches the error does not carry on against an understated counter.
 
 ## Composition
 
