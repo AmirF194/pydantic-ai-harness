@@ -92,6 +92,8 @@ The context depends on the execution path:
 | OpenRouter native | The executor supplies a consultation prompt. Pydantic AI configures `forward_transcript=false`. |
 | Local fallback | The executor supplies a consultation prompt through the `advisor` function tool. With `forward_history=True`, the advisor also receives completed executor message history. |
 
+The local advisor uses its own fixed instructions. It does not inherit executor dependencies, tools, or toolsets. `forward_history` adds completed messages only; it does not include the executor's current partial response.
+
 For portable behavior, tell the executor to put the question and all relevant evidence in its consultation prompt. The local tool description reinforces this requirement.
 
 The local fallback sends that prompt to the configured advisor model and provider. Native execution uses the executor's provider configuration. Treat this distinction as a data-routing choice when reviewing credentials, transcript sharing, and provider policies.

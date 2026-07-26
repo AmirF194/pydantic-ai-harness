@@ -2,16 +2,17 @@
 
 from __future__ import annotations
 
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import Any, Literal, Protocol, runtime_checkable
 
 from pydantic_ai import AdvisorTool, Agent, AgentRunResult
-from pydantic_ai.capabilities import NativeOrLocalTool, ValidatedToolArgs, WrapRunHandler
-from pydantic_ai.exceptions import SkipToolExecution, UserError
-from pydantic_ai.messages import ModelResponse, ToolCallPart
+from pydantic_ai.capabilities import NativeOrLocalTool, WrapRunHandler
+from pydantic_ai.exceptions import UserError
+from pydantic_ai.messages import ModelResponse
 from pydantic_ai.models import KnownModelName, Model, ModelRequestContext
 from pydantic_ai.settings import ModelSettings
-from pydantic_ai.tools import AgentDepsT, AgentNativeTool, RunContext, Tool, ToolDefinition
+from pydantic_ai.tools import AgentDepsT, AgentNativeTool, RunContext
 
 AdvisorModel = Model | KnownModelName | str
 """A Pydantic AI model instance or model name used for advisor consultations."""
@@ -19,12 +20,6 @@ AdvisorModel = Model | KnownModelName | str
 AdvisorMode = Literal['auto', 'native', 'local']
 """How advisor consultations are executed."""
 
-_LOCAL_TOOL_NAME = 'advisor'
-_LOCAL_TOOL_DESCRIPTION = (
-    'Consult a stronger model about a difficult or high-impact decision. '
-    'Include the complete question and all relevant context in `prompt` because '
-    'conversation history may not be available to the advisor.'
-)
 _LIMIT_REACHED = 'Advisor consultation limit reached for this model request. Continue without further advice.'
 
 
@@ -136,15 +131,27 @@ class Advisor(NativeOrLocalTool[AgentDepsT]):
             raise ValueError("Advisor.max_uses is not supported by OpenRouter in mode='native'")
 
         native: AgentNativeTool[AgentDepsT] | bool
-        local: Tool[AgentDepsT] | bool
+        local: Callable[[RunContext[AgentDepsT], str], Awaitable[str]] | bool
         if mode == 'native':
             native = self._required_native_advisor
             local = False
         else:
 
-            async def local_advisor(ctx: RunContext[AgentDepsT], prompt: str) -> str:
+            async def advisor(ctx: RunContext[AgentDepsT], prompt: str) -> str:
+                """Consult a stronger model about a difficult or high-impact decision.
+
+                Include the complete question and all relevant context in `prompt`
+                because conversation history may not be available to the advisor.
+                """
+                if max_uses is not None:
+                    run_id = ctx.run_id or ''
+                    local_uses = self._local_uses.get(run_id, 0)
+                    if local_uses >= max_uses:
+                        return _LIMIT_REACHED
+                    self._local_uses[run_id] = local_uses + 1
+
                 settings = ModelSettings(max_tokens=max_tokens) if max_tokens is not None else None
-                advisor = Agent(
+                advisor_agent = Agent(
                     model,
                     instructions=(
                         'You are an expert advisor. Give concise, actionable advice to the executor model '
@@ -152,7 +159,7 @@ class Advisor(NativeOrLocalTool[AgentDepsT]):
                     ),
                     model_settings=settings,
                 )
-                result = await advisor.run(
+                result = await advisor_agent.run(
                     prompt,
                     message_history=ctx.messages[:-1] if forward_history else None,
                     usage=ctx.usage,
@@ -160,11 +167,7 @@ class Advisor(NativeOrLocalTool[AgentDepsT]):
                 )
                 return result.output
 
-            local = Tool(
-                local_advisor,
-                name=_LOCAL_TOOL_NAME,
-                description=_LOCAL_TOOL_DESCRIPTION,
-            )
+            local = advisor
             native = False if mode == 'local' else self._native_advisor
         super().__init__(
             native=native,
@@ -182,23 +185,6 @@ class Advisor(NativeOrLocalTool[AgentDepsT]):
         """Reset the local consultation allowance for each executor response."""
         self._local_uses[ctx.run_id or ''] = 0
         return response
-
-    async def before_tool_execute(
-        self,
-        ctx: RunContext[AgentDepsT],
-        *,
-        call: ToolCallPart,
-        tool_def: ToolDefinition,
-        args: ValidatedToolArgs,
-    ) -> ValidatedToolArgs:
-        """Enforce `max_uses` after argument validation."""
-        if tool_def.capability_id == self.id and self.max_uses is not None:
-            run_id = ctx.run_id or ''
-            local_uses = self._local_uses.get(run_id, 0)
-            if local_uses >= self.max_uses:
-                raise SkipToolExecution(_LIMIT_REACHED)
-            self._local_uses[run_id] = local_uses + 1
-        return args
 
     async def wrap_run(self, ctx: RunContext[AgentDepsT], *, handler: WrapRunHandler) -> AgentRunResult[Any]:
         """Run the agent, then discard its local consultation count."""

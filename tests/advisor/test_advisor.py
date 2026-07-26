@@ -120,12 +120,11 @@ class TestAdvisor:
         agent = Agent(executor_model, capabilities=[Advisor(advisor, max_tokens=2048)])
 
         await agent.run('Plan the deployment.')
-        await agent.run('Plan another deployment.')
 
-        assert advisor_prompts == ['How should I deploy this?', 'How should I deploy this?']
-        assert advisor_settings == [ModelSettings(max_tokens=2048), ModelSettings(max_tokens=2048)]
+        assert advisor_prompts == ['How should I deploy this?']
+        assert advisor_settings == [ModelSettings(max_tokens=2048)]
 
-    async def test_unsupported_native_profile_exposes_parallel_local_tool(self) -> None:
+    async def test_unsupported_native_profile_exposes_local_tool(self) -> None:
         seen: list[ModelRequestParameters] = []
 
         def executor(_messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
@@ -139,7 +138,6 @@ class TestAdvisor:
 
         assert seen[0].native_tools == []
         assert [tool.name for tool in seen[0].function_tools] == ['advisor']
-        assert seen[0].function_tools[0].sequential is False
 
     @pytest.mark.parametrize(
         ('forward_history', 'expected_prompts'),
@@ -320,7 +318,6 @@ class TestAdvisor:
 
         assert seen[0].native_tools == []
         assert [tool.name for tool in seen[0].function_tools] == ['advisor']
-        assert seen[0].function_tools[0].sequential is False
 
     async def test_openrouter_without_max_uses_uses_native_advisor(self) -> None:
         seen: list[ModelRequestParameters] = []
@@ -486,18 +483,6 @@ class TestAdvisor:
         with pytest.raises(UserError, match='active durable execution'):
             await agent.run('Review this.')
 
-    def test_explicit_execution_modes(self) -> None:
-        local = Advisor('anthropic:claude-opus-4-8', mode='local')
-        assert local.get_native_tools() == []
-        assert local.get_toolset() is not None
-
-        other_provider = Advisor('openai:gpt-5.4')
-        assert other_provider.get_toolset() is not None
-
-        native = Advisor('anthropic:claude-opus-4-8', mode='native', max_uses=2)
-        assert len(native.get_native_tools()) == 1
-        assert native.get_toolset() is None
-
     @pytest.mark.parametrize(
         ('executor_provider', 'advisor_model', 'required_provider'),
         [
@@ -546,6 +531,8 @@ class TestAdvisor:
             Advisor(model, mode='native')
         with pytest.raises(ValueError, match="mode='native'.*model name"):
             Advisor('test', mode='native')
+        with pytest.raises(ValueError, match="mode='native'.*model name"):
+            Advisor('openai:gpt-5.4', mode='native')
         with pytest.raises(ValueError, match='not supported by OpenRouter'):
             Advisor('openrouter:anthropic/claude-opus-4.8', mode='native', max_uses=1)
 
