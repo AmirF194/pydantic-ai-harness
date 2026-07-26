@@ -3,8 +3,8 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
-from dataclasses import dataclass, field
-from typing import Literal
+from dataclasses import dataclass
+from typing import Generic, Literal
 
 from pydantic_ai import AdvisorTool, Agent
 from pydantic_ai.capabilities import NativeOrLocalTool
@@ -27,6 +27,64 @@ _LOCAL_TOOL_DESCRIPTION = (
     'the local advisor does not receive this conversation automatically.'
 )
 _LIMIT_REACHED = 'Advisor consultation limit reached for this model request. Continue without further advice.'
+
+
+@dataclass(frozen=True)
+class _AdvisorSubagentTool(Generic[AgentDepsT]):
+    """Local advisor tool backed by a Pydantic AI subagent."""
+
+    model: AdvisorModel
+    max_uses: int | None
+    max_tokens: int | None
+
+    async def __call__(self, ctx: RunContext[AgentDepsT], prompt: str) -> str:
+        """Consult the configured advisor model.
+
+        Args:
+            ctx: The executor run context.
+            prompt: A self-contained question with all context the advisor needs.
+        """
+        try:
+            messages = ctx.messages
+        except UserError as e:
+            raise UserError(
+                'Advisor local execution is not compatible with a serialized durable tool activity; '
+                "use mode='native' with a supported provider"
+            ) from e
+
+        if self.max_uses is not None and self._call_ordinal(messages, ctx.tool_call_id) > self.max_uses:
+            return _LIMIT_REACHED
+
+        settings = ModelSettings(max_tokens=self.max_tokens) if self.max_tokens is not None else None
+        advisor = Agent(
+            self.model,
+            instructions=(
+                'You are an expert advisor. Give concise, actionable advice to the executor model '
+                'about the question it sends you. Do not address the end user.'
+            ),
+            model_settings=settings,
+        )
+        result = await advisor.run(
+            prompt,
+            usage=ctx.usage,
+            usage_limits=ctx.usage_limits,
+        )
+        return result.output
+
+    @staticmethod
+    def _call_ordinal(messages: Sequence[ModelMessage], tool_call_id: str | None) -> int:
+        """Return this advisor call's 1-based position in the current executor response."""
+        for message in reversed(messages):
+            if not isinstance(message, ModelResponse):  # pragma: no cover - the current response is last
+                continue
+            calls = [
+                part for part in message.parts if isinstance(part, ToolCallPart) and part.tool_name == _LOCAL_TOOL_NAME
+            ]
+            for index, call in enumerate(calls, start=1):
+                if call.tool_call_id == tool_call_id:
+                    return index
+            break  # pragma: no cover - every executing local tool has a matching call
+        return 1  # pragma: no cover - agent tool execution always follows a model response
 
 
 @dataclass(init=False)
@@ -86,10 +144,6 @@ class Advisor(NativeOrLocalTool[AgentDepsT]):
     not provide an equivalent cache control.
     """
 
-    _advisor_agent: Agent[None, str] | None = field(init=False, repr=False)
-    _native_provider: Literal['anthropic', 'openrouter'] | None = field(init=False, repr=False)
-    _native_model_name: str | None = field(init=False, repr=False)
-
     def __init__(
         self,
         model: AdvisorModel,
@@ -111,32 +165,32 @@ class Advisor(NativeOrLocalTool[AgentDepsT]):
         self.max_uses = max_uses
         self.max_tokens = max_tokens
         self.caching = caching
-        self._advisor_agent = None
-        self._native_provider, self._native_model_name = self._parse_native_model(model)
-        if mode == 'native' and self._native_provider is None:
+        native_provider, _ = self._parse_native_model(model)
+        if mode == 'native' and native_provider is None:
             raise ValueError(
                 "Advisor(mode='native') requires an 'anthropic:<model>' or 'openrouter:<model>' model name"
             )
-        if mode == 'native' and self._native_provider == 'openrouter' and max_uses is not None:
+        if mode == 'native' and native_provider == 'openrouter' and max_uses is not None:
             raise ValueError("Advisor.max_uses is not supported by OpenRouter in mode='native'")
 
-        local_tool: Tool[AgentDepsT] = Tool(
-            self._consult_advisor,
-            name=_LOCAL_TOOL_NAME,
-            description=_LOCAL_TOOL_DESCRIPTION,
-            sequential=True,
-        )
         native: AgentNativeTool[AgentDepsT] | bool
         local: Tool[AgentDepsT] | bool
-        if mode == 'local':
-            native = False
-            local = local_tool
-        elif mode == 'native':
+        if mode == 'native':
             native = self._required_native_advisor
             local = False
         else:
-            native = self._native_advisor
-            local = local_tool
+            local_advisor = _AdvisorSubagentTool[AgentDepsT](
+                model=model,
+                max_uses=max_uses,
+                max_tokens=max_tokens,
+            )
+            local = Tool(
+                local_advisor.__call__,
+                name=_LOCAL_TOOL_NAME,
+                description=_LOCAL_TOOL_DESCRIPTION,
+                sequential=True,
+            )
+            native = False if mode == 'local' else self._native_advisor
         super().__init__(
             native=native,
             local=local,
@@ -149,21 +203,21 @@ class Advisor(NativeOrLocalTool[AgentDepsT]):
 
     def _native_advisor(self, ctx: RunContext[AgentDepsT]) -> AdvisorTool | None:
         """Build a native tool only when an explicit advisor model name is lossless."""
+        native_provider, native_model_name = self._parse_native_model(self.model)
         provider = ctx.model.system
-        if provider != self._native_provider or self._native_model_name is None:
+        if provider != native_provider or native_model_name is None:
             return None
         if provider == 'openrouter' and self.max_uses is not None:
             return None
-        return self._advisor_tool(self._native_model_name)
+        return self._advisor_tool(native_model_name)
 
     def _required_native_advisor(self, ctx: RunContext[AgentDepsT]) -> AdvisorTool:
         """Build a required native tool or reject a cross-provider executor."""
-        if ctx.model.system != self._native_provider:
-            raise UserError(
-                f"Advisor(mode='native') requires a {self._native_provider} executor, not {ctx.model.system}"
-            )
-        assert self._native_model_name is not None
-        return self._advisor_tool(self._native_model_name)
+        native_provider, native_model_name = self._parse_native_model(self.model)
+        if ctx.model.system != native_provider:
+            raise UserError(f"Advisor(mode='native') requires a {native_provider} executor, not {ctx.model.system}")
+        assert native_model_name is not None
+        return self._advisor_tool(native_model_name)
 
     def _advisor_tool(self, model_name: str) -> AdvisorTool:
         return AdvisorTool(
@@ -186,55 +240,6 @@ class Advisor(NativeOrLocalTool[AgentDepsT]):
                 "Advisor modes 'auto' and 'local' are not compatible with durable execution; "
                 "use mode='native' with a supported provider"
             )
-
-    async def _consult_advisor(self, ctx: RunContext[AgentDepsT], prompt: str) -> str:
-        """Consult the configured advisor model.
-
-        Args:
-            ctx: The executor run context.
-            prompt: A self-contained question with all context the advisor needs.
-        """
-        try:
-            messages = ctx.messages
-        except UserError as e:
-            raise UserError(
-                'Advisor local execution is not compatible with a serialized durable tool activity; '
-                "use mode='native' with a supported provider"
-            ) from e
-
-        if self.max_uses is not None and self._call_ordinal(messages, ctx.tool_call_id) > self.max_uses:
-            return _LIMIT_REACHED
-        if self._advisor_agent is None:
-            settings = ModelSettings(max_tokens=self.max_tokens) if self.max_tokens is not None else None
-            self._advisor_agent = Agent(
-                self.model,
-                instructions=(
-                    'You are an expert advisor. Give concise, actionable advice to the executor model '
-                    'about the question it sends you. Do not address the end user.'
-                ),
-                model_settings=settings,
-            )
-        result = await self._advisor_agent.run(
-            prompt,
-            usage=ctx.usage,
-            usage_limits=ctx.usage_limits,
-        )
-        return result.output
-
-    @staticmethod
-    def _call_ordinal(messages: Sequence[ModelMessage], tool_call_id: str | None) -> int:
-        """Return this advisor call's 1-based position in the current executor response."""
-        for message in reversed(messages):
-            if not isinstance(message, ModelResponse):  # pragma: no cover - the current response is last
-                continue
-            calls = [
-                part for part in message.parts if isinstance(part, ToolCallPart) and part.tool_name == _LOCAL_TOOL_NAME
-            ]
-            for index, call in enumerate(calls, start=1):
-                if call.tool_call_id == tool_call_id:
-                    return index
-            break  # pragma: no cover - every executing local tool has a matching call
-        return 1  # pragma: no cover - agent tool execution always follows a model response
 
     @staticmethod
     def _parse_native_model(
