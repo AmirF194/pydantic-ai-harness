@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from collections.abc import Awaitable
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from typing import Literal, Protocol
 
 import anyio
@@ -25,6 +26,8 @@ except ImportError as _import_error:  # pragma: no cover
         'browser-use is required for BrowserUse. Install it with: pip install "pydantic-ai-harness[browser-use]"'
     ) from _import_error
 
+logger = logging.getLogger(__name__)
+
 _TOOL_NAME = 'browse_web'
 
 # Teardown runs shielded from cancellation, so an unresponsive browser could otherwise hang the
@@ -42,10 +45,20 @@ async def _kill(session: BrowserSession) -> None:
     scope raises and leaves a live Chromium behind -- holding a lock on
     `user_data_dir` if the profile has one. The same shape as `ModalSandbox`'s
     teardown, for the same reason.
+
+    Its failures are swallowed for that same reason. `kill()` can raise -- it awaits a
+    storage-state save, a forced stop and an event-bus drain, none of which are wrapped
+    upstream -- and it runs in a `finally`, where a raise replaces whatever was unwinding
+    through it: a completed browse becomes a `TimeoutError` to the caller, a real error
+    becomes a teardown error, and a cancellation stops propagating. The browser is left to
+    the OS either way, so nothing is gained by letting it through.
     """
     with anyio.CancelScope(shield=True):
         with anyio.move_on_after(_TEARDOWN_TIMEOUT):
-            await session.kill()
+            try:
+                await session.kill()
+            except Exception:
+                logger.warning('browser-use session teardown failed; leaving the browser to the OS', exc_info=True)
 
 
 class BrowserAgentHistory(Protocol):
@@ -117,8 +130,11 @@ class BrowserTask:
     output_schema: type[BaseModel] | None
     """Schema the agent's final result must conform to, forwarded as browser-use's `output_model_schema`."""
 
-    sensitive_data: dict[str, str | dict[str, str]] | None
-    """Secret placeholders for browser-use to substitute without showing the values to the model."""
+    sensitive_data: dict[str, str | dict[str, str]] | None = field(repr=False)
+    """Secret placeholders for browser-use to substitute without showing the values to the model.
+
+    Kept out of `repr()`: a `BrowserTask` is what a factory receives, so it is the object most
+    likely to end up in a log line or a traceback."""
 
     extend_system_message: str | None
     """Extra instructions appended to the browser agent's own system prompt."""

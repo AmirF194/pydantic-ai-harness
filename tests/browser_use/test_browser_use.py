@@ -4,9 +4,10 @@ from __future__ import annotations
 
 import inspect
 import json
+from collections.abc import Awaitable
 from dataclasses import dataclass, field, fields
 from pathlib import Path
-from typing import TypeVar, overload
+from typing import Literal, TypeVar, overload
 
 import anyio
 import pytest
@@ -26,6 +27,8 @@ from pydantic_ai.messages import ModelRequest, ToolReturnPart
 from pydantic_ai.models.test import TestModel
 
 from pydantic_ai_harness.browser_use import (
+    BrowserAgent,
+    BrowserAgentHistory,
     BrowserAgentSettings,
     BrowserTask,
     BrowserUse,
@@ -451,12 +454,19 @@ class TestBrowserAgentSettings:
             assert parameter.default == setting.default, f'{setting.name} default drifted from browser-use'
 
     def test_every_setting_reaches_the_agent(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """The default factory forwards each setting; a forgotten one would silently do nothing."""
+        """Each setting arrives with its own value, not just its own key.
+
+        `default_browser_agent` forwards forty-odd settings by hand, which is the archetypal
+        copy-paste-swap surface. Asserting only that the key arrived leaves any swap between
+        two type-compatible fields passing: `loop_detection_window=settings.step_timeout`
+        reads fine and is wrong. Distinct values per field turn a swap into a failure.
+        """
         seen: dict[str, object] = {}
 
         def record_init(self: object, **kwargs: object) -> None:
             seen.update(kwargs)
 
+        settings = _distinctly_valued_settings()
         monkeypatch.setattr(BrowserUseAgent, '__init__', record_init)
         default_browser_agent(
             BrowserTask(
@@ -467,12 +477,116 @@ class TestBrowserAgentSettings:
                 output_schema=None,
                 sensitive_data=None,
                 extend_system_message=None,
-                settings=BrowserAgentSettings(),
+                settings=settings,
             )
         )
 
         missing = [setting.name for setting in fields(BrowserAgentSettings) if setting.name not in seen]
         assert missing == []
+        mismatched = {
+            setting.name: (getattr(settings, setting.name), seen[setting.name])
+            for setting in fields(BrowserAgentSettings)
+            if seen[setting.name] != getattr(settings, setting.name)
+        }
+        assert mismatched == {}
+
+
+def _distinctly_valued_settings() -> BrowserAgentSettings:
+    """`BrowserAgentSettings` with a value per field that no other field shares.
+
+    Derived from each field's default rather than written out, so a setting added upstream is
+    covered without anyone remembering to add a value for it. Fields whose default is `None`
+    and whose type is not a scalar keep it: identity still holds for them, they just cannot
+    catch a swap.
+    """
+    overrides: dict[str, object] = {}
+    for index, setting in enumerate(fields(BrowserAgentSettings)):
+        default = setting.default
+        if isinstance(default, bool):
+            overrides[setting.name] = not default
+        elif isinstance(default, int):
+            overrides[setting.name] = 1_000 + index
+        elif isinstance(default, str):
+            overrides[setting.name] = f'value-{index}'
+    return BrowserAgentSettings(**overrides)  # type: ignore[arg-type]
+
+
+class TestTeardownFailure:
+    """`_kill` runs in a `finally`, where a raise replaces whatever was unwinding through it."""
+
+    @pytest.fixture
+    def failing_kill(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        async def raise_on_kill(self: BrowserSession) -> None:
+            raise TimeoutError('event bus stop timed out')
+
+        monkeypatch.setattr(BrowserSession, 'kill', raise_on_kill)
+
+    @pytest.mark.parametrize('scope', ['call', 'agent'])
+    async def test_a_failed_teardown_does_not_replace_the_result(
+        self, failing_kill: None, scope: Literal['call', 'agent']
+    ) -> None:
+        toolset = BrowserUse[None](browser_agent=_success_factory('the answer'), session_scope=scope).get_toolset()
+        assert isinstance(toolset, BrowserUseToolset)
+
+        assert await toolset.browse_web('go') == 'the answer'
+
+        await toolset.aclose()
+
+    async def test_a_failed_teardown_does_not_replace_the_run_error(self, failing_kill: None) -> None:
+        """The original cause is what the caller needs; a teardown error hides it."""
+
+        class _Boom:
+            def run(self, max_steps: int = 500) -> Awaitable[BrowserAgentHistory]:
+                raise RuntimeError('the browser agent itself failed')
+
+        def factory(request: BrowserTask) -> BrowserAgent:
+            return _Boom()  # type: ignore[return-value]
+
+        toolset = BrowserUse[None](browser_agent=factory, session_scope='agent').get_toolset()
+        assert isinstance(toolset, BrowserUseToolset)
+
+        with pytest.raises(RuntimeError, match='the browser agent itself failed'):
+            await toolset.browse_web('go')
+
+        await toolset.aclose()
+
+
+class TestUntrustedContent:
+    def test_the_instructions_say_the_result_is_untrusted(self) -> None:
+        """The point of the capability is piping attacker-controllable page text into the host context."""
+        instructions = BrowserUse[None]().get_instructions()
+
+        assert isinstance(instructions, str)
+        assert 'untrusted' in instructions
+
+
+class TestCredentialsStayOutOfRepr:
+    """Keeping values from the sub-agent's model and then printing them in a repr is an odd place to stop."""
+
+    def test_the_capability_does_not_print_its_secrets(self) -> None:
+        capability = BrowserUse[None](sensitive_data={'x_password': 'hunter2'})
+
+        assert 'hunter2' not in repr(capability)
+
+    def test_the_capability_does_not_print_its_browser_profile(self) -> None:
+        """A profile carries proxy credentials and `storage_state` cookies."""
+        capability = BrowserUse[None](browser_profile=BrowserProfile(user_data_dir='/tmp/secret-profile'))
+
+        assert 'secret-profile' not in repr(capability)
+
+    def test_a_task_does_not_print_its_secrets(self) -> None:
+        task = BrowserTask(
+            task='t',
+            llm=None,
+            browser_session=BrowserSession(),
+            use_vision=True,
+            output_schema=None,
+            sensitive_data={'x_password': 'hunter2'},
+            extend_system_message=None,
+            settings=BrowserAgentSettings(),
+        )
+
+        assert 'hunter2' not in repr(task)
 
 
 class TestSessionScope:
