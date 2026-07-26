@@ -264,7 +264,7 @@ class TestAdvisor:
     async def test_local_capable_mode_rejects_active_durable_context(self, mode: AdvisorMode) -> None:
         model_called = False
 
-        def executor(_messages: list[ModelMessage], _info: AgentInfo) -> ModelResponse:
+        def executor(_messages: list[ModelMessage], _info: AgentInfo) -> ModelResponse:  # pragma: no cover
             nonlocal model_called
             model_called = True
             return ModelResponse(parts=[TextPart('done')])
@@ -308,7 +308,7 @@ class TestAdvisor:
     async def test_auto_mode_requires_explicit_native_opt_in_during_durable_execution(self) -> None:
         model_called = False
 
-        def executor(_messages: list[ModelMessage], _info: AgentInfo) -> ModelResponse:
+        def executor(_messages: list[ModelMessage], _info: AgentInfo) -> ModelResponse:  # pragma: no cover
             nonlocal model_called
             model_called = True
             return ModelResponse(parts=[TextPart('done')])
@@ -367,7 +367,7 @@ class TestAdvisor:
         with pytest.raises(UserError, match="Capability id 'advisor' is used by multiple capabilities"):
             Agent(model, capabilities=[Advisor(model), Advisor(model)])
 
-        def advisor(prompt: str) -> str:
+        def advisor(prompt: str) -> str:  # pragma: no cover
             return prompt
 
         agent = Agent(model, capabilities=[Advisor(model)], tools=[advisor])
