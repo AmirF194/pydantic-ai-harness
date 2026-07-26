@@ -33,9 +33,9 @@ DEFAULT_MODEL = os.environ.get('PYDANTIC_AI_MODEL', 'anthropic:claude-opus-4-7')
 
 INSTRUCTIONS = """\
 You are a data analyst. The dataset directory is mounted read-only at `/data`
-inside your sandbox: load files with `pathlib` (`Path.read_text()`). The sandbox
-is a restricted Python: no `csv` module and no `with` statements, so read whole
-files and parse lines manually (all parsed fields are strings).
+inside your sandbox: load files with `pathlib`. The sandbox is a restricted
+Python without the `csv` module, so parse lines manually (all parsed fields
+are strings).
 
 - Never estimate a number you can compute. Load the data and compute it in `run_code`.
 - Verify your parsing before aggregating: print one parsed row next to its raw line
@@ -56,7 +56,7 @@ def build_agent(model: Model | str = DEFAULT_MODEL, data_dir: Path | None = None
             # else on the machine. The model loads and aggregates with real Python,
             # so the numbers are computed, not guessed -- and the raw rows never
             # enter the context window.
-            CodeMode(mount=MountDir('/data', str(data_dir), mode='read-only')),
+            CodeMode(mount=MountDir(virtual_path='/data', host_path=str(data_dir), mode='read-only')),
             OverflowingToolOutput(),
         ],
         instructions=INSTRUCTIONS,
