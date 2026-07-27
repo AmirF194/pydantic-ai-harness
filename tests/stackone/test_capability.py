@@ -14,7 +14,7 @@ from pydantic_ai.tools import RunContext
 from pydantic_ai_harness.stackone import StackOne
 
 if TYPE_CHECKING:
-    from fastmcp import FastMCP
+    from mcp.server.fastmcp import FastMCP
 
 pytestmark = pytest.mark.anyio
 

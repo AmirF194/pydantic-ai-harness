@@ -14,7 +14,7 @@ from pydantic_ai.toolsets import FunctionToolset
 from pydantic_ai_harness.stackone import StackOneToolset
 
 if TYPE_CHECKING:
-    from fastmcp import FastMCP
+    from mcp.server.fastmcp import FastMCP
 
 pytestmark = pytest.mark.anyio
 
@@ -80,6 +80,29 @@ class TestStackOneToolset:
             account_id='1', api_key='key', tool_mode='search_execute', client='https://proxy.example/mcp?region=eu'
         )
         assert mcp_recorder.calls[1].client == 'https://proxy.example/mcp?region=eu&tool-mode=search_execute'
+
+    def test_custom_url_tool_mode_matches_configuration(self, mcp_recorder: MCPToolsetRecorder):
+        StackOneToolset(
+            account_id='1',
+            api_key='key',
+            tool_mode='search_execute',
+            client=(
+                'https://proxy.example/mcp?signature=a%2fb%20c&flag&not-tool-mode=individual'
+                '&tool%2Dmode=individual#fragment'
+            ),
+        )
+        assert (
+            mcp_recorder.calls[0].client
+            == 'https://proxy.example/mcp?signature=a%2fb%20c&flag&not-tool-mode=individual'
+            '&tool-mode=search_execute#fragment'
+        )
+        StackOneToolset(
+            account_id='1',
+            api_key='key',
+            tool_mode='individual',
+            client='https://proxy.example/mcp?region=eu&tool-mode=search_execute',
+        )
+        assert mcp_recorder.calls[1].client == 'https://proxy.example/mcp?region=eu'
 
     def test_no_headers_for_non_url_clients(self, stackone_server: FastMCP, mcp_recorder: MCPToolsetRecorder):
         StackOneToolset(account_id='45320', api_key='key', client=stackone_server)

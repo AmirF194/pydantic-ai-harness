@@ -66,6 +66,9 @@ exa = [
 skills = [
     "pyyaml>=6.0.2",
 ]
+stackone = [
+    "pydantic-ai-slim[mcp]>=2.18.0",
+]
 
 [project.urls]
 Homepage = 'https://github.com/pydantic/pydantic-ai-harness'

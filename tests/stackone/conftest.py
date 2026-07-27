@@ -11,7 +11,7 @@ from pydantic_ai.tools import RunContext
 from pydantic_ai.usage import RunUsage
 
 if TYPE_CHECKING:
-    from fastmcp import FastMCP
+    from mcp.server.fastmcp import FastMCP
 
 # `mcp` and `fastmcp` are gated on the `stackone` extra, so slim CI runs (no extras)
 # can't import these modules; ignore them at collection. A conditional expression rather
@@ -44,16 +44,16 @@ def run_context() -> RunContext[None]:
 @pytest.fixture
 def stackone_server() -> FastMCP:
     """In-process stand-in for StackOne's MCP endpoint in `individual` tool mode."""
-    from fastmcp import FastMCP
+    from mcp.server.fastmcp import FastMCP
 
     server = FastMCP('stackone-fake')
 
-    @server.tool
+    @server.tool()
     def bamboohr_list_employees(limit: int = 10) -> list[dict[str, str]]:
         """List employees from BambooHR."""
         return [{'id': '1', 'name': 'Ada'}, {'id': '2', 'name': 'Grace'}][:limit]
 
-    @server.tool
+    @server.tool()
     def bamboohr_create_employee(name: str) -> dict[str, str]:
         """Create an employee in BambooHR."""
         return {'id': '3', 'name': name}
@@ -64,16 +64,16 @@ def stackone_server() -> FastMCP:
 @pytest.fixture
 def search_execute_server() -> FastMCP:
     """In-process stand-in for StackOne's MCP endpoint in `search_execute` tool mode."""
-    from fastmcp import FastMCP
+    from mcp.server.fastmcp import FastMCP
 
     server = FastMCP('stackone-fake-search')
 
-    @server.tool
+    @server.tool()
     def bamboohr_search_actions(query: str, top_k: int = 10) -> list[dict[str, str]]:
         """Search available actions from a natural language query."""
         return [{'action_id': 'bamboohr_list_employees', 'description': 'List employees'}]
 
-    @server.tool
+    @server.tool()
     def bamboohr_execute_action(action_id: str) -> dict[str, str]:
         """Execute an action by its id."""
         return {'action_id': action_id, 'status': 'ok'}

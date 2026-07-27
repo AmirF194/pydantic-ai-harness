@@ -4,7 +4,7 @@ This module owns the StackOne wire contract: endpoint path, header names, and
 the tool naming convention. A StackOne API change should be a diff to this
 file only.
 
-Wire contract (https://docs.stackone.com/mcp/quickstart):
+Wire contract (https://docs.stackone.com/mcp/quickstart), verified 2026-07-27:
 
 - `POST {base_url}/mcp` -- MCP over streamable HTTP; lists and executes tools.
   `?tool-mode=search_execute` switches from one-tool-per-action to two
@@ -13,6 +13,10 @@ Wire contract (https://docs.stackone.com/mcp/quickstart):
   header selecting the linked account.
 - Tool names follow `{connector}_{action}_{entity}`, e.g.
   `bamboohr_list_employees`.
+
+Re-check these assumptions with the initialize and tools/list requests in the
+linked quickstart, once with the default URL and once with
+`?tool-mode=search_execute`.
 """
 
 from __future__ import annotations
@@ -22,6 +26,7 @@ import os
 from collections.abc import Callable, Mapping, Sequence
 from fnmatch import fnmatch
 from typing import Any, Literal
+from urllib.parse import unquote_plus, urlsplit, urlunsplit
 
 from pydantic_ai.exceptions import UserError
 from pydantic_ai.tools import AgentDepsT, RunContext, ToolDefinition
@@ -87,10 +92,14 @@ def _basic_auth(api_key: str) -> str:
 
 
 def _with_tool_mode(url: str, tool_mode: ToolMode) -> str:
-    if tool_mode != 'search_execute' or 'tool-mode=' in url:
+    parts = urlsplit(url)
+    fields = parts.query.split('&') if parts.query else []
+    query = [field for field in fields if unquote_plus(field.partition('=')[0]) != 'tool-mode']
+    if tool_mode == 'individual' and query == fields:
         return url
-    separator = '&' if '?' in url else '?'
-    return f'{url}{separator}{_SEARCH_EXECUTE_QUERY}'
+    if tool_mode == 'search_execute':
+        query.append(_SEARCH_EXECUTE_QUERY)
+    return urlunsplit(parts._replace(query='&'.join(query)))
 
 
 def check_actions_apply(tool_mode: ToolMode | None, actions: Sequence[str]) -> None:

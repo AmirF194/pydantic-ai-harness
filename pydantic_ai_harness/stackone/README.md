@@ -21,8 +21,11 @@ You also need an API key for the model your agent uses.
 ## Installation
 
 ```bash
-pip install "pydantic-ai-harness[stackone]"
+pip install "pydantic-ai-harness[stackone]" "pydantic-ai-slim[openai,spec]"
 ```
+
+The `openai` and `spec` extras support the model and agent-spec examples below. Install the provider extra for a
+different model provider instead.
 
 Set the credentials in the shell where you will run the example:
 
@@ -37,14 +40,14 @@ ID is not hard-coded. You can pass `api_key=` directly instead, but keep secrets
 
 ## Run your first agent
 
-```python {test="skip"}
+```python
 import os
 
 from pydantic_ai import Agent
 from pydantic_ai_harness.stackone import StackOne
 
 agent = Agent(
-    'openai:gpt-5.2',
+    'openai:gpt-5.6-sol',
     capabilities=[
         StackOne(account_id=os.environ['STACKONE_ACCOUNT_ID']),
     ],
@@ -65,7 +68,7 @@ Use `actions` when you also want to limit which tools the model sees. Patterns u
 [`fnmatch`](https://docs.python.org/3/library/fnmatch.html) syntax, where `*` is a wildcard. They ignore case and match
 the full `{connector}_{action}_{entity}` tool name:
 
-```python {test="skip"}
+```python
 from pydantic_ai_harness.stackone import StackOne
 
 StackOne(account_id='your-linked-account-id', actions=['*_list_*'])            # All matching list tools
@@ -91,19 +94,21 @@ Approval is not enabled automatically. For operations that need human confirmati
 `StackOneToolset` with Pydantic AI's
 [tool approval](https://pydantic.dev/docs/ai/tools-toolsets/toolsets/#requiring-tool-approval):
 
-```python {test="skip"}
+```python
 import os
 
+from pydantic_ai import Agent
 from pydantic_ai_harness.stackone import StackOneToolset
 
 stackone_tools = StackOneToolset(
     account_id=os.environ['STACKONE_ACCOUNT_ID'],
     actions=['workday_create_worker'],
 ).approval_required()
+
+agent = Agent('openai:gpt-5.6-sol', toolsets=[stackone_tools])
 ```
 
-Pass `stackone_tools` to `Agent(toolsets=[stackone_tools])` and handle the resulting deferred approval requests as
-described in the linked guide.
+Handle the resulting deferred approval requests as described in the linked guide.
 
 ## Define the agent in YAML or JSON
 
@@ -113,14 +118,14 @@ The capability also works with Pydantic AI's
 
 ```yaml
 # agent.yaml
-model: openai:gpt-5.2
+model: openai:gpt-5.6-sol
 capabilities:
   - StackOne:
       account_id: 'your-linked-account-id'
       actions: ['*_list_*']
 ```
 
-```python {test="skip"}
+```python
 from pydantic_ai import Agent
 from pydantic_ai_harness.stackone import StackOne
 
