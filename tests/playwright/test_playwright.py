@@ -737,6 +737,14 @@ class TestPlaywrightBrowserTools:
         result = await toolset.get_text('h1')
         assert result == "Error getting text from 'h1': inner_text timed out"
 
+    async def test_get_text_full_page_surfaces_playwright_error(self) -> None:
+        toolset = _toolset(_FakePage(inner_text_error=PlaywrightTimeoutError('body timed out')))
+        result = await toolset.get_text()
+        assert result == (
+            'Error: get_text timed out after 30000ms. The element may not exist or the page may be slow; '
+            'try a different selector, or navigate again.'
+        )
+
     async def test_get_text_full_page(self) -> None:
         toolset = _toolset(_FakePage(body='full page text'))
         assert await toolset.get_text() == 'full page text'
@@ -1091,6 +1099,16 @@ class TestWaitFor:
         assert await toolset.wait_for() == expected
         assert await toolset.wait_for(selector='.x', text='y') == expected
 
+    async def test_wait_for_page_text_error_returns_mapped_error(self) -> None:
+        # The page can close between a successful `wait_for_selector` and the
+        # body read; that must stay a tool result, not abort the run.
+        page = _FakePage(inner_text_error=TargetClosedError('Target page closed'))
+        result = await _toolset(page).wait_for(selector='.ready')
+        assert result == (
+            'Error: wait_for failed: the browser or page was closed unexpectedly. '
+            'Browser tools may be unavailable for the rest of this run.'
+        )
+
     async def test_wait_for_timeout_returns_mapped_error(self) -> None:
         page = _FakePage(wait_for_error=PlaywrightTimeoutError('Timeout 30000ms exceeded.'))
         result = await _toolset(page).wait_for(selector='.never')
@@ -1317,16 +1335,14 @@ class TestPlaywrightBrowserHooks:
 
 
 class TestDurabilityRejection:
-    def test_rejects_innermost_durability_capability(self) -> None:
-        # Durability capabilities are the `innermost` ordering tier; a live
-        # Chromium page cannot survive activity replay, so binding both to one
-        # agent must fail at construction, not deep inside the first tool call.
-        class _Durability(AbstractCapability[object]):
+    def test_accepts_innermost_non_durability_capability(self) -> None:
+        # `innermost` is not a durability marker: `InputGuard` declares it too,
+        # so ordering alone would reject the supported guard-plus-browser pairing.
+        class _Innermost(AbstractCapability[object]):
             def get_ordering(self) -> CapabilityOrdering:
                 return CapabilityOrdering(position='innermost')
 
-        with pytest.raises(UserError, match='does not support durable execution'):
-            Agent(TestModel(), capabilities=[PlaywrightBrowser(), _Durability()])
+        Agent(TestModel(), capabilities=[PlaywrightBrowser(), _Innermost()])
 
     def test_accepts_capability_with_non_durability_ordering(self) -> None:
         class _Outermost(AbstractCapability[object]):

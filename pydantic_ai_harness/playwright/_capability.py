@@ -15,6 +15,7 @@ from typing import TYPE_CHECKING
 
 from pydantic_ai import AgentRunResult, RunContext
 from pydantic_ai.capabilities import AbstractCapability, WrapRunHandler
+from pydantic_ai.durable_exec._base import BaseDurabilityCapability  # pyright: ignore[reportPrivateUsage]
 from pydantic_ai.exceptions import UserError
 from pydantic_ai.tools import AgentDepsT, ToolDefinition
 
@@ -217,15 +218,18 @@ class PlaywrightBrowser(AbstractCapability[AgentDepsT]):
         at agent construction and replays tool calls as activities. A live
         Chromium page cannot be checkpointed across activity boundaries or worker
         restarts, so the composition cannot work; without this guard it fails
-        deep inside the first browser tool call instead. Durability capabilities
-        are the `innermost` ordering tier (see
-        `AbstractCapability.get_ordering`), which is what is detected here.
+        deep inside the first browser tool call instead.
+
+        Detection matches `BaseDurabilityCapability`, the shared base of the
+        bundled Temporal/DBOS/Prefect integrations. Pydantic AI exposes no public
+        marker for the durability tier, and the `innermost` ordering position is
+        not one: `InputGuard` also declares `innermost`, so ordering alone would
+        reject the supported guard-plus-browser composition.
         """
         siblings: list[AbstractCapability[AgentDepsT]] = []
         agent.root_capability.apply(siblings.append)
         for sibling in siblings:
-            ordering = sibling.get_ordering()
-            if ordering is not None and ordering.position == 'innermost':
+            if isinstance(sibling, BaseDurabilityCapability):
                 raise UserError(
                     'PlaywrightBrowser does not support durable execution (e.g. TemporalDurability): '
                     'a live Chromium browser cannot survive activity replay or worker restart. '

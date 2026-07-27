@@ -581,7 +581,10 @@ class PlaywrightBrowserToolset(FunctionToolset[AgentDepsT]):
                 except Exception as exc:
                     return self._truncate_output(f"Error getting text from '{selector}': {exc}")
                 return self._truncate_output(text)
-            return await self._page_text(timeout)
+            try:
+                return await self._page_text(timeout)
+            except PlaywrightError as exc:
+                return self._truncate_output(self._playwright_error('get_text', exc, timeout))
 
     async def scroll(
         self, direction: str, x: int | None = None, y: int | None = None, timeout_ms: int | None = None
@@ -746,9 +749,9 @@ class PlaywrightBrowserToolset(FunctionToolset[AgentDepsT]):
             timeout = self._resolve_timeout(timeout_ms)
             try:
                 await page.wait_for_selector(query, timeout=timeout)
+                return self._truncate_output(f"Found '{query}'.\n\n{await self._page_text(timeout)}")
             except PlaywrightError as exc:
                 return self._truncate_output(self._playwright_error('wait_for', exc, timeout))
-            return self._truncate_output(f"Found '{query}'.\n\n{await self._page_text(timeout)}")
 
     async def snapshot(self, timeout_ms: int | None = None) -> str:
         """Return the page's accessibility tree with `aria-ref` handles for targeting.
