@@ -4,33 +4,18 @@ from __future__ import annotations
 
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
-from typing import Any, Literal, Protocol, runtime_checkable
+from typing import Literal
 
-from pydantic_ai import AdvisorTool, Agent, AgentRunResult
-from pydantic_ai.capabilities import NativeOrLocalTool, WrapRunHandler
-from pydantic_ai.exceptions import UserError
+from pydantic_ai import Agent
+from pydantic_ai.capabilities import ModelSelection, NativeOrLocalTool
+from pydantic_ai.exceptions import ModelRetry, UnexpectedModelBehavior, UserError
 from pydantic_ai.messages import ModelResponse
-from pydantic_ai.models import KnownModelName, Model, ModelRequestContext
+from pydantic_ai.models import ModelRequestContext, parse_model_id
+from pydantic_ai.native_tools import AdvisorTool
 from pydantic_ai.settings import ModelSettings
 from pydantic_ai.tools import AgentDepsT, AgentNativeTool, RunContext
 
-AdvisorModel = Model | KnownModelName | str
-"""A Pydantic AI model instance or model name used for advisor consultations."""
-
-AdvisorMode = Literal['auto', 'native', 'local']
-"""How advisor consultations are executed."""
-
 _LIMIT_REACHED = 'Advisor consultation limit reached for this model request. Continue without further advice.'
-
-
-@runtime_checkable
-class _DurabilityCapability(Protocol):
-    """Structural view of core durability capabilities without importing optional integrations."""
-
-    engine_name: str
-
-    @property
-    def in_durable_context(self) -> bool: ...  # pragma: no cover
 
 
 @dataclass(init=False)
@@ -53,7 +38,7 @@ class Advisor(NativeOrLocalTool[AgentDepsT]):
     ```
     """
 
-    model: AdvisorModel
+    model: ModelSelection
     """The model to consult.
 
     Accepts the same model names and model instances as `Agent`. In `auto`
@@ -61,7 +46,7 @@ class Advisor(NativeOrLocalTool[AgentDepsT]):
     is preserved.
     """
 
-    mode: AdvisorMode
+    mode: Literal['auto', 'native', 'local']
     """How advisor consultations are executed.
 
     `auto` uses a native advisor only for an explicit same-provider model name.
@@ -96,13 +81,13 @@ class Advisor(NativeOrLocalTool[AgentDepsT]):
     Native execution keeps the provider's transcript behavior unchanged.
     """
 
-    _local_uses: dict[str, int] = field(init=False, repr=False)
+    _local_uses: int = field(init=False, repr=False, default=0)
 
     def __init__(
         self,
-        model: AdvisorModel,
+        model: ModelSelection,
         *,
-        mode: AdvisorMode = 'auto',
+        mode: Literal['auto', 'native', 'local'] = 'auto',
         max_uses: int | None = None,
         max_tokens: int | None = None,
         caching: Literal['5m', '1h'] | None = None,
@@ -121,7 +106,7 @@ class Advisor(NativeOrLocalTool[AgentDepsT]):
         self.max_tokens = max_tokens
         self.caching = caching
         self.forward_history = forward_history
-        self._local_uses = {}
+        self._local_uses = 0
         native_provider, _ = self._parse_native_model(model)
         if mode == 'native' and native_provider is None:
             raise ValueError(
@@ -144,27 +129,29 @@ class Advisor(NativeOrLocalTool[AgentDepsT]):
                 because conversation history may not be available to the advisor.
                 """
                 if max_uses is not None:
-                    run_id = ctx.run_id or ''
-                    local_uses = self._local_uses.get(run_id, 0)
-                    if local_uses >= max_uses:
+                    if self._local_uses >= max_uses:
                         return _LIMIT_REACHED
-                    self._local_uses[run_id] = local_uses + 1
+                    self._local_uses += 1
 
                 settings = ModelSettings(max_tokens=max_tokens) if max_tokens is not None else None
                 advisor_agent = Agent(
                     model,
+                    output_type=str,
                     instructions=(
                         'You are an expert advisor. Give concise, actionable advice to the executor model '
                         'about the question it sends you. Do not address the end user.'
                     ),
                     model_settings=settings,
                 )
-                result = await advisor_agent.run(
-                    prompt,
-                    message_history=ctx.messages[:-1] if forward_history else None,
-                    usage=ctx.usage,
-                    usage_limits=ctx.usage_limits,
-                )
+                try:
+                    result = await advisor_agent.run(
+                        prompt,
+                        message_history=ctx.messages[:-1] if forward_history else None,
+                        usage=ctx.usage,
+                        usage_limits=ctx.usage_limits,
+                    )
+                except UnexpectedModelBehavior as e:
+                    raise ModelRetry(str(e)) from e
                 return result.output
 
             local = advisor
@@ -175,6 +162,19 @@ class Advisor(NativeOrLocalTool[AgentDepsT]):
             id='advisor',
         )
 
+    async def for_run(self, ctx: RunContext[AgentDepsT]) -> Advisor[AgentDepsT]:
+        """Return a fresh capability with local usage isolated to this run."""
+        if self.max_uses is None or self.mode == 'native':
+            return self
+        return Advisor(
+            self.model,
+            mode=self.mode,
+            max_uses=self.max_uses,
+            max_tokens=self.max_tokens,
+            caching=self.caching,
+            forward_history=self.forward_history,
+        )
+
     async def after_model_request(
         self,
         ctx: RunContext[AgentDepsT],
@@ -183,15 +183,8 @@ class Advisor(NativeOrLocalTool[AgentDepsT]):
         response: ModelResponse,
     ) -> ModelResponse:
         """Reset the local consultation allowance for each executor response."""
-        self._local_uses[ctx.run_id or ''] = 0
+        self._local_uses = 0
         return response
-
-    async def wrap_run(self, ctx: RunContext[AgentDepsT], *, handler: WrapRunHandler) -> AgentRunResult[Any]:
-        """Run the agent, then discard its local consultation count."""
-        try:
-            return await handler()
-        finally:
-            self._local_uses.pop(ctx.run_id or '', None)
 
     def _native_unique_id(self) -> str:
         """Identify the native tool paired with the local fallback."""
@@ -223,33 +216,17 @@ class Advisor(NativeOrLocalTool[AgentDepsT]):
             caching=self.caching,
         )
 
-    async def before_run(self, ctx: RunContext[AgentDepsT]) -> None:
-        """Reject local-capable execution inside an active durable container."""
-        if self.mode != 'native' and any(
-            isinstance(capability, _DurabilityCapability) and capability.in_durable_context
-            for capability in ctx.capabilities.values()
-        ):
-            raise UserError(
-                "Advisor modes 'auto' and 'local' are not compatible with active durable execution; "
-                "use mode='native' with a supported provider"
-            )
-
     @staticmethod
     def _parse_native_model(
-        model: AdvisorModel,
+        model: ModelSelection,
     ) -> tuple[Literal['anthropic', 'openrouter'] | None, str | None]:
         """Extract a native model ID only from an explicit provider-qualified name."""
         if not isinstance(model, str):
             return None, None
-        provider, separator, model_name = model.partition(':')
-        if separator and model_name:
+        provider, model_name = parse_model_id(model)
+        if model_name:
             if provider == 'anthropic':
-                return 'anthropic', model_name
+                return provider, model_name
             if provider == 'openrouter':
-                return 'openrouter', model_name
+                return provider, model_name
         return None, None
-
-    @classmethod
-    def get_serialization_name(cls) -> str | None:
-        """Model instances are not spec-serializable."""
-        return None

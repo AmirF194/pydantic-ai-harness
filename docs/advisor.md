@@ -80,7 +80,7 @@ Use `mode='native'` when the consultation must stay inside the executor provider
 
 `forward_history` only affects the local execution path, whether selected explicitly or as the `auto` fallback. It does not alter native tool configuration or native-versus-local selection. When enabled, the local advisor receives the completed executor message history before the current response. The current response, including partial text and unresolved tool calls, is not forwarded, so the consultation prompt still needs to contain the complete current question.
 
-Configure `Advisor` in Python. It is not available in YAML or JSON agent specs because its model input can be a runtime `Model` instance.
+String model configurations can be loaded from YAML or JSON agent specs by passing `Advisor` in `custom_capability_types`. Runtime `Model` instances remain Python-only.
 
 ## Context passed to the advisor
 
@@ -102,7 +102,7 @@ The local fallback sends that prompt to the configured advisor model and provide
 
 Local advisor requests share the parent run's [`RunUsage`](/ai/api/pydantic-ai/usage/#pydantic_ai.usage.RunUsage) and [`UsageLimits`](/ai/api/pydantic-ai/usage/#pydantic_ai.usage.UsageLimits), so their requests and tokens count toward the agent tree's normal limits. Native providers report advisor usage according to their own protocol. Anthropic records advisor-specific values in `RequestUsage.details`, while OpenRouter exposes aggregate server-tool counts in response provider details.
 
-Invalid option combinations fail when `Advisor` is constructed. Executor and provider compatibility is validated when a run prepares its model request. Local model resolution, authentication, provider, and request errors propagate through the normal Pydantic AI tool execution path. When a local call exceeds `max_uses`, the tool returns a bounded message telling the executor to continue without more advice, matching the native tool's non-fatal limit behavior.
+Invalid option combinations fail when `Advisor` is constructed. Executor and provider compatibility is validated when a run prepares its model request. Anthropic reports native advisor errors as tool results so the executor can continue. If a local advisor produces invalid model behavior, the executor receives a normal tool retry, matching Pydantic AI's other subagent-backed tools. Local model resolution, authentication, provider, request, and usage-limit errors otherwise propagate and can stop the run. When a local call exceeds `max_uses`, the tool returns a bounded message telling the executor to continue without more advice.
 
 ## Composition
 
@@ -116,9 +116,7 @@ Local consultations can run in parallel. When `max_uses` is set, calls claim the
 
 Native advice is compatible with durable execution because it remains part of the executor model request. Local execution cannot yet preserve the same semantics across every durable backend. Temporal and Prefect can checkpoint the returned advice, but changes to the activity-local or task-local [`RunUsage`](/ai/api/pydantic-ai/usage/#pydantic_ai.usage.RunUsage) do not merge back into the outer run. DBOS does not checkpoint ordinary function-tool calls, so a local advisor request could run again during workflow replay.
 
-When using the `TemporalDurability`, `DBOSDurability`, or `PrefectDurability` capability, modes `auto` and `local` therefore reject runs inside an active durable workflow or flow. The same configured agent still works normally outside that durable container. Use `mode='native'` with a supported provider when running the agent durably.
-
-The deprecated `TemporalAgent`, `DBOSAgent`, and `PrefectAgent` wrappers do not expose their active durable state to capability hooks. Local-capable Advisor modes are not supported with those wrappers. Migrate to the corresponding durability capability, or use `mode='native'`.
+Use `mode='native'` with a supported provider when running the agent durably. Harness does not inspect durability integrations because Pydantic AI core does not yet expose a public durable-context contract. Local execution, including an `auto` fallback, is therefore unsupported in durable runs rather than rejected by this capability.
 
 ## API reference
 

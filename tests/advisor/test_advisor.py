@@ -7,10 +7,11 @@ import pytest
 from inline_snapshot import snapshot
 from pydantic_ai import AdvisorTool, Agent
 from pydantic_ai.capabilities import AbstractCapability, PrefixTools
-from pydantic_ai.exceptions import UsageLimitExceeded, UserError
+from pydantic_ai.exceptions import UnexpectedModelBehavior, UsageLimitExceeded, UserError
 from pydantic_ai.messages import (
     ModelMessage,
     ModelResponse,
+    RetryPromptPart,
     TextPart,
     ToolCallPart,
     ToolReturnPart,
@@ -22,7 +23,7 @@ from pydantic_ai.profiles import ModelProfile
 from pydantic_ai.settings import ModelSettings
 from pydantic_ai.usage import UsageLimits
 
-from pydantic_ai_harness.advisor import Advisor, AdvisorMode
+from pydantic_ai_harness.advisor import Advisor
 
 pytestmark = pytest.mark.anyio
 
@@ -47,22 +48,6 @@ class _ProviderFunctionModel(FunctionModel):
     @property
     def system(self) -> str:
         return self._system_name
-
-
-class _ActiveDurability(AbstractCapability[None]):
-    engine_name = 'Test'
-
-    @property
-    def in_durable_context(self) -> bool:
-        return True
-
-
-class _InactiveDurability(AbstractCapability[None]):
-    engine_name = 'Test'
-
-    @property
-    def in_durable_context(self) -> bool:
-        return False
 
 
 def _has_tool_return(messages: Sequence[ModelMessage]) -> bool:
@@ -138,6 +123,16 @@ class TestAdvisor:
 
         assert seen[0].native_tools == []
         assert [tool.name for tool in seen[0].function_tools] == ['advisor']
+
+    async def test_unsupported_native_profile_rejects_native_mode(self) -> None:
+        model = _ProviderFunctionModel(
+            'anthropic',
+            lambda _messages, _info: ModelResponse(parts=[TextPart('done')]),
+        )
+        agent = Agent(model, capabilities=[Advisor('anthropic:claude-opus-4-8', mode='native')])
+
+        with pytest.raises(UserError, match=r'Native tool\(s\).*not supported'):
+            await agent.run('Review this plan.')
 
     @pytest.mark.parametrize(
         ('forward_history', 'expected_prompts'),
@@ -353,135 +348,20 @@ class TestAdvisor:
         with pytest.raises(UsageLimitExceeded, match='request_limit'):
             await agent.run('Ask for advice.', usage_limits=UsageLimits(request_limit=1))
 
-    @pytest.mark.parametrize('mode', ['auto', 'local'])
-    async def test_local_capable_mode_runs_outside_durable_context(self, mode: AdvisorMode) -> None:
-        advisor_calls = 0
-
+    async def test_local_unexpected_model_behavior_retries_executor(self) -> None:
         def advisor_model(_messages: list[ModelMessage], _info: AgentInfo) -> ModelResponse:
-            nonlocal advisor_calls
-            advisor_calls += 1
-            return ModelResponse(parts=[TextPart('Use a staged rollout.')])
+            raise UnexpectedModelBehavior('advisor did not return advice')
 
         def executor(messages: list[ModelMessage], _info: AgentInfo) -> ModelResponse:
-            if not _has_tool_return(messages):
-                return ModelResponse(
-                    parts=[ToolCallPart('advisor', {'prompt': 'Review this.'}, tool_call_id='advisor-1')]
-                )
-            return ModelResponse(parts=[TextPart('done')])
+            if any(isinstance(part, RetryPromptPart) for message in messages for part in message.parts):
+                return ModelResponse(parts=[TextPart('continued without advice')])
+            return ModelResponse(parts=[ToolCallPart('advisor', {'prompt': 'Review this.'})])
 
-        model = FunctionModel(advisor_model)
-        agent = Agent(
-            FunctionModel(executor),
-            name='executor',
-            deps_type=type(None),
-            capabilities=[Advisor(model, mode=mode), _InactiveDurability()],
-        )
+        agent = Agent(FunctionModel(executor), capabilities=[Advisor(FunctionModel(advisor_model))])
 
-        await agent.run('Review this.')
+        result = await agent.run('Ask for advice.')
 
-        assert advisor_calls == 1
-
-    @pytest.mark.parametrize('mode', ['auto', 'local'])
-    async def test_local_capable_mode_rejects_active_durable_context(self, mode: AdvisorMode) -> None:
-        model_called = False
-
-        def executor(_messages: list[ModelMessage], _info: AgentInfo) -> ModelResponse:  # pragma: no cover
-            nonlocal model_called
-            model_called = True
-            return ModelResponse(parts=[TextPart('done')])
-
-        model = FunctionModel(executor)
-        advisor: Advisor[None] = Advisor(model, mode=mode)
-        active: AbstractCapability[None] = _ActiveDurability()
-        agent = Agent[None, str](
-            model,
-            name='executor',
-            deps_type=type(None),
-            capabilities=[advisor, active],
-        )
-
-        with pytest.raises(UserError, match="modes 'auto' and 'local'.*active durable execution"):
-            await agent.run('Review this.')
-        assert model_called is False
-
-    async def test_native_mode_runs_inside_active_durable_context(self) -> None:
-        seen: list[ModelRequestParameters] = []
-
-        def executor(_messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
-            seen.append(info.model_request_parameters)
-            return ModelResponse(parts=[TextPart('done')])
-
-        model = _ProviderFunctionModel('anthropic', executor, supports_advisor=True)
-        advisor: Advisor[None] = Advisor('anthropic:claude-opus-4-8', mode='native')
-        active: AbstractCapability[None] = _ActiveDurability()
-        agent = Agent[None, str](
-            model,
-            deps_type=type(None),
-            capabilities=[advisor, active],
-        )
-
-        await agent.run('Review this.')
-
-        assert seen[0].function_tools == []
-        assert seen[0].native_tools == [AdvisorTool(model='claude-opus-4-8')]
-
-    async def test_auto_mode_requires_explicit_native_opt_in_during_durable_execution(self) -> None:
-        model_called = False
-
-        def executor(_messages: list[ModelMessage], _info: AgentInfo) -> ModelResponse:  # pragma: no cover
-            nonlocal model_called
-            model_called = True
-            return ModelResponse(parts=[TextPart('done')])
-
-        model = _ProviderFunctionModel('anthropic', executor, supports_advisor=True)
-        advisor: Advisor[None] = Advisor('anthropic:claude-opus-4-8')
-        active: AbstractCapability[None] = _ActiveDurability()
-        agent = Agent[None, str](
-            model,
-            deps_type=type(None),
-            capabilities=[advisor, active],
-        )
-
-        with pytest.raises(UserError, match="mode='native'"):
-            await agent.run('Review this.')
-        assert model_called is False
-
-    async def test_rejects_temporal_durability(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        pytest.importorskip('temporalio')
-        from pydantic_ai.durable_exec.temporal import TemporalDurability
-
-        await self._assert_rejects_durability(TemporalDurability(), monkeypatch)
-
-    async def test_rejects_dbos_durability(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        pytest.importorskip('dbos')
-        from pydantic_ai.durable_exec.dbos import DBOSDurability
-
-        await self._assert_rejects_durability(DBOSDurability(), monkeypatch)
-
-    async def test_rejects_prefect_durability(  # pragma: lax no cover
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        pytest.importorskip('prefect')
-        from pydantic_ai.durable_exec.prefect import PrefectDurability
-
-        await self._assert_rejects_durability(PrefectDurability(), monkeypatch)
-
-    @staticmethod
-    async def _assert_rejects_durability(
-        durability: AbstractCapability[None],
-        monkeypatch: pytest.MonkeyPatch,
-    ) -> None:
-        model = FunctionModel(lambda _messages, _info: ModelResponse(parts=[TextPart('done')]))
-        agent = Agent(
-            model,
-            name=f'advisor-{type(durability).__name__}',
-            deps_type=type(None),
-            capabilities=[Advisor(model, mode='local'), durability],
-        )
-        monkeypatch.setattr(type(durability), 'in_durable_context', property(lambda _self: True))
-
-        with pytest.raises(UserError, match='active durable execution'):
-            await agent.run('Review this.')
+        assert result.output == 'continued without advice'
 
     @pytest.mark.parametrize(
         ('executor_provider', 'advisor_model', 'required_provider'),
@@ -533,8 +413,27 @@ class TestAdvisor:
             Advisor('test', mode='native')
         with pytest.raises(ValueError, match="mode='native'.*model name"):
             Advisor('openai:gpt-5.4', mode='native')
+        with pytest.raises(ValueError, match="mode='native'.*model name"):
+            Advisor('anthropic:', mode='native')
         with pytest.raises(ValueError, match='not supported by OpenRouter'):
             Advisor('openrouter:anthropic/claude-opus-4.8', mode='native', max_uses=1)
 
-    def test_is_not_spec_serializable(self) -> None:
-        assert Advisor.get_serialization_name() is None
+    async def test_loads_string_model_from_agent_spec(self) -> None:
+        agent = Agent.from_spec(
+            {
+                'model': 'test',
+                'capabilities': [
+                    {
+                        'Advisor': {
+                            'model': 'test',
+                            'mode': 'local',
+                        }
+                    }
+                ],
+            },
+            custom_capability_types=[Advisor],
+        )
+
+        result = await agent.run('Consult the advisor.')
+
+        assert result.usage.requests == 3
