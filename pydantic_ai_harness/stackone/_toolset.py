@@ -94,6 +94,9 @@ def _basic_auth(api_key: str) -> str:
 def _with_tool_mode(url: str, tool_mode: ToolMode) -> str:
     parts = urlsplit(url)
     fields = parts.query.split('&') if parts.query else []
+    tool_mode_fields = [field for field in fields if unquote_plus(field.partition('=')[0]) == 'tool-mode']
+    if len(tool_mode_fields) == 1 and unquote_plus(tool_mode_fields[0].partition('=')[2]) == tool_mode:
+        return url
     query = [field for field in fields if unquote_plus(field.partition('=')[0]) != 'tool-mode']
     if tool_mode == 'individual' and query == fields:
         return url

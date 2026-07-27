@@ -82,6 +82,24 @@ class TestStackOneToolset:
         assert mcp_recorder.calls[1].client == 'https://proxy.example/mcp?region=eu&tool-mode=search_execute'
 
     def test_custom_url_tool_mode_matches_configuration(self, mcp_recorder: MCPToolsetRecorder):
+        search_execute_url = 'https://proxy.example/mcp?tool%2Dmode=search%5Fexecute&signature=a%2fb%20c&flag#fragment'
+        StackOneToolset(
+            account_id='1',
+            api_key='key',
+            tool_mode='search_execute',
+            client=search_execute_url,
+        )
+        assert mcp_recorder.calls[0].client == search_execute_url
+        individual_url = 'https://proxy.example/mcp?signature=a%2fb%20c&tool-mode=individual&flag#fragment'
+        StackOneToolset(
+            account_id='1',
+            api_key='key',
+            tool_mode='individual',
+            client=individual_url,
+        )
+        assert mcp_recorder.calls[1].client == individual_url
+
+    def test_custom_url_conflicting_tool_mode_is_replaced(self, mcp_recorder: MCPToolsetRecorder):
         StackOneToolset(
             account_id='1',
             api_key='key',
