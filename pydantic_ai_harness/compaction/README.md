@@ -24,12 +24,12 @@ provider rejects an orphaned pair. The zero-LLM strategies never call a model.
 | Capability | Cost | What it does | Reach for it when |
 |---|---|---|---|
 | `ClampOversizedMessages` | zero-LLM | Head/tail-truncates a single oversized part (response text, tool-call args) | One runaway generation blew past the context cap and no other strategy can reach it |
-| `SlidingWindow` | zero-LLM | Drops the oldest whole messages down to a tail | You only need the recent turns and can discard old context entirely |
+| `SlidingWindowCompaction` | zero-LLM | Drops the oldest whole messages down to a tail | You only need the recent turns and can discard old context entirely |
 | `ClearToolResults` | zero-LLM | Blanks the content of old tool *results* in place, keeping the last `keep_pairs` | Tool outputs dominate context and can be re-fetched on demand (the cheap first tier) |
 | `DeduplicateFileReads` | zero-LLM | Blanks every file read superseded by a newer read of the same file | The agent re-reads files and only the latest version matters |
 | `SummarizingCompaction` | one LLM call | Summarizes older messages into a structured summary, keeping the recent tail | Old context still matters but must be compressed; use behind the cheap tiers |
 | `TieredCompaction` | escalates | Runs cheap passes first, summarizes only if still over `target_tokens` | You want a sensible default: spend the expensive summary only when needed |
-| `LimitWarner` | zero-LLM | Injects an URGENT/CRITICAL warning as limits approach | You want the agent to wrap up rather than have its history rewritten |
+| `WarnNearLimits` | zero-LLM | Injects an URGENT/CRITICAL warning as limits approach | You want the agent to wrap up rather than have its history rewritten |
 
 ## Triggers
 
@@ -44,8 +44,8 @@ whole history -- the failure it targets is one oversized part, not a large total
 
 A single model response of repeated whitespace, or a single tool call with a giant payload, can
 produce one part so large the *next* request exceeds the provider's context cap. None of the other
-strategies can reach it: `SlidingWindow` drops the oldest messages but the offender is the newest;
-`ClearToolResults` only touches tool *results*; `LimitWarner` never edits history; and feeding the
+strategies can reach it: `SlidingWindowCompaction` drops the oldest messages but the offender is the newest;
+`ClearToolResults` only touches tool *results*; `WarnNearLimits` never edits history; and feeding the
 history to `SummarizingCompaction` hits the same cap.
 
 `ClampOversizedMessages` truncates the offending part in place, keeping a head slice and a tail slice
@@ -72,7 +72,10 @@ It clamps two kinds of part inside each `ModelResponse`:
   shape for a giant payload (e.g. a runaway `write_plan`). The args are replaced with a small JSON
   object `{"_clamped": "<head>...<tail>"}` so they stay valid function arguments; the original call
   already executed, so this only shrinks the history copy. Set `clamp_tool_call_args=False` to clamp
-  response text only.
+  response text only. Framework-typed call parts -- core's `search_tools` and `load_capability`
+  calls -- are never clamped, because their typed args are validated when persisted history is
+  restored (for example a `StepPersistence` resume) and the `_clamped` object would fail that
+  round-trip.
 
 Request-side parts (user prompts, tool *returns*, system prompts) are deliberately out of scope:
 user input should not be silently rewritten, and oversized tool returns are the job of
@@ -96,17 +99,19 @@ TieredCompaction(
 )
 ```
 
-## `SlidingWindow` and `ClearToolResults` options
+## `SlidingWindowCompaction` and `ClearToolResults` options
 
-`SlidingWindow` keeps the last `keep_messages` down to a tail; pass `keep_tokens` instead for a token
+`SlidingWindowCompaction` keeps the last `keep_messages` down to a tail; pass `keep_tokens` instead for a token
 budget rather than a message count. By default `preserve_first_user_message=True` keeps the first user
 turn even when it falls outside the window, so the agent does not lose the original task.
 
 `ClearToolResults` keeps the last `keep_pairs` intact. Set `clear_tool_inputs=True` to also blank the
 arguments of the cleared calls, and `exclude_tools` to a set of tool names whose results are never
-cleared.
+cleared. Framework-typed tool results -- core's `search_tools` and `load_capability` returns -- are
+left intact (a small token floor), because their structured content is re-parsed on later requests and
+rewriting it via `dataclasses.replace` would bypass validation and corrupt the part.
 
-## `LimitWarner` thresholds
+## `WarnNearLimits` thresholds
 
 Warnings begin at `warning_threshold` (default `0.7`, a fraction of the limit) and escalate to CRITICAL
 for iterations once the remaining request count drops to `critical_remaining_iterations` (default `3`).
@@ -204,7 +209,7 @@ to keep span cardinality low. Attributes:
 | Attribute | Type | Meaning |
 |---|---|---|
 | `gen_ai.conversation.compacted` | bool | Always `true`; the OpenTelemetry GenAI convention's flag for a compacted context |
-| `compaction.strategy` | str | Strategy class name (e.g. `SlidingWindow`, `SummarizingCompaction`) |
+| `compaction.strategy` | str | Strategy class name (e.g. `SlidingWindowCompaction`, `SummarizingCompaction`) |
 | `compaction.messages_before` | int | Message count before compaction |
 | `compaction.messages_after` | int | Message count after compaction |
 | `compaction.tokens_before` | int | Estimated token count before compaction |
@@ -226,13 +231,13 @@ pre-compaction transcript.
 
 ```python
 SummarizingCompaction(max_messages=60, keep_messages=20, receipts=True)
-SlidingWindow(max_messages=80, keep_messages=40, receipts=True)
+SlidingWindowCompaction(max_messages=80, keep_messages=40, receipts=True)
 ```
 
 - **Deterministic by construction.** The receipt carries no timestamp; its bytes are a pure
   function of the compaction, so it is safe to assert on and does not churn the cache.
 - **Honest wording.** `SummarizingCompaction` leaves a summary, so its receipt says the summary
-  above is secondhand; `SlidingWindow` drops history outright, so its receipt says that context
+  above is secondhand; `SlidingWindowCompaction` drops history outright, so its receipt says that context
   is gone. The blank-in-place strategies (`ClearToolResults`, `DeduplicateFileReads`,
   `ClampOversizedMessages`) keep every message and cross no boundary, so they emit no receipt.
 - **Transcript handle.** Attach any capability exposing `compaction_transcript_handle() -> str | None`
@@ -266,12 +271,14 @@ part-level `metadata`/`pinned` seam, the marker should migrate onto it.
 `wrap_model_request`, so it already survives compaction by construction. Pinning is for durable
 task state and scratchpads that live *in* the history.
 
-## Keeping user messages verbatim (`keep_user_messages`)
+## Keeping user messages (`keep_user_messages`)
 
 User turns are the highest signal-per-token content in a conversation, and losing them is the
 main driver of resumption drift. `SummarizingCompaction(keep_user_messages=True)` preserves
-every prior user message verbatim alongside the summary, each truncated to
-`keep_user_messages_max_chars` (default 20k) with an explicit truncation marker. This supersedes
+every prior user turn alongside the summary, each bounded to
+`keep_user_messages_max_chars` (default 20k) with an explicit truncation marker when it
+overruns. The budget applies per part, shared across the text items of a multi-part prompt;
+images, audio, and cache points pass through untouched. This supersedes
 `preserve_first_user_message` (which keeps only the first).
 
 ```python

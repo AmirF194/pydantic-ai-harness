@@ -34,7 +34,7 @@ Before implementing or reviewing a capability change:
 1. Read `agent_docs/index.md`.
 2. Read the linked `agent_docs/` guide for the task.
 3. Read the public Pydantic AI docs for every integration point you touch:
-   - capabilities: <https://pydantic.dev/docs/ai/core-concepts/capabilities/>
+   - capabilities: <https://pydantic.dev/docs/ai/capabilities/overview/>
    - hooks: <https://pydantic.dev/docs/ai/core-concepts/hooks/>
    - toolsets: <https://pydantic.dev/docs/ai/tools-toolsets/toolsets/>
    - advanced tools: <https://pydantic.dev/docs/ai/tools-toolsets/tools-advanced/>
@@ -51,11 +51,23 @@ Before implementing or reviewing a capability change:
    retired; ACP is the sole remaining experimental capability (see
    `agent_docs/capability-authoring.md`, "Capability Submodules And Exports").
 
+## Branch context (optional)
+
+`.agents/skills/branch-context/` is opt-in per-branch state for work that spans
+sessions: an issue brief, an append-only decisions log, and session handoffs.
+The scaffolding (`SKILL.md`, scripts, `*.template.md`) is committed; the
+instances are git-ignored and created per branch.
+
+- If `.agents/skills/branch-context/issue-brief.md` exists, read it plus
+  `pr-decisions.md` and the latest handoff before making design decisions.
+- To adopt a branch, instantiate the surfaces from the templates or run
+  `/adopt-pr`. Contributors who never instantiate them can ignore this section.
+
 ## Capabilities API reference
 
 When implementing a new capability, reference these docs:
 
-- <https://pydantic.dev/docs/ai/core-concepts/capabilities/> -- main capabilities documentation, usage patterns, built-in capabilities
+- <https://pydantic.dev/docs/ai/capabilities/overview/> -- main capabilities documentation, usage patterns, built-in capabilities
 - <https://pydantic.dev/docs/ai/core-concepts/hooks/> -- lifecycle hooks reference, hook ordering, all hook categories
 - <https://pydantic.dev/docs/ai/guides/extensibility/> -- publishing capabilities as packages, spec serialization
 - <https://pydantic.dev/docs/ai/tools-toolsets/toolsets/> -- toolset abstraction, building tools for capabilities
@@ -63,6 +75,15 @@ When implementing a new capability, reference these docs:
 - <https://pydantic.dev/docs/ai/core-concepts/agent/> -- agent configuration, instructions, model settings
 - Installed `pydantic_ai.capabilities` source -- `AbstractCapability`, hook signatures, and composition behavior
 - Installed `pydantic_ai.toolsets` source -- `AbstractToolset`, `WrapperToolset`, and `ToolsetTool`
+
+## Capability naming
+
+Follow the naming convention in `agent_docs/capability-authoring.md` ("Naming
+Capabilities"): a noun when the capability names a thing (a tool or faculty the
+model uses, a subsystem, a named strategy); an imperative verb phrase when it
+acts on the run and one verb phrase states its entire contract. Never invent a
+nominalization for an action, and never name a capability after the problem it
+solves.
 
 ## Coding standards
 
@@ -155,3 +176,18 @@ need.
 - Always link sources for any claims made during research
 - Run `make lint && make typecheck && make test` before every commit
 - Commit messages should summarize the "why", not the "what"
+
+## Pushing changes
+
+**A restriction is a conclusion you earn from a real failure, not a field you read.** Never report an
+operation as blocked, unavailable, or not-permitted based on a metadata flag, a config field, or a
+docs claim — attempt it and quote the actual error. (`maintainerCanModify: false` on a PR does *not*
+mean you cannot push: it governs the upstream-maintainer auto-grant, not your own access to the
+fork.) If you genuinely cannot attempt it, say "not attempted", never "we can't".
+
+**Pushing is not the end of the task.** After you push, do not go idle. The work is done when
+**CI is green and there are no unresolved comments** — see the `pushing-commits-to-the-repo` skill
+for the full loop.
+
+**Do not leave work uncommitted.** Don't end a turn with unstaged or uncommitted local changes
+unless the user's own instructions say otherwise.

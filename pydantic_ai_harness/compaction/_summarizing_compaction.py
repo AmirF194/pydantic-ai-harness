@@ -40,7 +40,7 @@ from pydantic_ai_harness.compaction._shared import (
 )
 
 if TYPE_CHECKING:
-    from pydantic_ai.messages import ModelRequestPart
+    from pydantic_ai.messages import ModelRequestPart, UserContent
     from pydantic_ai.models import Model, ModelRequestContext
 
 _DEFAULT_SUMMARY_PROMPT = """\
@@ -352,10 +352,7 @@ class SummarizingCompaction(AbstractCapability[AgentDepsT]):
         return result
 
     def _kept_user_messages(self, to_summarize: list[ModelMessage]) -> list[ModelMessage]:
-        """Rebuild each summarized user turn as a verbatim (truncated) user message."""
-        from pydantic_ai_harness.overflowing_tool_output import TruncationStrategy
-        from pydantic_ai_harness.overflowing_tool_output._payload import truncate_text
-
+        """Rebuild each summarized user turn as a preserved, size-bounded user message."""
         out: list[ModelMessage] = []
         for msg in to_summarize:
             if not isinstance(msg, ModelRequest):
@@ -366,12 +363,45 @@ class SummarizingCompaction(AbstractCapability[AgentDepsT]):
             kept: list[ModelRequestPart] = []
             for part in user_parts:
                 if isinstance(part.content, str):
-                    truncated = truncate_text(part.content, self.keep_user_messages_max_chars, TruncationStrategy.head)
+                    truncated = self._truncate(part.content)
                     kept.append(part if truncated == part.content else replace(part, content=truncated))
                 else:
-                    kept.append(part)
+                    bounded, changed = self._bound_sequence(part.content)
+                    kept.append(replace(part, content=bounded) if changed else part)
             out.append(ModelRequest(parts=kept))
         return out
+
+    def _truncate(self, text: str, max_chars: int | None = None) -> str:
+        from pydantic_ai_harness.tool_output_limits import TruncationStrategy
+        from pydantic_ai_harness.tool_output_limits._payload import truncate_text
+
+        limit = self.keep_user_messages_max_chars if max_chars is None else max_chars
+        return truncate_text(text, limit, TruncationStrategy.head)
+
+    def _bound_sequence(self, content: Sequence[UserContent]) -> tuple[list[UserContent], bool]:
+        """Apply the same per-part character budget to a sequence-shaped user prompt.
+
+        `keep_user_messages_max_chars` bounds the whole part, so the budget is shared across the
+        sequence's text-bearing items rather than granted to each one. Non-text items (images,
+        audio, cache points) pass through: they carry no characters to cut, and rewriting them
+        would change what the model sees rather than shrink it.
+        """
+        remaining = self.keep_user_messages_max_chars
+        bounded: list[UserContent] = []
+        changed = False
+        for item in content:
+            text = item if isinstance(item, str) else item.content if isinstance(item, TextContent) else None
+            if text is None:
+                bounded.append(item)
+                continue
+            truncated = self._truncate(text, remaining)
+            remaining = max(0, remaining - len(text))
+            if truncated == text:
+                bounded.append(item)
+                continue
+            changed = True
+            bounded.append(truncated if isinstance(item, str) else replace(item, content=truncated))
+        return bounded, changed
 
     def _maybe_bridge_prefix(self, summary: str, messages: list[ModelMessage], ctx: RunContext[AgentDepsT]) -> str:
         """Prefix *summary* with a cross-model handoff note when families differ."""

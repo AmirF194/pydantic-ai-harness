@@ -22,12 +22,12 @@ An agent that runs for many turns accumulates history: tool outputs, file reads,
 | Capability | Cost | What it does | Reach for it when |
 |---|---|---|---|
 | `ClampOversizedMessages` | zero-LLM | Head/tail-truncates a single oversized part (response text, tool-call args) | One runaway generation blew past the context cap and no other strategy can reach it |
-| `SlidingWindow` | zero-LLM | Drops the oldest whole messages down to a tail | You only need the recent turns and can discard old context entirely |
+| `SlidingWindowCompaction` | zero-LLM | Drops the oldest whole messages down to a tail | You only need the recent turns and can discard old context entirely |
 | `ClearToolResults` | zero-LLM | Blanks the content of old tool *results* in place, keeping the last `keep_pairs` | Tool outputs dominate context and can be re-fetched on demand (the cheap first tier) |
 | `DeduplicateFileReads` | zero-LLM | Blanks every file read superseded by a newer read of the same file | The agent re-reads files and only the latest version matters |
 | `SummarizingCompaction` | one LLM call | Summarizes older messages into a structured summary, keeping the recent tail | Old context still matters but must be compressed; use behind the cheap tiers |
 | `TieredCompaction` | escalates | Runs cheap passes first, summarizes only if still over `target_tokens` | You want a sensible default: spend the expensive summary only when needed |
-| `LimitWarner` | zero-LLM | Injects an URGENT/CRITICAL warning as limits approach | You want the agent to wrap up rather than have its history rewritten |
+| `WarnNearLimits` | zero-LLM | Injects an URGENT/CRITICAL warning as limits approach | You want the agent to wrap up rather than have its history rewritten |
 
 ## Triggers
 
@@ -75,7 +75,7 @@ A tier inside `TieredCompaction` is driven directly by the orchestrator, which r
 
 ## `ClampOversizedMessages`: surviving a runaway generation
 
-A single model response of repeated whitespace, or a single tool call with a giant payload, can produce one part so large the *next* request exceeds the provider's context cap. None of the other strategies can reach it: `SlidingWindow` drops the oldest messages but the offender is the newest; `ClearToolResults` only touches tool *results*; `LimitWarner` never edits history; and feeding the history to `SummarizingCompaction` hits the same cap.
+A single model response of repeated whitespace, or a single tool call with a giant payload, can produce one part so large the *next* request exceeds the provider's context cap. None of the other strategies can reach it: `SlidingWindowCompaction` drops the oldest messages but the offender is the newest; `ClearToolResults` only touches tool *results*; `WarnNearLimits` never edits history; and feeding the history to `SummarizingCompaction` hits the same cap.
 
 `ClampOversizedMessages` truncates the offending part in place, keeping a head slice and a tail slice with a `[clamped: removed N of M characters]` marker between them. Degenerate generations are low-entropy repetition, so a head/tail slice loses little.
 
@@ -96,7 +96,7 @@ A part is clamped only when it is oversized *and* the clamp actually shrinks it,
 It clamps two kinds of part inside each `ModelResponse`:
 
 - **Response text** (`TextPart`) -- the critical case, a runaway model-response text part.
-- **Tool-call args** (`ToolCallPart`), when `clamp_tool_call_args=True` (the default) -- the same failure shape for a giant payload (for example a runaway `write_plan`). The args are replaced with a small JSON object `{"_clamped": "<head>...<tail>"}` so they stay valid function arguments; the original call already executed, so this only shrinks the history copy. Set `clamp_tool_call_args=False` to clamp response text only.
+- **Tool-call args** (`ToolCallPart`), when `clamp_tool_call_args=True` (the default) -- the same failure shape for a giant payload (for example a runaway `write_plan`). The args are replaced with a small JSON object `{"_clamped": "<head>...<tail>"}` so they stay valid function arguments; the original call already executed, so this only shrinks the history copy. Set `clamp_tool_call_args=False` to clamp response text only. Framework-typed call parts -- core's `search_tools` and `load_capability` calls -- are never clamped, because their typed args are validated when persisted history is restored (for example a `StepPersistence` resume) and the `_clamped` object would fail that round-trip.
 
 Request-side parts (user prompts, tool *returns*, system prompts) are deliberately out of scope: user input should not be silently rewritten, and oversized tool returns are the job of `ClearToolResults`.
 
@@ -121,6 +121,8 @@ TieredCompaction(
 ## `ClearToolResults`: the cheap first tier
 
 Tool outputs typically dominate an agent's context, and the agent can usually re-run a tool if it needs the data again. `ClearToolResults` replaces the content of the oldest tool *results* with a short placeholder while keeping the most recent `keep_pairs` tool-call / tool-return pairs intact. The tool calls stay paired with their now-blanked results, so the history stays valid.
+
+Framework-typed tool results -- core's `search_tools` and `load_capability` returns -- are left intact (a small token floor), because their structured content is re-parsed on later requests and rewriting it via `dataclasses.replace` would bypass validation and corrupt the part.
 
 ```python
 from pydantic_ai import Agent
@@ -157,17 +159,17 @@ agent = Agent('openai:gpt-4o', capabilities=[DeduplicateFileReads(file_key=file_
 
 With no `max_messages` or `max_tokens` trigger set, `DeduplicateFileReads` runs on every request. It is cheap and near-lossless, so that default is usually what you want.
 
-## `SlidingWindow`: keep only the recent tail
+## `SlidingWindowCompaction`: keep only the recent tail
 
-When the conversation exceeds the configured threshold, `SlidingWindow` discards the oldest whole messages down to a tail, preserving tool-call / tool-return pairs. Reach for it when you only need the recent turns and can discard old context entirely.
+When the conversation exceeds the configured threshold, `SlidingWindowCompaction` discards the oldest whole messages down to a tail, preserving tool-call / tool-return pairs. Reach for it when you only need the recent turns and can discard old context entirely.
 
 ```python
 from pydantic_ai import Agent
-from pydantic_ai_harness.compaction import SlidingWindow
+from pydantic_ai_harness.compaction import SlidingWindowCompaction
 
 agent = Agent(
     'openai:gpt-4o',
-    capabilities=[SlidingWindow(max_messages=80, keep_messages=40)],
+    capabilities=[SlidingWindowCompaction(max_messages=80, keep_messages=40)],
 )
 ```
 
@@ -199,18 +201,18 @@ agent = Agent(
 
 The summary call is a real request to the model, so its full usage -- tokens **and** the request itself -- is folded into the run's `ctx.usage`. This is deliberate: it keeps cost honest, keeps the request count consistent (a model request that did not count as one would be the surprise), and lets a `UsageLimits` request limit catch a runaway compaction. A run-request or iteration limiter will therefore see compaction calls among its requests.
 
-## `LimitWarner`: warn instead of rewrite
+## `WarnNearLimits`: warn instead of rewrite
 
-`LimitWarner` never edits history. As the run approaches a configured limit, it injects an URGENT (then CRITICAL) warning as a trailing user turn, so the model wraps up rather than having its context rewritten under it. Models tend to pay more attention to user messages than system messages, which is why the warning is a user turn. Previous warnings from this capability are stripped before deciding whether to inject a new one.
+`WarnNearLimits` never edits history. As the run approaches a configured limit, it injects an URGENT (then CRITICAL) warning as a trailing user turn, so the model wraps up rather than having its context rewritten under it. Models tend to pay more attention to user messages than system messages, which is why the warning is a user turn. Previous warnings from this capability are stripped before deciding whether to inject a new one.
 
 ```python
 from pydantic_ai import Agent
-from pydantic_ai_harness.compaction import LimitWarner
+from pydantic_ai_harness.compaction import WarnNearLimits
 
 agent = Agent(
     'openai:gpt-4o',
     capabilities=[
-        LimitWarner(
+        WarnNearLimits(
             max_iterations=40,
             max_context_tokens=100_000,
         )
@@ -233,7 +235,7 @@ The span name is the static `compact_messages`; the strategy is an attribute, no
 | Attribute | Type | Meaning |
 |---|---|---|
 | `gen_ai.conversation.compacted` | bool | Always `true`; the OpenTelemetry GenAI convention's flag for a compacted context |
-| `compaction.strategy` | str | Strategy class name (for example `SlidingWindow`, `SummarizingCompaction`) |
+| `compaction.strategy` | str | Strategy class name (for example `SlidingWindowCompaction`, `SummarizingCompaction`) |
 | `compaction.messages_before` | int | Message count before compaction |
 | `compaction.messages_after` | int | Message count after compaction |
 | `compaction.tokens_before` | int | Estimated token count before compaction |
@@ -241,9 +243,63 @@ The span name is the static `compact_messages`; the strategy is an attribute, no
 
 `gen_ai.conversation.compacted` is the GenAI semantic convention's flag; the rest is harness-specific. Token counts use the strategy's `tokenizer` when set, otherwise the ~4-chars-per-token heuristic. Raw message content is not recorded.
 
+## Compaction receipts
+
+Compaction is a memory wipe the model cannot veto and often cannot detect, which invites *resumption drift* -- the model confabulates continuity with history it no longer has. A receipt makes the wipe legible: after a boundary-crossing strategy rewrites history it appends a short, deterministic note recording how much was compacted, warning that what survives is secondhand, and -- when a transcript store is attached -- a handle to the full pre-compaction transcript.
+
+```python
+from pydantic_ai_harness.compaction import SlidingWindowCompaction, SummarizingCompaction
+
+SummarizingCompaction(max_messages=60, keep_messages=20, receipts=True)
+SlidingWindowCompaction(max_messages=80, keep_messages=40, receipts=True)
+```
+
+The receipt carries no timestamp, so its bytes are a pure function of the compaction: it is safe to assert on and does not churn the prompt cache beyond the rewrite that produced it.
+
+Wording follows what actually survived. `SummarizingCompaction` leaves a summary, so its receipt says the summary above is secondhand; `SlidingWindowCompaction` drops history outright, so its receipt says that context is gone. The blank-in-place strategies (`ClearToolResults`, `DeduplicateFileReads`, `ClampOversizedMessages`) keep every message and cross no boundary, so they emit no receipt.
+
+Attach any capability exposing `compaction_transcript_handle() -> str | None` -- the `TranscriptStore` protocol -- and the receipt gains a `Full transcript: <handle>` pointer. `StepPersistence` implements it, returning its `run_id`, so attaching it is enough; there is no import coupling in either direction. Each receipt is also emitted as a `compaction.receipt` event on the `compact_messages` span, carrying `compaction.strategy`, `compaction.receipt.messages`, `compaction.receipt.tokens`, `compaction.receipt.by`, and `compaction.receipt.handle` when a handle was found.
+
+Receipts are opt-in (`receipts=False` by default) because the receipt text is content: the exact wording is provisional pending a benchmark eval-rig pass, while the mechanism is structural.
+
+## Pinning: content that survives compaction
+
+`pin` marks content that every shipped strategy must preserve:
+
+```python
+from pydantic_ai_harness.compaction import pin
+
+# In a ModelRequest placed in the run's message history (by a capability or the user):
+pinned = pin('Durable task state the model must never lose across compaction.')
+```
+
+A pinned part is never summarized away or dropped; if a strategy would have discarded it, the strategy re-injects it near the top of the surviving history. `is_pinned` reports whether a given part carries the marker.
+
+This is the least invasive marking available today. Message-part types share no universal `metadata` field (only `ToolReturnPart` has one), so pins use a sentinel-in-content envelope -- the same shape the existing warning and summary markers use. If pydantic-ai core later grows a part-level `metadata`/`pinned` seam, the marker should migrate onto it.
+
+The `Planning` capability does not need pinning: its plan is re-injected ephemerally on every request in `wrap_model_request`, so it already survives compaction by construction. Pinning is for durable task state and scratchpads that live *in* the history.
+
+## Keeping user messages (`keep_user_messages`)
+
+User turns are the highest signal-per-token content in a conversation, and losing them is the main driver of resumption drift. `SummarizingCompaction(keep_user_messages=True)` preserves every prior user turn alongside the summary, each bounded to `keep_user_messages_max_chars` (default 20k) with an explicit truncation marker when it overruns. The budget applies per part and is shared across the text items of a multi-part prompt; images, audio, and cache points pass through untouched. This supersedes `preserve_first_user_message`, which keeps only the first turn.
+
+```python
+from pydantic_ai_harness.compaction import SummarizingCompaction
+
+SummarizingCompaction(max_tokens=120_000, keep_messages=20, keep_user_messages=True)
+```
+
+## Anchored incremental summarization and the cross-model bridge
+
+With `incremental=True` (the default), a prior summary is not re-summarized -- summarizing summaries decays over successive compactions. It is fed back as an anchored `<previous-summary>` block with an *update* instruction: preserve still-true details, remove stale ones, merge in new facts. The summary becomes a living document updated in place under a fixed structure.
+
+`bridge_prefix=True` (the default) prepends a one-line note to the summary only when the summarizer's model family differs from the family that produced the history, derived from the history's `model_name` and the summarizer config. It marks the summary as a cross-model handoff so the resuming model builds on it rather than confabulating that it did the work itself. It never fires in the common same-model case, so it is cheap.
+
+As with receipts, the update instruction and the bridge-prefix wording are content, shipped minimal and neutral pending the eval-rig pass; the anchoring and family-gating mechanisms are structural.
+
 ## Out of scope
 
-These strategies compress or drop context *inside* the window. Moving large tool outputs *out* of the window -- overflowing them to a file the agent (or a subagent) can query on demand -- is a separate capability ([overflowing tool output](overflowing-tool-output.md)), not lossy truncation. Prefer it over capping individual tool outputs.
+These strategies compress or drop context *inside* the window. Moving large tool outputs *out* of the window -- overflowing them to a file the agent (or a subagent) can query on demand -- is a separate capability ([tool output limits](tool-output-limits.md)), not lossy truncation. Prefer it over capping individual tool outputs.
 
 ## API reference
 
@@ -257,8 +313,16 @@ The recommended default is `TieredCompaction`; the other strategies below can be
 
 ::: pydantic_ai_harness.compaction.DeduplicateFileReads
 
-::: pydantic_ai_harness.compaction.SlidingWindow
+::: pydantic_ai_harness.compaction.SlidingWindowCompaction
 
 ::: pydantic_ai_harness.compaction.SummarizingCompaction
 
-::: pydantic_ai_harness.compaction.LimitWarner
+::: pydantic_ai_harness.compaction.WarnNearLimits
+
+::: pydantic_ai_harness.compaction.pin
+
+::: pydantic_ai_harness.compaction.is_pinned
+
+::: pydantic_ai_harness.compaction.format_receipt
+
+::: pydantic_ai_harness.compaction.TranscriptStore
