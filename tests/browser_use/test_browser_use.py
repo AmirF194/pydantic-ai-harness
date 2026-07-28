@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import inspect
 import json
+import logging
 from collections.abc import Awaitable
 from dataclasses import dataclass, field, fields
 from pathlib import Path
@@ -71,12 +72,12 @@ class _FakeChatModel:
         raise NotImplementedError('the fake chat model is never validated')  # pragma: no cover
 
     @overload
-    async def ainvoke(
+    async def ainvoke(  # pragma: no cover - overload is enforced by static type checking
         self, messages: list[BaseMessage], output_format: None = None, **kwargs: object
     ) -> ChatInvokeCompletion[str]: ...
 
     @overload
-    async def ainvoke(
+    async def ainvoke(  # pragma: no cover - overload is enforced by static type checking
         self, messages: list[BaseMessage], output_format: type[T], **kwargs: object
     ) -> ChatInvokeCompletion[T]: ...
 
@@ -271,11 +272,13 @@ class TestBrowserUseToolset:
         too: without the shield around teardown, the first of those checkpoints
         raises inside the cancelled scope and the browser is never closed.
         """
-        killed: list[BrowserSession] = []
+        attempts: list[BrowserSession] = []
 
         async def suspending_kill(self: BrowserSession) -> None:
             await anyio.sleep(0)
-            killed.append(self)
+            attempts.append(self)
+            if len(attempts) == 1:
+                raise TimeoutError('event bus stop timed out')
 
         monkeypatch.setattr(BrowserSession, 'kill', suspending_kill)
 
@@ -303,7 +306,9 @@ class TestBrowserUseToolset:
             await running.wait()
             task_group.cancel_scope.cancel()
 
-        assert killed == [requests[0].browser_session]
+        await toolset.aclose()
+
+        assert attempts == [requests[0].browser_session, requests[0].browser_session]
 
     async def test_no_result_reports_step_errors(self, kill_calls: list[BrowserSession]) -> None:
         history = _FakeHistory(step_errors=[None, 'timeout on step 2', 'element not found'])
@@ -395,6 +400,7 @@ class TestBrowserUseToolset:
         secrets: dict[str, str | dict[str, str]] = {'x_password': 'hunter2'}
         toolset = BrowserUse[None](
             llm=llm,
+            allowed_domains=['example.com'],
             max_steps=3,
             sensitive_data=secrets,
             extend_system_message='Never buy anything.',
@@ -550,6 +556,92 @@ class TestTeardownFailure:
 
         await toolset.aclose()
 
+    async def test_a_teardown_timeout_is_reported(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        async def hanging_kill(self: BrowserSession) -> None:
+            await anyio.sleep_forever()
+
+        monkeypatch.setattr(BrowserSession, 'kill', hanging_kill)
+        monkeypatch.setattr('pydantic_ai_harness.browser_use._toolset._TEARDOWN_TIMEOUT', 0)
+        toolset = BrowserUse[None](browser_agent=_success_factory()).get_toolset()
+
+        with caplog.at_level(logging.WARNING):
+            assert await toolset.browse_web('go') == 'done'
+
+        assert 'browser-use session teardown timed out after 0 seconds' in caplog.text
+
+    async def test_a_failed_teardown_is_retried_before_the_next_call(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        attempts: list[BrowserSession] = []
+
+        async def fail_once(self: BrowserSession) -> None:
+            attempts.append(self)
+            if len(attempts) == 1:
+                raise TimeoutError('event bus stop timed out')
+
+        monkeypatch.setattr(BrowserSession, 'kill', fail_once)
+        factory = _success_factory()
+        toolset = BrowserUse[None](browser_agent=factory).get_toolset()
+
+        assert await toolset.browse_web('first') == 'done'
+        assert await toolset.browse_web('second') == 'done'
+
+        assert attempts == [
+            factory.requests[0].browser_session,
+            factory.requests[0].browser_session,
+            factory.requests[1].browser_session,
+        ]
+
+    @pytest.mark.parametrize('scope', ['call', 'agent'])
+    async def test_aclose_retries_cleanup_after_an_in_flight_call(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        scope: Literal['call', 'agent'],
+    ) -> None:
+        running = anyio.Event()
+        release = anyio.Event()
+        closing = anyio.Event()
+        attempts: list[BrowserSession] = []
+
+        async def fail_once(self: BrowserSession) -> None:
+            attempts.append(self)
+            if len(attempts) == 1:
+                raise TimeoutError('event bus stop timed out')
+
+        class _BlockingAgent:
+            async def run(self, max_steps: int = 500) -> _FakeHistory:
+                running.set()
+                await release.wait()
+                return _FakeHistory(result='done', success=True)
+
+        requests: list[BrowserTask] = []
+
+        def factory(request: BrowserTask) -> _BlockingAgent:
+            requests.append(request)
+            return _BlockingAgent()
+
+        async def close(toolset: BrowserUseToolset[None]) -> None:
+            closing.set()
+            await toolset.aclose()
+
+        monkeypatch.setattr(BrowserSession, 'kill', fail_once)
+        toolset = BrowserUse[None](browser_agent=factory, session_scope=scope).get_toolset()
+
+        async with anyio.create_task_group() as task_group:
+            task_group.start_soon(toolset.browse_web, 'go')
+            await running.wait()
+            task_group.start_soon(close, toolset)
+            await closing.wait()
+            await anyio.sleep(0)
+            release.set()
+
+        assert attempts == [requests[0].browser_session, requests[0].browser_session]
+
 
 class TestUntrustedContent:
     def test_the_instructions_say_the_result_is_untrusted(self) -> None:
@@ -564,7 +656,10 @@ class TestCredentialsStayOutOfRepr:
     """Keeping values from the sub-agent's model and then printing them in a repr is an odd place to stop."""
 
     def test_the_capability_does_not_print_its_secrets(self) -> None:
-        capability = BrowserUse[None](sensitive_data={'x_password': 'hunter2'})
+        capability = BrowserUse[None](
+            allowed_domains=['example.com'],
+            sensitive_data={'x_password': 'hunter2'},
+        )
 
         assert 'hunter2' not in repr(capability)
 
@@ -587,6 +682,45 @@ class TestCredentialsStayOutOfRepr:
         )
 
         assert 'hunter2' not in repr(task)
+
+
+class TestSensitiveDataSafety:
+    def test_flat_secrets_without_an_allowlist_warn(self) -> None:
+        with pytest.warns(UserWarning, match='Flat `sensitive_data` values apply to every domain'):
+            BrowserUse[None](sensitive_data={'x_password': 'hunter2'})
+
+    @pytest.mark.parametrize(
+        'capability',
+        [
+            BrowserUse[None](
+                allowed_domains=['example.com'],
+                sensitive_data={'x_password': 'hunter2'},
+            ),
+            BrowserUse[None](
+                browser_profile=BrowserProfile(allowed_domains=['example.com']),
+                sensitive_data={'x_password': 'hunter2'},
+            ),
+            BrowserUse[None](
+                sensitive_data={'https://example.com': {'x_password': 'hunter2'}},
+            ),
+        ],
+    )
+    def test_domain_scoped_secrets_do_not_warn(self, capability: BrowserUse[None]) -> None:
+        assert capability.sensitive_data is not None
+
+    def test_empty_capability_allowlist_warns(self) -> None:
+        with pytest.warns(UserWarning, match='Flat `sensitive_data` values apply to every domain'):
+            BrowserUse[None](
+                allowed_domains=[],
+                sensitive_data={'x_password': 'hunter2'},
+            )
+
+    def test_empty_profile_allowlist_warns(self) -> None:
+        with pytest.warns(UserWarning, match='Flat `sensitive_data` values apply to every domain'):
+            BrowserUse[None](
+                browser_profile=BrowserProfile(allowed_domains=[]),
+                sensitive_data={'x_password': 'hunter2'},
+            )
 
 
 class TestSessionScope:

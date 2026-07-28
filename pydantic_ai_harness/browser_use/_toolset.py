@@ -32,11 +32,11 @@ _TOOL_NAME = 'browse_web'
 
 # Teardown runs shielded from cancellation, so an unresponsive browser could otherwise hang the
 # caller forever on exit. Bound it instead: a browser that will not close within this window is
-# left to the OS at interpreter exit, which is strictly better than wedging the run.
+# retained for a later cleanup attempt, which is strictly better than wedging the run.
 _TEARDOWN_TIMEOUT = 30
 
 
-async def _kill(session: BrowserSession) -> None:
+async def _kill(session: BrowserSession) -> bool:
     """Close a browser session, even while the caller is being cancelled.
 
     `BrowserSession.kill` is not a single round-trip: it saves storage state,
@@ -51,14 +51,24 @@ async def _kill(session: BrowserSession) -> None:
     upstream -- and it runs in a `finally`, where a raise replaces whatever was unwinding
     through it: a completed browse becomes a `TimeoutError` to the caller, a real error
     becomes a teardown error, and a cancellation stops propagating. The browser is left to
-    the OS either way, so nothing is gained by letting it through.
+    the caller retains the session for another attempt, so nothing is gained by
+    letting it through.
     """
+    succeeded = True
     with anyio.CancelScope(shield=True):
-        with anyio.move_on_after(_TEARDOWN_TIMEOUT):
+        with anyio.move_on_after(_TEARDOWN_TIMEOUT) as timeout_scope:
             try:
                 await session.kill()
             except Exception:
-                logger.warning('browser-use session teardown failed; leaving the browser to the OS', exc_info=True)
+                succeeded = False
+                logger.warning('browser-use session teardown failed; retaining the session for retry', exc_info=True)
+        if timeout_scope.cancel_called:
+            succeeded = False
+            logger.warning(
+                'browser-use session teardown timed out after %s seconds; retaining the session for retry',
+                _TEARDOWN_TIMEOUT,
+            )
+    return succeeded
 
 
 class BrowserAgentHistory(Protocol):
@@ -273,7 +283,12 @@ class BrowserUseToolset(FunctionToolset[AgentDepsT]):
         self._session_scope: Literal['call', 'agent'] = session_scope
         self._cdp_url = cdp_url
         self._shared_session: BrowserSession | None = None
+        self._pending_cleanup: list[BrowserSession] = []
         self._session_closed = False
+        self._active_call_sessions = 0
+        self._call_cleanup_in_progress = False
+        self._call_condition = asyncio.Condition()
+        self._cleanup_lock = asyncio.Lock()
         self._session_lock = asyncio.Lock()
         self.add_function(self.browse_web, name=_TOOL_NAME)
 
@@ -362,19 +377,42 @@ class BrowserUseToolset(FunctionToolset[AgentDepsT]):
             The browser agent's final text result, or JSON conforming to the
             configured output schema when one is set.
         """
+        await self._retry_pending_cleanup()
         if self._session_scope == 'call':
             history = await self._run_in_fresh_session(task)
         else:
             history = await self._run_in_shared_session(task)
         return self._render_result(history)
 
+    async def _close_session(self, session: BrowserSession) -> None:
+        """Close `session`, retaining its identity when cleanup needs another attempt."""
+        with anyio.CancelScope(shield=True):
+            if not await _kill(session):
+                async with self._cleanup_lock:
+                    self._pending_cleanup.append(session)
+
+    async def _retry_pending_cleanup(self) -> None:
+        """Retry sessions whose previous teardown failed or timed out."""
+        async with self._cleanup_lock:
+            pending, self._pending_cleanup = self._pending_cleanup, []
+            for session in pending:
+                if not await _kill(session):
+                    self._pending_cleanup.append(session)
+
     async def _run_in_fresh_session(self, task: str) -> BrowserAgentHistory:
         """One disposable session for one call, killed when the call ends, on success or failure."""
         session = self._build_session()
+        async with self._call_condition:
+            await self._call_condition.wait_for(lambda: not self._call_cleanup_in_progress)
+            self._active_call_sessions += 1
         try:
             return await self._run_agent(task, session)
         finally:
-            await _kill(session)
+            with anyio.CancelScope(shield=True):
+                await self._close_session(session)
+                async with self._call_condition:
+                    self._active_call_sessions -= 1
+                    self._call_condition.notify_all()
 
     async def _run_in_shared_session(self, task: str) -> BrowserAgentHistory:
         """The `'agent'`-scoped shared session; the lock serializes calls -- one browser, one driver at a time."""
@@ -394,28 +432,38 @@ class BrowserUseToolset(FunctionToolset[AgentDepsT]):
             except BaseException:
                 # A failed or cancelled run can leave the shared browser in an
                 # unknown state; kill it so the next call starts fresh. Dropping
-                # the reference first makes this the last chance to close that
-                # session, which is why the kill has to survive cancellation.
                 session, self._shared_session = self._shared_session, None
-                await _kill(session)
+                await self._close_session(session)
                 raise
 
     async def aclose(self) -> None:
         """Kill the shared browser session and refuse to open another.
 
-        Only relevant in `'agent'` session scope: it closes for good, so a later
-        `browse_web` raises rather than starting a browser nothing would close.
-        In `'call'` scope no session is retained between calls, so there is
-        nothing to close and later calls keep working. Safe to call multiple
-        times.
+        In `'agent'` session scope it closes for good, so a later `browse_web`
+        raises rather than starting a browser nothing would close. In either
+        scope it retries sessions retained after an earlier teardown failure or
+        timeout. Safe to call multiple times.
 
-        It takes the same lock as `browse_web`, so it waits for an in-flight
-        call to finish rather than closing the browser under it -- and that call
-        can run for `max_steps` steps of up to `BrowserAgentSettings.step_timeout`
-        each. Cancel the run first if you need to close sooner.
+        It coordinates with `browse_web`, so it waits for in-flight calls to
+        finish before the final cleanup attempt -- and a call can run for
+        `max_steps` steps of up to `BrowserAgentSettings.step_timeout` each.
+        Cancel the run first if you need to close sooner.
         """
+        if self._session_scope == 'call':
+            async with self._call_condition:
+                await self._call_condition.wait_for(lambda: not self._call_cleanup_in_progress)
+                self._call_cleanup_in_progress = True
+                try:
+                    await self._call_condition.wait_for(lambda: self._active_call_sessions == 0)
+                    await self._retry_pending_cleanup()
+                finally:
+                    self._call_cleanup_in_progress = False
+                    self._call_condition.notify_all()
+            return
+
         async with self._session_lock:
             self._session_closed = True
             if self._shared_session is not None:
                 session, self._shared_session = self._shared_session, None
-                await _kill(session)
+                await self._close_session(session)
+        await self._retry_pending_cleanup()

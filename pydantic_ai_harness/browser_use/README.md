@@ -164,13 +164,21 @@ BrowserUse(
 )
 ```
 
+Flat `sensitive_data` values are available on every domain. Constructing
+`BrowserUse` with flat values and no effective `allowed_domains` emits a
+warning; configure an allowlist on the capability or `browser_profile`, or use
+the domain-scoped nested form shown above.
+
 ## Sessions and safety
 
-- **One session per call** by default; it is killed in a `finally`, so an
-  exception or a cancelled run does not leak a browser process. Concurrent
-  calls therefore each drive their own browser, so N calls in flight means N
-  Chromium processes and their memory. See [Session reuse](#session-reuse) for
-  the shared alternative, which serializes calls on one browser.
+- **One session per call** by default; cleanup is attempted in a `finally`,
+  including after an exception or cancelled run. Cleanup failures and the
+  30-second cleanup timeout are logged; the session is retained for another
+  attempt before the next call or by `aclose()`. Concurrent calls each drive
+  their own browser, so N calls in flight means N Chromium processes and their
+  memory. See
+  [Session reuse](#session-reuse) for the shared alternative, which serializes
+  calls on one browser.
 - **Domain allowlist.** `allowed_domains` is enforced by browser-use's
   `BrowserProfile`: navigation outside the list is blocked inside the
   sub-agent, not just discouraged in the prompt. Glob patterns like
@@ -201,7 +209,7 @@ BrowserUse(
 `session_scope` controls how long a browser lives:
 
 - `'call'` (the default): every `browse_web` call gets a fresh session, killed
-  when the call ends. Nothing can leak, but nothing carries over either.
+  when the call ends when cleanup succeeds. No browser state carries over.
 - `'agent'`: one session is kept alive and reused across calls -- tabs,
   logins, and page state carry over, and calls are serialized on the shared
   browser. Close it with `aclose()`, or use the capability as an async context
@@ -225,6 +233,13 @@ A run that fails in `'agent'` scope kills the shared session (its state is
 unknown) and the next call starts fresh. For cookie and login persistence
 alone -- without keeping a browser process alive -- a `browser_profile` with a
 `user_data_dir` also works in `'call'` scope.
+
+`'agent'` scope is not compatible with durable execution capabilities such as
+Temporal, DBOS, or Prefect: its live browser session and lock cannot survive an
+activity, process, or replay boundary. If composing this capability with
+durable execution, use the default `'call'` scope so each tool invocation owns
+its browser, and validate that composition for the durability integration you
+use; the capability does not currently include durability integration tests.
 
 ## Instructions
 
@@ -327,7 +342,7 @@ capabilities:
   - BrowserUse:
       allowed_domains: [example.com]
       max_steps: 30
-      session_scope: agent
+      session_scope: call
 ```
 
 ```python

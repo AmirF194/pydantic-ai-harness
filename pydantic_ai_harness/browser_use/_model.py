@@ -166,12 +166,12 @@ class PydanticAIChatModel(BaseChatModel):
         return self._model.model_name
 
     @overload
-    async def ainvoke(
+    async def ainvoke(  # pragma: no cover - overload is enforced by static type checking
         self, messages: list[BaseMessage], output_format: None = None, **kwargs: object
     ) -> ChatInvokeCompletion[str]: ...
 
     @overload
-    async def ainvoke(
+    async def ainvoke(  # pragma: no cover - overload is enforced by static type checking
         self, messages: list[BaseMessage], output_format: type[T], **kwargs: object
     ) -> ChatInvokeCompletion[T]: ...
 

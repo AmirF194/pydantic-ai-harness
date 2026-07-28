@@ -177,7 +177,6 @@ exclude_lines = [
     'pragma: lax no cover',
     'assert_never',
     'if TYPE_CHECKING:',
-    '@overload',
 ]
 
 [tool.mutmut]

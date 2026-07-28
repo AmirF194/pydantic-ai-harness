@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import warnings
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Literal
 
@@ -202,6 +203,20 @@ class BrowserUse(AbstractCapability[AgentDepsT]):
 
     _toolset: BrowserUseToolset[AgentDepsT] | None = field(default=None, init=False, repr=False, compare=False)
     """The cached toolset, so `'agent'`-scoped session state has one owner."""
+
+    def __post_init__(self) -> None:
+        """Warn when flat secrets have no effective navigation allowlist."""
+        profile_has_allowlist = self.browser_profile is not None and bool(self.browser_profile.allowed_domains)
+        has_flat_secrets = self.sensitive_data is not None and any(
+            isinstance(value, str) for value in self.sensitive_data.values()
+        )
+        if has_flat_secrets and not self.allowed_domains and not profile_has_allowlist:
+            warnings.warn(
+                'Flat `sensitive_data` values apply to every domain when no `allowed_domains` are configured. '
+                'Set `allowed_domains`, configure them on `browser_profile`, or use domain-scoped nested values.',
+                UserWarning,
+                stacklevel=2,
+            )
 
     def get_instructions(self) -> AgentInstructions[AgentDepsT] | None:
         """Static delegation guidance: when to hand a task to `browse_web`.
