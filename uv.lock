@@ -1931,6 +1931,9 @@ modal = [
 mongodb = [
     { name = "pymongo" },
 ]
+skills = [
+    { name = "pyyaml" },
+]
 temporal = [
     { name = "pydantic-ai-slim", extra = ["temporal"] },
 ]
@@ -1962,16 +1965,17 @@ requires-dist = [
     { name = "httpx", specifier = ">=0.28.1" },
     { name = "logfire", marker = "extra == 'logfire'", specifier = ">=4.31.0" },
     { name = "modal", marker = "extra == 'modal'", specifier = ">=1.5.0" },
-    { name = "pydantic-ai-slim", specifier = ">=2.14.1" },
+    { name = "pydantic-ai-slim", specifier = ">=2.18.0" },
     { name = "pydantic-ai-slim", extras = ["dbos"], marker = "extra == 'dbos'" },
-    { name = "pydantic-ai-slim", extras = ["spec"], marker = "extra == 'logfire'", specifier = ">=2.14.1" },
+    { name = "pydantic-ai-slim", extras = ["spec"], marker = "extra == 'logfire'", specifier = ">=2.18.0" },
     { name = "pydantic-ai-slim", extras = ["temporal"], marker = "extra == 'temporal'" },
     { name = "pydantic-monty", marker = "extra == 'code-mode'", specifier = ">=0.0.19" },
     { name = "pydantic-monty", marker = "extra == 'codemode'", specifier = ">=0.0.19" },
     { name = "pydantic-monty", marker = "extra == 'dynamic-workflow'", specifier = ">=0.0.19" },
     { name = "pymongo", marker = "extra == 'mongodb'", specifier = ">=4.17.0" },
+    { name = "pyyaml", marker = "extra == 'skills'", specifier = ">=6.0.2" },
 ]
-provides-extras = ["acp", "code-mode", "codemode", "dbos", "dynamic-workflow", "exa", "logfire", "modal", "mongodb", "temporal"]
+provides-extras = ["acp", "code-mode", "codemode", "dbos", "dynamic-workflow", "exa", "logfire", "modal", "mongodb", "skills", "temporal"]
 
 [package.metadata.requires-dev]
 dev = [
@@ -1982,7 +1986,7 @@ dev = [
     { name = "logfire", extras = ["httpx"], specifier = ">=4.31.0" },
     { name = "mongomock-motor", specifier = ">=0.0.36" },
     { name = "pydantic-ai-harness", extras = ["code-mode"] },
-    { name = "pydantic-ai-slim", extras = ["spec"], specifier = ">=2.14.1" },
+    { name = "pydantic-ai-slim", extras = ["spec"], specifier = ">=2.18.0" },
     { name = "pytest", specifier = ">=9.0.0" },
     { name = "pytest-anyio" },
     { name = "pytest-examples", specifier = ">=0.0.18" },
@@ -1995,7 +1999,7 @@ lint = [
 
 [[package]]
 name = "pydantic-ai-slim"
-version = "2.14.1"
+version = "2.18.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "exceptiongroup", marker = "python_full_version < '3.11'" },
@@ -2007,9 +2011,9 @@ dependencies = [
     { name = "pydantic-graph" },
     { name = "typing-inspection" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/20/0e/33989e7bcd2abaefdc2534129055dce0943bbcdcc5212d2296f79fd604b7/pydantic_ai_slim-2.14.1.tar.gz", hash = "sha256:3ce0afde81cd50fcd434ccdd46774f4386bee8cc0ed3e75d7dc8784fdca303ff", size = 866335, upload-time = "2026-07-21T05:40:59.91Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/4b/39/c3a941027be87f6bc07e50e1e72ae93e66a1b11b838e33ad5d135d2fe2f0/pydantic_ai_slim-2.18.0.tar.gz", hash = "sha256:dfe47a3602049f779223702a684ed8091b111cfae1851236616d6b0eb3b0b077", size = 902113, upload-time = "2026-07-25T01:21:05.614Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/74/51/8682b564598571d7056971d62221fafda2ce513481cc241f3ac621e6460e/pydantic_ai_slim-2.14.1-py3-none-any.whl", hash = "sha256:64687be32deb8075eb99edba837a61d22daf1801cd3b1e6925e8519c13838934", size = 1050646, upload-time = "2026-07-21T05:40:52.205Z" },
+    { url = "https://files.pythonhosted.org/packages/bf/a0/a0619bddf602f69a754540cb82147f9b53dfa2d093e1fe7051c5e6a8eceb/pydantic_ai_slim-2.18.0-py3-none-any.whl", hash = "sha256:4c4076166a63ad96fe6ed5a517223c4a5aba6c9682a17d8d0ac42839cbc83622", size = 1091565, upload-time = "2026-07-25T01:20:57.323Z" },
 ]
 
 [package.optional-dependencies]
@@ -2142,7 +2146,7 @@ wheels = [
 
 [[package]]
 name = "pydantic-graph"
-version = "2.14.1"
+version = "2.18.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "httpx" },
@@ -2150,9 +2154,9 @@ dependencies = [
     { name = "pydantic" },
     { name = "typing-inspection" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/e8/e7/db61f8c7a323feb55884ca701f138ae18911126628595375ff9d0d47397a/pydantic_graph-2.14.1.tar.gz", hash = "sha256:8f3a577a3ae278012d168c0db07a9bdf1b0021d21e48831c0b05518f2230730e", size = 43934, upload-time = "2026-07-21T05:41:02.136Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/e5/f9/1554e818e6d38bcb3f66ec7da7abe17c28dcd00caa1550b034e175b8841f/pydantic_graph-2.18.0.tar.gz", hash = "sha256:9423defa047b477a561a06eadfd37aaf101a2b690d044adb79de80d7ea203e4e", size = 44017, upload-time = "2026-07-25T01:21:08.152Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/26/03/ff2ee9174ea0083638c1e31b5f5c92ffd3e795024db23caa0ea297458cd5/pydantic_graph-2.14.1-py3-none-any.whl", hash = "sha256:4e4b2afb0751b5495fce9f253a5b4ccac9a0f86989fa7479ee8d517f76bd449f", size = 51658, upload-time = "2026-07-21T05:40:55.711Z" },
+    { url = "https://files.pythonhosted.org/packages/2f/29/fd05a4a84db9dae16c0417d8bcd6847148439a55329d000ef101d7243ded/pydantic_graph-2.18.0-py3-none-any.whl", hash = "sha256:48df74e3ae12ca44f99890e9b4f7020ae70a5a38d20df02db7cb16b0db3c3711", size = 51662, upload-time = "2026-07-25T01:21:00.764Z" },
 ]
 
 [[package]]
@@ -2520,11 +2524,11 @@ wheels = [
 
 [[package]]
 name = "pytz"
-version = "2026.2"
+version = "2026.3.post1"
 source = { registry = "https://pypi.org/simple" }
-sdist = { url = "https://files.pythonhosted.org/packages/ff/46/dd499ec9038423421951e4fad73051febaa13d2df82b4064f87af8b8c0c3/pytz-2026.2.tar.gz", hash = "sha256:0e60b47b29f21574376f218fe21abc009894a2321ea16c6754f3cad6eb7cdd6a", size = 320861, upload-time = "2026-05-04T01:35:29.667Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/fb/48/fb042503b6ca6cd271261dc559fd6432f7d8c713153e9ec5c591af4dfc1c/pytz-2026.3.post1.tar.gz", hash = "sha256:2211d3fcf9a797d3405cac96ac7f61d80e6a644f72a3309607282fe8a2010c5d", size = 319745, upload-time = "2026-07-25T15:12:07.385Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/ec/dd/96da98f892250475bdf2328112d7468abdd4acc7b902b6af23f4ed958ea0/pytz-2026.2-py2.py3-none-any.whl", hash = "sha256:04156e608bee23d3792fd45c94ae47fae1036688e75032eea2e3bf0323d1f126", size = 510141, upload-time = "2026-05-04T01:35:27.408Z" },
+    { url = "https://files.pythonhosted.org/packages/0f/7b/39c34ca613b0b198cb866466651b26b045e2009864c5183c979a3b83f383/pytz-2026.3.post1-py2.py3-none-any.whl", hash = "sha256:dd95840dd199baea12d9cc096a1d452caa6596a1c1e4b5f3dbd1541855d5e815", size = 508283, upload-time = "2026-07-25T15:12:05.782Z" },
 ]
 
 [[package]]
