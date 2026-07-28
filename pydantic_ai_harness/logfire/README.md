@@ -37,6 +37,12 @@ share one variable across agents. A nameless capability derives its variable -- 
 model for a model-less agent -- from the agent's `name` the first time it's needed in a run, so
 naming the agent is all it takes.
 
+Normalization is lossy, so agent names that differ only in punctuation or case land on one variable:
+`checkout-assistant`, `Checkout Assistant`, and `checkout_assistant` all resolve
+`agent__checkout_assistant`. Two such agents share a single managed config -- including when they
+live in different services that report to the same Logfire project. Pass an explicit `name` to keep
+them apart.
+
 They share one contract: **the code-defined agent is the fallback.** Every managed value is a
 patch on what's written in code -- absent fields keep their code values, and a missing, invalid,
 or unreachable remote value degrades to exactly the agent the developer wrote, never a crashed
@@ -48,11 +54,19 @@ from `pydantic_ai_harness.logfire`) to read *why* it resolved the way it did (e.
 
 **Auto-create on first use:** when the backing variable doesn't exist in Logfire yet, it is
 created in the background on first use -- with the payload's JSON schema and description -- so the
-Logfire UI becomes the editing surface without a manual create step. `AgentControl` additionally
-writes the variable's `example` as an `AgentConfig`-shaped snapshot of the code-side agent taken
-from the first model request (instructions, model, effective settings, and each tool's description
-and parameter descriptions) -- the baseline the Logfire UI's override editor and optimizer read.
-Opt out per capability with `auto_create=False`.
+Logfire UI becomes the editing surface without a manual create step. Creation happens off the run's
+thread, is attempted at most once per process per variable and Logfire instance, and never blocks or
+fails the run. Because the variable it writes is persistent and visible to everyone with access to
+the project, the outcome is reported into that same Logfire project: a log record on success, and a
+log record plus a `UserWarning` on failure. Opt out per capability with `auto_create=False`.
+
+`AgentControl` additionally writes the variable's `example` as an `AgentConfig`-shaped snapshot of
+the code-side agent (instructions, model, effective settings, and each tool's description and
+parameter descriptions) -- the baseline the Logfire UI's override editor and optimizer diff managed
+values against. The snapshot is taken from whichever model request comes first in the process, so
+for instructions or a toolset that vary with `deps`, run input, or the step within a run, it is one
+point-in-time sample rather than a description of the agent. An agent that never reaches a model
+request never auto-creates.
 
 Install the extra:
 
@@ -367,5 +381,12 @@ The variable holds an `AgentConfig`:
   the sections the capability applied (e.g. `instructions,settings`), which the Logfire UI reads to
   distinguish a wired-up managed agent from one whose config resolves but isn't applied. `model` is
   reported when present even if a call-site `run(model=...)` outranked it that run.
+- **One stored schema, two writers:** the variable can be created by this SDK or by the Logfire
+  Agent Control UI, and whichever gets there first stores the schema that the UI edits against and
+  that Logfire validates every later version of the value against. Both sides therefore write the
+  same hand-maintained schema, exported as `AGENT_CONFIG_JSON_SCHEMA`. It stays permissive on
+  purpose: `AgentConfig` ignores keys it doesn't know so a value written by a newer UI degrades to
+  the sections an older SDK understands instead of failing, and a stored schema that rejected those
+  keys would break that by refusing the write.
 - `AgentControl.resolved` exposes the active run's `ResolvedVariable`, and resolution is isolated
   per run, exactly like `ManagedPrompt`.

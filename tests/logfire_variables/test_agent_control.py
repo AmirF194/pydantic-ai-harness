@@ -16,6 +16,7 @@ from pydantic_ai.tools import ToolDefinition
 
 from pydantic_ai_harness import AgentControl as RootAgentControl
 from pydantic_ai_harness.logfire import (
+    AGENT_CONFIG_JSON_SCHEMA,
     AgentConfig,
     AgentConfigSettings,
     AgentControl,
@@ -116,8 +117,7 @@ async def test_auto_create_uses_request_snapshot(capfire: CaptureLogfire, monkey
     _managed_variable._reset_auto_create_guard()
     created: list[VariableConfig] = []
 
-    def create_inline(variable: Variable[object], config: VariableConfig | None = None) -> None:
-        assert config is not None
+    def create_inline(variable: Variable[object], config: VariableConfig) -> None:
         created.append(config)
         _managed_variable._create_variable(variable, config)
 
@@ -158,6 +158,8 @@ async def test_auto_create_uses_request_snapshot(capfire: CaptureLogfire, monkey
         await agent.run('hello')
 
     assert len(created) == 1
+    # The stored schema is the canonical hand-maintained one, not the payload's Pydantic-derived one.
+    assert created[0].json_schema == AGENT_CONFIG_JSON_SCHEMA
     example = json.loads(created[0].example or '{}')
     assert example == {
         'instructions': 'Code instructions.',

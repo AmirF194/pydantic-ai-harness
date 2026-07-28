@@ -126,6 +126,100 @@ class AgentConfig(BaseModel):
     """LLM-facing overlays keyed by each tool's original code-side name."""
 
 
+AGENT_CONFIG_JSON_SCHEMA: dict[str, Any] = {
+    'type': 'object',
+    'properties': {
+        'instructions': {
+            'type': 'string',
+            'description': 'Instructions replacing the code-defined ones.',
+        },
+        'model': {
+            'type': 'string',
+            'description': "A Pydantic AI model string, such as 'openai:gpt-5'.",
+        },
+        'settings': {
+            'type': 'object',
+            'description': (
+                'Model settings patch. Keys match `pydantic_ai.settings.ModelSettings`; '
+                'a key this schema does not name is still allowed.'
+            ),
+            'properties': {
+                'max_tokens': {'type': 'integer'},
+                'temperature': {'type': 'number'},
+                'top_p': {'type': 'number'},
+                'top_k': {'type': 'integer'},
+                'seed': {'type': 'integer'},
+                'presence_penalty': {'type': 'number'},
+                'frequency_penalty': {'type': 'number'},
+                'parallel_tool_calls': {'type': 'boolean'},
+                'timeout': {'type': 'number'},
+                'stop_sequences': {'type': 'array', 'items': {'type': 'string'}},
+                'thinking': {
+                    'anyOf': [{'type': 'boolean'}, {'type': 'string'}],
+                    'description': "Enabled/disabled, or an effort level: 'minimal', 'low', 'medium', 'high', 'xhigh'.",
+                },
+                'service_tier': {
+                    'type': 'string',
+                    'description': "Provider service tier: 'auto', 'default', 'flex', or 'priority'.",
+                },
+                'provider_options': {
+                    'type': 'object',
+                    'description': (
+                        'Per-provider settings: `provider_options.<provider>.<key>` lowers to the '
+                        '`<provider>_<key>` model setting.'
+                    ),
+                    'additionalProperties': {'type': 'object'},
+                },
+            },
+        },
+        'tool_definitions': {
+            'type': 'object',
+            'description': (
+                "LLM-facing overlays keyed by each tool's code-side name. Parameter names, types, "
+                'requiredness, validation, and implementation stay code-defined.'
+            ),
+            'additionalProperties': {
+                'type': 'object',
+                'properties': {
+                    'new_name': {
+                        'type': 'string',
+                        'minLength': 1,
+                        'description': 'Name shown to the model; a call to it routes back to the original tool.',
+                    },
+                    'description': {'type': 'string'},
+                    'parameter_descriptions': {
+                        'type': 'object',
+                        'description': 'Replacement description text per top-level parameter name.',
+                        'additionalProperties': {'type': 'string'},
+                    },
+                },
+            },
+        },
+    },
+}
+"""The stored JSON schema for an `agent__<name>` variable, shared with the Logfire Agent Control UI.
+
+The Logfire UI holds a copy of this in `app/project/managed-agents/agent-config.ts`, and whichever
+side creates the variable first is the one whose schema is persisted. The schema is not cosmetic: the
+Logfire backend validates every new version of the value against it, so anything this schema rejects
+cannot be written at all.
+
+It is maintained by hand rather than taken from `AgentConfig.model_json_schema()` because the two
+artifacts answer different questions. Pydantic's output describes *this* release's model on *this*
+Pydantic version -- `$defs`, `anyOf [T, null]` wrappers, `default: null`, and `title` noise -- while
+the stored schema is a long-lived contract between a Logfire project and every SDK version that will
+ever write to it.
+
+That is also why it is permissive at every level: `AgentConfig` ignores extra keys precisely so a key
+written by a newer UI does not fail validation and revert the whole config to code, and an
+`additionalProperties: false` anywhere in the stored schema would defeat that by rejecting the key at
+write time instead. For the same reason the fields whose accepted values grow over releases
+(`thinking`, `service_tier`) are typed rather than enumerated, and the known `settings` keys are named
+for the editor's benefit while unnamed ones stay writable. The one constraint kept is `new_name`'s
+`minLength`, which is structural rather than versioned: an empty tool name is never valid.
+"""
+
+
 OverridesProvider: TypeAlias = Callable[[], Mapping[str, ToolDefinitionOverride]]
 
 
@@ -235,9 +329,12 @@ class AgentControl(ManagedVariableCapability[AgentDepsT, AgentConfig]):
     code-defined behavior. Removing a section in Logfire deliberately reverts that section to code.
 
     When `name` is omitted, the variable name is derived from the agent's telemetry name using the
-    same normalization as the Logfire UI. The variable is resolved once per run, and its label and
-    version baggage remains active for the whole run. Managed settings override constructor settings;
-    settings passed to `run()` override both.
+    same normalization as the Logfire UI, which is lossy: `checkout-assistant` and `checkout_assistant`
+    both resolve `agent__checkout_assistant`, so two agents that differ only in punctuation -- in one
+    service or across several in the same project -- share one managed config. Pass an explicit `name`
+    to keep them apart. The variable is resolved once per run, and its label and version baggage
+    remains active for the whole run. Managed settings override constructor settings; settings passed
+    to `run()` override both.
 
     The managed `model` is sourced during model selection, so it slots in with the right precedence:
     a call-site `run(model=...)` beats it, it beats the agent's constructor model, and a fully
@@ -254,8 +351,16 @@ class AgentControl(ManagedVariableCapability[AgentDepsT, AgentConfig]):
 
     Missing, invalid, or unreachable remote values degrade to the code-defined agent through Logfire's
     resolution fallback. If the provider does not know the variable, auto-create is attempted once per
-    process in the background. Its `example` is an `AgentConfig`-shaped snapshot of the code-side agent
-    from the first model request -- the baseline read by the Logfire UI and optimizer.
+    process in the background, storing
+    [`AGENT_CONFIG_JSON_SCHEMA`][pydantic_ai_harness.logfire.AGENT_CONFIG_JSON_SCHEMA] as the
+    variable's schema and logging the creation to Logfire.
+
+    Its `example` is an `AgentConfig`-shaped snapshot of the code-side agent taken from whichever model
+    request happens to come first in the process. The Logfire UI presents that snapshot as the code
+    baseline to diff managed values against, so it is worth knowing what it really is: for instructions
+    or a toolset that vary with `deps`, run input, or the step within a run, it is one point-in-time
+    sample rather than a description of the agent. An agent that never reaches a model request never
+    auto-creates at all.
 
     ```python
     import logfire
@@ -288,7 +393,11 @@ class AgentControl(ManagedVariableCapability[AgentDepsT, AgentConfig]):
 
     def __post_init__(self) -> None:
         self._setup_variable(
-            self.name, prefix=_AGENT_VARIABLE_PREFIX, value_type=AgentConfig, default=self.default or AgentConfig()
+            self.name,
+            prefix=_AGENT_VARIABLE_PREFIX,
+            value_type=AgentConfig,
+            default=self.default or AgentConfig(),
+            json_schema=AGENT_CONFIG_JSON_SCHEMA,
         )
 
     def get_instructions(self) -> Callable[[RunContext[AgentDepsT]], str | None]:
@@ -423,6 +532,11 @@ class AgentControl(ManagedVariableCapability[AgentDepsT, AgentConfig]):
         agent has assembled them. Auto-create only fires when the provider does not know the variable,
         so this effective request is the code baseline. The snapshot is built synchronously while the
         HTTP creation itself remains in the background.
+
+        "First" is first in the process, not first in some canonical run: dynamic instructions and
+        dynamic toolsets make the snapshot a sample of one request, whichever run and step got there
+        first. It is stored as the variable's `example` and never revised, so the baseline stays
+        stable for the UI to diff against rather than drifting with traffic.
         """
         resolved = self.resolved
         if resolved is None:
@@ -460,7 +574,4 @@ class AgentControl(ManagedVariableCapability[AgentDepsT, AgentConfig]):
             else None,
             tool_definitions=tool_definitions or None,
         )
-        config = self._variable.to_config().model_copy(
-            update={'example': json.dumps(example.model_dump(exclude_none=True), indent=2)}
-        )
-        self._maybe_auto_create(self._variable, config)
+        self._maybe_auto_create(self._variable, example=json.dumps(example.model_dump(exclude_none=True), indent=2))
