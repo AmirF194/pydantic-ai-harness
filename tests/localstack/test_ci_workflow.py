@@ -42,19 +42,45 @@ def test_localstack_ci_gates_the_aggregate_check() -> None:
     assert 'localstack-integration' in needs
 
 
+def _localstack_condition() -> str:
+    """The `localstack-integration` job's `if:` expression, collapsed to one line.
+
+    The expression is folded across several lines for readability, so match on its
+    content rather than its formatting.
+    """
+    lines = _workflow_lines()
+    start = lines.index('  localstack-integration:')
+    end = next(i for i in range(start + 1, len(lines)) if lines[i].startswith('    steps:'))
+    block = ' '.join(line.strip() for line in lines[start:end] if not line.strip().startswith('#'))
+    condition = block.split('if:', 1)[1]
+    return ' '.join(condition.split())
+
+
 def test_localstack_integration_is_scoped_to_localstack_changes() -> None:
     lines = _workflow_lines()
+    condition = _localstack_condition()
 
     # Pull requests and branch pushes run the live job only when LocalStack paths
     # change; tags run it unconditionally so releases exercise the live path.
     assert "    if: github.event_name == 'pull_request' || github.ref_type == 'branch'" in lines
-    assert (
-        "    if: ${{ always() && (github.ref_type == 'tag' || needs.changes.outputs.localstack == 'true') }}" in lines
-    )
+    assert 'always()' in condition
+    assert "github.ref_type == 'tag' || needs.changes.outputs.localstack == 'true'" in condition
 
     # A skipped live job must not fail the required aggregate check; a job that
     # actually runs and fails still votes (see allowed-skips semantics).
     assert any('allowed-skips: changes, localstack-integration' in line for line in lines)
+
+
+def test_localstack_integration_skips_pull_requests_from_forks() -> None:
+    condition = _localstack_condition()
+
+    # GitHub withholds repository secrets from `pull_request` runs on cross-repository
+    # branches, so LOCALSTACK_AUTH_TOKEN is empty and LOCALSTACK_REQUIRE_AUTH_TOKEN
+    # turns that into a failure. `check` tolerates a skip but not a failure, so
+    # without this clause every fork pull request touching pyproject.toml or uv.lock
+    # is red for a reason unrelated to its changes.
+    assert "github.event_name != 'pull_request'" in condition
+    assert 'github.event.pull_request.head.repo.full_name == github.repository' in condition
 
 
 def test_changes_job_uses_owned_git_diff_with_read_only_checkout() -> None:
