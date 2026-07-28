@@ -26,6 +26,7 @@ Collections (created lazily on first write):
 from __future__ import annotations
 
 import json
+import logging
 from datetime import datetime
 
 from pydantic_ai.messages import ModelMessage, ModelMessagesTypeAdapter
@@ -40,20 +41,25 @@ from pydantic_ai_harness.step_persistence._store import (
     _event_from_dict,  # pyright: ignore[reportPrivateUsage]
     _event_to_dict,  # pyright: ignore[reportPrivateUsage]
     _opt_str,  # pyright: ignore[reportPrivateUsage]
+    _retained_seqs,  # pyright: ignore[reportPrivateUsage]
     _run_from_dict,  # pyright: ignore[reportPrivateUsage]
     _run_to_dict,  # pyright: ignore[reportPrivateUsage]
     _snapshot_state,  # pyright: ignore[reportPrivateUsage]
     _tool_effect_from_dict,  # pyright: ignore[reportPrivateUsage]
     _tool_effect_to_dict,  # pyright: ignore[reportPrivateUsage]
+    _validate_max_snapshots,  # pyright: ignore[reportPrivateUsage]
 )
 from pydantic_ai_harness.step_persistence._types import (
     ContinuableSnapshot,
     RunRecord,
+    SnapshotState,
     StepEvent,
     ToolEffectRecord,
 )
 
 _MongoDocument = dict[str, object]
+
+_logger = logging.getLogger(__name__)
 
 
 class MongoStepStore:
@@ -69,6 +75,10 @@ class MongoStepStore:
     `media` collections). Pass `None` to keep payloads inline in the snapshot
     document, or pass any `MediaStore` (e.g. `S3MediaStore`) to redirect.
     Parts whose byte length is >= `media_threshold_bytes` are externalized.
+
+    `max_snapshots_per_run` (default `None`, unbounded) bounds per-run
+    snapshot growth: after each write, one `delete_many` prunes the documents
+    outside the retain set (see `_prune_snapshots`).
     """
 
     def __init__(
@@ -79,11 +89,14 @@ class MongoStepStore:
         database: str | None = None,
         media_store: MediaStore | None | _AutoMedia = 'auto',
         media_threshold_bytes: int = _DEFAULT_MEDIA_THRESHOLD_BYTES,
+        max_snapshots_per_run: int | None = None,
     ) -> None:
         if (client is None) == (db_url is None):
             raise ValueError('provide exactly one of `client=` or `db_url=`')
         if database is None:
             raise ValueError('`database=` is required')
+        _validate_max_snapshots(max_snapshots_per_run)
+        self._max_snapshots_per_run = max_snapshots_per_run
 
         if client is not None:
             self._client = client
@@ -193,15 +206,32 @@ class MongoStepStore:
                 'messages': json.dumps(messages_json),
             }
         )
+        await self._prune_snapshots(snapshot.run_id)
 
-    async def latest_snapshot(self, *, run_id: str, include_interrupted: bool = False) -> ContinuableSnapshot | None:
-        query: _MongoDocument = {'run_id': run_id}
-        if not include_interrupted:
-            query['state'] = 'complete'
-        doc = await self._db['snapshots'].find_one(query, sort=[('seq', -1)])
-        if doc is None:
-            return None
+    async def _prune_snapshots(self, run_id: str) -> None:
+        """Delete this run's snapshot documents outside the retain set when bounded.
 
+        No-op when `max_snapshots_per_run` is `None`. Externalized media in the
+        sibling `media` collections is content-addressed and may be shared
+        across snapshots and runs, so a deleted snapshot document never removes
+        a blob -- orphaned-blob GC is a separate concern (see the capability
+        README non-goals).
+
+        The retain set comes from `_retained_seqs`, so the newest overall and
+        the newest `complete` survive even when the newest `keep` documents are
+        all `interrupted`.
+        """
+        if self._max_snapshots_per_run is None:
+            return
+        entries: list[tuple[int, SnapshotState]] = []
+        async for doc in self._db['snapshots'].find({'run_id': run_id}, {'seq': 1, 'state': 1}):
+            seq = doc['seq']
+            assert isinstance(seq, int)
+            entries.append((seq, _snapshot_state(doc.get('state'))))
+        retained = _retained_seqs(entries, self._max_snapshots_per_run)
+        await self._db['snapshots'].delete_many({'run_id': run_id, 'seq': {'$nin': sorted(retained)}})
+
+    async def _snapshot_from_doc(self, run_id: str, doc: _MongoDocument) -> ContinuableSnapshot:
         messages_text = doc['messages']
         step_index = doc['step_index']
         timestamp_raw = doc['timestamp']
@@ -222,6 +252,36 @@ class MongoStepStore:
             timestamp=datetime.fromisoformat(timestamp_raw),
             state=_snapshot_state(doc.get('state')),
         )
+
+    async def latest_snapshot(self, *, run_id: str, include_interrupted: bool = False) -> ContinuableSnapshot | None:
+        query: _MongoDocument = {'run_id': run_id}
+        if not include_interrupted:
+            query['state'] = 'complete'
+        doc = await self._db['snapshots'].find_one(query, sort=[('seq', -1)])
+        if doc is None:
+            return None
+        return await self._snapshot_from_doc(run_id, doc)
+
+    async def list_snapshots(self, *, run_id: str, include_interrupted: bool = False) -> list[ContinuableSnapshot]:
+        """Return retained snapshots for `run_id` in write order.
+
+        Mirrors the `latest_snapshot` gate: `interrupted` snapshots are skipped
+        unless `include_interrupted=True`. Documents that fail to parse are
+        skipped and logged, so one damaged document does not hide the rest of
+        the run's history. Not part of the `StepStore` protocol: the
+        `conversation_search` capability consumes it through its narrower
+        `SnapshotStore` protocol.
+        """
+        query: _MongoDocument = {'run_id': run_id}
+        if not include_interrupted:
+            query['state'] = 'complete'
+        snapshots: list[ContinuableSnapshot] = []
+        async for doc in self._db['snapshots'].find(query).sort('seq', 1):
+            try:
+                snapshots.append(await self._snapshot_from_doc(run_id, doc))
+            except Exception:
+                _logger.warning('Skipping unparsable snapshot document for run %s', run_id, exc_info=True)
+        return snapshots
 
     async def record_tool_effect(self, record: ToolEffectRecord) -> None:
         await self._ensure_indexes()

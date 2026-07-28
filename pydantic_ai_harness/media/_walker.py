@@ -7,8 +7,14 @@ they recognize the serialized shapes emitted by
 `ModelMessagesTypeAdapter.dump_json`:
 
 - `BinaryContent`: `{"kind": "binary", "data": "<b64>", ...}`.
-- Any part carrying a string `content` (`TextPart`, `ToolReturnPart`,
-  a string-valued `UserPromptPart`, ...): `{"content": "<text>", ...}`.
+- Any message part carrying a string `content` -- every part serializes a
+  `part_kind` discriminator, so `TextPart`, `ThinkingPart`, `ToolReturnPart`
+  with a string return and a string-valued `UserPromptPart` all match:
+  `{"content": "<text>", "part_kind": "<kind>", ...}`.
+- `TextContent`, the `UserContent`/`ToolReturn` element that carries text
+  inside a part rather than being one: `{"content": "<text>", "kind":
+  "text-content", ...}`. It has no `part_kind`, so it needs its own
+  discriminator match.
 
 Both kinds go to the same content-addressed `MediaStore`; the marker records
 which field was externalized so `restore_media` re-inlines the right one.
@@ -29,12 +35,16 @@ from pydantic_ai_harness.media._store import MediaContext, MediaStore
 
 _EXTERNAL_MARKER = '__harness_external_media__'
 _TEXT_MARKER = '__harness_external_text__'
-# The externalized-blob reference is stored under a namespaced key, not `uri`,
-# so a part or arbitrary `ToolReturnPart.content` mapping that already carries
-# its own `uri` field round-trips it intact. `ToolReturnContent` permits any
+# Authoritative location of the externalized-blob reference. It is namespaced so
+# a part or arbitrary `ToolReturnPart.content` mapping that already carries its
+# own `uri` field round-trips it intact: `ToolReturnContent` permits any
 # `Mapping[str, ...]`, so a user payload can legitimately collide on
-# `part_kind`/`content`/`uri`; a plain `uri` marker key would drop the original.
+# `part_kind`/`content`/`uri`, and a plain `uri` key alone would drop the
+# original. See `_write_reference` for the backward-compatible `uri` mirror.
 _URI_KEY = '__harness_external_uri__'
+# `TextContent.kind` (`pydantic_ai.messages.TextContent`). Unlike a message
+# part it carries no `part_kind`, so it needs its own discriminator match.
+_TEXT_CONTENT_KIND = 'text-content'
 
 
 def _is_json_dict(node: object) -> TypeGuard[dict[str, object]]:
@@ -61,22 +71,29 @@ def _is_binary_part(node: dict[str, object]) -> bool:
 
 
 def _is_text_part(node: dict[str, object]) -> bool:
-    """A serialized message part carrying inline text.
+    """A serialized node carrying inline text under `content`.
 
-    Requires a string `part_kind` -- the discriminator every `pydantic_ai`
-    message part serializes -- as well as a string `content`. Gating on
-    `part_kind` narrows the match, but `ToolReturnContent` permits arbitrary
-    `Mapping[str, ...]` payloads, so a user structure can still carry a string
-    `part_kind` and `content` and be treated here as a part. That stays
-    lossless: the externalized `content` re-inlines byte-for-byte on restore,
-    and the reference URI lives under the namespaced `_URI_KEY`, so a colliding
-    payload's own `uri` (or any other field) round-trips untouched.
-    Covers `TextPart`, `ToolReturnPart` with a string return, and
-    string-valued `UserPromptPart`. A bare string element inside a
+    Requires a string `content` plus a discriminator: either a string
+    `part_kind` (every `pydantic_ai` message part serializes one) or
+    `kind == 'text-content'` (`TextContent`, which travels inside a
+    `UserPromptPart.content` sequence or a `ToolReturn`, so it has no
+    `part_kind` of its own). Between them these cover `TextPart`,
+    `ThinkingPart`, `ToolReturnPart` with a string return, a string-valued
+    `UserPromptPart`, and `TextContent` wherever it appears.
+
+    Requiring a known discriminator is what keeps arbitrary payloads out:
+    `ToolReturnContent` permits any `Mapping[str, ...]`, so a plain "has a
+    string `content`" test would match user data. A payload that does collide
+    on one of these discriminators still round-trips losslessly -- the
+    externalized `content` re-inlines byte-for-byte, and the reference URI
+    lives under the namespaced `_URI_KEY`, so the payload's own `uri` (or any
+    other field) survives. A bare string element inside a
     `UserPromptPart.content` list is not a dict, so it is never a candidate
     (replacing it with a marker dict would break `UserContent` validation).
     """
-    return isinstance(node.get('part_kind'), str) and isinstance(node.get('content'), str)
+    if not isinstance(node.get('content'), str):
+        return False
+    return isinstance(node.get('part_kind'), str) or node.get('kind') == _TEXT_CONTENT_KIND
 
 
 def _is_external_marker(node: dict[str, object]) -> bool:
@@ -130,7 +147,7 @@ async def _maybe_externalize_binary(
     # are recursively walked so any nested externalizable payload still goes out.
     marker = await _preserve_fields(node, 'data', media_store, threshold_bytes)
     marker[_EXTERNAL_MARKER] = True
-    marker[_URI_KEY] = uri
+    _write_reference(marker, node, uri)
     return marker
 
 
@@ -157,8 +174,26 @@ async def _maybe_externalize_text(
     marker = await _preserve_fields(node, 'content', media_store, threshold_bytes)
     marker[_EXTERNAL_MARKER] = True
     marker[_TEXT_MARKER] = True
-    marker[_URI_KEY] = uri
+    _write_reference(marker, node, uri)
     return marker
+
+
+def _write_reference(marker: dict[str, object], node: dict[str, object], uri: str) -> None:
+    """Record the blob reference on `marker`, mirroring it to `uri` when that key is free.
+
+    `_URI_KEY` is authoritative. The plain `uri` mirror exists so a reader from
+    before `_URI_KEY` (which resolves `node['uri']` and raises without it) can
+    still restore snapshots written here -- without it, upgrading is one-way.
+
+    The mirror is written only when the source node had no `uri` of its own,
+    because a genuine `uri` is data that has to round-trip and overwriting it
+    is the bug `_URI_KEY` was introduced to fix. A node that does carry one
+    therefore gets no mirror, and an older reader fails loudly on it rather
+    than restoring the wrong bytes.
+    """
+    marker[_URI_KEY] = uri
+    if 'uri' not in node:
+        marker['uri'] = uri
 
 
 async def _preserve_fields(
@@ -199,27 +234,32 @@ async def restore_media(node: object, *, media_store: MediaStore) -> object:
 
 
 async def _restore_external(node: dict[str, object], media_store: MediaStore) -> dict[str, object]:
-    uri_value = node.get(_URI_KEY)
-    ref_key = _URI_KEY
-    if not isinstance(uri_value, str):
+    dropped = {_EXTERNAL_MARKER, _TEXT_MARKER}
+    if _URI_KEY in node:
+        uri_value = node[_URI_KEY]
+        dropped.add(_URI_KEY)
+        # `_write_reference` mirrors the reference to `uri` only when the source
+        # node had none, so a `uri` equal to the reference is that mirror and
+        # goes; anything else is the node's own data and stays.
+        if node.get('uri') == uri_value:
+            dropped.add('uri')
+    else:
         # Markers written before `_URI_KEY` existed stored the blob reference
-        # under a plain `uri`. Fall back to it, but only when `_URI_KEY` is
-        # absent: a new-format marker's genuine `uri` is data, never a reference,
-        # so it must not be consumed here (that was the bug `_URI_KEY` fixed).
+        # under a plain `uri`. Falling back keyed on `_URI_KEY` being absent (not
+        # on its value being unusable) keeps a genuine `uri` from ever being read
+        # as a reference -- the bug `_URI_KEY` was introduced to fix.
         uri_value = node.get('uri')
-        ref_key = 'uri'
+        dropped.add('uri')
     if not isinstance(uri_value, str):
         raise ValueError(f'externalized media marker missing string uri: {node!r}')
     raw = await media_store.get(uri_value)
-    # Inverse of `_maybe_externalize_*`: drop the marker keys and the reference
-    # key, restore the externalized field, keep every other field the original
-    # part carried (including a genuine `uri` on a new-format marker, which the
-    # namespaced `_URI_KEY` never shadows). Preserved fields are recursively
-    # restored so a nested marker (from the externalize-side recursion) is
-    # re-inlined too.
+    # Inverse of `_maybe_externalize_*`: drop the marker and reference keys,
+    # restore the externalized field, keep every other field the original part
+    # carried. Preserved fields are recursively restored so a nested marker
+    # (from the externalize-side recursion) is re-inlined too.
     restored: dict[str, object] = {}
     for key, value in node.items():
-        if key in (_EXTERNAL_MARKER, _TEXT_MARKER, ref_key):
+        if key in dropped:
             continue
         restored[key] = await restore_media(value, media_store=media_store)
     if node.get(_TEXT_MARKER) is True:

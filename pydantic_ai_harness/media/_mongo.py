@@ -3,8 +3,9 @@
 Blobs are split into fixed-size chunks stored across two collections -- a
 `files` manifest document keyed by the sha256 hex digest plus one document
 per chunk in a sibling `<collection>_chunks` collection. Chunking bounds the
-byte payload so it never lands in one oversized document regardless of blob
-size, without depending on the GridFS driver. The manifest itself stores
+size of each BSON document, not memory: `put` takes the whole payload and
+`get` reassembles it, so a blob must fit in process memory either way. The
+bound is achieved without depending on the GridFS driver. The manifest itself stores
 `MediaContext.metadata` inline and is not chunked, so callers should keep
 per-blob metadata small (it is not covered by the chunk-size bound).
 

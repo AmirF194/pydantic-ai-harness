@@ -326,13 +326,14 @@ fields when it writes the terminal `completed` / `failed` entry.
   `runs`, `events`, `snapshots`, `tool_effects`, and `counters` (atomic
   `$inc` for monotonic `seq`). `runs._id = run_id` enforces the single-shot
   `run_id` contract. Needs the `mongodb` extra
-  (`pip install pydantic-ai-harness[mongodb]`); pass a shared
-  `AsyncMongoClient` as `client=`, or a connection string as `db_url=` (the
-  store then owns the client -- call `await store.aclose()` to release it).
+  (`pip install pydantic-ai-harness[mongodb]`, which installs
+  `pymongo>=4.17.0`); pass a shared `AsyncMongoClient` as `client=`, or a
+  connection string as `db_url=` (the store then owns the client -- call
+  `await store.aclose()` to release it).
   Externalizes individual parts at or above `media_threshold_bytes` by
   default to a `MongoMediaStore` on the same client. That is a per-value
   offload, not an aggregate cap: a snapshot of many below-threshold parts can
-  still exceed MongoDB's 16MB document limit and fail on insert -- lower the
+  still exceed MongoDB's 16 MiB document limit and fail on insert -- lower the
   threshold if that is a risk for your workload.
 
 All implement the same async `StepStore` protocol, so capability hooks never
@@ -343,6 +344,30 @@ block the event loop on the file/sqlite backends (I/O is dispatched via
 rejects `..`) to prevent path traversal -- callers passing user-controlled
 IDs should still sanitise first.
 
+### What `MongoStepStore` creates on first write
+
+The store issues `createIndex` on its first write, for eight indexes:
+`conversation_id` and `parent_run_id` (both sparse) plus `started_at` on
+`runs`; `(run_id, seq)` on `events`; `(run_id, seq)` and
+`(run_id, state, seq)` on `snapshots`; and a unique `(run_id, tool_call_id)`
+plus `(run_id, status)` on `tool_effects`. Its default
+`MongoMediaStore` adds one more (see the [media docs](../media/)). Three
+consequences worth knowing before pointing the store at an existing
+deployment:
+
+- The connecting user needs the privilege to create indexes. A restricted
+  Atlas role without it fails on the first write, not at construction.
+- The unique index build fails if an existing `tool_effects` collection
+  already holds duplicate `(run_id, tool_call_id)` pairs.
+- Index builds against already-populated collections cost time and I/O on
+  that first call.
+
+`RunRecord.metadata` and `StepEvent.metadata` are stored as nested documents,
+so their keys become BSON field names: keys containing `.` or starting with
+`$` need [MongoDB 5.0 or later](https://www.mongodb.com/docs/manual/core/dot-dollar-considerations/),
+and a key containing a NULL byte is rejected by the BSON encoder before it
+reaches the server. CI exercises both Mongo backends against `mongo:8`.
+
 ## Bounding snapshot growth
 
 Each step writes a new full-history snapshot keyed by an incrementing `seq`,
@@ -350,10 +375,10 @@ and nothing is pruned by default. Within one long `Agent.run` the snapshot
 count equals the number of settled tool-call steps, so a long single run pays a
 growing storage cost.
 
-`InMemoryStepStore`, `FileStepStore`, and `SqliteStepStore` accept an opt-in
-`max_snapshots_per_run: int | None` (default `None`, unbounded -- byte-for-byte
-the prior behavior). When set to `N >= 1`, each `save_snapshot` prunes the run
-down to a retain set:
+All four stores -- `InMemoryStepStore`, `FileStepStore`, `SqliteStepStore`, and
+`MongoStepStore` -- accept an opt-in `max_snapshots_per_run: int | None`
+(default `None`, unbounded -- byte-for-byte the prior behavior). When set to
+`N >= 1`, each `save_snapshot` prunes the run down to a retain set:
 
 - the newest `N` snapshots by `seq`,
 - the newest snapshot overall (serves `latest_snapshot(include_interrupted=True)`),
@@ -362,7 +387,8 @@ down to a retain set:
 The last two keep both read modes correct even when the newest `N` snapshots
 are all `interrupted` and the newest resumable `complete` sits below that
 window, so the retain set can exceed `N`. `from_spec(..., max_snapshots_per_run=N)`
-forwards the bound to the constructed store.
+forwards the bound to the store it constructs (`backend='memory'`, `'file'`, or
+`'sqlite'`; a Mongo store is built directly, not from a spec).
 
 ```python
 from pydantic_ai_harness.step_persistence import FileStepStore
@@ -389,14 +415,20 @@ when full-transcript reconstruction matters.
 `BinaryContent` payloads (images, audio, documents, video) inline as
 base64 inside a snapshot would balloon every file/row containing the
 message; a large text part (e.g. a big tool-return string) does the same and
-can push a `MongoStepStore` snapshot past MongoDB's 16MB document cap
+can push a `MongoStepStore` snapshot past MongoDB's 16 MiB document cap
 ([#440](https://github.com/pydantic/pydantic-ai-harness/issues/440)). The
-file/sqlite/mongo backends externalize any `BinaryContent.data` -- and any
-part whose string `content` -- at or above 64 KiB through a configured
+file/sqlite/mongo backends externalize any `BinaryContent.data`, and any
+part whose string `content` is at or above 64 KiB, through a configured
 `MediaStore`, leaving a URI reference in the snapshot. The same
 `media_threshold_bytes` governs both binary and text; there is no separate
 text knob. Round-trip is transparent -- `latest_snapshot(...).messages[*]`
 returns the original `BinaryContent` bytes and text.
+
+Text externalization is not Mongo-only and has no opt-out short of
+`media_store=None`: the walker is shared, so an existing `FileStepStore` or
+`SqliteStepStore` deployment starts writing blobs for large text parts as well
+as binary ones from this release on. Snapshots written before it still restore
+-- the reader recognises the older marker shape.
 
 | StepStore           | Default `media_store`                  | Where blobs live                      |
 | ------------------- | --------------------------------------- | ------------------------------------- |
@@ -447,10 +479,13 @@ implementations are:
 - `MongoMediaStore(client= or db_url=, database=...)` -- MongoDB, needs the
   `mongodb` extra. Stores each blob as sha256-addressed chunks across a
   `media` manifest document and a sibling `media_chunks` collection (manual
-  chunking, not GridFS -- see the [media docs](../media/) for why), so the
-  blob payload never lands in one document regardless of size. The manifest
-  holds `MediaContext.metadata` inline and is not chunked, so keep per-blob
-  metadata small.
+  chunking, not GridFS -- see the [media docs](../media/) for why), so a blob
+  larger than one BSON document still stores and reads back. Chunking bounds
+  the document, not memory: there is no streaming API, so each blob is held
+  whole in process memory on both `put` and `get`. The manifest holds
+  `MediaContext.metadata` inline and is not chunked, so keep per-blob metadata
+  small. `collection=` renames both collections and `chunk_size_bytes=`
+  (default 8 MiB) sets the split size.
 
 ### Exposing externalized bytes as URLs
 
@@ -521,15 +556,18 @@ stored for the byte payload itself, e.g. as the `Content-Type`).
   alongside each blob, atomic via tmp + rename. Sidecars are absent
   only when the put carried no metadata
 - `MongoMediaStore` writes `metadata` as a JSON string and `media_type`
-  as a dedicated field on the blob's `files` document; `get_metadata`
-  decodes the JSON string back
+  as a dedicated field on the blob's manifest document (the `media`
+  collection by default); `get_metadata` decodes the JSON string back.
+  Because the mapping is one JSON string rather than nested fields,
+  metadata keys are not subject to BSON field-name rules here
 
 ### `key_strategy` -- controlling the backend storage path
 
 Default is `<sha256>.bin`. `DiskMediaStore` and `S3MediaStore` accept
-overrides to fit existing layouts; `SqliteMediaStore` does not (its
-primary key is the digest, so a user-chosen key would either break
-dedup or be a no-op):
+overrides to fit existing layouts; `SqliteMediaStore` and `MongoMediaStore`
+do not (the digest is their primary key, so a user-chosen key would either
+break dedup or be a no-op -- use `table=` / `collection=` to move the rows
+or documents):
 
 ```python
 from pydantic_ai_harness.media import DiskMediaStore, MediaContext
@@ -570,8 +608,8 @@ always safe -- you only ever lose wire savings, never correctness.
 
 DynamoDB, Postgres, Redis, GCS, and other backends are out of scope for
 this release. Write your own `StepStore` (about ten methods on a Protocol) or
-your own `MediaStore` (three methods) and pass it via `store=` /
-`media_store=`. Please open an issue if you ship one -- we want to feed
+your own `MediaStore` (five methods: `put`, `get`, `exists`, `public_url`,
+`get_metadata`) and pass it via `store=` / `media_store=`. Please open an issue if you ship one -- we want to feed
 the eventual shared adapter layer with N >= 3 real implementations before
 abstracting.
 

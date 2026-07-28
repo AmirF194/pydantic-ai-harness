@@ -9,6 +9,7 @@ The store uses only the async collection surface `mongomock-motor` provides
 
 from __future__ import annotations
 
+import logging
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -27,6 +28,7 @@ from pydantic_ai.models.test import TestModel
 from pymongo import AsyncMongoClient
 from pymongo.errors import DuplicateKeyError
 
+from pydantic_ai_harness.conversation_search import SnapshotHistorySource
 from pydantic_ai_harness.media import MongoMediaStore
 from pydantic_ai_harness.step_persistence import (
     ContinuableSnapshot,
@@ -61,20 +63,53 @@ class TestMongoStepStoreConstruction:
             MongoStepStore(client=_mock_client())
 
     def test_auto_media_store_shares_client(self) -> None:
-        store = MongoStepStore(client=_mock_client(), database='t')
-        assert isinstance(store._media_store, MongoMediaStore)  # pyright: ignore[reportPrivateUsage]
+        client = _mock_client()
+        store = MongoStepStore(client=client, database='t')
+        media_store = store._media_store  # pyright: ignore[reportPrivateUsage]
+        assert isinstance(media_store, MongoMediaStore)
+        assert media_store._client is client  # pyright: ignore[reportPrivateUsage]
 
     def test_media_store_none_disables_media(self) -> None:
         store = MongoStepStore(client=_mock_client(), database='t', media_store=None)
         assert store._media_store is None  # pyright: ignore[reportPrivateUsage]
 
-    async def test_db_url_owns_client_and_aclose_closes_it(self) -> None:
+    def test_rejects_invalid_max_snapshots_per_run(self) -> None:
+        with pytest.raises(ValueError, match='must be an int >= 1 or None'):
+            MongoStepStore(client=_mock_client(), database='t', max_snapshots_per_run=1.5)  # type: ignore[arg-type]
+        with pytest.raises(ValueError, match='must be >= 1 or None'):
+            MongoStepStore(client=_mock_client(), database='t', max_snapshots_per_run=0)
+
+    async def test_db_url_owns_client_and_aclose_closes_it(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        closed: list[object] = []
+
+        async def _record(client: AsyncMongoClient[dict[str, object]]) -> None:
+            closed.append(client)
+
+        monkeypatch.setattr(AsyncMongoClient, 'close', _record)
         store = MongoStepStore(db_url='mongodb://localhost:59017', database='t', media_store=None)
         await store.aclose()
+        assert len(closed) == 1
+        assert closed[0] is store._client  # pyright: ignore[reportPrivateUsage]
 
-    async def test_shared_client_aclose_is_noop(self) -> None:
-        store = MongoStepStore(client=_mock_client(), database='t', media_store=None)
+        monkeypatch.undo()
         await store.aclose()
+
+    async def test_shared_client_aclose_is_noop(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        client = _mock_client()
+        closed: list[object] = []
+
+        async def _record() -> None:
+            closed.append(client)
+
+        monkeypatch.setattr(client, 'close', _record)
+        store = MongoStepStore(client=client, database='t', media_store=None)
+        await store.aclose()
+        assert closed == []
+
+        # Prove the spy would have recorded a close, so the empty list above is
+        # an observation rather than a spy that never wired up.
+        await client.close()
+        assert closed == [client]
 
 
 class TestMongoStepStoreProtocol:
@@ -206,6 +241,23 @@ class TestMongoStepStoreProtocol:
         assert await store.list_unresolved_tool_effects(run_id='nope') == []
         assert await store.list_runs() == []
 
+    async def test_non_ascii_metadata_round_trips(self) -> None:
+        """Run and event `metadata` survives as a native BSON subdocument.
+
+        Unlike `MongoMediaStore`, which JSON-encodes its metadata, the run and
+        event documents nest it, so both keys and values go through BSON's own
+        UTF-8 encoding.
+        """
+        store = MongoStepStore(client=_mock_client(), database='t', media_store=None)
+        metadata = {'user': 'Ada Lovelace ✨', 'ключ': 'ジョブ完了', 'emoji': '🙂'}
+        await store.register_run(RunRecord(run_id='r1', metadata=metadata))
+        await store.append_event(StepEvent(run_id='r1', kind='run_started', step_index=0, metadata=metadata))
+
+        run = await store.get_run(run_id='r1')
+        assert run is not None
+        assert run.metadata == metadata
+        assert [e.metadata for e in await store.list_events(run_id='r1')] == [metadata]
+
     async def test_corrupted_snapshot_document_raises(self) -> None:
         """A poked snapshot with a wrong-typed field surfaces as a ValueError."""
         client = _mock_client()
@@ -216,6 +268,104 @@ class TestMongoStepStoreProtocol:
         await client['t']['snapshots'].update_one({'run_id': 'r1'}, {'$set': {'timestamp': 123}})
         with pytest.raises(ValueError, match='snapshot document has wrong types'):
             await store.latest_snapshot(run_id='r1')
+
+
+class TestMongoStepStoreListSnapshots:
+    async def test_write_order_and_interrupted_filter(self) -> None:
+        store = MongoStepStore(client=_mock_client(), database='t', media_store=None)
+        msgs: list[ModelMessage] = [ModelRequest(parts=[UserPromptPart(content='a')])]
+        # Descending then ascending `step_index` so write order is neither a
+        # `step_index` sort nor its reverse.
+        await store.save_snapshot(ContinuableSnapshot(run_id='r1', step_index=2, messages=msgs))
+        await store.save_snapshot(ContinuableSnapshot(run_id='r1', step_index=0, messages=msgs, state='interrupted'))
+        await store.save_snapshot(ContinuableSnapshot(run_id='r1', step_index=1, messages=msgs))
+        await store.save_snapshot(ContinuableSnapshot(run_id='r2', step_index=9, messages=msgs))
+
+        assert [s.step_index for s in await store.list_snapshots(run_id='r1')] == [2, 1]
+        opted = await store.list_snapshots(run_id='r1', include_interrupted=True)
+        assert [s.step_index for s in opted] == [2, 0, 1]
+        assert [s.state for s in opted] == ['complete', 'interrupted', 'complete']
+        assert await store.list_snapshots(run_id='nope') == []
+
+    async def test_restores_externalized_media(self) -> None:
+        store = MongoStepStore(client=_mock_client(), database='t', media_threshold_bytes=1024)
+        big_text = 'Z' * 5_000
+        messages: list[ModelMessage] = [
+            ModelRequest(parts=[ToolReturnPart(tool_name='scrape', content=big_text, tool_call_id='t1')])
+        ]
+        await store.save_snapshot(ContinuableSnapshot(run_id='r1', step_index=0, messages=messages))
+
+        snapshots = await store.list_snapshots(run_id='r1')
+        assert len(snapshots) == 1
+        request = snapshots[0].messages[0]
+        assert isinstance(request, ModelRequest)
+        tool_return = request.parts[0]
+        assert isinstance(tool_return, ToolReturnPart)
+        assert tool_return.content == big_text
+
+    async def test_store_is_accepted_as_a_search_substrate(self) -> None:
+        """`SnapshotHistorySource` rejects stores lacking `list_snapshots` at construction."""
+        store = MongoStepStore(client=_mock_client(), database='t', media_store=None)
+        msgs: list[ModelMessage] = [ModelRequest(parts=[UserPromptPart(content='remember this')])]
+        await store.save_snapshot(ContinuableSnapshot(run_id='r1', step_index=0, messages=msgs))
+
+        source = SnapshotHistorySource(store)
+        assert [type(m).__name__ for m in await source.run_history(run_id='r1')] == ['ModelRequest']
+
+    async def test_skips_unparsable_document(self, caplog: pytest.LogCaptureFixture) -> None:
+        client = _mock_client()
+        store = MongoStepStore(client=client, database='t', media_store=None)
+        msgs: list[ModelMessage] = [ModelRequest(parts=[UserPromptPart(content='a')])]
+        await store.save_snapshot(ContinuableSnapshot(run_id='r1', step_index=0, messages=msgs))
+        await store.save_snapshot(ContinuableSnapshot(run_id='r1', step_index=1, messages=msgs))
+        await client['t']['snapshots'].update_one({'step_index': 0}, {'$set': {'timestamp': 123}})
+
+        with caplog.at_level(logging.WARNING):
+            snapshots = await store.list_snapshots(run_id='r1')
+        assert [s.step_index for s in snapshots] == [1]
+        assert 'Skipping unparsable snapshot document for run r1' in caplog.text
+
+
+class TestMongoStepStoreRetention:
+    async def test_unbounded_keeps_every_snapshot(self) -> None:
+        store = MongoStepStore(client=_mock_client(), database='t', media_store=None)
+        msgs: list[ModelMessage] = [ModelRequest(parts=[UserPromptPart(content='a')])]
+        for step in range(4):
+            await store.save_snapshot(ContinuableSnapshot(run_id='r1', step_index=step, messages=msgs))
+        assert [s.step_index for s in await store.list_snapshots(run_id='r1')] == [0, 1, 2, 3]
+
+    async def test_prunes_to_the_newest_window(self) -> None:
+        store = MongoStepStore(client=_mock_client(), database='t', media_store=None, max_snapshots_per_run=2)
+        msgs: list[ModelMessage] = [ModelRequest(parts=[UserPromptPart(content='a')])]
+        for step in range(5):
+            await store.save_snapshot(ContinuableSnapshot(run_id='r1', step_index=step, messages=msgs))
+        assert [s.step_index for s in await store.list_snapshots(run_id='r1')] == [3, 4]
+
+    async def test_keeps_newest_complete_below_the_window(self) -> None:
+        """A `complete` snapshot pushed out of the window by `interrupted` writes survives."""
+        store = MongoStepStore(client=_mock_client(), database='t', media_store=None, max_snapshots_per_run=2)
+        msgs: list[ModelMessage] = [ModelRequest(parts=[UserPromptPart(content='a')])]
+        await store.save_snapshot(ContinuableSnapshot(run_id='r1', step_index=0, messages=msgs))
+        for step in (1, 2, 3):
+            await store.save_snapshot(
+                ContinuableSnapshot(run_id='r1', step_index=step, messages=msgs, state='interrupted')
+            )
+
+        retained = await store.list_snapshots(run_id='r1', include_interrupted=True)
+        assert [s.step_index for s in retained] == [0, 2, 3]
+        resumable = await store.latest_snapshot(run_id='r1')
+        assert resumable is not None
+        assert resumable.step_index == 0
+
+    async def test_pruning_is_scoped_to_the_written_run(self) -> None:
+        store = MongoStepStore(client=_mock_client(), database='t', media_store=None, max_snapshots_per_run=1)
+        msgs: list[ModelMessage] = [ModelRequest(parts=[UserPromptPart(content='a')])]
+        await store.save_snapshot(ContinuableSnapshot(run_id='r1', step_index=0, messages=msgs))
+        await store.save_snapshot(ContinuableSnapshot(run_id='r2', step_index=0, messages=msgs))
+        await store.save_snapshot(ContinuableSnapshot(run_id='r1', step_index=1, messages=msgs))
+
+        assert [s.step_index for s in await store.list_snapshots(run_id='r1')] == [1]
+        assert [s.step_index for s in await store.list_snapshots(run_id='r2')] == [0]
 
 
 class TestMongoStepStoreMedia:
@@ -261,6 +411,14 @@ class TestMongoStepStoreMedia:
         messages: list[ModelMessage] = [ModelResponse(parts=[TextPart(content='small')])]
         await store.save_snapshot(ContinuableSnapshot(run_id='r1', step_index=0, messages=messages))
         assert await client['t']['media'].count_documents({}) == 0
+
+        snap = await store.latest_snapshot(run_id='r1')
+        assert snap is not None
+        response = snap.messages[0]
+        assert isinstance(response, ModelResponse)
+        text = response.parts[0]
+        assert isinstance(text, TextPart)
+        assert text.content == 'small'
 
     async def test_agent_run_round_trips_through_step_persistence(self) -> None:
         """An Agent run with a large BinaryContent prompt persists and restores via Mongo."""

@@ -25,6 +25,23 @@ def _mock_client() -> AsyncMongoClient[dict[str, object]]:
     return AsyncMongoMockClient()  # pyright: ignore[reportUnknownVariableType, reportReturnType]
 
 
+@pytest.fixture
+def close_calls(monkeypatch: pytest.MonkeyPatch) -> list[AsyncMongoClient[dict[str, object]]]:
+    """Record every `AsyncMongoClient.close()` so `aclose` ownership is observable.
+
+    Both `aclose` cases hinge on whether `close` was called, which is invisible
+    from the store's own surface -- without this the "shared client" case passes
+    even when `aclose` closes a client it does not own.
+    """
+    calls: list[AsyncMongoClient[dict[str, object]]] = []
+
+    async def record_close(self: AsyncMongoClient[dict[str, object]]) -> None:
+        calls.append(self)
+
+    monkeypatch.setattr(AsyncMongoClient, 'close', record_close)
+    return calls
+
+
 class TestMongoMediaStoreConstruction:
     def test_requires_exactly_one_of_client_or_db_url(self) -> None:
         with pytest.raises(ValueError, match='exactly one'):
@@ -49,13 +66,30 @@ class TestMongoMediaStoreConstruction:
         with pytest.raises(ValueError, match='must not exceed'):
             MongoMediaStore(client=_mock_client(), database='t', chunk_size_bytes=20 * 1024 * 1024)
 
-    async def test_db_url_owns_client_and_aclose_closes_it(self) -> None:
+    async def test_db_url_owns_client_and_aclose_closes_it(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        close_calls: list[AsyncMongoClient[dict[str, object]]],
+    ) -> None:
         store = MongoMediaStore(db_url='mongodb://localhost:59017', database='t')
-        await store.aclose()  # owned client -> closed
+        await store.aclose()
+        assert len(close_calls) == 1
 
-    async def test_shared_client_aclose_is_noop(self) -> None:
-        store = MongoMediaStore(client=_mock_client(), database='t')
-        await store.aclose()  # shared client -> left open
+        monkeypatch.undo()
+        await close_calls[0].close()  # the recorded close was a stub; release it for real
+
+    async def test_shared_client_aclose_is_noop(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        close_calls: list[AsyncMongoClient[dict[str, object]]],
+    ) -> None:
+        client = AsyncMongoClient[dict[str, object]]('mongodb://localhost:59017')
+        store = MongoMediaStore(client=client, database='t')
+        await store.aclose()
+        assert close_calls == []  # a caller-supplied client stays open
+
+        monkeypatch.undo()
+        await client.close()
 
 
 class TestMongoMediaStoreRoundTrip:
@@ -67,24 +101,76 @@ class TestMongoMediaStoreRoundTrip:
         assert await store.get(uri) == data
 
     async def test_multi_chunk_split_and_reassembly(self) -> None:
-        """A blob larger than `chunk_size_bytes` splits into ordered chunks and rejoins."""
+        """A blob larger than `chunk_size_bytes` splits into ordered chunks and rejoins.
+
+        Chunk 0 is deleted and re-inserted so that storage order no longer matches
+        `n`. Reassembly can then only produce the original bytes by sorting on `n`:
+        the in-memory fake returns insertion order for an unsorted `find`, and the
+        `size_bytes` guard cannot catch a scramble because the total length is
+        unchanged. Real MongoDB gives no order guarantee for an unsorted query.
+        """
         client = _mock_client()
         store = MongoMediaStore(client=client, database='t', chunk_size_bytes=4)
         data = bytes(range(256)) * 40  # 10_240 bytes -> 2560 chunks of 4
         uri = await store.put(data)
-        chunk_count = await client['t']['media_chunks'].count_documents({})
-        assert chunk_count == (len(data) + 3) // 4
+        digest = parse_media_uri(uri)
+        expected_chunks = (len(data) + 3) // 4
+        chunks = client['t']['media_chunks']
+        assert await chunks.count_documents({}) == expected_chunks
+        manifest = await client['t']['media'].find_one({'_id': digest})
+        assert manifest is not None
+        assert manifest['chunk_count'] == expected_chunks
+
+        first_chunk = await chunks.find_one({'_id': f'{digest}:0'})
+        assert first_chunk is not None
+        await chunks.delete_one({'_id': f'{digest}:0'})
+        await chunks.insert_one(first_chunk)
+
         assert await store.get(uri) == data
 
-    async def test_dedup_is_idempotent(self) -> None:
+    async def test_dedup_short_circuits_the_write_path(self) -> None:
+        """A repeat `put` returns on the manifest lookup without touching the chunks.
+
+        A chunk is deleted between the two writes: `$setOnInsert` is idempotent by
+        itself, so the deleted chunk staying absent is what pins the early return
+        rather than merely the absence of duplicates.
+        """
         client = _mock_client()
         store = MongoMediaStore(client=client, database='t', chunk_size_bytes=4)
         data = b'duplicate me'
         first = await store.put(data)
-        second = await store.put(data)  # hits the early-return dedup path
+        digest = parse_media_uri(first)
+        expected_chunks = (len(data) + 3) // 4
+        assert await client['t']['media_chunks'].count_documents({}) == expected_chunks
+        await client['t']['media_chunks'].delete_one({'_id': f'{digest}:0'})
+
+        second = await store.put(data)
         assert first == second
         assert await client['t']['media'].count_documents({}) == 1
-        assert await client['t']['media_chunks'].count_documents({}) == (len(data) + 3) // 4
+        assert await client['t']['media_chunks'].count_documents({}) == expected_chunks - 1
+
+    async def test_empty_blob_round_trips(self) -> None:
+        """Zero bytes produce a manifest with no chunks and still read back."""
+        client = _mock_client()
+        store = MongoMediaStore(client=client, database='t')
+        uri = await store.put(b'')
+        digest = parse_media_uri(uri)
+        manifest = await client['t']['media'].find_one({'_id': digest})
+        assert manifest is not None
+        assert manifest['chunk_count'] == 0
+        assert await client['t']['media_chunks'].count_documents({}) == 0
+        assert await store.get(uri) == b''
+        assert await store.exists(uri) is True
+
+    async def test_multi_byte_text_survives_chunk_boundaries(self) -> None:
+        """Chunking splits raw bytes, so a multi-byte character straddles two chunks."""
+        store = MongoMediaStore(client=_mock_client(), database='t', chunk_size_bytes=7)
+        text = 'héllo wörld 日本語 🎉 ' * 500
+        data = text.encode('utf-8')
+        uri = await store.put(data, context=MediaContext(media_type='text/plain'))
+        fetched = await store.get(uri)
+        assert fetched == data
+        assert fetched.decode('utf-8') == text
 
     async def test_exists(self) -> None:
         store = MongoMediaStore(client=_mock_client(), database='t')

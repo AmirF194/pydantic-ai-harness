@@ -23,7 +23,7 @@ These are building blocks, not a capability. There is no class you add to `Agent
 
 ## Why
 
-A conversation that carries images, audio, or other `BinaryContent` inlines those bytes into every message. Persist that history and each snapshot re-serializes the payloads. Content-addressed storage writes each payload once, keyed by its own hash, and leaves a short `media://` URI in its place. The same bytes are stored once no matter how many messages or snapshots reference them.
+A conversation that carries images, audio, or other `BinaryContent` inlines those bytes into every message, and a large text part (a big tool-return string, say) is just as heavy. Persist that history and each snapshot re-serializes the payloads. Content-addressed storage writes each payload once, keyed by its own hash, and leaves a short `media+sha256://` URI in its place. The same bytes are stored once no matter how many messages or snapshots reference them.
 
 ## Stores
 
@@ -34,11 +34,13 @@ Every store implements the `MediaStore` protocol: `put`, `get`, `exists`, `publi
 | `DiskMediaStore(directory=...)` | A directory on disk | Local runs and tests |
 | `SqliteMediaStore(...)` | A SQLite database | A single-file store that travels with the data |
 | `S3MediaStore(...)` | S3 or an S3-compatible bucket | Shared or production storage |
-| `MongoMediaStore(...)` | MongoDB (sha256-addressed manual chunking) | A MongoDB deployment; blob payloads of any size, split so no chunk hits the 16MB BSON cap |
+| `MongoMediaStore(...)` | MongoDB (sha256-addressed manual chunking) | A MongoDB deployment; blobs larger than one BSON document, split so no chunk hits the 16 MiB cap |
 
-`MongoMediaStore` needs the `mongodb` extra (`pip install pydantic-ai-harness[mongodb]`) and is imported the same way (`from pydantic_ai_harness.media import MongoMediaStore`). It stores each blob as sha256-addressed chunks (default 8MB) in a `media_chunks` collection, with a `media` manifest document per blob. The chunking bounds the byte payload so it never lands in one oversized document. The manifest itself holds `MediaContext.metadata` inline and is not chunked, so keep per-blob metadata small. Manual chunking is used instead of GridFS: it keeps content-addressed dedup (GridFS keys files by `ObjectId` and does none) and stays fully testable in-memory.
+`MongoMediaStore` needs the `mongodb` extra (`pip install pydantic-ai-harness[mongodb]`, which installs `pymongo>=4.17.0`) and is imported the same way (`from pydantic_ai_harness.media import MongoMediaStore`). It stores each blob as sha256-addressed chunks in a `media_chunks` collection, with a `media` manifest document per blob. The chunking bounds each BSON document, so a blob larger than MongoDB's 16 MiB document cap still stores and reads back; it does not bound memory, since `put` takes the whole payload as `bytes` and `get` reassembles every chunk into one `bytearray` (there is no streaming API). The manifest itself holds `MediaContext.metadata` inline and is not chunked, so keep per-blob metadata small. Manual chunking is used instead of GridFS: it keeps content-addressed dedup (GridFS keys files by `ObjectId` and does none) and stays fully testable in-memory.
 
-A `KeyStrategy` controls the on-store layout, and a `PublicUrlResolver` (or `make_static_public_url`) turns a stored URI into a public URL when the store is served over HTTP.
+`collection=` (default `'media'`) names the manifest collection and derives the chunk collection as `<collection>_chunks`. `chunk_size_bytes=` (default 8 MiB) sets the split size and is rejected below 1 byte or above 16 MiB minus 64 KiB of headroom for the chunk document's own fields. On the first `put` or `get` the store issues `createIndex` for a compound `(files_id, n)` index on the chunk collection, without which reassembly is a collection scan -- so the connecting user needs the privilege to create indexes, and an already-populated collection pays the index build on that first call.
+
+A `KeyStrategy` controls the on-store layout for `DiskMediaStore` and `S3MediaStore` (`SqliteMediaStore` and `MongoMediaStore` key on the digest itself, so they take `table=` / `collection=` instead), and a `PublicUrlResolver` (or `make_static_public_url`) turns a stored URI into a public URL when the store is served over HTTP.
 
 ## Walker helpers
 
@@ -47,14 +49,14 @@ A `KeyStrategy` controls the on-store layout, and a `PublicUrlResolver` (or `mak
 ```python
 store = DiskMediaStore(directory='./media')
 
-# Replace BinaryContent larger than the threshold with media:// URIs.
+# Replace binary and text payloads at or above the threshold with media+sha256:// URIs.
 lean = await externalize_media(message, media_store=store, threshold_bytes=32_000)
 
-# Later, rehydrate the URIs back into BinaryContent.
+# Later, rehydrate the URIs back into the original parts.
 full = await restore_media(lean, media_store=store)
 ```
 
-`externalize_media` externalizes both large `BinaryContent` and large text parts (a part whose string `content` is at least `threshold_bytes` UTF-8 bytes -- e.g. a big tool-return string). The same `threshold_bytes` governs both; there is no separate text knob. Payloads below the threshold stay inline, and `restore_media` re-inlines binary and text symmetrically. `media_uri_for` and `parse_media_uri` give you the raw URI round-trip if you need to key media yourself.
+`externalize_media` externalizes both large `BinaryContent` and large text: any message part whose string `content` is at least `threshold_bytes` UTF-8 bytes (`TextPart`, `ThinkingPart`, a string-returning `ToolReturnPart`, a string-valued `UserPromptPart`), plus any `TextContent` element travelling inside a `UserPromptPart.content` sequence or a `ToolReturn`. The same `threshold_bytes` governs both; there is no separate text knob. Payloads below the threshold stay inline, and `restore_media` re-inlines binary and text symmetrically. `media_uri_for` and `parse_media_uri` give you the raw URI round-trip if you need to key media yourself.
 
 ## API
 
@@ -66,4 +68,4 @@ full = await restore_media(lean, media_store=store)
 | `KeyStrategy`, `default_key_strategy` | On-store key layout |
 | `PublicUrlResolver`, `make_static_public_url` | Resolve a stored URI to a public URL |
 | `externalize_media`, `restore_media` | Walk a message node to externalize / rehydrate large binary and text payloads |
-| `media_uri_for`, `parse_media_uri` | Compute and parse a `media://` URI |
+| `media_uri_for`, `parse_media_uri` | Compute and parse a `media+sha256://` URI |
