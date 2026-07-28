@@ -192,7 +192,19 @@ jobs:
     # Skip on pull requests and branch pushes that leave LocalStack untouched;
     # always run on tags so releases exercise the live path. `always()` lets this
     # evaluate even though `changes` is skipped on tag events.
-    if: ${{ always() && (github.ref_type == 'tag' || needs.changes.outputs.localstack == 'true') }}
+    #
+    # Also skip on pull requests from a fork. GitHub withholds repository secrets
+    # from `pull_request` runs on cross-repository branches, so LOCALSTACK_AUTH_TOKEN
+    # is empty there and LOCALSTACK_REQUIRE_AUTH_TOKEN turns that into a failure.
+    # `check` allows this job to be skipped but not to fail, so without this guard
+    # every fork pull request touching pyproject.toml or uv.lock is red for a
+    # reason unrelated to its changes. Fork branches get their live LocalStack run
+    # once the change reaches main.
+    if: >-
+      ${{ always()
+          && (github.ref_type == 'tag' || needs.changes.outputs.localstack == 'true')
+          && (github.event_name != 'pull_request'
+              || github.event.pull_request.head.repo.full_name == github.repository) }}
     runs-on: ubuntu-latest
     name: LocalStack integration tests
     env:
@@ -259,7 +271,8 @@ jobs:
       - uses: re-actors/alls-green@05ac9388f0aebcb5727afa17fcccfecd6f8ec5fe # v1.2.2
         with:
           # localstack-integration is skipped when a pull request or branch push
-          # doesn't touch LocalStack, and `changes` is skipped on tag events.
+          # doesn't touch LocalStack, when the pull request comes from a fork
+          # (no secrets there), and `changes` is skipped on tag events.
           # Both still vote (block the merge) when they actually run and fail.
           allowed-skips: changes, localstack-integration
           jobs: ${{ toJSON(needs) }}
