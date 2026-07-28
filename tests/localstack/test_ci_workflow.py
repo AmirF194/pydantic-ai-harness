@@ -71,16 +71,21 @@ def test_localstack_integration_is_scoped_to_localstack_changes() -> None:
     assert any('allowed-skips: changes, localstack-integration' in line for line in lines)
 
 
-def test_localstack_integration_skips_pull_requests_from_forks() -> None:
+def test_localstack_integration_skips_pull_requests_without_secrets() -> None:
     condition = _localstack_condition()
 
-    # GitHub withholds repository secrets from `pull_request` runs on cross-repository
-    # branches, so LOCALSTACK_AUTH_TOKEN is empty and LOCALSTACK_REQUIRE_AUTH_TOKEN
-    # turns that into a failure. `check` tolerates a skip but not a failure, so
-    # without this clause every fork pull request touching pyproject.toml or uv.lock
-    # is red for a reason unrelated to its changes.
+    # LOCALSTACK_AUTH_TOKEN comes from repository secrets, and
+    # LOCALSTACK_REQUIRE_AUTH_TOKEN turns an empty token into a failure rather than a
+    # skip. `check` tolerates a skip but not a failure, so a pull request that cannot
+    # read secrets goes red for a reason unrelated to its changes.
     assert "github.event_name != 'pull_request'" in condition
+
+    # Cross-repository (fork) branches never receive repository secrets.
     assert 'github.event.pull_request.head.repo.full_name == github.repository' in condition
+
+    # Dependabot reads a separate secrets store, and its branches live in this repo,
+    # so the head-repo check alone would let those runs through.
+    assert "github.actor != 'dependabot[bot]'" in condition
 
 
 def test_changes_job_uses_owned_git_diff_with_read_only_checkout() -> None:
