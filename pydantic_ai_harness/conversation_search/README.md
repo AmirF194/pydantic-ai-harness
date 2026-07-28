@@ -15,7 +15,7 @@ Give the model a `search_conversation_history` tool that BM25-ranks the history 
 
 ## The problem
 
-Compaction capabilities (`SlidingWindow`, `SummarizingCompaction`, ...) narrow the live history so it fits the context window. `SummarizingCompaction` persists its edits: once a prefix is replaced by a summary, the originals are gone from the run's `message_history` on the next turn. The model can no longer recall an exact file path, a decision, or a value stated earlier -- only the summary's paraphrase of it. And nothing at all from previous runs is reachable, however well persisted.
+Compaction capabilities (`SlidingWindowCompaction`, `SummarizingCompaction`, ...) narrow the live history so it fits the context window. `SummarizingCompaction` persists its edits: once a prefix is replaced by a summary, the originals are gone from the run's `message_history` on the next turn. The model can no longer recall an exact file path, a decision, or a value stated earlier -- only the summary's paraphrase of it. And nothing at all from previous runs is reachable, however well persisted.
 
 ## The solution
 
@@ -25,7 +25,7 @@ The shipped source, `SnapshotHistorySource`, reads the snapshots `StepPersistenc
 
 ```python
 from pydantic_ai import Agent
-from pydantic_ai_harness.compaction import SlidingWindow
+from pydantic_ai_harness.compaction import SlidingWindowCompaction
 from pydantic_ai_harness.conversation_search import ConversationSearch, SnapshotHistorySource
 from pydantic_ai_harness.step_persistence import SqliteStepStore, StepPersistence
 
@@ -35,7 +35,7 @@ agent = Agent(
     capabilities=[
         StepPersistence(store=store),
         ConversationSearch(SnapshotHistorySource(store)),
-        SlidingWindow(max_messages=40),
+        SlidingWindowCompaction(max_messages=40),
     ],
 )
 ```
@@ -46,9 +46,9 @@ agent = Agent(
 
 ## How recovery works
 
-`StepPersistence` saves a full-history snapshot at every step boundary. A compaction strategy that persists its edits (like `SummarizingCompaction`) carries those edits into *later* snapshots -- but the earlier snapshots of the same run were taken while the originals were still live. `SnapshotHistorySource` unions each run's snapshots in write order, keeping the first occurrence of every message (by content hash) and skipping derived summary artifacts, which recovers the originals plus everything compaction never touched -- as far back as the store still retains those pre-compaction snapshots (see Limitations). Only `complete` snapshots contribute: `interrupted` captures (unsettled tool work, synthesized tool returns) are excluded by the stores' default read gate.
+`StepPersistence` saves a full-history snapshot at every step boundary. A compaction strategy that persists its edits (like `SummarizingCompaction`) carries those edits into *later* snapshots -- but the earlier snapshots of the same run were taken while the originals were still live. `SnapshotHistorySource` unions each run's snapshots in write order, skips derived summary artifacts, and removes the overlap between the accumulated history's suffix and each snapshot's prefix. This recovers the originals plus everything compaction never touched while preserving repeated messages at distinct sequence positions -- as far back as the store still retains those pre-compaction snapshots (see Limitations). Only `complete` snapshots contribute: `interrupted` captures (unsettled tool work, synthesized tool returns) are excluded by the stores' default read gate.
 
-The dedup keys off a content hash of each serialized message, not object identity: consecutive snapshots re-serialize the same growing history, and durable executors (Temporal, DBOS) re-instantiate messages between steps.
+Overlap matching keys off a content hash of each serialized message, not object identity: consecutive snapshots re-serialize the same growing history, and durable executors (Temporal, DBOS) re-instantiate messages between steps.
 
 `HistorySource` is deliberately substrate-neutral ("enumerate runs, yield each run's durable message record"): a persistence substrate that keeps an append-only entry log can implement it directly by replay, replacing the snapshot-union adapter without touching the search layer.
 

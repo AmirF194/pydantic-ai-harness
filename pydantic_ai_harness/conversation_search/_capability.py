@@ -31,7 +31,7 @@ class ConversationSearch(AbstractCapability[AgentDepsT]):
 
     ```python
     from pydantic_ai import Agent
-    from pydantic_ai_harness.compaction import SlidingWindow
+    from pydantic_ai_harness.compaction import SlidingWindowCompaction
     from pydantic_ai_harness.conversation_search import ConversationSearch, SnapshotHistorySource
     from pydantic_ai_harness.step_persistence import SqliteStepStore, StepPersistence
 
@@ -41,14 +41,14 @@ class ConversationSearch(AbstractCapability[AgentDepsT]):
         capabilities=[
             StepPersistence(store=store),
             ConversationSearch(SnapshotHistorySource(store)),
-            SlidingWindow(max_messages=40),
+            SlidingWindowCompaction(max_messages=40),
         ],
     )
     ```
 
     Some compaction strategies persist their edits into the run's durable message
     history (`SummarizingCompaction` replaces summarized prefixes for good; a
-    `SlidingWindow` trim only narrows what each request sends). Either way,
+    `SlidingWindowCompaction` trim only narrows what each request sends). Either way,
     `StepPersistence` snapshots each step boundary before the next compaction runs,
     so the union of a run's snapshots still holds the originals --
     `SnapshotHistorySource` recovers them. No ordering or hook coordination between

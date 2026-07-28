@@ -33,7 +33,7 @@ from pydantic_ai.models.test import TestModel
 from pydantic_ai.tools import RunContext
 from pydantic_ai.usage import RunUsage
 
-from pydantic_ai_harness.compaction import SlidingWindow, SummarizingCompaction
+from pydantic_ai_harness.compaction import SlidingWindowCompaction, SummarizingCompaction
 from pydantic_ai_harness.conversation_search import (
     ConversationSearch,
     ConversationSearchToolset,
@@ -140,6 +140,15 @@ class TestSnapshotHistorySource:
 
         history = await SnapshotHistorySource(store).run_history(run_id='r1')
         assert history == [original, reply, follow_up]
+
+    async def test_repeated_identical_messages_keep_distinct_positions(self) -> None:
+        store = InMemoryStepStore()
+        repeated = _user('repeat this exactly')
+        reply = _reply('done')
+        await _seed_run(store, 'r1', [repeated], [repeated, repeated, reply])
+
+        history = await SnapshotHistorySource(store).run_history(run_id='r1')
+        assert history == [repeated, repeated, reply]
 
     async def test_summary_skip_stays_in_sync_with_compaction(self) -> None:
         # Drift guard: the source hand-copies the prefix `SummarizingCompaction` emits. If
@@ -256,6 +265,25 @@ class TestSnapshotHistorySource:
         # Search over the survivors still works; it simply cannot surface the lost original.
         assert 'No matches' in await _search(SnapshotHistorySource(store), 'ZEBRA')
 
+    async def test_bounded_file_store_reconciles_retained_snapshots(self, tmp_path: Path) -> None:
+        store = FileStepStore(tmp_path / 'bounded-runs', media_store=None, max_snapshots_per_run=2)
+        original = _user('the pruned ZEBRA detail')
+        reply = _reply('noted')
+        summary = ModelRequest(parts=[SystemPromptPart(content='Summary of previous conversation:\n\nolder context')])
+        follow_up = _user('what was it again?')
+        latest = _reply('the surviving ONYX detail')
+        await store.register_run(RunRecord(run_id='r1'))
+        await store.save_snapshot(ContinuableSnapshot(run_id='r1', step_index=0, messages=[original, reply]))
+        await store.save_snapshot(ContinuableSnapshot(run_id='r1', step_index=1, messages=[summary, reply, follow_up]))
+        await store.save_snapshot(
+            ContinuableSnapshot(run_id='r1', step_index=2, messages=[summary, reply, follow_up, latest])
+        )
+
+        history = await SnapshotHistorySource(store).run_history(run_id='r1')
+        assert history == [reply, follow_up, latest]
+        assert 'ONYX' in await _search(SnapshotHistorySource(store), 'ONYX')
+        assert 'No matches' in await _search(SnapshotHistorySource(store), 'ZEBRA')
+
 
 class TestConversationSearch:
     async def test_cross_run_recall_through_shared_store(self) -> None:
@@ -265,14 +293,14 @@ class TestConversationSearch:
             capabilities=[
                 StepPersistence(store=store),
                 ConversationSearch(SnapshotHistorySource(store)),
-                SlidingWindow(max_messages=2),
+                SlidingWindowCompaction(max_messages=2),
             ],
         )
         result = await agent.run('remember the ZEBRA passphrase')
         result = await agent.run('now talk about apples', message_history=result.all_messages())
         await agent.run('now talk about oranges', message_history=result.all_messages())
 
-        # A `SlidingWindow` trim narrows what each request sends to the model;
+        # A `SlidingWindowCompaction` trim narrows what each request sends to the model;
         # the persisted snapshots keep the originals, and search reaches them.
         recall = await _search(SnapshotHistorySource(store), 'ZEBRA passphrase')
         assert 'ZEBRA' in recall
