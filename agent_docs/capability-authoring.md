@@ -95,7 +95,7 @@ tool) rather than guessing -- a name is a public commitment once shipped.
 When a class or module is renamed, keep the old name working for at least one
 release: a renamed module keeps a shim package at its old path, and a renamed
 class keeps a module-level `__getattr__` alias, both emitting
-`DeprecationWarning` via the helpers in `pydantic_ai_harness/_warn.py`.
+`HarnessDeprecationWarning` via the helpers in `pydantic_ai_harness/_warn.py`.
 
 Top-level re-exports in `pydantic_ai_harness/__init__.py` (`CodeMode`,
 `FileSystem`, `Shell`, `ManagedPrompt`) are the exception, not the rule. Once an
