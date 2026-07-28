@@ -7,12 +7,14 @@ from typing import Any, cast
 import logfire
 import pytest
 from logfire.testing import CaptureLogfire
-from logfire.variables import Rollout, Variable, VariableConfig, VariablesConfig
+from logfire.variables import LabeledValue, Rollout, Variable, VariableConfig, VariablesConfig
 from pydantic_ai import Agent, RunContext, Tool
+from pydantic_ai.exceptions import UserError
 from pydantic_ai.messages import ModelMessage, ModelRequest, ModelResponse, TextPart, ToolCallPart
 from pydantic_ai.models.function import AgentInfo, FunctionModel
 from pydantic_ai.models.test import TestModel
 from pydantic_ai.tools import ToolDefinition
+from pydantic_ai.toolsets import FunctionToolset
 
 from pydantic_ai_harness import AgentControl as RootAgentControl
 from pydantic_ai_harness.logfire import (
@@ -40,10 +42,59 @@ async def test_empty_config_keeps_code_behavior() -> None:
     assert instructions_seen(result.all_messages()) == ['code']
 
 
-async def test_instructions_apply_independently() -> None:
+async def test_managed_instructions_are_appended_not_replaced() -> None:
     capability = AgentControl('instructions', default=AgentConfig(instructions='managed'))
-    result = await Agent(TestModel(), instructions='code', capabilities=[capability]).run('hello')
-    assert instructions_seen(result.all_messages()) == ['code\n\nmanaged']
+    agent = Agent(
+        TestModel(),
+        instructions='code',
+        toolsets=[FunctionToolset[object](instructions='toolset')],
+        capabilities=[capability],
+    )
+
+    @agent.instructions
+    def dynamic(ctx: RunContext[object]) -> str:
+        return 'dynamic'
+
+    result = await agent.run('hello')
+    # A capability can only contribute instructions, so everything code-defined still reaches the
+    # model. Static text is grouped ahead of dynamic text (for prompt-cache stability) and source
+    # order is kept within each group, putting the managed value after the agent's own.
+    assert instructions_seen(result.all_messages()) == ['code\n\ntoolset\n\ndynamic\n\nmanaged']
+
+
+async def test_published_instructions_supersede_the_code_side_default(capfire: CaptureLogfire) -> None:
+    config = VariablesConfig(
+        variables={
+            'agent__base_prompt': VariableConfig(
+                name='agent__base_prompt',
+                labels={'production': LabeledValue(version=1, serialized_value='{"instructions": "published"}')},
+                rollout=Rollout(labels={'production': 1.0}),
+                overrides=[],
+            )
+        }
+    )
+    capability = AgentControl('base_prompt', instructions='code-side base', label='production')
+    with variables_provider(capfire, config):
+        result = await Agent(TestModel(), instructions='code', capabilities=[capability]).run('hello')
+    # The capability contributes the published value *or* its default, never both -- which is what
+    # makes the capability, rather than the agent, the place for a base prompt you mean to manage.
+    assert instructions_seen(result.all_messages()) == ['code\n\npublished']
+
+
+async def test_instructions_shorthand_is_equivalent_to_default() -> None:
+    shorthand = AgentControl('shorthand', instructions='base')
+    assert shorthand.default == AgentConfig(instructions='base')
+
+    seen: list[list[str]] = []
+    for capability in (shorthand, AgentControl('long_form', default=AgentConfig(instructions='base'))):
+        result = await Agent(TestModel(), instructions='code', capabilities=[capability]).run('hello')
+        seen.append(instructions_seen(result.all_messages()))
+    assert seen == [['code\n\nbase'], ['code\n\nbase']]
+
+
+def test_instructions_and_default_together_raise() -> None:
+    with pytest.raises(UserError, match='shorthand for `default=AgentConfig'):
+        AgentControl('ambiguous', instructions='base', default=AgentConfig(model='test'))
 
 
 async def test_tool_definition_patches() -> None:

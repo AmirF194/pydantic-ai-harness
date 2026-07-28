@@ -66,7 +66,9 @@ parameter descriptions) -- the baseline the Logfire UI's override editor and opt
 values against. The snapshot is taken from whichever model request comes first in the process, so
 for instructions or a toolset that vary with `deps`, run input, or the step within a run, it is one
 point-in-time sample rather than a description of the agent. An agent that never reaches a model
-request never auto-creates.
+request never auto-creates. Its `instructions` are the whole assembled block the model was sent, so
+publishing that sample verbatim while the same text still lives on the agent duplicates it -- see
+[Where your base prompt lives](#where-your-base-prompt-lives).
 
 Install the extra:
 
@@ -314,7 +316,12 @@ agent = Agent(
     'openai:gpt-5',
     name='checkout_assistant',
     tools=[get_weather],
-    capabilities=[AgentControl(label='production')],  # -> agent__checkout_assistant
+    capabilities=[
+        AgentControl(  # -> agent__checkout_assistant
+            instructions='You are a concise checkout assistant.',
+            label='production',
+        )
+    ],
 )
 ```
 
@@ -342,8 +349,10 @@ The variable holds an `AgentConfig`:
 }
 ```
 
-- `instructions` supports `{{...}}` runtime placeholders, which pass through verbatim unless
-  `render_template=True` renders them against `deps` (like `ManagedPrompt`).
+- `instructions` is **added to** the agent's own instructions, not a replacement for them (see
+  [Where your base prompt lives](#where-your-base-prompt-lives)). It supports `{{...}}` runtime
+  placeholders, which pass through verbatim unless `render_template=True` renders them against `deps`
+  (like `ManagedPrompt`).
 - `model` is a pydantic-ai model string. It's a first-class field, not a setting: pydantic-ai keeps
   the model id separate from `ModelSettings` (which has no `model` key), so there's no collision
   putting them side by side.
@@ -356,8 +365,61 @@ The variable holds an `AgentConfig`:
 - `tool_definitions` is keyed by each tool's original (code-side) name; every override field is
   optional and unset fields keep the tool's own definition.
 
+### Where your base prompt lives
+
+`instructions` is the one section that **adds to** the agent rather than superseding it. A capability
+can only *contribute* instructions -- pydantic-ai appends every contribution to the agent's own -- so
+an `Agent(instructions='CODE')` with a managed `instructions` of `'MANAGED'` sends the model
+`"CODE\n\nMANAGED"`. That is on purpose: instructions are a composition point, and a section that
+replaced them wholesale would also silence toolset and MCP instructions, a skill catalog, and dynamic
+`@agent.instructions` functions (the ones injecting today's date or the signed-in user), all of which
+have to keep reaching the model.
+
+So there are three places instructions can come from, and only one of them is where a *managed* base
+prompt belongs:
+
+| Where | Managed from Logfire? | What a published config does to it |
+| --- | --- | --- |
+| `Agent(instructions=...)` | No | Adds to it. The text is always sent and can't be edited or removed from the UI. |
+| `AgentControl(instructions=...)` | It *is* the code-side default | **Supersedes** it -- the capability contributes the published value or the default, never both. |
+| The published `instructions` in Logfire | Yes | It is the value. |
+
+Put the base prompt on the capability, not on the agent:
+
+```python
+from pydantic_ai import Agent
+
+from pydantic_ai_harness.logfire import AgentControl
+
+agent = Agent(
+    'openai:gpt-5',
+    name='checkout_assistant',
+    capabilities=[AgentControl(instructions='You are a concise checkout assistant.')],
+)
+```
+
+`instructions=` is shorthand for `default=AgentConfig(instructions=...)` and behaves identically; pass
+the two together and you get a `UserError` rather than a silent precedence rule. Use the long form
+when other sections need code-side defaults too. The other sections have no shorthand because they
+have no such trap: a managed `model`, `settings`, or `tool_definitions` supersedes the agent's own, so
+`Agent(model=...)`, `Agent(model_settings=...)`, and a tool's own docstring stay the natural code-side
+homes.
+
+> **The mistake to avoid.** Seeding a managed config from the agent's observed system prompt -- the
+> `example` snapshot the UI offers, or a prompt copied out of a trace -- while leaving the same text in
+> `Agent(instructions=...)` sends it to the model **twice**. Move the text to the capability first.
+
+Everything else keeps composing around whichever value the capability contributes. Pydantic AI groups
+static instruction text ahead of dynamic text (so providers can cache the stable prefix) and preserves
+source order within each group, which puts the managed instructions after the agent's own literal and
+`@agent.instructions` text and before dynamic toolset instructions. Only `agent.override(instructions=...)`
+replaces the lot, and a capability can't reach it.
+
 ### Notes
 
+- **Instructions add, they never replace:** the managed value is appended to the agent's own, so a
+  base prompt you want to manage belongs on the capability (`AgentControl(instructions=...)`), which a
+  published config supersedes. See [Where your base prompt lives](#where-your-base-prompt-lives).
 - **Tool definitions are overlays, never code:** the tool itself -- its implementation and its
   parameter schema structure -- stays exactly as written in code. Only the LLM-facing spec (name,
   description, parameter description strings) is remotely patchable, so a remote value can never

@@ -207,7 +207,13 @@ class AgentConfig(BaseModel):
     model_config = ConfigDict(protected_namespaces=())
 
     instructions: str | None = None
-    """Instructions replacing what the model is shown when present.
+    """Instructions added to the ones the agent defines in code, when present.
+
+    A capability contributes instructions, it cannot take them over: Pydantic AI appends every
+    contribution to the agent's own, so text that also lives in `Agent(instructions=...)` reaches the
+    model twice. The code-side home for a managed base prompt is `AgentControl.instructions` (or
+    `AgentControl.default`), which this value supersedes rather than adds to; see
+    [`AgentControl`][pydantic_ai_harness.logfire.AgentControl].
 
     `{{...}}` runtime placeholders are rendered against `deps` only when
     `AgentControl.render_template` is set.
@@ -253,7 +259,7 @@ AGENT_CONFIG_JSON_SCHEMA: dict[str, Any] = {
     'properties': {
         'instructions': {
             'type': 'string',
-            'description': 'Instructions replacing the code-defined ones.',
+            'description': 'Instructions added to the ones the agent defines in code, not a replacement for them.',
         },
         'model': {
             'type': 'string',
@@ -447,8 +453,28 @@ class AgentControl(ManagedVariableCapability[AgentDepsT, AgentConfig]):
     """Manage an agent's config through one `agent__<name>` Logfire variable.
 
     The variable holds an `AgentConfig`. Each present section -- `instructions`, `model`, `settings`,
-    or `tool_definitions` -- patches the code-defined agent, while an absent section keeps the
-    code-defined behavior. Removing a section in Logfire deliberately reverts that section to code.
+    or `tool_definitions` -- is managed from Logfire, while an absent section keeps the code-defined
+    behavior. Removing a section in Logfire deliberately reverts that section to code.
+
+    Instructions are the one section that **adds to** the agent instead of patching it: a capability
+    can only contribute instructions, so the managed text is appended to whatever the agent already
+    sends. That is deliberate -- replacing everything would also drop toolset and MCP instructions, a
+    skill catalog, and dynamic `@agent.instructions` functions, all of which have to keep composing --
+    but it decides where a managed base prompt belongs:
+
+    - `Agent(instructions=...)` is never managed. Anything published in Logfire is *added* to it, so
+      text kept here cannot be edited or removed from the UI. Seeding a managed config from an agent's
+      observed system prompt while the same text stays on the agent sends it to the model twice.
+    - `AgentControl.instructions` (shorthand for `default=AgentConfig(instructions=...)`) is the
+      code-side base prompt. `get_instructions` contributes the published value *or* the default and
+      never both, so publishing supersedes this text instead of duplicating it -- which is what makes
+      it, not the agent, the place for a base prompt you intend to manage.
+    - The published `instructions` in Logfire takes over from that default the moment it is set.
+
+    Everything else composes around whichever of the two is contributed. Pydantic AI groups static
+    instruction text ahead of dynamic text so providers can cache the stable prefix, and keeps source
+    order within each group, which puts the managed instructions after the agent's own literal and
+    `@agent.instructions` text and before dynamic toolset instructions.
 
     When `name` is omitted, the variable name is derived from the agent's telemetry name using the
     same normalization as the Logfire UI, which is lossy: `checkout-assistant` and `checkout_assistant`
@@ -486,7 +512,10 @@ class AgentControl(ManagedVariableCapability[AgentDepsT, AgentConfig]):
     baseline to diff managed values against, so it is worth knowing what it really is: for instructions
     or a toolset that vary with `deps`, run input, or the step within a run, it is one point-in-time
     sample rather than a description of the agent. An agent that never reaches a model request never
-    auto-creates at all.
+    auto-creates at all. Its `instructions` are the whole assembled block the model was sent -- the
+    agent's own text, this capability's contribution, and any toolset instructions -- so publishing
+    that sample verbatim while the same text still lives on the agent is exactly the duplication
+    described above.
 
     ```python
     import logfire
@@ -495,7 +524,11 @@ class AgentControl(ManagedVariableCapability[AgentDepsT, AgentConfig]):
     from pydantic_ai_harness.logfire import AgentControl
 
     logfire.configure()
-    agent = Agent('openai:gpt-5', name='checkout_assistant', capabilities=[AgentControl(label='production')])
+    agent = Agent(
+        'openai:gpt-5',
+        name='checkout_assistant',
+        capabilities=[AgentControl(instructions='You are a checkout assistant.', label='production')],
+    )
     result = agent.run_sync('Refund my last order.')
     ```
 
@@ -511,13 +544,39 @@ class AgentControl(ManagedVariableCapability[AgentDepsT, AgentConfig]):
     the first time it's needed in a run; the agent must then have a `name`.
     """
     default: AgentConfig | None = None
-    """Code-side fallback config; omitted sections preserve the corresponding agent behavior."""
+    """Code-side fallback config; omitted sections preserve the corresponding agent behavior.
+
+    Mutually exclusive with the `instructions` shorthand below.
+    """
+    instructions: str | None = None
+    """Code-side base prompt, exactly equivalent to `default=AgentConfig(instructions=...)`.
+
+    The base prompt belongs here rather than on `Agent(instructions=...)`, which a published config
+    can only add to. Mutually exclusive with `default`: an agent that also needs code-side defaults
+    for `model`, `settings`, or `tool_definitions` carries its instructions on that `AgentConfig`,
+    and passing both raises [`UserError`][pydantic_ai.exceptions.UserError] rather than picking one.
+
+    The other sections have no such shorthand because they have no such trap: a managed `model`,
+    `settings`, or `tool_definitions` supersedes the agent's own, so `Agent(model=...)`,
+    `Agent(model_settings=...)`, and a tool's own docstring remain the natural code-side homes.
+    """
     render_template: bool = False
     """Render managed instruction `{{...}}` placeholders against run dependencies when enabled."""
 
     _auto_create_in_wrap_run: ClassVar[bool] = False
 
     def __post_init__(self) -> None:
+        if self.instructions is not None:
+            if self.default is not None:
+                raise UserError(
+                    '`AgentControl` was given both `instructions` and `default`, which set the same value: '
+                    '`instructions=...` is shorthand for `default=AgentConfig(instructions=...)`. Pass one or '
+                    'the other, putting the base prompt on the `default` config when other sections need '
+                    'code-side defaults too.'
+                )
+            # Normalized into `default` so the resolved value -- and every reader of it -- sees one
+            # code-side config, and `get_instructions` keeps a single path through `resolved.value`.
+            self.default = AgentConfig(instructions=self.instructions)
         self._setup_variable(
             self.name,
             prefix=_AGENT_VARIABLE_PREFIX,
@@ -527,7 +586,12 @@ class AgentControl(ManagedVariableCapability[AgentDepsT, AgentConfig]):
         )
 
     def get_instructions(self) -> Callable[[RunContext[AgentDepsT]], str | None]:
-        """Contribute managed instructions, optionally rendered against the run dependencies."""
+        """Contribute managed instructions -- appended to the agent's own -- optionally rendered against `deps`.
+
+        `resolved.value` is either the published config or this capability's `default`, never a merge
+        of the two, so a code-side base prompt set through `instructions`/`default` is superseded by a
+        published one rather than sent alongside it.
+        """
 
         def instructions(ctx: RunContext[AgentDepsT]) -> str | None:
             resolved = self.resolved
