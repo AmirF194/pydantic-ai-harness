@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
 import sqlite3
 from collections import defaultdict
 from datetime import datetime
 from pathlib import Path
 from typing import Literal, Protocol, runtime_checkable
+from uuid import uuid4
 
 import anyio.to_thread
 from pydantic import TypeAdapter
@@ -33,6 +35,27 @@ from pydantic_ai_harness.step_persistence._types import (
 )
 
 _logger = logging.getLogger(__name__)
+
+
+def _atomic_write_text(path: Path, text: str) -> None:
+    """Write `text` to `path` so a concurrent reader sees either the old file or the new one.
+
+    Run and snapshot files are read while a run is still writing -- by a resuming
+    worker, or by the `conversation_search` corpus reader. A plain `write_text`
+    truncates first, so a reader can observe a half-written file. Writing to a
+    uniquely-named temporary sibling and `os.replace`-ing it into position makes
+    the swap atomic on POSIX and Windows; the unique name keeps two concurrent
+    writers from sharing a temporary. The suffix is `.tmp`, not `.json`, so a
+    partial file never enters a `*.json` scan.
+    """
+    tmp = path.with_name(f'{path.name}.{uuid4().hex}.tmp')
+    try:
+        tmp.write_text(text, encoding='utf-8')
+        os.replace(tmp, path)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
+
 
 _DEFAULT_MEDIA_THRESHOLD_BYTES = 64 * 1024
 _AutoMedia = Literal['auto']
@@ -394,7 +417,7 @@ class FileStepStore:
         run_dir = self._run_dir(record.run_id)
         run_dir.mkdir(parents=True, exist_ok=True)
         (run_dir / 'snapshots').mkdir(exist_ok=True)
-        (run_dir / 'run.json').write_text(json.dumps(_run_to_dict(record)), encoding='utf-8')
+        _atomic_write_text(run_dir / 'run.json', json.dumps(_run_to_dict(record)))
 
     async def get_run(self, *, run_id: str) -> RunRecord | None:
         return await anyio.to_thread.run_sync(self._sync_get_run, run_id)
@@ -481,7 +504,7 @@ class FileStepStore:
             'messages': messages_json,
         }
         seq = self._next_snapshot_seq(snap_dir)
-        (snap_dir / f'{seq}.json').write_text(json.dumps(payload), encoding='utf-8')
+        _atomic_write_text(snap_dir / f'{seq}.json', json.dumps(payload))
 
     @staticmethod
     def _next_snapshot_seq(snap_dir: Path) -> int:

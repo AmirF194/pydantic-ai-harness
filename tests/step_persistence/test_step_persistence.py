@@ -2055,3 +2055,72 @@ class TestLiveHistoryInvariant:
         assert any(
             isinstance(part, ToolReturnPart) and part.tool_call_id == 'lookup-1' for part in snap.messages[-1].parts
         )
+
+
+class TestAtomicFileWrites:
+    """`FileStepStore` swaps files into place so a concurrent reader never sees a partial one."""
+
+    @staticmethod
+    def _residue(root: Path) -> list[Path]:
+        return sorted(root.rglob('*.tmp'))
+
+    async def test_writes_leave_no_temporary_residue(self, tmp_path: Path) -> None:
+        store = FileStepStore(tmp_path, media_store=None)
+        await store.register_run(RunRecord(run_id='r1', conversation_id='conv'))
+        for step_index in range(3):
+            await store.save_snapshot(
+                ContinuableSnapshot(
+                    run_id='r1',
+                    step_index=step_index,
+                    messages=[ModelRequest(parts=[UserPromptPart(content=f'step {step_index}')])],
+                )
+            )
+
+        assert self._residue(tmp_path) == []
+        record = await store.get_run(run_id='r1')
+        assert record is not None and record.conversation_id == 'conv'
+        assert [s.step_index for s in await store.list_snapshots(run_id='r1')] == [0, 1, 2]
+
+    async def test_a_failed_swap_keeps_the_previous_file_and_cleans_up(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        store = FileStepStore(tmp_path, media_store=None)
+        await store.save_snapshot(
+            ContinuableSnapshot(
+                run_id='r1',
+                step_index=0,
+                messages=[ModelRequest(parts=[UserPromptPart(content='the durable one')])],
+            )
+        )
+
+        def boom(src: object, dst: object) -> None:
+            raise OSError('replace failed')
+
+        monkeypatch.setattr('pydantic_ai_harness.step_persistence._store.os.replace', boom)
+        with pytest.raises(OSError, match='replace failed'):
+            await store.save_snapshot(
+                ContinuableSnapshot(
+                    run_id='r1',
+                    step_index=1,
+                    messages=[ModelRequest(parts=[UserPromptPart(content='the lost one')])],
+                )
+            )
+
+        monkeypatch.undo()
+        assert self._residue(tmp_path) == []
+        snaps = await store.list_snapshots(run_id='r1')
+        assert [s.step_index for s in snaps] == [0]
+        surviving = snaps[0].messages[0]
+        assert isinstance(surviving, ModelRequest)
+        assert [getattr(part, 'content', None) for part in surviving.parts] == ['the durable one']
+
+    async def test_a_stray_temporary_does_not_enter_a_snapshot_scan(self, tmp_path: Path) -> None:
+        """A `.tmp` sibling is invisible to both the sequence counter and the reader."""
+        store = FileStepStore(tmp_path, media_store=None)
+        await store.save_snapshot(ContinuableSnapshot(run_id='r1', step_index=0, messages=[]))
+        (tmp_path / 'r1' / 'snapshots' / '1.json.deadbeef.tmp').write_text('{half-writ', encoding='utf-8')
+
+        await store.save_snapshot(ContinuableSnapshot(run_id='r1', step_index=1, messages=[]))
+
+        assert [s.step_index for s in await store.list_snapshots(run_id='r1')] == [0, 1]
+        assert (tmp_path / 'r1' / 'snapshots' / '1.json').exists()

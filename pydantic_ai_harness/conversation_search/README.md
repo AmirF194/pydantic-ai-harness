@@ -52,11 +52,39 @@ The dedup keys off a content hash of each serialized message, not object identit
 
 `HistorySource` is deliberately substrate-neutral ("enumerate runs, yield each run's durable message record"): a persistence substrate that keeps an append-only entry log can implement it directly by replay, replacing the snapshot-union adapter without touching the search layer.
 
+## Scope
+
+A store is a single corpus. With the default `scope='all'`, one `search_conversation_history` call ranks every run the source enumerates and can return verbatim excerpts from any of them -- which is the cross-session recall [#124](https://github.com/pydantic/pydantic-ai-harness/issues/124) asks for, and the right default when the store holds one principal's history.
+
+If several users or tenants share a store, set `scope='conversation'`:
+
+```python
+agent = Agent(
+    'openai:gpt-5',
+    capabilities=[
+        StepPersistence(store=store),
+        ConversationSearch(SnapshotHistorySource(store), scope='conversation'),
+    ],
+)
+
+
+async def ask(question: str, user_id: str) -> str:
+    result = await agent.run(question, conversation_id=user_id)
+    return result.output
+```
+
+The corpus is then restricted to runs whose `conversation_id` matches the calling run's, the tool's own description tells the model the restriction applies, and the tool's `run_id` argument cannot reach past it -- an out-of-scope run reports the same "no persisted history" answer as a run that does not exist.
+
+A run with no `conversation_id` searches nothing under this scope and the tool says why. Matching on "conversation id is unset" would pool every unlabelled run in the store into one corpus, which is the exposure the scope exists to prevent, so it fails closed instead. Pass `conversation_id=` to `Agent.run(...)` (the same value `StepPersistence` records on the run).
+
+Scoping is applied to the `RunRecord`s a `HistorySource` returns, so a custom source must populate `conversation_id` on them for `scope='conversation'` to match anything.
+
 ## Key options
 
 | Option | Default | Purpose |
 | --- | --- | --- |
 | `source` | (required) | Where the corpus comes from. Use `SnapshotHistorySource(store)` over the store `StepPersistence` writes to. |
+| `scope` | `'all'` | How much of the store one search may reach: `'all'`, or `'conversation'` to restrict it to the calling run's `conversation_id`. See Scope. |
 | `max_matches` | `10` | Maximum matching excerpts the search tool returns. |
 | `context_lines` | `5` | Lines shown around each match (within the match's run). |
 | `bm25_k1` | `1.5` | BM25 term-frequency saturation. This capability's default; Lucene's `BM25Similarity` uses `1.2`. |

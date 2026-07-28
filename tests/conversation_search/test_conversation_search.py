@@ -38,6 +38,7 @@ from pydantic_ai_harness.conversation_search import (
     ConversationSearch,
     ConversationSearchToolset,
     HistorySource,
+    SearchScope,
     SnapshotHistorySource,
     SnapshotStore,
 )
@@ -58,7 +59,7 @@ def anyio_backend() -> str:
     return 'asyncio'
 
 
-def _run_context() -> RunContext[None]:
+def _run_context(conversation_id: str | None = None) -> RunContext[None]:
     return RunContext[None](
         deps=None,
         model=TestModel(),
@@ -66,6 +67,7 @@ def _run_context() -> RunContext[None]:
         prompt=None,
         messages=[],
         run_step=0,
+        conversation_id=conversation_id,
     )
 
 
@@ -96,6 +98,8 @@ async def _search(
     run_id: str | None = None,
     max_matches: int = 10,
     context_lines: int = 5,
+    scope: SearchScope = 'all',
+    conversation_id: str | None = None,
 ) -> str:
     """Invoke the search tool directly against a source."""
     toolset: ConversationSearchToolset[None] = ConversationSearchToolset(
@@ -105,8 +109,9 @@ async def _search(
         context_lines=context_lines,
         bm25_k1=1.5,
         bm25_b=0.75,
+        scope=scope,
     )
-    return await toolset.search_conversation_history(_run_context(), query, run_id=run_id)
+    return await toolset.search_conversation_history(_run_context(conversation_id), query, run_id=run_id)
 
 
 class _StubSource:
@@ -437,6 +442,82 @@ class TestSearchTool:
         await store.register_run(RunRecord(run_id='registered-only'))
         rendered = await _search(SnapshotHistorySource(store), 'anything')
         assert 'No persisted conversation history to search yet' in rendered
+
+
+class TestSearchScope:
+    """A store shared by several conversations is one corpus unless `scope` narrows it."""
+
+    @staticmethod
+    async def _two_conversation_store() -> InMemoryStepStore:
+        store = InMemoryStepStore()
+        await _seed_run(store, 'r-alice', [_user('the passport number is X99881234')], conversation_id='conv-alice')
+        await _seed_run(store, 'r-bob', [_user('remind me about the passport thing')], conversation_id='conv-bob')
+        return store
+
+    async def test_default_scope_spans_every_conversation(self) -> None:
+        source = SnapshotHistorySource(await self._two_conversation_store())
+        rendered = await _search(source, 'passport', conversation_id='conv-bob')
+        assert 'X99881234' in rendered
+        assert 'conversation: conv-alice' in rendered
+
+    async def test_conversation_scope_hides_other_conversations(self) -> None:
+        source = SnapshotHistorySource(await self._two_conversation_store())
+        rendered = await _search(source, 'passport', scope='conversation', conversation_id='conv-bob')
+        assert 'X99881234' not in rendered
+        assert 'conversation: conv-alice' not in rendered
+        assert 'remind me about the passport thing' in rendered
+
+    async def test_conversation_scope_blocks_an_out_of_scope_run_id(self) -> None:
+        """An explicit `run_id` cannot reach past the scope, and says nothing about the run."""
+        source = SnapshotHistorySource(await self._two_conversation_store())
+        rendered = await _search(source, 'passport', run_id='r-alice', scope='conversation', conversation_id='conv-bob')
+        assert rendered == "No persisted history for run 'r-alice'."
+
+    async def test_conversation_scope_without_a_conversation_id_searches_nothing(self) -> None:
+        """Fail closed: matching `conversation_id is None` would expose every unlabelled run."""
+        store = await self._two_conversation_store()
+        await _seed_run(store, 'r-anon', [_user('an unlabelled passport mention')])
+        rendered = await _search(SnapshotHistorySource(store), 'passport', scope='conversation')
+        assert 'Conversation-scoped search needs a conversation id' in rendered
+        assert 'passport' not in rendered.replace('Conversation-scoped', '')
+        assert 'X99881234' not in rendered
+
+    async def test_conversation_scope_is_announced_in_the_tool_description(self) -> None:
+        source = SnapshotHistorySource(InMemoryStepStore())
+        scoped: ConversationSearchToolset[None] = ConversationSearchToolset(
+            source, tool_id='t', max_matches=10, context_lines=5, bm25_k1=1.5, bm25_b=0.75, scope='conversation'
+        )
+        unscoped: ConversationSearchToolset[None] = ConversationSearchToolset(
+            source, tool_id='t', max_matches=10, context_lines=5, bm25_k1=1.5, bm25_b=0.75
+        )
+        scoped_tools = await scoped.get_tools(_run_context())
+        unscoped_tools = await unscoped.get_tools(_run_context())
+        scoped_description = scoped_tools['search_conversation_history'].tool_def.description or ''
+        unscoped_description = unscoped_tools['search_conversation_history'].tool_def.description or ''
+        assert 'only the current conversation' in scoped_description
+        assert 'only the current conversation' not in unscoped_description
+
+    async def test_capability_scope_reaches_the_tool(self) -> None:
+        """The end-to-end path: `ConversationSearch(scope=...)` through `Agent` to the tool result."""
+        store = await self._two_conversation_store()
+        agent = Agent(
+            TestModel(call_tools=['search_conversation_history']),
+            capabilities=[
+                ConversationSearch(SnapshotHistorySource(store), scope='conversation'),
+            ],
+        )
+        result = await agent.run('find the passport detail', conversation_id='conv-bob')
+        returned = '\n'.join(
+            str(part.content)
+            for message in result.all_messages()
+            for part in getattr(message, 'parts', [])
+            if isinstance(part, ToolReturnPart) and part.tool_name == 'search_conversation_history'
+        )
+        assert 'conv-alice' not in returned
+        assert 'X99881234' not in returned
+
+    def test_scope_default_is_store_wide(self) -> None:
+        assert ConversationSearch(SnapshotHistorySource(InMemoryStepStore())).scope == 'all'
 
     async def test_context_window_stays_within_run(self) -> None:
         store = InMemoryStepStore()

@@ -14,6 +14,7 @@ import json
 import math
 import re
 from dataclasses import dataclass
+from typing import Literal
 
 from pydantic_ai import RunContext
 from pydantic_ai.messages import (
@@ -53,6 +54,21 @@ When to use:
 When NOT to use:
 - The information is still in the current conversation context
 - You need external or real-time information (use web tools instead)"""
+
+_CONVERSATION_SCOPE_NOTE = (
+    '\n\nThis search covers only the current conversation; runs belonging to other '
+    'conversations in the same store are not reachable.'
+)
+
+SearchScope = Literal['all', 'conversation']
+"""How much of the store one search may reach.
+
+`all` searches every run the source enumerates -- the shape pydantic-ai-harness#124
+asks for, and correct when the store holds a single principal's history. `conversation`
+restricts the corpus to runs whose `conversation_id` matches the calling run's, which is
+what a store shared across users or tenants needs: without it, any run reading that store
+can retrieve verbatim excerpts from every other conversation in it.
+"""
 
 _TOKENIZE_RE = re.compile(r'\w+')
 """Tokenizer regex: word runs (unicode letters, digits, underscore)."""
@@ -240,6 +256,7 @@ class ConversationSearchToolset(FunctionToolset[AgentDepsT]):
         context_lines: int,
         bm25_k1: float,
         bm25_b: float,
+        scope: SearchScope = 'all',
     ) -> None:
         super().__init__(id=tool_id)
         if max_matches < 0:
@@ -258,10 +275,14 @@ class ConversationSearchToolset(FunctionToolset[AgentDepsT]):
         self._max_matches = max_matches
         self._context_lines = context_lines
         self._params = _Bm25Params(k1=bm25_k1, b=bm25_b)
+        self._scope: SearchScope = scope
+        description = SEARCH_HISTORY_DESCRIPTION
+        if scope == 'conversation':
+            description += _CONVERSATION_SCOPE_NOTE
         self.add_function(
             self.search_conversation_history,
             name='search_conversation_history',
-            description=SEARCH_HISTORY_DESCRIPTION,
+            description=description,
         )
 
     async def search_conversation_history(
@@ -279,8 +300,23 @@ class ConversationSearchToolset(FunctionToolset[AgentDepsT]):
             run_id: Search only this run's history. Use it to resolve a run
                 another tool or a compaction receipt referenced.
         """
-        sections = await self._load_sections(run_id)
+        conversation_id: str | None = None
+        if self._scope == 'conversation':
+            # Fail closed. Filtering on `conversation_id is None` would match every
+            # unlabelled run in the store, which is the exposure the scope exists to
+            # prevent, so an unlabelled run searches nothing rather than everything.
+            if ctx.conversation_id is None:
+                return (
+                    'Conversation-scoped search needs a conversation id, and this run has none. '
+                    'Pass `conversation_id=` to `Agent.run(...)` so the search can tell this '
+                    "conversation's history from other conversations in the same store."
+                )
+            conversation_id = ctx.conversation_id
+
+        sections = await self._load_sections(run_id, conversation_id)
         if run_id is not None and not sections:
+            # Same answer whether the run is absent or out of scope: a distinct
+            # message would tell the model which run ids exist in other conversations.
             return f"No persisted history for run '{run_id}'."
         total_messages = sum(len(section.display_lines) for section in sections)
         if total_messages == 0:
@@ -324,8 +360,10 @@ class ConversationSearchToolset(FunctionToolset[AgentDepsT]):
         header = f"Found {len(results)} match(es) for '{query}' in {total_messages} persisted messages:\n\n"
         return header + '\n\n---\n\n'.join(results)
 
-    async def _load_sections(self, run_id: str | None) -> list[_RunSection]:
+    async def _load_sections(self, run_id: str | None, conversation_id: str | None) -> list[_RunSection]:
         runs = await self._source.list_runs()
+        if conversation_id is not None:
+            runs = [run for run in runs if run.conversation_id == conversation_id]
         if run_id is not None:
             runs = [run for run in runs if run.run_id == run_id]
         sections: list[_RunSection] = []

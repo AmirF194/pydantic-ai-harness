@@ -10,7 +10,7 @@ from pydantic_ai.tools import AgentDepsT
 from pydantic_ai.toolsets import AgentToolset
 
 from pydantic_ai_harness.conversation_search._source import HistorySource
-from pydantic_ai_harness.conversation_search._toolset import ConversationSearchToolset
+from pydantic_ai_harness.conversation_search._toolset import ConversationSearchToolset, SearchScope
 
 _INSTRUCTIONS = (
     'A `search_conversation_history` tool can retrieve exact details from persisted history: '
@@ -60,6 +60,17 @@ class ConversationSearch(AbstractCapability[AgentDepsT]):
     """Where the search corpus comes from. Use `SnapshotHistorySource` over the
     store a `StepPersistence` capability writes to."""
 
+    scope: SearchScope = 'all'
+    """How much of the store one search may reach.
+
+    `all` searches every run the source enumerates. `conversation` restricts the
+    corpus to runs whose `conversation_id` matches the calling run's, which a store
+    shared across users or tenants needs: with `all`, any run reading that store can
+    retrieve verbatim excerpts from every other conversation in it. Under
+    `conversation`, a run with no `conversation_id` searches nothing and the tool says
+    so, rather than falling back to every other unlabelled run.
+    """
+
     tool_id: str = 'conversation-search'
     """Toolset id for the `search_conversation_history` tool."""
 
@@ -88,6 +99,7 @@ class ConversationSearch(AbstractCapability[AgentDepsT]):
             context_lines=self.context_lines,
             bm25_k1=self.bm25_k1,
             bm25_b=self.bm25_b,
+            scope=self.scope,
         )
 
     def get_instructions(self) -> AgentInstructions[AgentDepsT] | None:
