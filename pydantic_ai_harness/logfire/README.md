@@ -388,5 +388,13 @@ The variable holds an `AgentConfig`:
   purpose: `AgentConfig` ignores keys it doesn't know so a value written by a newer UI degrades to
   the sections an older SDK understands instead of failing, and a stored schema that rejected those
   keys would break that by refusing the write.
+- **Forward compatibility covers values, not just keys:** a `thinking` effort level or a
+  `service_tier` that a newer Pydantic AI accepts and this SDK has never heard of drops just that
+  setting, and a tool override that doesn't validate (an empty `new_name`, say) drops just that
+  override -- each with a warning naming the field and the offending value, emitted once per process
+  so a per-run resolution can't turn it into noise. Everything else in the config still applies. The
+  alternative isn't stricter, it's blunter: an `AgentConfig` that fails validation falls back to the
+  code-defined agent *whole*, so one unfamiliar enum value would silently un-manage the instructions,
+  the model, and every tool override with it.
 - `AgentControl.resolved` exposes the active run's `ResolvedVariable`, and resolution is isolated
   per run, exactly like `ManagedPrompt`.

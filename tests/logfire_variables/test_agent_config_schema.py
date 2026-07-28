@@ -187,7 +187,8 @@ def test_wrong_types_are_rejected() -> None:
         'value.settings.stop_sequences[0]: expected string, got int'
     ]
     # An empty `new_name` is the one value constraint the schema keeps: it is structural rather than
-    # versioned, and `ToolDefinitionOverride` would reject the whole config over it.
+    # versioned, so it is worth refusing at write time instead of leaving the SDK to drop the override
+    # (see `test_agent_config_skew.py`) on every read.
     assert schema_errors(AGENT_CONFIG_JSON_SCHEMA, {'tool_definitions': {'t': {'new_name': ''}}}) == [
         'value.tool_definitions.t.new_name: shorter than minLength'
     ]

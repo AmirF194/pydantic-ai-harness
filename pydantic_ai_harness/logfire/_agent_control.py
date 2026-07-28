@@ -6,11 +6,11 @@ import json
 import warnings
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field, replace
-from typing import TYPE_CHECKING, Any, ClassVar, Literal, TypeAlias, cast
+from typing import TYPE_CHECKING, Any, ClassVar, Literal, TypeAlias, cast, get_args, get_origin
 
 import logfire
 from logfire.variables import Variable
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, ValidationError, field_validator, model_validator
 from pydantic_ai import AbstractToolset, RunContext, TemplateStr, ToolDefinition, WrapperToolset
 from pydantic_ai.exceptions import UserError
 from pydantic_ai.messages import ModelRequest
@@ -30,6 +30,25 @@ if TYPE_CHECKING:
 
 _AGENT_VARIABLE_PREFIX = 'agent__'
 
+# Drop warnings already emitted in this process, keyed by the message itself. See `_warn_dropped`.
+_warned_drops: set[str] = set()
+
+
+def _warn_dropped(message: str) -> None:
+    """Surface a dropped managed value once per process.
+
+    A drop means Logfire shows one thing and the agent does another, which has to be visible. But the
+    config is resolved on every single run, so warning per drop would bury that signal under its own
+    repetition. Deduplicating on the message rather than on the field costs nothing in clarity -- each
+    message names its subject and the offending value -- and still lets a *different* unrecognized
+    value surface later, which a per-field guard would swallow. A concurrent first run can at worst
+    duplicate the warning, which is not worth a lock.
+    """
+    if message in _warned_drops:
+        return
+    _warned_drops.add(message)
+    warnings.warn(message)
+
 
 class AgentConfigSettings(BaseModel):
     """Canonical model settings managed as one section of an `AgentConfig`.
@@ -37,7 +56,10 @@ class AgentConfigSettings(BaseModel):
     Every field name matches a key in [`ModelSettings`][pydantic_ai.settings.ModelSettings], so the
     payload lowers without translation. Unset fields keep their code-defined values. Extra fields
     are allowed so canonical settings introduced by a newer Logfire UI can flow through older SDKs.
-    The model itself is the sibling `model` field on `AgentConfig`.
+    A field whose *value* this SDK doesn't recognize -- an effort level or service tier a newer
+    Pydantic AI accepts -- is dropped with a warning so that setting alone keeps its code-defined
+    value, rather than failing the enclosing `AgentConfig`. The model itself is the sibling `model`
+    field on `AgentConfig`.
     """
 
     model_config = ConfigDict(extra='allow')
@@ -61,6 +83,63 @@ class AgentConfigSettings(BaseModel):
     options are applied after canonical fields, so a provider-specific value wins on collision.
     """
 
+    @model_validator(mode='before')
+    @classmethod
+    def _drop_unrecognized_values(cls, data: Any) -> Any:
+        """Drop a versioned field whose value this SDK doesn't recognize, keeping the rest of the patch.
+
+        Tolerating unknown *keys* is only half of forward compatibility: a newer Logfire UI (or a newer
+        Pydantic AI adding an effort level or service tier) writes a value that the stored schema and
+        the Logfire backend both accept, and an older SDK would then fail the whole `AgentConfig` over
+        it and revert instructions, model, and every tool override to code along with it. Dropping the
+        one field the SDK can't act on leaves the value it doesn't understand out of the lowered
+        settings, so that setting -- and only that setting -- keeps its code-defined behavior.
+
+        Unrecognized values are rejected, not passed through: the field's public type is the guarantee
+        `_lower_settings` and its consumers hold, and forwarding an unknown effort level to the
+        provider would trade a version-skew problem for a request-time one. Keys the SDK has never
+        heard of are a different case and stay untouched, so `extra='allow'` still carries them.
+        """
+        if not isinstance(data, dict):
+            return data
+        values = cast(dict[str, Any], data)
+        dropped: dict[str, Any] = {}
+        for name, adapter in _VERSIONED_SETTINGS.items():
+            if name in values:
+                try:
+                    adapter.validate_python(values[name])
+                except ValidationError:
+                    dropped[name] = values[name]
+        if not dropped:
+            return values
+        for name, value in dropped.items():
+            _warn_dropped(
+                f'Managed agent config sets {name!r} to {value!r}, which this version of the SDK does not '
+                f'recognize; ignoring that setting and keeping the rest of the managed config.'
+            )
+        return {name: value for name, value in values.items() if name not in dropped}
+
+
+def _enumerates_values(annotation: object) -> bool:
+    """Whether an annotation spells out the values it accepts, i.e. names a `Literal` anywhere."""
+    return get_origin(annotation) is Literal or any(_enumerates_values(arg) for arg in get_args(annotation))
+
+
+_VERSIONED_SETTINGS: dict[str, TypeAdapter[Any]] = {
+    name: TypeAdapter(field_info.annotation)
+    for name, field_info in AgentConfigSettings.model_fields.items()
+    if _enumerates_values(field_info.annotation)
+}
+"""Per-field validators for the settings whose accepted values grow from release to release.
+
+A `Literal` in a field's annotation is exactly the signal that the field enumerates what *this*
+release knows about, so the set of version-skew-prone fields (`thinking`, `service_tier`) and the
+values each one accepts are both read off the annotations rather than restated here, where the two
+would drift apart. Fields without a `Literal` -- `provider_options` above all, the deliberate
+free-form escape hatch -- are left alone: a wrong type there is malformed rather than merely newer,
+and the stored schema already rejects it at write time.
+"""
+
 
 def _lower_settings(value: AgentConfigSettings) -> ModelSettings:
     """Lower an `AgentConfigSettings` value to Pydantic AI's flat `ModelSettings` shape.
@@ -82,7 +161,8 @@ class ToolDefinitionOverride(BaseModel):
 
     Overrides change only what the model is shown. Schema structure, validation, and execution
     remain code-defined. The dictionary key in `AgentConfig.tool_definitions` looks up the tool by
-    its original code-side name.
+    its original code-side name. An entry that doesn't validate is dropped from
+    `AgentConfig.tool_definitions` with a warning, leaving its siblings in place.
     """
 
     new_name: str | None = Field(default=None, min_length=1)
@@ -100,14 +180,28 @@ class ToolDefinitionOverride(BaseModel):
     """
 
 
+def _override_errors(error: ValidationError) -> str:
+    """Render a rejected tool override's failure -- offending field, value, and reason -- for one warning."""
+    return '; '.join(
+        f'{".".join(str(part) for part in details["loc"]) or "override"}={details["input"]!r} ({details["msg"]})'
+        for details in error.errors()
+    )
+
+
 class AgentConfig(BaseModel):
     """The schema contract shared with the Logfire Agent Control UI.
 
     Every managed value is a patch on the code-defined agent. A key present in the value is managed
     from Logfire; an absent key keeps code-defined behavior. Removing a key in Logfire is therefore
-    a deliberate revert to code. Extra keys retain Pydantic's default `ignore` behavior: a key
-    written by a newer UI must not fail validation, because the SDK's validation fallback would
-    otherwise revert every section to code rather than only ignoring the unknown section.
+    a deliberate revert to code.
+
+    Nothing the SDK fails to understand costs more than the part that contains it. Extra keys retain
+    Pydantic's default `ignore` behavior, and a *value* it cannot make sense of -- an effort level or
+    service tier a newer Pydantic AI accepts, a tool override that doesn't validate -- drops only its
+    own setting or its own override, with a warning. Both rules exist for the same reason: a value
+    that fails validation falls back through Logfire's resolution to the code-defined agent *in its
+    entirety*, so without them one unfamiliar key or enum value would silently un-manage the
+    instructions, the model, and every tool override alongside it.
     """
 
     model_config = ConfigDict(protected_namespaces=())
@@ -124,6 +218,34 @@ class AgentConfig(BaseModel):
     """Canonical model settings patch; see `AgentConfigSettings`."""
     tool_definitions: dict[str, ToolDefinitionOverride] | None = None
     """LLM-facing overlays keyed by each tool's original code-side name."""
+
+    @field_validator('tool_definitions', mode='before')
+    @classmethod
+    def _drop_invalid_overrides(cls, data: Any) -> Any:
+        """Drop an override entry that doesn't validate, keeping its siblings and the rest of the config.
+
+        A tool override is the natural unit here: each entry patches exactly one tool, so an entry the
+        SDK can't validate -- an empty `new_name`, a field carrying a shape it doesn't know, something
+        that isn't an object at all -- can be left out while every other tool keeps its managed
+        definition. Without this, one bad entry would fail the whole `AgentConfig` and revert the
+        agent's instructions, model, and settings to code as well. (Merely *unknown* keys inside an
+        entry are ignored by `ToolDefinitionOverride` itself and cost nothing.)
+
+        Entries are returned already validated so the field doesn't validate them a second time.
+        """
+        if not isinstance(data, dict):
+            return data
+        entries = cast(dict[str, Any], data)
+        overrides: dict[str, ToolDefinitionOverride] = {}
+        for name, entry in entries.items():
+            try:
+                overrides[name] = ToolDefinitionOverride.model_validate(entry)
+            except ValidationError as error:
+                _warn_dropped(
+                    f'Managed tool definition override for {name!r} is invalid -- {_override_errors(error)}; '
+                    f'ignoring that override and keeping the rest of the managed config.'
+                )
+        return overrides
 
 
 AGENT_CONFIG_JSON_SCHEMA: dict[str, Any] = {
@@ -346,11 +468,15 @@ class AgentControl(ManagedVariableCapability[AgentDepsT, AgentConfig]):
     and static targeting inputs do.
 
     Tool overrides change only the definitions shown to the model. Renames route back to the original
-    implementation, collisions retain the original name with a warning, and unknown tool keys are
-    inert. Parameter names, types, requiredness, validation, and implementation stay code-owned.
+    implementation, collisions retain the original name with a warning, unknown tool keys are inert,
+    and an override the SDK can't validate is dropped with a warning while its siblings still apply.
+    Parameter names, types, requiredness, validation, and implementation stay code-owned.
 
     Missing, invalid, or unreachable remote values degrade to the code-defined agent through Logfire's
-    resolution fallback. If the provider does not know the variable, auto-create is attempted once per
+    resolution fallback, which is why a value this SDK doesn't recognize degrades the narrowest unit
+    that contains it -- one setting, one tool override -- rather than the whole config; see
+    [`AgentConfig`][pydantic_ai_harness.logfire.AgentConfig]. If the provider does not know the
+    variable, auto-create is attempted once per
     process in the background, storing
     [`AGENT_CONFIG_JSON_SCHEMA`][pydantic_ai_harness.logfire.AGENT_CONFIG_JSON_SCHEMA] as the
     variable's schema and logging the creation to Logfire.
