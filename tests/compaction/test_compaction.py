@@ -2523,27 +2523,16 @@ class TestCompactWithSpan:
 # Pin contract (survives_compaction)
 # ---------------------------------------------------------------------------
 
-from pydantic_ai_harness.compaction import format_receipt, is_pinned, pin  # noqa: E402
-from pydantic_ai_harness.compaction._pinning import (  # noqa: E402
-    _leading_context_len,
-    collect_pinned,
-    reinject_pinned,
-)
-from pydantic_ai_harness.compaction._receipts import (  # noqa: E402
-    ReceiptInfo,
-    TranscriptStore,
-    discover_transcript_handle,
-    is_receipt_part,
-    make_receipt_part,
-    record_receipt,
-)
-from pydantic_ai_harness.compaction._summarizing_compaction import (  # noqa: E402
-    _BRIDGE_PREFIX,
-    _INCREMENTAL_UPDATE_INSTRUCTION,
-    _history_model_name,
-    _model_family,
-    _model_name,
-)
+from pydantic_ai_harness.compaction import TranscriptStore, format_receipt, is_pinned, pin  # noqa: E402
+
+_RECEIPT_MARKER = format_receipt(dropped_messages=0, dropped_tokens=0, by='x', handle=None).split(' (')[0]
+"""The receipt prefix, derived from the public formatter rather than the private constant."""
+
+_BRIDGE_ANCHOR = 'produced by a different model'
+"""Stable fragment of the bridge-prefix wording; the full text is provisional (eval-rig pending)."""
+
+_UPDATE_ANCHOR = 'Update it using the conversation above'
+"""Stable fragment of the incremental update instruction; likewise provisional."""
 
 
 def _pinned_msg(text: str) -> ModelRequest:
@@ -2551,14 +2540,23 @@ def _pinned_msg(text: str) -> ModelRequest:
 
 
 def _receipt_parts(messages: list[ModelMessage]) -> list[str]:
-    out: list[str] = []
-    for m in messages:
-        if isinstance(m, ModelRequest):
-            for p in m.parts:
-                if is_receipt_part(p):
-                    assert isinstance(p, UserPromptPart) and isinstance(p.content, str)
-                    out.append(p.content)
-    return out
+    return [
+        p.content
+        for m in messages
+        if isinstance(m, ModelRequest)
+        for p in m.parts
+        if isinstance(p, UserPromptPart) and isinstance(p.content, str) and p.content.startswith(_RECEIPT_MARKER)
+    ]
+
+
+def _pinned_texts(messages: list[ModelMessage]) -> list[str]:
+    return [
+        p.content
+        for m in messages
+        if isinstance(m, ModelRequest)
+        for p in m.parts
+        if is_pinned(p) and isinstance(p.content, str)
+    ]
 
 
 class TestPinning:
@@ -2576,47 +2574,75 @@ class TestPinning:
         assert not is_pinned(UserPromptPart(content=['list', 'content']))
         assert not is_pinned(TextPart(content='<pinned>'))
 
-    def test_collect_pinned(self):
-        msgs: list[ModelMessage] = [_pinned_msg('a'), _user('b'), _assistant('c'), _pinned_msg('d')]
-        collected = collect_pinned(msgs)
-        assert len(collected) == 2
-
-    def test_leading_context_len(self):
-        msgs: list[ModelMessage] = [
-            ModelRequest(parts=[SystemPromptPart(content='sys')]),
-            ModelRequest(parts=[SystemPromptPart(content='summary')]),
-            _user('conversation'),
+    @pytest.mark.anyio
+    async def test_every_dropped_pin_is_reinjected_in_order(self):
+        sw = SlidingWindowCompaction(max_messages=4, keep_messages=1, preserve_first_user_message=False)
+        messages: list[ModelMessage] = [
+            _pinned_msg('first pin'),
+            _user('chatter'),
+            _pinned_msg('second pin'),
+            _assistant('a'),
+            _user('recent'),
         ]
-        assert _leading_context_len(msgs) == 2
-        assert _leading_context_len([_user('a')]) == 0
-        # A run of only system-only requests: the loop completes without breaking.
-        all_system: list[ModelMessage] = [
+        result = await sw.compact(messages, _make_ctx())
+        assert [t for t in _pinned_texts(result)] == [
+            '<pinned>\nfirst pin\n</pinned>',
+            '<pinned>\nsecond pin\n</pinned>',
+        ]
+
+    @pytest.mark.anyio
+    async def test_reinjected_pin_lands_after_leading_context(self):
+        # The summary message is system-only, so pins are placed after it, not above it.
+        comp = SummarizingCompaction(
+            model='test:m', max_messages=3, keep_messages=1, bridge_prefix=False, preserve_first_user_message=False
+        )
+        messages: list[ModelMessage] = [_pinned_msg('durable'), _assistant('a'), _user('b'), _assistant('c')]
+        with patch('pydantic_ai.Agent', return_value=_patched_summary_agent('S')):
+            result = await comp.compact(messages, _make_ctx())
+        first, second = result[0], result[1]
+        assert isinstance(first, ModelRequest)
+        assert any(isinstance(p, SystemPromptPart) and p.content.startswith(_SUMMARY_PREFIX) for p in first.parts)
+        assert isinstance(second, ModelRequest)
+        assert is_pinned(second.parts[0])
+
+    @pytest.mark.anyio
+    async def test_reinjected_pin_leads_when_no_system_context(self):
+        sw = SlidingWindowCompaction(max_messages=3, keep_messages=1, preserve_first_user_message=False)
+        messages: list[ModelMessage] = [_pinned_msg('durable'), _assistant('a'), _user('b'), _assistant('c')]
+        result = await sw.compact(messages, _make_ctx())
+        head = result[0]
+        assert isinstance(head, ModelRequest)
+        assert is_pinned(head.parts[0])
+
+    @pytest.mark.anyio
+    async def test_reinjection_appends_when_tail_is_all_system(self):
+        # Every surviving message is system-only, so the placement scan runs to the end.
+        sw = SlidingWindowCompaction(max_messages=3, keep_messages=2, preserve_first_user_message=False)
+        messages: list[ModelMessage] = [
+            _pinned_msg('durable'),
+            _assistant('a'),
             ModelRequest(parts=[SystemPromptPart(content='s1')]),
             ModelRequest(parts=[SystemPromptPart(content='s2')]),
         ]
-        assert _leading_context_len(all_system) == 2
+        result = await sw.compact(messages, _make_ctx())
+        assert _pinned_texts(result) == ['<pinned>\ndurable\n</pinned>']
+        last = result[-1]
+        assert isinstance(last, ModelRequest)
+        assert is_pinned(last.parts[0])
 
-    def test_reinject_no_pins_passthrough(self):
-        compacted: list[ModelMessage] = [_user('a')]
-        assert reinject_pinned([_user('orig')], compacted) is compacted
+    @pytest.mark.anyio
+    async def test_history_without_pins_is_untouched(self):
+        sw = SlidingWindowCompaction(max_messages=3, keep_messages=1, preserve_first_user_message=False)
+        messages: list[ModelMessage] = [_user('a'), _assistant('b'), _user('c'), _assistant('d')]
+        result = await sw.compact(messages, _make_ctx())
+        assert _pinned_texts(result) == []
 
-    def test_reinject_all_surviving_passthrough(self):
-        pinned = _pinned_msg('keep')
-        original: list[ModelMessage] = [pinned, _user('x')]
-        compacted: list[ModelMessage] = [pinned]
-        assert reinject_pinned(original, compacted) is compacted
-
-    def test_reinject_missing_pin_reinserted_after_system(self):
-        pinned = _pinned_msg('keep me across compaction')
-        original: list[ModelMessage] = [_user('old'), pinned, _assistant('a'), _user('recent')]
-        compacted: list[ModelMessage] = [
-            ModelRequest(parts=[SystemPromptPart(content='summary')]),
-            _user('recent'),
-        ]
-        result = reinject_pinned(original, compacted)
-        # Pin re-injected right after the leading summary message.
-        assert isinstance(result[1], ModelRequest)
-        assert is_pinned(result[1].parts[0])
+    @pytest.mark.anyio
+    async def test_surviving_pin_is_not_duplicated(self):
+        sw = SlidingWindowCompaction(max_messages=3, keep_messages=2, preserve_first_user_message=False)
+        messages: list[ModelMessage] = [_user('old'), _assistant('a'), _pinned_msg('durable'), _assistant('c')]
+        result = await sw.compact(messages, _make_ctx())
+        assert _pinned_texts(result) == ['<pinned>\ndurable\n</pinned>']
 
 
 # ---------------------------------------------------------------------------
@@ -2655,41 +2681,56 @@ class TestReceiptFormatting:
         assert 'was dropped by the harness' in text
         assert 'no longer in the window' in text
 
-    def test_make_and_detect_receipt_part(self):
-        part = make_receipt_part(format_receipt(dropped_messages=1, dropped_tokens=1, by='x', handle=None))
-        assert is_receipt_part(part)
-        assert not is_receipt_part(UserPromptPart(content='not a receipt'))
-        assert not is_receipt_part(TextPart(content='[History before this point ...'))
+    @pytest.mark.anyio
+    async def test_only_receipt_shaped_parts_are_de_accumulated(self):
+        # A prior receipt is replaced; look-alike and non-user parts in the same history survive.
+        sw = SlidingWindowCompaction(max_messages=3, keep_messages=2, receipts=True)
+        decoy_system = ModelRequest(parts=[SystemPromptPart(content=f'{_RECEIPT_MARKER} not really a receipt]')])
+        decoy_sequence = ModelRequest(parts=[UserPromptPart(content=[f'{_RECEIPT_MARKER} in a list]'])])
+        messages: list[ModelMessage] = [_user('a'), _assistant('b'), decoy_system, decoy_sequence]
+        result = await sw.compact(messages, _make_ctx())
+        assert len(_receipt_parts(result)) == 1
+        assert decoy_system in result
+        assert decoy_sequence in result
+
+
+class _CtxWith:
+    """Build the fake run context variants the handle-discovery paths need."""
+
+    @staticmethod
+    def capabilities(**caps: object) -> Any:
+        ctx = _make_ctx()
+        ctx.capabilities = dict(caps)
+        return ctx
+
+
+async def _receipt_for(ctx: Any) -> str:
+    sw = SlidingWindowCompaction(max_messages=3, keep_messages=1, receipts=True, preserve_first_user_message=False)
+    messages: list[ModelMessage] = [_user('a'), _assistant('b'), _user('c'), _assistant('d')]
+    return _receipt_parts(await sw.compact(messages, ctx))[0]
 
 
 class TestTranscriptHandleDiscovery:
-    def test_no_capabilities_attr(self):
-        assert discover_transcript_handle(_make_ctx()) is None
+    @pytest.mark.anyio
+    async def test_no_capabilities_attr(self):
+        assert 'Full transcript' not in await _receipt_for(_make_ctx())
 
-    def test_empty_capabilities(self):
-        ctx = _make_ctx()
-        ctx.capabilities = {}
-        assert discover_transcript_handle(ctx) is None
+    @pytest.mark.anyio
+    async def test_empty_capabilities(self):
+        assert 'Full transcript' not in await _receipt_for(_CtxWith.capabilities())
 
-    def test_capability_without_method_skipped(self):
-        ctx = _make_ctx()
-        ctx.capabilities = {'x': _NotAStore()}
-        assert discover_transcript_handle(ctx) is None
+    @pytest.mark.anyio
+    async def test_capability_without_method_skipped(self):
+        assert 'Full transcript' not in await _receipt_for(_CtxWith.capabilities(x=_NotAStore()))
 
-    def test_capability_returning_none_continues(self):
-        ctx = _make_ctx()
-        ctx.capabilities = {'a': _FakeTranscriptStore(None), 'b': _FakeTranscriptStore('found')}
-        assert discover_transcript_handle(ctx) == 'found'
+    @pytest.mark.anyio
+    async def test_capability_returning_none_continues(self):
+        ctx = _CtxWith.capabilities(a=_FakeTranscriptStore(None), b=_FakeTranscriptStore('found'))
+        assert 'Full transcript: found.' in await _receipt_for(ctx)
 
     def test_isinstance_protocol(self):
         assert isinstance(_FakeTranscriptStore('h'), TranscriptStore)
         assert not isinstance(_NotAStore(), TranscriptStore)
-
-
-class TestReceiptRecording:
-    def test_record_receipt_no_scope_is_noop(self):
-        # Called outside an open receipt scope: silently drops, no error.
-        record_receipt(ReceiptInfo('S', 1, 1, 'x', None))
 
 
 # ---------------------------------------------------------------------------
@@ -2799,9 +2840,9 @@ class TestSlidingWindowCompactionReceipts:
         first = result.messages[0]
         assert isinstance(first, ModelRequest)
         receipt = first.parts[0]
-        assert is_receipt_part(receipt)
         assert isinstance(receipt, UserPromptPart)
         assert isinstance(receipt.content, str)
+        assert receipt.content.startswith(_RECEIPT_MARKER)
         assert 'was dropped by the harness' in receipt.content
 
 
@@ -2879,21 +2920,27 @@ class TestKeepUserMessages:
 
         comp = SummarizingCompaction(
             model='test:m',
-            max_messages=2,
+            max_messages=3,
             keep_messages=1,
             keep_user_messages=True,
             bridge_prefix=False,
+            preserve_first_user_message=False,
         )
-        to_summarize: list[ModelMessage] = [
+        messages: list[ModelMessage] = [
             _assistant('an assistant turn is skipped'),
             ModelRequest(parts=[SystemPromptPart(content='no user here')]),
             ModelRequest(parts=[UserPromptPart(content=[TextContent(content='multimodal')])]),
+            _assistant('recent'),
         ]
-        kept = comp._kept_user_messages(to_summarize)
-        # Only the one message carrying a user part survives; content that fits is untouched.
+        rc = _make_request_context(messages)
+        with patch('pydantic_ai.Agent', return_value=_patched_summary_agent('SUMMARY')):
+            result = await comp.before_model_request(_make_ctx(), rc)
+        # Exactly one user part survives the summarized prefix, and content that fits is untouched.
+        kept = [
+            p for m in result.messages if isinstance(m, ModelRequest) for p in m.parts if isinstance(p, UserPromptPart)
+        ]
         assert len(kept) == 1
-        assert isinstance(kept[0], ModelRequest)
-        assert isinstance(kept[0].parts[0], UserPromptPart)
+        assert kept[0].content == [TextContent(content='multimodal')]
 
     @pytest.mark.anyio
     async def test_bounds_text_inside_sequence_content(self):
@@ -2901,31 +2948,31 @@ class TestKeepUserMessages:
 
         comp = SummarizingCompaction(
             model='test:m',
-            max_messages=2,
+            max_messages=3,
             keep_messages=1,
             keep_user_messages=True,
             keep_user_messages_max_chars=30,
             bridge_prefix=False,
+            preserve_first_user_message=False,
         )
         cache_point = CachePoint()
-        to_summarize: list[ModelMessage] = [
-            ModelRequest(
-                parts=[
-                    UserPromptPart(
-                        content=[
-                            'a' * 100,
-                            cache_point,
-                            TextContent(content='b' * 100),
-                        ]
-                    )
-                ]
-            ),
+        messages: list[ModelMessage] = [
+            ModelRequest(parts=[UserPromptPart(content=['a' * 100, cache_point, TextContent(content='b' * 100)])]),
+            _assistant('a'),
+            _user('b'),
+            _assistant('recent'),
         ]
-        kept = comp._kept_user_messages(to_summarize)
-        part = kept[0].parts[0]
-        assert isinstance(part, UserPromptPart)
-        assert not isinstance(part.content, str)
-        first, passthrough, third = part.content
+        rc = _make_request_context(messages)
+        with patch('pydantic_ai.Agent', return_value=_patched_summary_agent('SUMMARY')):
+            result = await comp.before_model_request(_make_ctx(), rc)
+        bounded = next(
+            p
+            for m in result.messages
+            if isinstance(m, ModelRequest)
+            for p in m.parts
+            if isinstance(p, UserPromptPart) and not isinstance(p.content, str)
+        )
+        first, passthrough, third = bounded.content
         assert isinstance(first, str)
         assert '[truncated: showing first 30 of 100 chars]' in first
         # Non-text items ride along untouched.
@@ -2977,7 +3024,7 @@ class TestAnchoredIncremental:
         rc = _make_request_context(messages)
         result = await comp.before_model_request(_make_ctx(), rc)
         prompt = '\n'.join(captured)
-        assert _INCREMENTAL_UPDATE_INSTRUCTION in prompt
+        assert _UPDATE_ANCHOR in prompt
         assert '<previous-summary>' in prompt
         assert 'Anchored prior summary.' in prompt
         # The updated anchor lands in the new summary message.
@@ -2992,23 +3039,14 @@ class TestAnchoredIncremental:
 
 
 class TestBridgePrefix:
-    def test_model_helpers(self):
-        assert _model_name(None) is None
-        assert _model_name('openai:gpt-4o') == 'openai:gpt-4o'
-        assert _model_family('openai:gpt-4o-mini') == 'gpt'
-        assert _model_family('anthropic:claude-sonnet-4') == 'claude'
-        assert _model_family(None) is None
-        assert _model_family('') is None
-
-    def test_history_model_name(self):
-        msgs: list[ModelMessage] = [
-            ModelResponse(parts=[TextPart(content='x')], model_name='anthropic:claude-sonnet'),
-            _user('later'),
-        ]
-        assert _history_model_name(msgs) == 'anthropic:claude-sonnet'
-        assert _history_model_name([_user('none')]) is None
-
-    async def _compact_with(self, *, bridge_prefix: bool, run_model: str, summarizer: str) -> str:
+    async def _compact_with(
+        self,
+        *,
+        bridge_prefix: bool = True,
+        run_model: str | None = 'anthropic:claude-sonnet',
+        summarizer: str | None = 'openai:gpt-4o-mini',
+        ctx: Any = None,
+    ) -> str:
         comp = SummarizingCompaction(
             model=summarizer,
             max_messages=3,
@@ -3016,15 +3054,18 @@ class TestBridgePrefix:
             bridge_prefix=bridge_prefix,
             preserve_first_user_message=False,
         )
-        messages: list[ModelMessage] = [
-            _user('a'),
-            ModelResponse(parts=[TextPart(content='b')], model_name=run_model),
-            _user('c'),
-            ModelResponse(parts=[TextPart(content='d')], model_name=run_model),
-        ]
+        tail: list[ModelMessage] = (
+            [_assistant('b'), _assistant('d')]
+            if run_model is None
+            else [
+                ModelResponse(parts=[TextPart(content='b')], model_name=run_model),
+                ModelResponse(parts=[TextPart(content='d')], model_name=run_model),
+            ]
+        )
+        messages: list[ModelMessage] = [_user('a'), tail[0], _user('c'), tail[1]]
         rc = _make_request_context(messages)
         with patch('pydantic_ai.Agent', return_value=_patched_summary_agent('BASE')):
-            result = await comp.before_model_request(_make_ctx(), rc)
+            result = await comp.before_model_request(ctx if ctx is not None else _make_ctx(), rc)
         first = result.messages[0]
         assert isinstance(first, ModelRequest)
         return next(
@@ -3033,24 +3074,37 @@ class TestBridgePrefix:
 
     @pytest.mark.anyio
     async def test_prefix_added_on_family_mismatch(self):
-        summary = await self._compact_with(
-            bridge_prefix=True, run_model='anthropic:claude-sonnet', summarizer='openai:gpt-4o-mini'
-        )
-        assert _BRIDGE_PREFIX in summary
+        assert _BRIDGE_ANCHOR in await self._compact_with()
 
     @pytest.mark.anyio
     async def test_no_prefix_same_family(self):
-        summary = await self._compact_with(
-            bridge_prefix=True, run_model='openai:gpt-4o', summarizer='openai:gpt-4o-mini'
-        )
-        assert _BRIDGE_PREFIX not in summary
+        summary = await self._compact_with(run_model='openai:gpt-4o', summarizer='openai:gpt-4o-mini')
+        assert _BRIDGE_ANCHOR not in summary
 
     @pytest.mark.anyio
     async def test_no_prefix_when_disabled(self):
-        summary = await self._compact_with(
-            bridge_prefix=False, run_model='anthropic:claude-sonnet', summarizer='openai:gpt-4o-mini'
-        )
-        assert _BRIDGE_PREFIX not in summary
+        assert _BRIDGE_ANCHOR not in await self._compact_with(bridge_prefix=False)
+
+    @pytest.mark.anyio
+    async def test_no_prefix_when_run_family_unknown(self):
+        # No response carries a `model_name` and the run's model exposes none either, so the
+        # gate has nothing to compare against and stays quiet rather than guessing.
+        ctx = _make_ctx()
+        ctx.model = None
+        assert _BRIDGE_ANCHOR not in await self._compact_with(run_model=None, ctx=ctx)
+
+    @pytest.mark.anyio
+    async def test_no_prefix_when_summarizer_family_is_empty(self):
+        assert _BRIDGE_ANCHOR not in await self._compact_with(summarizer='')
+
+    @pytest.mark.anyio
+    async def test_no_prefix_when_summarizer_name_has_no_family_token(self):
+        assert _BRIDGE_ANCHOR not in await self._compact_with(summarizer='-')
+
+    @pytest.mark.anyio
+    async def test_run_family_falls_back_to_the_running_model(self):
+        # `TestModel.model_name` is `test`, which differs from the summarizer's family.
+        assert _BRIDGE_ANCHOR in await self._compact_with(run_model=None)
 
 
 # ---------------------------------------------------------------------------
@@ -3108,15 +3162,14 @@ class TestPinsSurviveStrategies:
 
 
 class TestStepPersistenceHandle:
-    def test_handle_is_run_id_and_discoverable(self):
+    @pytest.mark.anyio
+    async def test_handle_is_run_id_and_reaches_the_receipt(self):
         from pydantic_ai_harness.step_persistence import InMemoryStepStore, StepPersistence
 
         sp: StepPersistence[None] = StepPersistence(store=InMemoryStepStore(), run_id='libr-1')
         assert isinstance(sp, TranscriptStore)
         assert sp.compaction_transcript_handle() == 'libr-1'
-        ctx = _make_ctx()
-        ctx.capabilities = {'sp': sp}
-        assert discover_transcript_handle(ctx) == 'libr-1'
+        assert 'Full transcript: libr-1.' in await _receipt_for(_CtxWith.capabilities(sp=sp))
 
     def test_handle_none_before_materialization(self):
         from pydantic_ai_harness.step_persistence import InMemoryStepStore, StepPersistence
