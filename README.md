@@ -152,8 +152,8 @@ We studied leading coding agents, agent frameworks, and Claw-style assistants to
 | | **Shell** | Execute commands with allowlists, denylists, and timeouts | :white_check_mark: [Docs](pydantic_ai_harness/shell/) | [pydantic-ai-backend](https://github.com/vstorm-co/pydantic-ai-backend) (vstorm&#8209;co) |
 | | **LocalStack** | Environment-backed AWS emulator with AWS CLI tools and optional Docker lifecycle | :white_check_mark: [Docs](pydantic_ai_harness/localstack/) | |
 | | **Modal sandbox** | Run commands and manage files in an isolated [Modal](https://modal.com) cloud sandbox | :white_check_mark: [Docs](pydantic_ai_harness/modal_sandbox/) | |
-| | **Repo context injection** | Auto-load CLAUDE.md/AGENTS.md and repo structure | :white_check_mark: [Docs](pydantic_ai_harness/context/) | [pydantic-deep](https://github.com/vstorm-co/pydantic-deepagents) (vstorm&#8209;co) |
-| | **Docs lookup** | On-demand `read_pyai_docs` tool for Pydantic AI docs | :white_check_mark: [Docs](pydantic_ai_harness/docs/) | |
+| | **Repo context injection** | Auto-load CLAUDE.md/AGENTS.md and repo structure | :white_check_mark: [Docs](pydantic_ai_harness/repo_context/) | [pydantic-deep](https://github.com/vstorm-co/pydantic-deepagents) (vstorm&#8209;co) |
+| | **Docs lookup** | On-demand `read_pyai_docs` tool for Pydantic AI docs | :white_check_mark: [Docs](pydantic_ai_harness/pydantic_ai_docs/) | |
 | | **Web research** | Web search returning relevant page excerpts, full single-page retrieval, and opt-in deep search with cited answers, backed by [Exa](https://exa.ai) | :white_check_mark: [Docs](pydantic_ai_harness/exa/) | |
 | | **Hosted research agent** | Delegate open-ended research to the [Exa](https://exa.ai) Agent API as deferred tool calls -- resolved inline or by the host application | :white_check_mark: [Docs](pydantic_ai_harness/exa/) | |
 | | **Verification loop** | Run tests after edits, auto-fix failures | :construction: [PR&nbsp;#169](https://github.com/pydantic/pydantic-ai-harness/pull/169) | |
@@ -163,8 +163,8 @@ We studied leading coding agents, agent frameworks, and Claw-style assistants to
 | **Context management** | **Sliding window** | Trim conversation history to stay within token limits | :white_check_mark: [Docs](pydantic_ai_harness/compaction/) | [summarization-pydantic-ai](https://github.com/vstorm-co/summarization-pydantic-ai) (vstorm&#8209;co) |
 | | **Context compaction** | LLM-powered summarization of older messages | :white_check_mark: [Docs](pydantic_ai_harness/compaction/) | [summarization-pydantic-ai](https://github.com/vstorm-co/summarization-pydantic-ai) (vstorm&#8209;co) |
 | | **Limit warnings** | Warn agent before hitting context/iteration limits | :white_check_mark: [Docs](pydantic_ai_harness/compaction/) | [summarization-pydantic-ai](https://github.com/vstorm-co/summarization-pydantic-ai) (vstorm&#8209;co) |
-| | **Tool output management** | Truncate, summarize, or spill large tool outputs | :white_check_mark: [Docs](pydantic_ai_harness/overflowing_tool_output/) | |
-| | **Cache-bust monitoring** | Warn when a run's prompt-cache prefix collapses between model requests | :white_check_mark: [Docs](pydantic_ai_harness/cache_stability/) | |
+| | **Tool output limits** | Truncate, summarize, or spill large tool outputs | :white_check_mark: [Docs](pydantic_ai_harness/tool_output_limits/) | |
+| | **Cache-bust monitoring** | Warn when a run's prompt-cache prefix collapses between model requests | :white_check_mark: [Docs](pydantic_ai_harness/warn_on_cache_busts/) | |
 | | **System reminders** | Inject periodic reminders to counteract instruction drift | :construction: [PR&nbsp;#181](https://github.com/pydantic/pydantic-ai-harness/pull/181) | |
 | **Memory &&nbsp;persistence** | **Memory** | Persistent, namespaced notebook with bounded prompt injection, on-demand search, and concurrency-safe stores | :white_check_mark: [Docs](pydantic_ai_harness/memory/) | [pydantic-deep](https://github.com/vstorm-co/pydantic-deepagents) (vstorm&#8209;co) |
 | | **Session persistence** | Save and restore full conversation state | :white_check_mark: [Docs](pydantic_ai_harness/step_persistence/) | |
@@ -174,7 +174,7 @@ We studied leading coding agents, agent frameworks, and Claw-style assistants to
 | | **Dynamic workflow** | Orchestrate sub-agents from a model-written Python script -- fan-out, chaining, voting in one tool call | :white_check_mark: [Docs](pydantic_ai_harness/dynamic_workflow/) | |
 | | **Skills** | Progressive tool loading -- search, activate, deactivate | :construction: [PR&nbsp;#183](https://github.com/pydantic/pydantic-ai-harness/pull/183) | [pydantic-ai-skills](https://github.com/DougTrajano/pydantic-ai-skills) (DougTrajano), [pydantic-deep](https://github.com/vstorm-co/pydantic-deepagents) (vstorm&#8209;co) |
 | | **Planning** | Break complex tasks into structured plans before execution | :white_check_mark: [Docs](pydantic_ai_harness/planning/) | |
-| | **Runtime authoring** | Let an agent author, validate, and load real capabilities at runtime | :white_check_mark: [Docs](pydantic_ai_harness/runtime_authoring/) | |
+| | **Capability creation** | Let an agent author, validate, and load real capabilities at runtime | :white_check_mark: [Docs](pydantic_ai_harness/capability_creation/) | |
 | | **Task tracking** | Track tasks, subtasks, and dependencies | :memo: [#65](https://github.com/pydantic/pydantic-ai-harness/issues/65) | [pydantic-ai-todo](https://github.com/vstorm-co/pydantic-ai-todo) (vstorm&#8209;co) |
 | | **Teams** | Multi-agent teams with shared state and message bus | :memo: [#195](https://github.com/pydantic/pydantic-ai-harness/issues/195) | [pydantic-deep](https://github.com/vstorm-co/pydantic-deepagents) (vstorm&#8209;co) |
 | **Safety &&nbsp;guardrails** | **Input guardrails** | Validate user input before the agent run starts | :white_check_mark: [Docs](pydantic_ai_harness/guardrails/) | [pydantic-ai-shields](https://github.com/vstorm-co/pydantic-ai-shields) (vstorm&#8209;co) |
