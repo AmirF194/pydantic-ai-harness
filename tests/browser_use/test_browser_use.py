@@ -722,6 +722,14 @@ class TestSensitiveDataSafety:
                 sensitive_data={'x_password': 'hunter2'},
             )
 
+    def test_empty_capability_allowlist_overrides_profile_allowlist_and_warns(self) -> None:
+        with pytest.warns(UserWarning, match='Flat `sensitive_data` values apply to every domain'):
+            BrowserUse[None](
+                browser_profile=BrowserProfile(allowed_domains=['safe.example']),
+                allowed_domains=[],
+                sensitive_data={'x_password': 'hunter2'},
+            )
+
 
 class TestSessionScope:
     async def test_agent_scope_reuses_one_session(self, kill_calls: list[BrowserSession]) -> None:
