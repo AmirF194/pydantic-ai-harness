@@ -3087,7 +3087,7 @@ class TestKeepUserMessages:
         assert second.messages == first.messages
 
     @pytest.mark.anyio
-    async def test_retained_users_leave_unused_token_tail_slots_intact(self):
+    async def test_retained_users_and_tail_share_the_token_budget(self):
         comp = SummarizingCompaction(
             model='test:m',
             max_tokens=2,
@@ -3100,8 +3100,28 @@ class TestKeepUserMessages:
         messages: list[ModelMessage] = [_user('xx'), _assistant('x')]
         with patch('pydantic_ai.Agent', return_value=_patched_summary_agent('S')):
             result = await comp.compact(messages, _make_ctx())
-        assert _user_texts(result) == ['xx']
+        assert _user_texts(result) == []
         assert result[-1] == messages[-1]
+        assert comp.keep_tokens is not None
+        assert estimate_token_count(result[1:], len) <= comp.keep_tokens
+
+    @pytest.mark.anyio
+    async def test_retained_user_can_consume_the_token_budget(self):
+        comp = SummarizingCompaction(
+            model='test:m',
+            max_tokens=2,
+            keep_tokens=1,
+            keep_messages=3,
+            keep_user_messages=True,
+            bridge_prefix=False,
+            tokenizer=len,
+        )
+        messages: list[ModelMessage] = [_user('x'), _assistant('x')]
+        with patch('pydantic_ai.Agent', return_value=_patched_summary_agent('S')):
+            result = await comp.compact(messages, _make_ctx())
+        assert _user_texts(result) == ['x']
+        assert comp.keep_tokens is not None
+        assert estimate_token_count(result[1:], len) <= comp.keep_tokens
 
     @pytest.mark.anyio
     async def test_pin_is_not_rebuilt_as_a_kept_user_message(self):

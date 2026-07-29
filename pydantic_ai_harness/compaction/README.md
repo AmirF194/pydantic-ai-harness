@@ -278,6 +278,8 @@ main driver of resumption drift. `SummarizingCompaction(keep_user_messages=True)
 the newest user turns from the summarized prefix alongside the summary. They consume the
 existing `keep_messages` tail budget, so at most that many retained user messages and tail
 messages survive together; compaction therefore does not grow retained copies on each cycle.
+When `keep_tokens` is set, those same retained user messages and tail messages also share its
+token budget; a user turn that does not fit is summarized instead.
 Each retained turn is bounded to `keep_user_messages_max_chars` (default 20k) with an explicit
 truncation marker when it overruns. The character budget applies per part, shared across the
 text items of a multi-part prompt; images, audio, and cache points pass through untouched. This

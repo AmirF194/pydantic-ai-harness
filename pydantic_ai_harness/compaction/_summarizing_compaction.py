@@ -363,7 +363,24 @@ class SummarizingCompaction(AbstractCapability[AgentDepsT]):
         if self.keep_user_messages:
             extra = self._kept_user_messages(to_summarize)
             extra = extra[-self.keep_messages :] if self.keep_messages else []
+            token_tail_budget = self.keep_tokens
+            if token_tail_budget is not None:
+                retained: list[ModelMessage] = []
+                for message in reversed(extra):
+                    tokens = estimate_token_count([message], self.tokenizer)
+                    if tokens <= token_tail_budget:
+                        retained.append(message)
+                        token_tail_budget -= tokens
+                extra = list(reversed(retained))
             retained_tail_slots = self.keep_messages - len(extra)
+            if token_tail_budget is not None:
+                if token_tail_budget == 0:
+                    preserved = []
+                else:
+                    token_tail = preserved[find_token_cutoff(preserved, token_tail_budget, self.tokenizer) :]
+                    preserved = (
+                        token_tail if estimate_token_count(token_tail, self.tokenizer) <= token_tail_budget else []
+                    )
             if len(preserved) > retained_tail_slots:
                 preserved = preserved[find_safe_cutoff(preserved, retained_tail_slots) :]
         elif self.preserve_first_user_message:
