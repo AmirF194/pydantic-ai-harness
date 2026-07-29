@@ -28,11 +28,14 @@ snapshots, and graph-node resume are out of scope and tracked separately
 1. **Append-only step events** -- every interesting boundary (run start/end,
    model request, tool call, failure) appends a `StepEvent`. A run killed
    mid-tool-call still leaves a usable event trail.
-2. **Continuable snapshots** -- a `ContinuableSnapshot` is saved only at
-   boundaries where the message history is **provider-valid**: every
-   `ToolCallPart` has a matching `ToolReturnPart` or `RetryPromptPart`, with
-   no orphan, duplicate, or out-of-order returns. Pass the snapshot's
-   `messages` back to `Agent.run(message_history=...)` to continue or fork.
+2. **Continuable snapshots** -- a `ContinuableSnapshot` is saved at settled
+   node boundaries, and a failing run saves its live at-failure history.
+   Each snapshot carries a `state`: `complete` when every `ToolCallPart`
+   has a matching result, `interrupted` when the capture holds unsettled
+   tool work (e.g. a crash mid-tool-cycle). `latest_snapshot` and
+   `continue_run` return only `complete` snapshots unless the caller passes
+   `include_interrupted=True`. Pass the snapshot's `messages` back to
+   `Agent.run(message_history=...)` to continue or fork.
 3. **Tool-effect ledger** -- every tool call's lifecycle (`started`,
    `completed`, `failed`) is recorded against `(run_id, tool_call_id)`.
    After a crash, a tool with a `started` record and no terminal update
@@ -118,7 +121,7 @@ runs = await store.list_runs(conversation_id='conv-abc')  # 3 records, chronolog
 
 pydantic_ai already has `message_history=` for "carry on with this prior
 context". `StepPersistence` does not introduce a parallel mechanism -- it
-exposes one helper that loads the most recent provider-valid snapshot:
+exposes one helper that loads the most recent settled snapshot:
 
 ```python
 from pydantic_ai_harness.step_persistence import continue_run
@@ -145,20 +148,31 @@ run gets a fresh `run_id` and probably a fresh `conversation_id`).
 
 ### What "safe to continue from" means
 
-`continue_run` only returns the messages of the latest provider-valid
-snapshot for that `run_id`. Snapshots are written at these boundaries:
+By default `continue_run` returns the messages of the latest `complete`
+snapshot for that `run_id` -- a point whose tool work was fully settled
+when captured. Snapshots are written at these boundaries:
 
-- after every `CallToolsNode` completes (all tool calls returned),
-- at `after_run`, as a fallback if the run reached no such boundary, and
-- when a run *fails* against a provider-valid history -- a model request that
-  raises after a clean tool cycle, or output validation that raises after a
-  text response -- so an errored run still exposes its last safe resume point.
+- after every `CallToolsNode` whose tool calls all returned -- the pending
+  tool-return request is folded in, so the point is durable the moment the
+  tool completes, before the next model request is even sent,
+- at `after_run`, when the run ended past that boundary (a run that reached
+  no boundary at all, or an `Agent.run_stream` whose closing response lands
+  after the last one), and
+- when a run *fails*: the live history at failure time is saved, whatever
+  its shape -- a model request that raises after a clean tool cycle
+  produces a `complete` snapshot; a crash mid-tool-cycle produces an
+  `interrupted` one carrying every completed cycle.
 
-A run that crashed mid-tool-call has events (`tool_call_started`) but no
-snapshot for that point: the dangling `ToolCallPart` is not provider-valid, so
-the error-path capture skips it. `continue_run` returns the snapshot from the
-previous safe boundary, not the failed step. If no continuable snapshot
-exists at all, `continue_run` raises `LookupError`.
+An `interrupted` snapshot is sendable on resume -- pydantic-ai (>= 2.10)
+repairs broken tool-call/result pairing before every model request -- but
+not necessarily *safe*: a pending tool call may be re-executed (resuming
+without a new prompt) or closed out with a synthesized `interrupted`
+return, and neither says whether the original side effect happened. That
+is the tool-effect ledger's job. So the default read path skips
+`interrupted` snapshots; pass `include_interrupted=True` to
+`continue_run` / `fork_run` / `latest_snapshot` after checking
+`list_unresolved_tool_effects`. If no matching snapshot exists,
+`continue_run` raises `LookupError`.
 
 ## Run lineage -- `parent_run_id`
 
@@ -253,6 +267,10 @@ await librarian.run('continue investigating', message_history=history,
 # If side effects might have happened and the orchestrator wants a fresh attempt:
 history = await fork_run(store, run_id='libr-3f2a')
 # ... pass to a new delegate run with a different agent_name / conversation_id.
+
+# To resume from the interrupted frontier itself (the crashed cycle included),
+# after checking the unresolved effects above:
+history = await continue_run(store, run_id='libr-3f2a', include_interrupted=True)
 ```
 
 Side-effect deduplication is the orchestrator's responsibility. Tools that
@@ -298,6 +316,8 @@ fields when it writes the terminal `completed` / `failed` entry.
   below). WAL mode is enabled; `tool_effects` upserts per
   `(run_id, tool_call_id)` so the latest state wins; snapshots use
   `AUTOINCREMENT seq` to mirror `FileStepStore._next_snapshot_seq`.
+  Databases created before the snapshot `state` column existed gain it
+  automatically on open (existing rows read as `complete`).
   Pass `connection=` instead of `database=` to share a `sqlite3.Connection`
   with the rest of your application; the connection must be opened with
   `check_same_thread=False` because hook calls are dispatched onto a
@@ -310,6 +330,47 @@ dispatched via `anyio.to_thread`).
 `FileStepStore` validates `run_id` against `[A-Za-z0-9_.-]{1,200}` (and
 rejects `..`) to prevent path traversal -- callers passing user-controlled
 IDs should still sanitise first.
+
+## Bounding snapshot growth
+
+Each step writes a new full-history snapshot keyed by an incrementing `seq`,
+and nothing is pruned by default. Within one long `Agent.run` the snapshot
+count equals the number of settled tool-call steps, so a long single run pays a
+growing storage cost.
+
+`InMemoryStepStore`, `FileStepStore`, and `SqliteStepStore` accept an opt-in
+`max_snapshots_per_run: int | None` (default `None`, unbounded -- byte-for-byte
+the prior behavior). When set to `N >= 1`, each `save_snapshot` prunes the run
+down to a retain set:
+
+- the newest `N` snapshots by `seq`,
+- the newest snapshot overall (serves `latest_snapshot(include_interrupted=True)`),
+- the newest `complete` snapshot (serves the default read path).
+
+The last two keep both read modes correct even when the newest `N` snapshots
+are all `interrupted` and the newest resumable `complete` sits below that
+window, so the retain set can exceed `N`. `from_spec(..., max_snapshots_per_run=N)`
+forwards the bound to the constructed store.
+
+```python
+from pydantic_ai_harness.step_persistence import FileStepStore
+
+store = FileStepStore('runs', max_snapshots_per_run=8)
+```
+
+Pruning a snapshot never deletes its externalized media: blobs are
+content-addressed and may be shared across snapshots and runs, so orphaned-blob
+GC is out of scope (see the non-goals below). Age-based (TTL) expiry is out of
+scope too -- it belongs at whole-run granularity, not per snapshot.
+
+Bounded retention discards older per-step snapshots, including pre-compaction
+ones. Any downstream that reconstructs history by unioning a run's retained
+snapshots -- snapshot search or a "full transcript" receipt keyed on `run_id`
+-- can only see what is retained. With a tight bound (for example
+`max_snapshots_per_run=1`) the older, pre-compaction states are gone, so treat
+the bound as a hard limit on how far back such recovery can reach. Leave the
+bound at `None`, or set it high enough to cover the history you need to recover,
+when full-transcript reconstruction matters.
 
 ## Persisting media
 
@@ -495,8 +556,12 @@ abstracting.
   write artifacts, labels, PRs, or external state should call
   `annotate_tool_effect(store, ctx, ...)` (see [Failure recovery](#failure-recovery))
   so the orchestrator can decide whether replay is safe.
-- It does not clean up old snapshots/events. Retention is the caller's
-  responsibility.
+- It does not prune events, and by default does not prune snapshots.
+  Retention is the caller's responsibility; snapshot growth can be bounded
+  opt-in with `max_snapshots_per_run` (see [Bounding snapshot growth](#bounding-snapshot-growth)).
+- It does not garbage-collect externalized media. Pruning a snapshot leaves
+  its content-addressed blobs in place, since they may be shared across
+  snapshots and runs.
 - It does not emit OpenTelemetry spans. pydantic_ai's `Instrumentation`
   capability already spans `agent run` / `chat` / `running tool` and
   populates `gen_ai.agent.name`, `gen_ai.agent.call.id`,
