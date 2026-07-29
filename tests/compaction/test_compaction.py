@@ -1262,8 +1262,8 @@ class TestIncrementalSummarization:
         """When incremental=True and a prior summary exists, it should be included in the prompt."""
         comp = SummarizingCompaction(
             model='test:m',
-            max_messages=3,
-            keep_messages=1,
+            max_messages=4,
+            keep_messages=3,
             incremental=True,
             preserve_first_user_message=False,
         )
@@ -2957,7 +2957,7 @@ class TestKeepUserMessages:
             SummarizingCompaction(model='test', max_messages=10, keep_user_messages_max_chars=0)
 
     @pytest.mark.anyio
-    async def test_all_user_messages_preserved_and_truncated(self):
+    async def test_newest_summarized_user_message_is_preserved_and_truncated(self):
         comp = SummarizingCompaction(
             model='test:m',
             max_messages=3,
@@ -2978,7 +2978,6 @@ class TestKeepUserMessages:
         with patch('pydantic_ai.Agent', return_value=_patched_summary_agent('SUMMARY')):
             result = await comp.before_model_request(_make_ctx(), rc)
         kept = _user_texts(result.messages)
-        assert any('short one' in t for t in kept)
         assert any(t.endswith('[...]') and len(t) == 10 for t in kept)
 
     @pytest.mark.anyio
@@ -3014,7 +3013,7 @@ class TestKeepUserMessages:
         comp = SummarizingCompaction(
             model='test:m',
             max_messages=3,
-            keep_messages=1,
+            keep_messages=2,
             keep_user_messages=True,
             keep_user_messages_max_chars=30,
             bridge_prefix=False,
@@ -3049,7 +3048,7 @@ class TestKeepUserMessages:
         comp = SummarizingCompaction(
             model='test:m',
             max_messages=3,
-            keep_messages=1,
+            keep_messages=2,
             keep_user_messages=True,
             bridge_prefix=False,
         )
@@ -3067,6 +3066,42 @@ class TestKeepUserMessages:
         with patch('pydantic_ai.Agent', return_value=_patched_summary_agent('S2')):
             second = await comp.compact([*first, _user('third'), _assistant('c')], _make_ctx())
         assert sum('first' in text for text in _user_texts(second)) == 1
+
+    @pytest.mark.anyio
+    async def test_retained_user_messages_converge_within_the_tail_budget(self):
+        comp = SummarizingCompaction(
+            model='test:m',
+            max_messages=3,
+            keep_messages=1,
+            keep_user_messages=True,
+            bridge_prefix=False,
+        )
+        messages: list[ModelMessage] = [_user('first'), _assistant('a'), _user('second'), _assistant('b')]
+        summary_agent = _patched_summary_agent('S')
+        with patch('pydantic_ai.Agent', return_value=summary_agent):
+            first = await comp.before_model_request(_make_ctx(), _make_request_context(messages))
+            second = await comp.before_model_request(_make_ctx(), _make_request_context(first.messages))
+        assert summary_agent.run.await_count == 1
+        assert comp.max_messages is not None
+        assert len(first.messages) <= comp.max_messages
+        assert second.messages == first.messages
+
+    @pytest.mark.anyio
+    async def test_retained_users_leave_unused_token_tail_slots_intact(self):
+        comp = SummarizingCompaction(
+            model='test:m',
+            max_tokens=2,
+            keep_tokens=1,
+            keep_messages=3,
+            keep_user_messages=True,
+            bridge_prefix=False,
+            tokenizer=len,
+        )
+        messages: list[ModelMessage] = [_user('xx'), _assistant('x')]
+        with patch('pydantic_ai.Agent', return_value=_patched_summary_agent('S')):
+            result = await comp.compact(messages, _make_ctx())
+        assert _user_texts(result) == ['xx']
+        assert result[-1] == messages[-1]
 
     @pytest.mark.anyio
     async def test_pin_is_not_rebuilt_as_a_kept_user_message(self):

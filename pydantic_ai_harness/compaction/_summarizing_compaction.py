@@ -301,9 +301,10 @@ class SummarizingCompaction(AbstractCapability[AgentDepsT]):
     """
 
     keep_user_messages: bool = False
-    """When ``True``, preserve every prior user message verbatim (each truncated to
-    ``keep_user_messages_max_chars``) alongside the summary -- Codex's cheap fidelity anchor,
-    anti-resumption-drift by construction.  Supersedes ``preserve_first_user_message``.
+    """When ``True``, preserve recent summarized user messages (each truncated to
+    ``keep_user_messages_max_chars``) alongside the summary. Retained messages consume the
+    ``keep_messages`` tail budget, keeping compaction bounded. Supersedes
+    ``preserve_first_user_message``.
     """
 
     keep_user_messages_max_chars: int = 20_000
@@ -361,6 +362,10 @@ class SummarizingCompaction(AbstractCapability[AgentDepsT]):
         extra: list[ModelMessage] = []
         if self.keep_user_messages:
             extra = self._kept_user_messages(to_summarize)
+            extra = extra[-self.keep_messages :] if self.keep_messages else []
+            retained_tail_slots = self.keep_messages - len(extra)
+            if len(preserved) > retained_tail_slots:
+                preserved = preserved[find_safe_cutoff(preserved, retained_tail_slots) :]
         elif self.preserve_first_user_message:
             first_user_msg = find_first_user_message(messages)
             if first_user_msg is not None:

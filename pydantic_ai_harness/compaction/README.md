@@ -275,11 +275,13 @@ task state and scratchpads that live *in* the history.
 
 User turns are the highest signal-per-token content in a conversation, and losing them is the
 main driver of resumption drift. `SummarizingCompaction(keep_user_messages=True)` preserves
-every prior user turn alongside the summary, each bounded to
-`keep_user_messages_max_chars` (default 20k) with an explicit truncation marker when it
-overruns. The budget applies per part, shared across the text items of a multi-part prompt;
-images, audio, and cache points pass through untouched. This supersedes
-`preserve_first_user_message` (which keeps only the first).
+the newest user turns from the summarized prefix alongside the summary. They consume the
+existing `keep_messages` tail budget, so at most that many retained user messages and tail
+messages survive together; compaction therefore does not grow retained copies on each cycle.
+Each retained turn is bounded to `keep_user_messages_max_chars` (default 20k) with an explicit
+truncation marker when it overruns. The character budget applies per part, shared across the
+text items of a multi-part prompt; images, audio, and cache points pass through untouched. This
+supersedes `preserve_first_user_message` (which keeps only the first).
 
 ```python
 SummarizingCompaction(max_tokens=120_000, keep_messages=20, keep_user_messages=True)
