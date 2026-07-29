@@ -204,7 +204,10 @@ class E2BSandboxExecResult:
     """The bounded outcome of running a command in an E2B sandbox."""
 
     stdout: str
+    """Retained stdout: the bounded tail, or the bounded prefix when `timed_out` is set."""
+
     stderr: str
+    """Retained stderr: the bounded tail, or the bounded prefix when `timed_out` is set."""
     returncode: int
     stdout_truncated: bool = False
     stderr_truncated: bool = False
@@ -213,32 +216,51 @@ class E2BSandboxExecResult:
 
 
 def _capture_wrapper(temp_dir: str, max_output_bytes: int) -> str:
-    """Build a Bash wrapper that retains a bounded tail and counts total bytes."""
+    """Build a Bash wrapper that retains a bounded tail and counts total bytes.
+
+    `tail -c` and `wc -c` only flush at EOF, so a timed-out command (killed before
+    its streams close) leaves both files empty. Each stream is therefore also teed
+    into a FIFO drained by `head -c limit+1`, which writes a bounded prefix
+    incrementally and keeps a reader attached afterwards (`cat`), so tee never
+    loses a reader and a SIGKILLed pipeline still leaves partial output on disk.
+    The extra byte past the limit makes timeout truncation detection exact.
+    """
     command_path = shlex.quote(posixpath.join(temp_dir, 'command.sh'))
     stdout_path = shlex.quote(posixpath.join(temp_dir, 'stdout'))
     stderr_path = shlex.quote(posixpath.join(temp_dir, 'stderr'))
+    stdout_partial = shlex.quote(posixpath.join(temp_dir, 'stdout.partial'))
+    stderr_partial = shlex.quote(posixpath.join(temp_dir, 'stderr.partial'))
     stdout_stream = shlex.quote(posixpath.join(temp_dir, 'stdout.stream'))
     stderr_stream = shlex.quote(posixpath.join(temp_dir, 'stderr.stream'))
     stdout_count_stream = shlex.quote(posixpath.join(temp_dir, 'stdout.count.stream'))
     stderr_count_stream = shlex.quote(posixpath.join(temp_dir, 'stderr.count.stream'))
+    stdout_partial_stream = shlex.quote(posixpath.join(temp_dir, 'stdout.partial.stream'))
+    stderr_partial_stream = shlex.quote(posixpath.join(temp_dir, 'stderr.partial.stream'))
     stdout_count = shlex.quote(posixpath.join(temp_dir, 'stdout.count'))
     stderr_count = shlex.quote(posixpath.join(temp_dir, 'stderr.count'))
     limit = str(max_output_bytes)
+    prefix_limit = str(max_output_bytes + 1)
     return f"""#!/bin/bash
 set +e
-mkfifo {stdout_stream} {stderr_stream} {stdout_count_stream} {stderr_count_stream} || exit 125
+mkfifo {stdout_stream} {stderr_stream} {stdout_count_stream} {stderr_count_stream} {stdout_partial_stream} {stderr_partial_stream} || exit 125
 wc -c < {stdout_count_stream} > {stdout_count} &
 stdout_count_pid=$!
-tee {stdout_count_stream} < {stdout_stream} | tail -c {limit} > {stdout_path} &
+tee {stdout_count_stream} {stdout_partial_stream} < {stdout_stream} | tail -c {limit} > {stdout_path} &
 stdout_capture_pid=$!
+{{ head -c {prefix_limit} > {stdout_partial}; cat > /dev/null; }} < {stdout_partial_stream} &
+stdout_partial_pid=$!
 wc -c < {stderr_count_stream} > {stderr_count} &
 stderr_count_pid=$!
-tee {stderr_count_stream} < {stderr_stream} | tail -c {limit} > {stderr_path} &
+tee {stderr_count_stream} {stderr_partial_stream} < {stderr_stream} | tail -c {limit} > {stderr_path} &
 stderr_capture_pid=$!
+{{ head -c {prefix_limit} > {stderr_partial}; cat > /dev/null; }} < {stderr_partial_stream} &
+stderr_partial_pid=$!
 /bin/bash {command_path} > {stdout_stream} 2> {stderr_stream}
 command_status=$?
-wait "$stdout_capture_pid" "$stderr_capture_pid" "$stdout_count_pid" "$stderr_count_pid"
-capture_status=$?
+capture_status=0
+for pid in "$stdout_capture_pid" "$stderr_capture_pid" "$stdout_count_pid" "$stderr_count_pid" "$stdout_partial_pid" "$stderr_partial_pid"; do
+  wait "$pid" || capture_status=1
+done
 if [ "$capture_status" -ne 0 ]; then
   exit 125
 fi
@@ -369,23 +391,36 @@ class E2BSandboxSession:
         )
 
     async def __aexit__(self, *args: object) -> None:
-        """Kill an owned sandbox; leave an attached sandbox running."""
-        body_failed = bool(args and args[0] is not None)
+        """Kill an owned sandbox; leave an attached sandbox running.
+
+        A cleanup failure never replaces the body's result or an exception already
+        unwinding: it warns with the sandbox id and the `sandbox_timeout` backstop,
+        and keeps the sandbox reference so `close()` can be retried explicitly.
+        """
         try:
             await self.close()
         except E2BSandboxError as e:
-            if not body_failed:
-                raise
-            warnings.warn(f'Could not clean up the owned E2B sandbox: {e}', RuntimeWarning, stacklevel=2)
+            warnings.warn(
+                f'Could not clean up the owned E2B sandbox {self.sandbox_id!r}: {e}. '
+                f'It stays running until its {self._sandbox_timeout}s sandbox_timeout terminates it; '
+                'call `close()` to retry.',
+                RuntimeWarning,
+                stacklevel=2,
+            )
 
     async def close(self) -> None:
-        """Close the session, preserving sandbox identity when owned cleanup fails."""
+        """Close the session, preserving sandbox identity when owned cleanup fails.
+
+        A sandbox that is already gone counts as cleaned up. Any other kill failure
+        raises and keeps `self._sandbox` so the caller can retry `close()`.
+        """
         sandbox = self._sandbox
         if sandbox is None:
             return
         if self._sandbox_id is not None:
             self._sandbox = None
             return
+        e2b = _load_e2b()
         with self._tracer.start_as_current_span('e2b.sandbox.kill') as span:
             span.set_attribute('e2b.sandbox.id', sandbox.sandbox_id)
             span.set_attribute('e2b.sandbox.mode', 'owned')
@@ -394,10 +429,16 @@ class E2BSandboxSession:
                     with anyio.fail_after(_TEARDOWN_TIMEOUT):
                         await sandbox.kill()
             except Exception as e:
-                span.set_attribute('e2b.outcome', 'error')
-                span.set_attribute('e2b.exception_type', type(e).__name__)
-                raise self._operation_error(e, 'Could not kill the owned E2B sandbox') from e
-            span.set_attribute('e2b.outcome', 'success')
+                if isinstance(e, e2b.SandboxNotFoundException):
+                    # An owned sandbox that already self-terminated (e.g. at its
+                    # `sandbox_timeout`) needs no cleanup.
+                    span.set_attribute('e2b.outcome', 'already_gone')
+                else:
+                    span.set_attribute('e2b.outcome', 'error')
+                    span.set_attribute('e2b.exception_type', type(e).__name__)
+                    raise self._operation_error(e, 'Could not kill the owned E2B sandbox') from e
+            else:
+                span.set_attribute('e2b.outcome', 'success')
             self._sandbox = None
 
     def _require_sandbox(self) -> _AsyncSandbox:
@@ -483,18 +524,14 @@ class E2BSandboxSession:
             raise
 
         try:
-            stdout, stdout_truncated = await self._read_capture(
-                temp_dir,
-                'stdout',
-                max_output_bytes,
-                incomplete_ok=timed_out,
-            )
-            stderr, stderr_truncated = await self._read_capture(
-                temp_dir,
-                'stderr',
-                max_output_bytes,
-                incomplete_ok=timed_out,
-            )
+            if timed_out:
+                # The tail/count pipeline is killed before it can flush; the prefix
+                # files are written incrementally and survive the kill.
+                stdout, stdout_truncated = await self._read_partial(temp_dir, 'stdout', max_output_bytes)
+                stderr, stderr_truncated = await self._read_partial(temp_dir, 'stderr', max_output_bytes)
+            else:
+                stdout, stdout_truncated = await self._read_capture(temp_dir, 'stdout', max_output_bytes)
+                stderr, stderr_truncated = await self._read_capture(temp_dir, 'stderr', max_output_bytes)
         except Exception as e:
             raise self._operation_error(e, 'Could not read bounded E2B command output') from e
         finally:
@@ -537,32 +574,38 @@ class E2BSandboxSession:
         temp_dir: str,
         stream: str,
         max_output_bytes: int,
-        *,
-        incomplete_ok: bool,
     ) -> tuple[str, bool]:
         sandbox = self._require_sandbox()
-        e2b = _load_e2b()
-        try:
-            data = bytes(await sandbox.files.read(posixpath.join(temp_dir, stream), 'bytes'))
-        except Exception as e:
-            if incomplete_ok and isinstance(e, e2b.FileNotFoundException):
-                return '', False
-            raise
+        data = bytes(await sandbox.files.read(posixpath.join(temp_dir, stream), 'bytes'))
         bounded = data[-max_output_bytes:]
         decoded = bounded.decode('utf-8', errors='replace')
-        try:
-            count_data = bytes(await sandbox.files.read(posixpath.join(temp_dir, f'{stream}.count'), 'bytes'))
-        except Exception as e:
-            if incomplete_ok and isinstance(e, e2b.FileNotFoundException):
-                return decoded, len(data) >= max_output_bytes
-            raise
+        count_data = bytes(await sandbox.files.read(posixpath.join(temp_dir, f'{stream}.count'), 'bytes'))
         try:
             total_bytes = int(count_data.decode().strip())
         except (UnicodeDecodeError, ValueError) as e:
-            if incomplete_ok:
-                return decoded, len(data) >= max_output_bytes
             raise E2BSandboxError(f'E2B command {stream} byte count was invalid.') from e
         return decoded, total_bytes > len(bounded)
+
+    async def _read_partial(
+        self,
+        temp_dir: str,
+        stream: str,
+        max_output_bytes: int,
+    ) -> tuple[str, bool]:
+        """Read the incrementally captured prefix of a killed command's stream.
+
+        The prefix file holds at most `max_output_bytes + 1` bytes; the extra byte
+        makes truncation exact rather than a length guess. A missing file means the
+        pipeline died before producing anything, not an error.
+        """
+        sandbox = self._require_sandbox()
+        e2b = _load_e2b()
+        try:
+            data = bytes(await sandbox.files.read(posixpath.join(temp_dir, f'{stream}.partial'), 'bytes'))
+        except e2b.FileNotFoundException:
+            return '', False
+        bounded = data[:max_output_bytes]
+        return bounded.decode('utf-8', errors='replace'), len(data) > max_output_bytes
 
     async def _remove_temp_dir(self, temp_dir: str) -> None:
         with anyio.CancelScope(shield=True):

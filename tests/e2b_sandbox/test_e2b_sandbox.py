@@ -13,6 +13,7 @@ from opentelemetry.sdk.trace.export import SimpleSpanProcessor
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 from opentelemetry.trace import NoOpTracer, Tracer
 from pydantic_ai import Agent, RunContext
+from pydantic_ai.capabilities import Capability
 from pydantic_ai.exceptions import ModelRetry, UserError
 from pydantic_ai.messages import ModelMessage, ModelResponse, TextPart, ToolCallPart, ToolReturnPart
 from pydantic_ai.models.function import AgentInfo, FunctionModel
@@ -128,6 +129,13 @@ class TestRunCommand:
             result = await tools.run_command('sleep 99', timeout_seconds=2)
         assert result == '[stdout]\npartial\n[timed out after 2s]'
         assert fake_e2b.sandboxes[0].commands.handles[0].killed is True
+
+    async def test_timeout_output_is_marked_as_prefix(self, fake_e2b: FakeE2B) -> None:
+        fake_e2b.responder = lambda command, timeout: ('A' * 100 + 'END', '', 0)
+        fake_e2b.wait_error = TimeoutException('deadline')
+        async with _toolset(max_output_bytes=20) as tools:
+            result = await tools.run_command('flood', timeout_seconds=2)
+        assert result == f'[stdout]\n{"A" * 20}\n[... output truncated to the first 20B ...]\n[timed out after 2s]'
 
     async def test_timeout_rounds_and_clamps(self, fake_e2b: FakeE2B) -> None:
         async with _toolset(sandbox_timeout=20, default_command_timeout=4.1) as tools:
@@ -444,6 +452,40 @@ class TestCapability:
                 name=f'e2b_{engine_name.lower()}',
                 capabilities=[E2BSandbox(), durability_type()],
             )
+
+    @pytest.mark.parametrize(
+        ('module_name', 'class_name', 'engine_name'),
+        [
+            ('pydantic_ai.durable_exec.temporal', 'TemporalDurability', 'Temporal'),
+            ('pydantic_ai.durable_exec.dbos', 'DBOSDurability', 'DBOS'),
+        ],
+    )
+    @pytest.mark.anyio(backends=['asyncio'])
+    async def test_run_level_durable_execution_is_rejected(
+        self,
+        fake_e2b: FakeE2B,
+        module_name: str,
+        class_name: str,
+        engine_name: str,
+    ) -> None:
+        module = pytest.importorskip(module_name)
+        durability_type = getattr(module, class_name)
+        agent: Agent[None, str] = Agent(TestModel(), capabilities=[E2BSandbox()])
+
+        with pytest.raises(UserError, match=rf'E2BSandbox.*{engine_name}'):
+            await agent.run('hi', capabilities=[durability_type()])
+        assert fake_e2b.sandboxes == []
+
+    @pytest.mark.anyio(backends=['asyncio'])
+    async def test_run_level_non_durability_capability_is_allowed(self, fake_e2b: FakeE2B) -> None:
+        import sniffio
+
+        if sniffio.current_async_library() != 'asyncio':  # pragma: no cover
+            pytest.skip('Agent.run() requires asyncio')
+        agent: Agent[None, str] = Agent(TestModel(), capabilities=[E2BSandbox()])
+        result = await agent.run('hi', capabilities=[Capability(id='run_extra', description='run extra')])
+        assert result.output
+        assert fake_e2b.sandboxes[0].kill_calls == 1
 
     @pytest.mark.anyio(backends=['asyncio'])
     async def test_agent_can_call_command(self, fake_e2b: FakeE2B) -> None:

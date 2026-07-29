@@ -155,12 +155,12 @@ class E2BSandboxToolset(FunctionToolset[AgentDepsT]):
         )
         return min(max(1, math.ceil(requested)), ceiling)
 
-    def _truncate_stream(self, text: str, already_truncated: bool) -> str:
+    def _truncate_stream(self, text: str, already_truncated: bool, *, direction: Literal['head', 'tail']) -> str:
         return truncate_output(
             text,
             max_lines=self._max_output_lines,
             max_bytes=self._max_output_bytes,
-            direction='tail',
+            direction=direction,
             already_truncated=already_truncated,
         )
 
@@ -203,11 +203,18 @@ class E2BSandboxToolset(FunctionToolset[AgentDepsT]):
             else:
                 span.set_attribute('e2b.outcome', 'success')
 
+        # Timed-out commands return a bounded prefix, so truncate head-first and say
+        # "first" in the marker; completed commands keep the bounded tail.
+        direction: Literal['head', 'tail'] = 'head' if result.timed_out else 'tail'
         parts: list[str] = []
         if result.stdout:
-            parts.append(f'[stdout]\n{self._truncate_stream(result.stdout, result.stdout_truncated)}')
+            parts.append(
+                f'[stdout]\n{self._truncate_stream(result.stdout, result.stdout_truncated, direction=direction)}'
+            )
         if result.stderr:
-            parts.append(f'[stderr]\n{self._truncate_stream(result.stderr, result.stderr_truncated)}')
+            parts.append(
+                f'[stderr]\n{self._truncate_stream(result.stderr, result.stderr_truncated, direction=direction)}'
+            )
         output = '\n'.join(parts) if parts else '(no output)'
         if result.timed_out:
             return f'{output}\n[timed out after {result.applied_timeout}s]'

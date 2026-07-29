@@ -4,10 +4,11 @@ from __future__ import annotations
 
 import math
 import posixpath
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
+from pydantic_ai import RunContext
 from pydantic_ai.capabilities import AbstractCapability
 from pydantic_ai.exceptions import UserError
 from pydantic_ai.tools import AgentDepsT
@@ -43,6 +44,25 @@ _REUSED_INSTRUCTIONS = (
 )
 
 
+def _durability_engines(capabilities: Iterable[AbstractCapability[Any]]) -> set[str]:
+    """Name the durable execution engines among `capabilities` (e.g. Temporal, DBOS)."""
+    engines: set[str] = set()
+    for capability in capabilities:
+        if any((base.__module__, base.__name__) == _DURABILITY_BASE for base in type(capability).__mro__):
+            engines.add(type(capability).__name__.removesuffix('Durability'))
+    return engines
+
+
+def _reject_durability(engines: set[str]) -> None:
+    if engines:
+        names = ', '.join(sorted(engines))
+        raise UserError(
+            f'E2BSandbox cannot be combined with durable execution capabilities ({names}). '
+            'Its run-scoped E2B client and sandbox lifecycle cannot safely cross or replay '
+            'activity, step, or task boundaries.'
+        )
+
+
 @dataclass(kw_only=True)
 class E2BSandbox(AbstractCapability[AgentDepsT]):
     """Access to an isolated cloud sandbox powered by [E2B](https://e2b.dev).
@@ -54,8 +74,8 @@ class E2BSandbox(AbstractCapability[AgentDepsT]):
 
     Requires the `e2b` extra (`uv add "pydantic-ai-harness[e2b]"`) and an
     `E2B_API_KEY`. Durable execution capabilities are rejected during agent
-    construction because E2B's run-scoped client and sandbox lifecycle cannot
-    safely cross or replay their activity, step, or task boundaries.
+    construction and at run start because E2B's run-scoped client and sandbox
+    lifecycle cannot safely cross or replay their activity, step, or task boundaries.
     """
 
     template: str | None = None
@@ -137,21 +157,20 @@ class E2BSandbox(AbstractCapability[AgentDepsT]):
 
     def for_agent(self, agent: AbstractAgent[AgentDepsT, Any]) -> Self:
         """Reject durability wrappers that cannot preserve the E2B session lifecycle."""
-        engines: set[str] = set()
-
-        def collect(capability: AbstractCapability[AgentDepsT]) -> None:
-            if any((base.__module__, base.__name__) == _DURABILITY_BASE for base in type(capability).__mro__):
-                engines.add(type(capability).__name__.removesuffix('Durability'))
-
-        agent.root_capability.apply(collect)
-        if engines:
-            names = ', '.join(sorted(engines))
-            raise UserError(
-                f'E2BSandbox cannot be combined with durable execution capabilities ({names}). '
-                'Its run-scoped E2B client and sandbox lifecycle cannot safely cross or replay '
-                'activity, step, or task boundaries.'
-            )
+        leaves: list[AbstractCapability[AgentDepsT]] = []
+        agent.root_capability.apply(leaves.append)
+        _reject_durability(_durability_engines(leaves))
         return self
+
+    def _validate_runtime_capabilities(
+        self, ctx: RunContext[AgentDepsT], capabilities: Sequence[AbstractCapability[AgentDepsT]]
+    ) -> None:
+        """Apply the durability rejection to capabilities added for a single run.
+
+        This private core hook is the existing seam for vetoing per-run capability
+        additions (pydantic-ai#5477); the coupling is isolated to this one override.
+        """
+        _reject_durability(_durability_engines(capabilities))
 
     def _validate_configuration(self) -> None:
         for name, value in (

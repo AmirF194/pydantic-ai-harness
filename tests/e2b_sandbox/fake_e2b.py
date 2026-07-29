@@ -260,14 +260,23 @@ class FakeCommands:
         temp_dir = posixpath.dirname(wrapper_path)
         command_text = self._sandbox.files.files[f'{temp_dir}/command.sh'].decode()
         wrapper = self._sandbox.files.files[wrapper_path].decode()
-        match = re.search(r'tail -c (\d+)', wrapper)
-        if match is None:  # pragma: no cover - asserts Harness's private wrapper contract
-            raise AssertionError('Harness capture wrapper did not contain a byte limit')
-        byte_limit = int(match.group(1))
+        tail_match = re.search(r'tail -c (\d+)', wrapper)
+        head_match = re.search(r'head -c (\d+)', wrapper)
+        if tail_match is None or head_match is None:  # pragma: no cover - asserts Harness's private wrapper contract
+            raise AssertionError('Harness capture wrapper did not contain the byte limits')
+        byte_limit = int(tail_match.group(1))
+        if int(head_match.group(1)) != byte_limit + 1:  # pragma: no cover - asserts Harness's private wrapper contract
+            raise AssertionError('Harness prefix capture must hold one byte past the tail limit')
         stdout, stderr, exit_code = self._control.responder(command_text, int(timeout or 0))
         if not self._control.omit_capture:
-            self._write_capture(temp_dir, 'stdout', stdout, byte_limit)
-            self._write_capture(temp_dir, 'stderr', stderr, byte_limit)
+            if isinstance(self._control.wait_error, TimeoutException):
+                # A killed pipeline flushes only the incrementally written prefix;
+                # the tail/count files die empty with the process group.
+                self._write_partial(temp_dir, 'stdout', stdout, byte_limit)
+                self._write_partial(temp_dir, 'stderr', stderr, byte_limit)
+            else:
+                self._write_capture(temp_dir, 'stdout', stdout, byte_limit)
+                self._write_capture(temp_dir, 'stderr', stderr, byte_limit)
         result = FakeCommandResult(
             self._control.sdk_stdout,
             self._control.sdk_stderr,
@@ -284,6 +293,10 @@ class FakeCommands:
         count = b'invalid' if self._control.invalid_count else str(len(data)).encode()
         if not self._control.omit_count:
             self._sandbox.files.files[f'{temp_dir}/{stream}.count'] = count
+
+    def _write_partial(self, temp_dir: str, stream: str, text: str, byte_limit: int) -> None:
+        data = text.encode()
+        self._sandbox.files.files[f'{temp_dir}/{stream}.partial'] = data[: byte_limit + 1]
 
 
 class FakeSandbox:

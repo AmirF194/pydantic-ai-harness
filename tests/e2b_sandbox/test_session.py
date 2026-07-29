@@ -104,16 +104,28 @@ class TestLifecycle:
 
     async def test_cleanup_failure_warns_during_body_error(self, fake_e2b: FakeE2B) -> None:
         fake_e2b.kill_error = SandboxException('kill failed')
-        with pytest.warns(RuntimeWarning, match='Could not clean up'):
+        with pytest.warns(RuntimeWarning, match="'sbx-1'.*sandbox_timeout"):
             with pytest.raises(RuntimeError, match='body failed'):
                 async with E2BSandboxSession():
                     raise RuntimeError('body failed')
 
-    async def test_cleanup_failure_raises_after_clean_body(self, fake_e2b: FakeE2B) -> None:
+    async def test_cleanup_failure_warns_after_clean_body_and_allows_retry(self, fake_e2b: FakeE2B) -> None:
         fake_e2b.kill_error = SandboxException('kill failed')
-        with pytest.raises(E2BSandboxError, match='Could not kill'):
-            async with E2BSandboxSession():
-                pass
+        session = E2BSandboxSession()
+        await session.__aenter__()
+        with pytest.warns(RuntimeWarning, match="'sbx-1'.*300s sandbox_timeout"):
+            await session.__aexit__(None, None, None)
+        assert session.sandbox_id == 'sbx-1'
+        fake_e2b.kill_error = None
+        await session.close()
+        assert session.sandbox_id is None
+
+    async def test_gone_sandbox_is_successful_cleanup(self, fake_e2b: FakeE2B) -> None:
+        fake_e2b.kill_error = SandboxNotFoundException('gone')
+        async with E2BSandboxSession() as session:
+            pass
+        assert fake_e2b.sandboxes[0].kill_calls == 1
+        assert session.sandbox_id is None
 
 
 class TestConfigurationAndErrors:
@@ -222,7 +234,6 @@ class TestExec:
     async def test_timeout_kills_process_group_and_handle(self, fake_e2b: FakeE2B) -> None:
         fake_e2b.responder = lambda command, timeout: ('partial', '', 0)
         fake_e2b.wait_error = TimeoutException('deadline')
-        fake_e2b.invalid_count = True
         fake_e2b.kill_process_error = SandboxException('already gone')
         fake_e2b.handle_kill_error = SandboxException('already gone')
         async with E2BSandboxSession() as session:
@@ -232,6 +243,25 @@ class TestExec:
         assert result.stdout == 'partial'
         assert fake_e2b.sandboxes[0].commands.handles[0].killed is True
 
+    async def test_timeout_returns_bounded_prefix_not_tail(self, fake_e2b: FakeE2B) -> None:
+        fake_e2b.responder = lambda command, timeout: ('A' * 20 + 'END', 'B' * 20 + 'ERR', 0)
+        fake_e2b.wait_error = TimeoutException('deadline')
+        async with E2BSandboxSession() as session:
+            result = await session.exec('flood', timeout=2, max_output_bytes=10)
+        assert result.stdout == 'A' * 10
+        assert result.stderr == 'B' * 10
+        assert result.stdout_truncated is True
+        assert result.stderr_truncated is True
+
+    @pytest.mark.parametrize(('length', 'truncated'), [(10, False), (11, True)])
+    async def test_timeout_prefix_truncation_boundary(self, fake_e2b: FakeE2B, length: int, truncated: bool) -> None:
+        fake_e2b.responder = lambda command, timeout: ('x' * length, '', 0)
+        fake_e2b.wait_error = TimeoutException('deadline')
+        async with E2BSandboxSession() as session:
+            result = await session.exec('flood', timeout=2, max_output_bytes=10)
+        assert result.stdout == 'x' * min(length, 10)
+        assert result.stdout_truncated is truncated
+
     async def test_timeout_without_capture_returns_empty(self, fake_e2b: FakeE2B) -> None:
         fake_e2b.wait_error = TimeoutException('deadline')
         fake_e2b.omit_capture = True
@@ -239,15 +269,6 @@ class TestExec:
             result = await session.exec('sleep 99', timeout=2, max_output_bytes=100)
         assert result.stdout == result.stderr == ''
         assert result.timed_out is True
-
-    async def test_timeout_without_count_returns_available_tail(self, fake_e2b: FakeE2B) -> None:
-        fake_e2b.responder = lambda command, timeout: ('partial', '', 0)
-        fake_e2b.wait_error = TimeoutException('deadline')
-        fake_e2b.omit_count = True
-        async with E2BSandboxSession() as session:
-            result = await session.exec('sleep 99', timeout=2, max_output_bytes=100)
-        assert result.stdout == 'partial'
-        assert result.stdout_truncated is False
 
     async def test_missing_capture_on_completed_command_is_an_error(self, fake_e2b: FakeE2B) -> None:
         fake_e2b.omit_capture = True

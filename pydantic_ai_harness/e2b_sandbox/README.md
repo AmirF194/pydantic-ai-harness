@@ -123,9 +123,15 @@ before the SDK receives them. Each stream retains at most `max_output_bytes`,
 then the model-facing result applies `max_output_bytes` and `max_output_lines`
 again. Truncation is marked and stream labels are preserved.
 
-This capture wrapper requires Bash, `setsid`, `mkfifo`, `wc`, `tee`, and GNU
-`tail`. E2B's standard `base` template supplies them. Custom templates must
-retain those programs.
+A completed command returns the bounded tail. The tail pipeline flushes only
+when the streams close, so a timed-out command instead returns a bounded prefix
+(at most `max_output_bytes`) captured incrementally and marked as truncated to
+the first bytes. The truncation flag is exact: the prefix capture retains one
+byte past the limit to tell "exactly full" from "cut off".
+
+This capture wrapper requires Bash, `setsid`, `mkfifo`, `cat`, `wc`, `tee`, and
+GNU `head` and `tail`. E2B's standard `base` template supplies them. Custom
+templates must retain those programs.
 
 `read_file` checks metadata and then streams at most `max_read_bytes + 1` bytes,
 so a file that grows after the metadata check still cannot create an unbounded
@@ -142,16 +148,20 @@ unless `max_command_timeout` is set explicitly.
 
 When E2B reports a timeout or the client wait is cancelled, Harness makes
 best-effort attempts to kill both the command's process group and its E2B command
-handle. Exiting an owned session also kills the whole sandbox. The E2B async SDK
-uses asyncio internally, so real E2B runs require an asyncio event loop.
+handle. Exiting an owned session also kills the whole sandbox; a sandbox that is
+already gone counts as cleaned up. If the kill request itself fails, the run
+keeps its result: Harness emits a `RuntimeWarning` naming the sandbox id and the
+`sandbox_timeout` backstop, and the session keeps the sandbox reference so
+`close()` can be retried. The E2B async SDK uses asyncio internally, so real E2B
+runs require an asyncio event loop.
 
 ## Durable execution
 
 `E2BSandbox` cannot currently be combined with Pydantic AI's Temporal, DBOS, or
 Prefect durability capabilities. Its run-scoped E2B client and sandbox lifecycle
 cannot safely cross or replay activity, step, or task boundaries. Harness rejects
-that combination when the agent is constructed, before a sandbox or tool call is
-started.
+that combination when the agent is constructed and when durability capabilities
+are supplied for a single run, before a sandbox or tool call is started.
 
 ## Configuration
 
