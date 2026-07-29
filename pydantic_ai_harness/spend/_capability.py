@@ -7,9 +7,10 @@ share. It prices each response with
 [`ModelResponse.cost()`][pydantic_ai.messages.ModelResponse.cost], adds it to
 every configured window, and refuses the next request once a window is spent.
 
-The gate is local and immediate. Provider usage APIs report minutes to hours
-late and Logfire around half a minute late, which is useful for reconciling a
-counter and useless for stopping the request a runaway loop is about to make.
+The gate is local and immediate. Provider usage APIs and observability backends
+aggregate after the fact and are read by polling, so a number there moves only
+once the requests behind it have already been made -- enough to reconcile a
+counter, not enough to stop the request a runaway loop is about to make.
 """
 
 from __future__ import annotations
@@ -79,7 +80,9 @@ class SpendLimits(AbstractCapability[AgentDepsT]):
     itself is the activity. A store that talks over the network therefore reads
     and writes from workflow code, which Temporal replays. Use the in-process
     store there, and enforce a shared budget before starting the workflow with
-    `status()`.
+    `exhausted()`. Temporal's workflow sandbox also restricts the clock these
+    hooks read, so the workflow runner needs
+    `SandboxRestrictions.default.with_passthrough_modules('pydantic_ai_harness')`.
     """
 
     budgets: Sequence[Budget] = ()
@@ -115,7 +118,12 @@ class SpendLimits(AbstractCapability[AgentDepsT]):
     """
 
     clock: Callable[[], datetime] = utc_now
-    """Supplies the time that day and month windows are derived from."""
+    """Supplies the time that day and month windows are derived from.
+
+    It does not reach a default-constructed `store`, which keeps its own `utc_now` for
+    expiry. Both remain absolute instants, so a custom clock buckets on one and expires on
+    the other; pass the same callable to the store when that matters.
+    """
 
     def __post_init__(self) -> None:
         """Reject an `on_unpriced` that arrived as plain data and is not one of the two policies.
@@ -152,13 +160,17 @@ class SpendLimits(AbstractCapability[AgentDepsT]):
         return 'SpendLimits'
 
     def get_ordering(self) -> CapabilityOrdering:
-        """Sit innermost, so no capability can reject a response before it is counted.
+        """Sit innermost, so a capability listed after this one cannot reject a billed response.
 
-        `after_model_request` runs innermost first. Anywhere else in the chain, a
-        capability listed after this one -- which is how anyone would write it --
-        can raise `ModelRetry` on a response that was already generated and
-        billed, and the counter never sees it. Being innermost is what makes
-        "counted exactly once" true rather than order-dependent.
+        `after_model_request` reaches innermost capabilities first. Anywhere else in the
+        chain, a capability listed after this one -- which is how anyone would write it --
+        can raise `ModelRetry` on a response that was already generated and billed, and the
+        counter never sees it.
+
+        This orders against non-innermost capabilities only. Innermost members are not
+        ordered among themselves, and the one listed later runs `after_model_request`
+        first, so another innermost capability (`TemporalDurability`, `InputGuardrail`)
+        placed after this one can still reject a response before it is counted.
         """
         return CapabilityOrdering(position='innermost')
 
@@ -253,8 +265,8 @@ class SpendLimits(AbstractCapability[AgentDepsT]):
 
         Reach for [`exhausted`][pydantic_ai_harness.spend.SpendLimits.exhausted] when the
         answer gates something: `any(s.exhausted for s in ...)` over a tuple that happens to
-        be empty is a brake that reads as enforcement and inspects nothing, and a `SpendLimits` whose
-        budgets are all scoped returns exactly that tuple.
+        be empty is a brake that reads as enforcement and inspects nothing, and a `SpendLimits`
+        whose budgets are all scoped returns exactly that tuple.
         """
         statuses, _ = await self._resolve(ctx, scope)
         return statuses
@@ -262,8 +274,19 @@ class SpendLimits(AbstractCapability[AgentDepsT]):
     async def _resolve(
         self, ctx: RunContext[AgentDepsT] | None, scope: str | None
     ) -> tuple[tuple[BudgetStatus, ...], tuple[str, ...]]:
-        """The readable budgets, and the names of the ones this call cannot resolve."""
-        now = self.clock()
+        """The readable budgets, and the names of the ones this call cannot resolve.
+
+        `ctx` and `scope` are two answers to the same question, so supplying both is refused
+        rather than resolved by precedence: a run's own scope silently winning would report
+        one tenant's money under another tenant's name, and the caller has no way to tell.
+        """
+        if ctx is not None and scope is not None:
+            raise UserError(
+                'Pass either a run context or `scope=`, not both: `ctx` already names the partition to read, '
+                'so a second answer here would be reporting one scope under the name of another. '
+                'Drop `scope=` to read the run, or drop `ctx` to read another partition.'
+            )
+        now = self._now()
         statuses: list[BudgetStatus] = []
         unresolved: list[str] = []
         for budget in self.budgets:
@@ -315,6 +338,27 @@ class SpendLimits(AbstractCapability[AgentDepsT]):
         budgets = [_budget_from_spec(entry) for entry in kwargs.pop('budgets', [])]
         return cls(*args, budgets=budgets, **kwargs)
 
+    def _now(self) -> datetime:
+        """The current time, naming the fix when Temporal's sandbox refuses the clock.
+
+        These hooks run in workflow code, and the default clock calls `datetime.now`, which
+        Temporal's workflow sandbox restricts. The sandbox's own error names
+        `datetime.datetime.now` and not the setting that resolves it, so it is translated
+        here. Matched by class name rather than by importing `temporalio`, which this package
+        does not depend on.
+        """
+        try:
+            return self.clock()
+        except Exception as error:
+            if type(error).__name__ != 'RestrictedWorkflowAccessError':
+                raise
+            raise UserError(
+                "SpendLimits reads the clock from workflow code, which Temporal's workflow sandbox "
+                'restricts. Pass this package through the sandbox with '
+                "`SandboxRestrictions.default.with_passthrough_modules('pydantic_ai_harness')`, "
+                'and keep the in-process store inside the workflow.'
+            ) from error
+
     def _key(
         self,
         budget: Budget,
@@ -353,7 +397,7 @@ class SpendLimits(AbstractCapability[AgentDepsT]):
         the same string are caught as well. That is the common way it happens: a scope written
         twice as `lambda ctx: ctx.deps.tenant` is two objects and one key.
         """
-        now = self.clock()
+        now = self._now()
         keyed = [(budget, self._key(budget, ctx, now, None)) for budget in self.budgets]
         claimed: dict[tuple[str, str], Budget] = {}
         for budget, key in keyed:

@@ -32,7 +32,6 @@ from pydantic_ai_harness.spend import (
     Spent,
     UnpricedModelError,
 )
-from pydantic_ai_harness.spend._store import _SWEEP_EVERY
 
 pytestmark = pytest.mark.anyio
 
@@ -349,6 +348,24 @@ class TestScope:
 
         with pytest.raises(UserError, match='must be non-empty and must not be'):
             await _record(guard)
+
+    async def test_a_run_context_and_an_explicit_scope_together_are_refused(self):
+        """Resolving one over the other silently reports one tenant's money under another's name."""
+        guard = SpendLimits(
+            budgets=[Budget(usd=Decimal('5'), scope=lambda ctx: str(ctx.deps), name='tenant')],
+            price=lambda r: Decimal('1'),
+        )
+        await _record(guard, ctx=_run_ctx(deps='tenant-a'))
+        ctx = _run_ctx(deps='tenant-a')
+
+        with pytest.raises(UserError, match='not both'):
+            await guard.status(ctx, scope='tenant-b')
+        with pytest.raises(UserError, match='not both'):
+            await guard.exhausted(ctx, scope='tenant-b')
+
+        assert '|tenant-a|' in (await guard.status(ctx))[0].key
+        assert (await guard.status(ctx))[0].spent.usd == Decimal('1')
+        assert (await guard.status(scope='tenant-b'))[0].spent.usd == Decimal('0')
 
 
 class TestEnforcement:
@@ -724,19 +741,25 @@ class TestInMemoryStore:
         assert await store.get('monday') == Spent()
 
     async def test_dead_entries_are_physically_dropped_once_the_sweep_runs(self):
-        """`__len__` hides them; only the resident dict shows whether memory is actually reclaimed."""
+        """`__len__` hides dead entries either way, so residency is read by rewinding the clock.
+
+        An entry the sweep dropped stays gone when the clock goes back; one merely filtered by
+        `__len__` counts again. That is the difference between reclaiming the memory and only
+        hiding it, without reading the store's internals.
+        """
         clock = Clock()
-        store = InMemorySpendStore(clock=clock)
-        for index in range(_SWEEP_EVERY):
+        store = InMemorySpendStore(clock=clock, sweep_every=4)
+        for index in range(4):
             await store.add(f'k{index}', usd=Decimal('1'), tokens=1, requests=1, unpriced=0, ttl=timedelta(hours=1))
         clock.advance(timedelta(hours=2))
-        assert len(store._entries) == _SWEEP_EVERY  # pyright: ignore[reportPrivateUsage]
+        assert len(store) == 0
 
-        for index in range(_SWEEP_EVERY):
+        for index in range(4):
             await store.add(f'n{index}', usd=Decimal('1'), tokens=1, requests=1, unpriced=0, ttl=timedelta(hours=1))
 
-        assert len(store._entries) == _SWEEP_EVERY  # pyright: ignore[reportPrivateUsage]
-        assert len(store) == _SWEEP_EVERY
+        assert len(store) == 4
+        clock.now = _EPOCH
+        assert len(store) == 4, 'the rolled-over entries were hidden rather than dropped'
 
     async def test_a_reconciler_may_post_a_negative_delta(self):
         store = InMemorySpendStore()
@@ -1012,3 +1035,38 @@ class TestSpec:
     def test_a_budget_scope_is_refused(self):
         with pytest.raises(UserError, match='cannot be expressed in a spec'):
             SpendLimits[None].from_spec(budgets=[{'scope': 'tenant'}])
+
+
+class TestDurableClock:
+    """Temporal's workflow sandbox restricts `datetime.now`, which these hooks read."""
+
+    async def test_a_restricted_clock_is_re_raised_naming_the_sandbox_setting(self):
+        """The sandbox's own error names `datetime.datetime.now`, not the setting that fixes it.
+
+        Matched by class name so the translation costs no `temporalio` import; the fake stands
+        in for the real exception, which `tests/spend/test_temporal.py` exercises end to end.
+        """
+
+        class RestrictedWorkflowAccessError(Exception):
+            pass
+
+        def restricted() -> datetime:
+            raise RestrictedWorkflowAccessError('Cannot access datetime.datetime.now.__call__')
+
+        guard = SpendLimits[None](budgets=[Budget(usd=Decimal('5'))], clock=restricted)
+
+        with pytest.raises(UserError, match='with_passthrough_modules'):
+            await _gate(guard)
+        with pytest.raises(UserError, match='pydantic_ai_harness'):
+            await guard.status()
+
+    async def test_any_other_clock_failure_is_left_alone(self):
+        """Only the sandbox's refusal is translated; a broken clock still reports itself."""
+
+        def broken() -> datetime:
+            raise ZeroDivisionError('the clock is broken')
+
+        guard = SpendLimits[None](budgets=[Budget(usd=Decimal('5'))], clock=broken)
+
+        with pytest.raises(ZeroDivisionError, match='the clock is broken'):
+            await _gate(guard)

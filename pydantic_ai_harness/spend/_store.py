@@ -17,13 +17,6 @@ from typing import Protocol, runtime_checkable
 from pydantic_ai_harness.spend._snapshot import Spent
 
 _Entries = dict[str, tuple[Spent, 'datetime | None']]
-
-_SWEEP_EVERY = 256
-"""Writes between expiry sweeps in `InMemorySpendStore`.
-
-Large enough that the linear scan is amortised to nothing on the hot path, small enough that
-dead entries never accumulate beyond this many.
-"""
 """Each key's counter and the moment it stops counting, if it ever does."""
 
 
@@ -74,6 +67,16 @@ class InMemorySpendStore:
 
     clock: Callable[[], datetime] = utc_now
     """Supplies the time expiry is measured against."""
+
+    sweep_every: int = 256
+    """Writes between expiry sweeps.
+
+    Expiry cannot wait for the next read of a key: a day window produces a new key each day,
+    so yesterday's is never asked for again. The scan is linear in resident keys, so it is
+    amortised over this many writes rather than run on each one, which bounds dead entries to
+    roughly that many. Lower it where scopes are high-cardinality and memory matters more than
+    the scan.
+    """
 
     _entries: _Entries = field(default_factory=_Entries, init=False, repr=False)
     _lock: Lock = field(default_factory=Lock, init=False, repr=False)
@@ -126,7 +129,7 @@ class InMemorySpendStore:
         """
         with self._lock:
             self._writes_since_sweep += 1
-            if self._writes_since_sweep >= _SWEEP_EVERY:
+            if self._writes_since_sweep >= self.sweep_every:
                 self._sweep()
             current = self._live(key)
             updated = Spent(
@@ -141,15 +144,12 @@ class InMemorySpendStore:
     def _sweep(self) -> None:
         """Drop every entry whose window has rolled over.
 
-        Expiry cannot wait for the next read of a key: a day window produces a new key each
-        day, so yesterday's is never asked for again and would sit in the dict forever.
-
-        Amortised over `_SWEEP_EVERY` writes rather than run on each one. The scan is linear
-        in live keys, and `run` and `conversation` budgets hold one key per run and per
+        Amortised over `sweep_every` writes rather than run on each one. The scan is linear in
+        resident keys, and `run` and `conversation` budgets hold one key per run and per
         conversation for a day and a month respectively -- a worker at ten runs a second
         carries most of a million of them after a day, and a full scan under a
         `threading.Lock` inside an `async def` would block the event loop for milliseconds on
-        every model request. The interval bounds the excess to that many dead entries.
+        every model request.
         """
         self._writes_since_sweep = 0
         now = self.clock()
