@@ -6,6 +6,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, NamedTuple
 
 import pytest
+from pydantic import AnyUrl
 from pydantic_ai.exceptions import UserError
 from pydantic_ai.mcp import MCPToolsetClient
 from pydantic_ai.tools import RunContext
@@ -81,6 +82,19 @@ class TestStackOneToolset:
         )
         assert mcp_recorder.calls[1].client == 'https://proxy.example/mcp?region=eu&tool-mode=search_execute'
 
+    def test_any_url_gets_headers_and_tool_mode(self, mcp_recorder: MCPToolsetRecorder):
+        StackOneToolset(
+            account_id='1',
+            api_key='key',
+            tool_mode='search_execute',
+            client=AnyUrl('https://proxy.example/mcp?region=eu'),
+        )
+        call = mcp_recorder.calls[0]
+        assert call.client == 'https://proxy.example/mcp?region=eu&tool-mode=search_execute'
+        assert call.headers is not None
+        assert call.headers['Authorization'].startswith('Basic ')
+        assert call.headers['x-account-id'] == '1'
+
     def test_custom_url_tool_mode_matches_configuration(self, mcp_recorder: MCPToolsetRecorder):
         search_execute_url = 'https://proxy.example/mcp?tool%2Dmode=search%5Fexecute&signature=a%2fb%20c&flag#fragment'
         StackOneToolset(
@@ -126,6 +140,12 @@ class TestStackOneToolset:
         StackOneToolset(account_id='45320', api_key='key', client=stackone_server)
         call = mcp_recorder.calls[0]
         assert call.client is stackone_server
+        assert call.headers is None
+
+    def test_script_path_string_is_not_treated_as_url(self, mcp_recorder: MCPToolsetRecorder):
+        StackOneToolset(account_id='45320', api_key='key', client='server.py')
+        call = mcp_recorder.calls[0]
+        assert call.client == 'server.py'
         assert call.headers is None
 
     def test_missing_api_key_fails_at_construction(self, monkeypatch: pytest.MonkeyPatch):

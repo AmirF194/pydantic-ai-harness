@@ -21,7 +21,7 @@ You also need an API key for the model your agent uses.
 ## Installation
 
 ```bash
-pip install "pydantic-ai-harness[stackone]" "pydantic-ai-slim[openai,spec]"
+uv add "pydantic-ai-harness[stackone]" "pydantic-ai-slim[openai,spec]"
 ```
 
 The `openai` and `spec` extras support the model and agent-spec examples below. Install the provider extra for a
@@ -87,6 +87,16 @@ Passing `actions` selects `individual` mode automatically. Explicitly combining 
 
 In `search_execute` mode, action IDs are returned by the search tool at runtime and should not be guessed. In
 `individual` mode, all selected tool schemas are sent to the model, so filter large action sets with `actions`.
+
+To keep StackOne tools out of the model context until they are needed, pass `defer_loading=True`. The capability uses
+`id='stackone'` by default so it can be loaded on demand. Give each instance a distinct `id` when one agent uses
+multiple StackOne accounts:
+
+```python
+from pydantic_ai_harness.stackone import StackOne
+
+StackOne(account_id='your-linked-account-id', defer_loading=True)
+```
 
 ### Require approval
 

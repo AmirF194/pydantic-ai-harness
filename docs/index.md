@@ -38,6 +38,7 @@ uv add "pydantic-ai-harness[dynamic-workflow]"  # Dynamic Workflow (adds the Mon
 uv add "pydantic-ai-harness[logfire]"           # Managed Prompt (Logfire-managed prompts)
 uv add "pydantic-ai-harness[exa]"               # Exa Search (web research via the Exa API)
 uv add "pydantic-ai-harness[skills]"            # Skills (loads SKILL.md frontmatter)
+uv add "pydantic-ai-harness[stackone]"          # StackOne (actions on linked business applications)
 uv add "pydantic-ai-harness[acp]"               # ACP (Agent Client Protocol SDK)
 ```
 

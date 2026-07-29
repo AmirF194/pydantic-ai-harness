@@ -1,6 +1,6 @@
 """StackOne capability: actions on a linked SaaS account (HRIS, ATS, CRM, and more) for agents.
 
-Requires the `stackone` extra: `pip install "pydantic-ai-harness[stackone]"`.
+Requires the `stackone` extra: `uv add "pydantic-ai-harness[stackone]"`.
 """
 
 from pydantic_ai_harness.stackone._capability import StackOne

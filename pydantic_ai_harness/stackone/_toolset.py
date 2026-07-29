@@ -4,7 +4,7 @@ This module owns the StackOne wire contract: endpoint path, header names, and
 the tool naming convention. A StackOne API change should be a diff to this
 file only.
 
-Wire contract (https://docs.stackone.com/mcp/quickstart), verified 2026-07-27:
+Wire contract (https://docs.stackone.com/mcp/quickstart), verified 2026-07-29:
 
 - `POST {base_url}/mcp` -- MCP over streamable HTTP; lists and executes tools.
   `?tool-mode=search_execute` switches from one-tool-per-action to two
@@ -25,9 +25,10 @@ import base64
 import os
 from collections.abc import Callable, Mapping, Sequence
 from fnmatch import fnmatch
-from typing import Any, Literal
+from typing import Literal
 from urllib.parse import unquote_plus, urlsplit, urlunsplit
 
+from pydantic import AnyUrl
 from pydantic_ai.exceptions import UserError
 from pydantic_ai.tools import AgentDepsT, RunContext, ToolDefinition
 from pydantic_ai.toolsets import AbstractToolset, WrapperToolset
@@ -36,8 +37,7 @@ try:
     from pydantic_ai.mcp import MCPToolset, MCPToolsetClient
 except ImportError as _import_error:  # pragma: no cover
     raise ImportError(
-        'MCP support is required for the StackOne capability. '
-        'Install it with: pip install "pydantic-ai-harness[stackone]"'
+        'MCP support is required for the StackOne capability. Install it with: uv add "pydantic-ai-harness[stackone]"'
     ) from _import_error
 
 __all__ = (
@@ -58,6 +58,38 @@ ToolMode = Literal['individual', 'search_execute']
 
 _MCP_PATH = '/mcp'
 _SEARCH_EXECUTE_QUERY = 'tool-mode=search_execute'
+
+
+def validate_configuration(
+    tool_mode: object, actions: str | Sequence[object]
+) -> tuple[ToolMode | None, tuple[str, ...]]:
+    if tool_mode is None:
+        resolved_mode = None
+    elif tool_mode == 'individual':
+        resolved_mode = 'individual'
+    elif tool_mode == 'search_execute':
+        resolved_mode = 'search_execute'
+    else:
+        raise UserError('`tool_mode` must be `individual`, `search_execute`, or `None`.')
+
+    if isinstance(actions, str):
+        resolved_actions = (actions,)
+    elif not isinstance(actions, bytes):
+        action_patterns: list[str] = []
+        for action in actions:
+            if not isinstance(action, str):
+                raise UserError('`actions` must contain only string patterns.')
+            action_patterns.append(action)
+        resolved_actions = tuple(action_patterns)
+    else:
+        raise UserError('`actions` must be a string pattern or a sequence of string patterns.')
+
+    if resolved_mode == 'search_execute' and resolved_actions:
+        raise UserError(
+            '`actions` filters cannot apply in `search_execute` mode: individual action names '
+            'never reach the agent. Use `individual` mode to filter actions.'
+        )
+    return resolved_mode, resolved_actions
 
 
 def resolve_tool_mode(tool_mode: ToolMode | None, actions: Sequence[str]) -> ToolMode:
@@ -105,22 +137,6 @@ def _with_tool_mode(url: str, tool_mode: ToolMode) -> str:
     return urlunsplit(parts._replace(query='&'.join(query)))
 
 
-def check_actions_apply(tool_mode: ToolMode | None, actions: Sequence[str]) -> None:
-    """Reject `actions` combined with explicitly requested `search_execute` mode.
-
-    The globs cannot apply to the two meta-tools, so the configuration fails
-    closed instead of being ignored.
-
-    Raises:
-        UserError: When both are set.
-    """
-    if tool_mode == 'search_execute' and actions:
-        raise UserError(
-            '`actions` filters cannot apply in `search_execute` mode: individual action names '
-            'never reach the agent. Use `individual` mode to filter actions.'
-        )
-
-
 def _action_filter(actions: Sequence[str]) -> Callable[[RunContext[AgentDepsT], ToolDefinition], bool]:
     """A `FilteredToolset` predicate matching tool names against the given globs.
 
@@ -157,7 +173,7 @@ class StackOneToolset(WrapperToolset[AgentDepsT]):
         base_url: str = STACKONE_BASE_URL,
         actions: Sequence[str] = (),
         tool_mode: ToolMode | None = None,
-        metadata: Mapping[str, Any] | None = None,
+        metadata: Mapping[str, object] | None = None,
         client: MCPToolsetClient | None = None,
         id: str = 'stackone',
     ) -> None:
@@ -180,16 +196,19 @@ class StackOneToolset(WrapperToolset[AgentDepsT]):
             client: Replacement for the default `{base_url}/mcp` connection: anything
                 `MCPToolset` accepts (URL, `FastMCP` server, prebuilt `fastmcp.Client`).
                 Auth headers and the `search_execute` query parameter are only applied
-                when the client is a URL string.
+                when the client is an HTTP URL.
             id: Stable toolset id. Give each instance a distinct id when an agent uses
                 several StackOne toolsets.
         """
-        check_actions_apply(tool_mode, actions)
+        tool_mode, actions = validate_configuration(tool_mode, actions)
         mode = resolve_tool_mode(tool_mode, actions)
         resolved = client if client is not None else f'{base_url.rstrip("/")}{_MCP_PATH}'
         headers: dict[str, str] | None = None
-        if isinstance(resolved, str):
-            resolved = _with_tool_mode(resolved, mode)
+        is_url = isinstance(resolved, AnyUrl) or (
+            isinstance(resolved, str) and resolved.startswith(('http://', 'https://'))
+        )
+        if is_url:
+            resolved = _with_tool_mode(str(resolved), mode)
             headers = {'Authorization': _basic_auth(resolve_api_key(api_key)), 'x-account-id': account_id}
         toolset: AbstractToolset[AgentDepsT] = MCPToolset(resolved, id=id, headers=headers)
         if mode == 'individual' and actions:

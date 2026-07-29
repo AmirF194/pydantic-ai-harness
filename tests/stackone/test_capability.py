@@ -2,12 +2,21 @@
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 import pytest
 from pydantic_ai import Agent
 from pydantic_ai.exceptions import UserError
-from pydantic_ai.messages import ModelMessage, ModelRequest, ToolCallPart
+from pydantic_ai.messages import (
+    LoadCapabilityReturnPart,
+    ModelMessage,
+    ModelRequest,
+    ModelResponse,
+    TextPart,
+    ToolCallPart,
+)
+from pydantic_ai.models.function import AgentInfo, FunctionModel
 from pydantic_ai.models.test import TestModel
 from pydantic_ai.tools import RunContext
 
@@ -42,10 +51,46 @@ class TestStackOne:
         monkeypatch.setenv('STACKONE_API_KEY', 'env-key')
         assert StackOne(account_id='45320').get_toolset() is not None
 
+    def test_api_key_is_hidden_from_repr(self):
+        capability = StackOne(account_id='45320', api_key='secret')
+        assert 'secret' not in repr(capability)
+
     def test_construction_does_not_warn(self, recwarn: pytest.WarningsRecorder):
         StackOne(account_id='45320', api_key='key', actions=['*_list_*'])
-        StackOne(account_id='45320', api_key='key', id='stackone', defer_loading=True)
+        StackOne(account_id='45320', api_key='key', defer_loading=True)
         assert not recwarn.list
+
+    def test_agent_spec_loads_stackone(self, tmp_path: Path):
+        spec = tmp_path / 'agent.yaml'
+        spec.write_text(
+            """\
+capabilities:
+  - StackOne:
+      account_id: '45320'
+      api_key: 'key'
+      actions: '*_list_*'
+""",
+            encoding='utf-8',
+        )
+        agent = Agent.from_file(spec, custom_capability_types=[StackOne], model=TestModel())
+        assert isinstance(agent, Agent)
+
+    @pytest.mark.parametrize(
+        ('arguments', 'match'),
+        [
+            ({'tool_mode': 'search-execute'}, '`tool_mode` must be'),
+            ({'actions': [1]}, '`actions` must contain only string patterns'),
+            ({'actions': b'*_list_*'}, '`actions` must be a string pattern'),
+        ],
+    )
+    def test_agent_spec_rejects_invalid_configuration(self, arguments: dict[str, object], match: str):
+        spec = {
+            'capabilities': [
+                {'StackOne': {'account_id': '45320', 'api_key': 'key', **arguments}},
+            ]
+        }
+        with pytest.raises(ValueError, match=match):
+            Agent.from_spec(spec, custom_capability_types=[StackOne], model=TestModel())
 
     def test_rejects_actions_in_explicit_search_execute(self):
         with pytest.raises(UserError, match='cannot apply in `search_execute` mode'):
@@ -58,11 +103,46 @@ class TestStackOne:
         assert 'bamboohr_list_employees' in tool_call_names(result.all_messages())
         assert 'Ada' in result.output
 
-    async def test_actions_glob_filter(self, stackone_server: FastMCP):
-        capability = StackOne(account_id='45320', api_key='key', client=stackone_server, actions=['*_list_*'])
+    @pytest.mark.parametrize('actions', [['*_list_*'], '*_list_*'])
+    async def test_actions_glob_filter(self, stackone_server: FastMCP, actions: list[str] | str):
+        capability = StackOne(account_id='45320', api_key='key', client=stackone_server, actions=actions)
         agent = Agent(TestModel(), capabilities=[capability])
         result = await agent.run('list employees')
         assert tool_call_names(result.all_messages()) == {'bamboohr_list_employees'}
+
+    async def test_deferred_loading_uses_stable_default_id(self, stackone_server: FastMCP):
+        seen_tools: list[dict[str, bool]] = []
+        seen_instructions: list[str] = []
+
+        def model_fn(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+            tools = {tool.name: tool.defer_loading for tool in info.function_tools}
+            seen_tools.append(tools)
+            seen_instructions.append(info.instructions or '')
+            if tools['bamboohr_list_employees']:
+                return ModelResponse(parts=[ToolCallPart(tool_name='load_capability', args={'id': 'stackone'})])
+            return ModelResponse(parts=[TextPart('done')])
+
+        capability = StackOne(
+            account_id='45320',
+            api_key='key',
+            client=stackone_server,
+            actions=['*_list_*'],
+            defer_loading=True,
+        )
+        agent = Agent(FunctionModel(model_fn), capabilities=[capability])
+        result = await agent.run('list employees')
+
+        assert result.output == 'done'
+        assert seen_tools[0]['bamboohr_list_employees'] is True
+        assert seen_tools[1]['bamboohr_list_employees'] is False
+        assert '{connector}_{action}_{entity}' not in seen_instructions[0]
+        returns = [
+            part
+            for message in result.all_messages()
+            for part in message.parts
+            if isinstance(part, LoadCapabilityReturnPart)
+        ]
+        assert '{connector}_{action}_{entity}' in returns[-1].content.get('instructions', '')
 
     async def test_instructions_follow_the_resolved_mode(self, stackone_server: FastMCP):
         individual = StackOne(account_id='45320', api_key='key', client=stackone_server, actions=['*_list_*'])

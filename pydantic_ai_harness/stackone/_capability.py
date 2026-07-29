@@ -3,8 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
-from dataclasses import KW_ONLY, dataclass
-from typing import Any
+from dataclasses import KW_ONLY, dataclass, field
 
 from pydantic_ai.capabilities import AbstractCapability
 from pydantic_ai.tools import AgentDepsT
@@ -14,8 +13,8 @@ from pydantic_ai_harness.stackone._toolset import (
     MCPToolsetClient,
     StackOneToolset,
     ToolMode,
-    check_actions_apply,
     resolve_tool_mode,
+    validate_configuration,
 )
 
 _INDIVIDUAL_INSTRUCTIONS = (
@@ -47,7 +46,13 @@ class StackOne(AbstractCapability[AgentDepsT]):
 
     _: KW_ONLY
 
-    api_key: str | None = None
+    id: str | None = 'stackone'
+    """Stable capability and toolset ID. Override it when one agent uses several StackOne accounts."""
+
+    description: str | None = 'Use actions from a linked business application through StackOne.'
+    """Routing description used when the capability is loaded on demand."""
+
+    api_key: str | None = field(default=None, repr=False)
     """StackOne API key. Defaults to the `STACKONE_API_KEY` environment variable."""
 
     base_url: str = STACKONE_BASE_URL
@@ -66,7 +71,7 @@ class StackOne(AbstractCapability[AgentDepsT]):
     include_instructions: bool = True
     """Inject StackOne usage instructions into the system prompt."""
 
-    metadata: Mapping[str, Any] | None = None
+    metadata: Mapping[str, object] | None = None
     """Metadata merged onto every tool, available to tool-selection machinery such as
     `CodeMode(tools={'code_mode': True})` or custom `prepare_tools` hooks."""
 
@@ -74,7 +79,7 @@ class StackOne(AbstractCapability[AgentDepsT]):
     """Replacement for the default `{base_url}/mcp` connection; see `StackOneToolset`."""
 
     def __post_init__(self) -> None:
-        check_actions_apply(self.tool_mode, self.actions)
+        self.tool_mode, self.actions = validate_configuration(self.tool_mode, self.actions)
 
     def get_toolset(self) -> StackOneToolset[AgentDepsT]:
         """Build the StackOne toolset, failing fast if no API key is configured."""
