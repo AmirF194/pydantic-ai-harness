@@ -77,10 +77,9 @@ class SnapshotStore(Protocol):
 
     A structural subset of the step-persistence stores: `InMemoryStepStore`,
     `FileStepStore`, `SqliteStepStore`, and `MongoStepStore` all satisfy it.
-    `list_snapshots` is not
-    part of the `StepStore` protocol yet -- the shipped stores implement it as a
-    plain method; promoting it into the protocol is proposed alongside the
-    session-tree evolution (pydantic-ai-harness#321).
+    `list_snapshots` is not part of the `StepStore` protocol yet -- the shipped
+    stores implement it as a plain method; promoting it into the protocol is
+    proposed alongside the session-tree evolution (pydantic-ai-harness#321).
     """
 
     async def list_runs(
