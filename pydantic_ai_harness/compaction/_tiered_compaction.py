@@ -86,7 +86,8 @@ class TieredCompaction(AbstractCapability[AgentDepsT]):
             if estimate_token_count(messages, self.tokenizer) <= self.target_tokens:
                 break
             messages = await tier.compact(messages, ctx)
-        return reinject_pinned(original, messages)
+            messages = reinject_pinned(original, messages)
+        return messages
 
     async def before_model_request(
         self,

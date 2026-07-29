@@ -123,7 +123,9 @@ class SlidingWindowCompaction(AbstractCapability[AgentDepsT]):
             trimmed = prepend_first_user_message(messages, cutoff, trimmed)
         trimmed = reinject_pinned(messages, trimmed)
         if self.receipts:
-            trimmed = [self._receipt_message(messages[:cutoff], ctx), *self._without_receipts(trimmed)]
+            trimmed = self._without_receipts(trimmed)
+            dropped = self._dropped_messages(messages, trimmed)
+            trimmed = [self._receipt_message(dropped, ctx), *trimmed]
         return trimmed
 
     def _receipt_token_reservation(self, messages: list[ModelMessage], ctx: RunContext[AgentDepsT]) -> int:
@@ -149,6 +151,25 @@ class SlidingWindowCompaction(AbstractCapability[AgentDepsT]):
                 and all(is_receipt_part(part) for part in message.parts)
             )
         ]
+
+    @staticmethod
+    def _dropped_messages(messages: list[ModelMessage], retained: list[ModelMessage]) -> list[ModelMessage]:
+        """Return original messages that are absent from the retained history."""
+        unmatched = list(retained)
+        dropped: list[ModelMessage] = []
+        for message in messages:
+            for index, survivor in enumerate(unmatched):
+                if message is survivor:
+                    del unmatched[index]
+                    break
+            else:
+                if not (
+                    isinstance(message, ModelRequest)
+                    and message.parts
+                    and all(is_receipt_part(part) for part in message.parts)
+                ):
+                    dropped.append(message)
+        return dropped
 
     def _receipt_message(self, dropped: list[ModelMessage], ctx: RunContext[AgentDepsT]) -> ModelRequest:
         """Build (and record for tracing) a receipt for the *dropped* prefix."""

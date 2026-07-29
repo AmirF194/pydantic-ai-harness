@@ -75,7 +75,14 @@ def reinject_pinned(original: Sequence[ModelMessage], compacted: list[ModelMessa
     if not pinned:
         return compacted
     surviving = collect_pinned(compacted)
-    missing = [part for part in pinned if part not in surviving]
+    missing: list[ModelRequestPart] = []
+    for part in pinned:
+        for index, survivor in enumerate(surviving):
+            if part == survivor:
+                del surviving[index]
+                break
+        else:
+            missing.append(part)
     if not missing:
         return compacted
     index = _leading_context_len(compacted)

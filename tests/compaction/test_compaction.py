@@ -1808,6 +1808,17 @@ class TestTieredCompaction:
         assert len(result.messages) == 1
 
     @pytest.mark.anyio
+    async def test_reinjects_pins_before_deciding_to_stop(self):
+        calls: list[str] = []
+        t1 = _RecordingTier('t1', calls, drop=1)
+        t2 = _RecordingTier('t2', calls, drop=1)
+        cap = TieredCompaction(tiers=[t1, t2], target_tokens=10)
+        messages: list[ModelMessage] = [_pinned_msg('x' * 40), _user('tail')]
+        result = await cap.before_model_request(_make_ctx(), _make_request_context(messages))
+        assert calls == ['t1', 't2']
+        assert _pinned_texts(result.messages) == ['x' * 40]
+
+    @pytest.mark.anyio
     async def test_composes_real_strategies(self):
         # ClearToolResults then SummarizingCompaction, driven by the orchestrator.
         clear = ClearToolResults(max_messages=1, keep_pairs=0)
@@ -2656,6 +2667,18 @@ class TestPinning:
         result = await sw.compact(messages, _make_ctx())
         assert _pinned_texts(result) == ['durable']
 
+    @pytest.mark.anyio
+    async def test_duplicate_pin_is_reinjected_when_only_one_survives(self):
+        sw = SlidingWindowCompaction(max_messages=4, keep_messages=2, preserve_first_user_message=False)
+        messages: list[ModelMessage] = [
+            _pinned_msg('durable'),
+            _assistant('a'),
+            _pinned_msg('durable'),
+            _assistant('b'),
+        ]
+        result = await sw.compact(messages, _make_ctx())
+        assert _pinned_texts(result) == ['durable', 'durable']
+
 
 # ---------------------------------------------------------------------------
 # Receipts -- formatting, handle discovery, span plumbing
@@ -2881,6 +2904,13 @@ class TestSlidingWindowCompactionReceipts:
         first = await sw.compact(messages, _make_ctx())
         second = await sw.compact([*first, _user('next'), _assistant('c')], _make_ctx())
         assert 'original task' in _user_texts(second)
+
+    @pytest.mark.anyio
+    async def test_receipt_excludes_restored_messages_from_drop_count(self):
+        sw = SlidingWindowCompaction(max_messages=3, keep_messages=1, receipts=True)
+        messages: list[ModelMessage] = [_user('original task'), _assistant('a'), _user('later'), _assistant('b')]
+        result = await sw.compact(messages, _make_ctx())
+        assert _receipt_parts(result)[0].startswith('[History before this point (3 messages,')
 
 
 @pytest.mark.skipif(not logfire_installed, reason='logfire not installed')
