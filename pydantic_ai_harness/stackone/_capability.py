@@ -105,7 +105,8 @@ class StackOne(AbstractCapability[AgentDepsT]):
     def get_serialization_name(cls) -> str:
         """Serialization name for agent-spec support.
 
-        All fields are YAML-expressible; keep the API key out of spec files and
-        rely on the `STACKONE_API_KEY` environment variable instead.
+        Configuration fields are YAML-expressible. Omit the runtime-only
+        `client`, keep the API key out of spec files, and rely on the
+        `STACKONE_API_KEY` environment variable instead.
         """
         return 'StackOne'

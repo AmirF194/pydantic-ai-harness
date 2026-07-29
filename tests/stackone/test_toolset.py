@@ -119,13 +119,12 @@ class TestStackOneToolset:
             api_key='key',
             tool_mode='search_execute',
             client=(
-                'https://proxy.example/mcp?signature=a%2fb%20c&flag&not-tool-mode=individual'
+                'https://proxy.example/mcp?opaque=a%2fb%20c&flag&not-tool-mode=individual'
                 '&tool%2Dmode=individual#fragment'
             ),
         )
         assert (
-            mcp_recorder.calls[0].client
-            == 'https://proxy.example/mcp?signature=a%2fb%20c&flag&not-tool-mode=individual'
+            mcp_recorder.calls[0].client == 'https://proxy.example/mcp?opaque=a%2fb%20c&flag&not-tool-mode=individual'
             '&tool-mode=search_execute#fragment'
         )
         StackOneToolset(

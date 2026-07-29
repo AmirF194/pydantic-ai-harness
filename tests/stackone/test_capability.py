@@ -81,6 +81,9 @@ capabilities:
             ({'tool_mode': 'search-execute'}, '`tool_mode` must be'),
             ({'actions': [1]}, '`actions` must contain only string patterns'),
             ({'actions': b'*_list_*'}, '`actions` must be a string pattern'),
+            ({'actions': {'*': False}}, '`actions` must be a string pattern'),
+            ({'actions': 1}, '`actions` must be a string pattern'),
+            ({'actions': None}, '`actions` must be a string pattern'),
         ],
     )
     def test_agent_spec_rejects_invalid_configuration(self, arguments: dict[str, object], match: str):

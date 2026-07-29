@@ -25,7 +25,7 @@ import base64
 import os
 from collections.abc import Callable, Mapping, Sequence
 from fnmatch import fnmatch
-from typing import Literal
+from typing import Literal, TypeGuard
 from urllib.parse import unquote_plus, urlsplit, urlunsplit
 
 from pydantic import AnyUrl
@@ -60,9 +60,11 @@ _MCP_PATH = '/mcp'
 _SEARCH_EXECUTE_QUERY = 'tool-mode=search_execute'
 
 
-def validate_configuration(
-    tool_mode: object, actions: str | Sequence[object]
-) -> tuple[ToolMode | None, tuple[str, ...]]:
+def _is_sequence(value: object) -> TypeGuard[Sequence[object]]:
+    return isinstance(value, Sequence)
+
+
+def validate_configuration(tool_mode: object, actions: object) -> tuple[ToolMode | None, tuple[str, ...]]:
     if tool_mode is None:
         resolved_mode = None
     elif tool_mode == 'individual':
@@ -74,7 +76,7 @@ def validate_configuration(
 
     if isinstance(actions, str):
         resolved_actions = (actions,)
-    elif not isinstance(actions, bytes):
+    elif _is_sequence(actions) and not isinstance(actions, bytes):
         action_patterns: list[str] = []
         for action in actions:
             if not isinstance(action, str):
@@ -196,7 +198,9 @@ class StackOneToolset(WrapperToolset[AgentDepsT]):
             client: Replacement for the default `{base_url}/mcp` connection: anything
                 `MCPToolset` accepts (URL, `FastMCP` server, prebuilt `fastmcp.Client`).
                 Auth headers and the `search_execute` query parameter are only applied
-                when the client is an HTTP URL.
+                when the client is an HTTP URL. For a signed URL, include the resolved
+                `tool-mode` query parameter before signing so this wrapper can preserve
+                the URL unchanged.
             id: Stable toolset id. Give each instance a distinct id when an agent uses
                 several StackOne toolsets.
         """
