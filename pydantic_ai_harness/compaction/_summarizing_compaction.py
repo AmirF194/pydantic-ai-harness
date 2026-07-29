@@ -371,6 +371,8 @@ class SummarizingCompaction(AbstractCapability[AgentDepsT]):
                     if tokens <= token_tail_budget:
                         retained.append(message)
                         token_tail_budget -= tokens
+                    else:
+                        break
                 extra = list(reversed(retained))
             retained_tail_slots = self.keep_messages - len(extra)
             if token_tail_budget is not None:

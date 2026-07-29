@@ -3124,6 +3124,23 @@ class TestKeepUserMessages:
         assert estimate_token_count(result[1:], len) <= comp.keep_tokens
 
     @pytest.mark.anyio
+    async def test_older_user_is_not_retained_when_the_newest_does_not_fit(self):
+        comp = SummarizingCompaction(
+            model='test:m',
+            max_tokens=3,
+            keep_tokens=1,
+            keep_messages=3,
+            keep_user_messages=True,
+            bridge_prefix=False,
+            tokenizer=len,
+        )
+        messages: list[ModelMessage] = [_user('x'), _assistant('x'), _user('xx'), _assistant('x')]
+        with patch('pydantic_ai.Agent', return_value=_patched_summary_agent('S')):
+            result = await comp.compact(messages, _make_ctx())
+        assert _user_texts(result) == []
+        assert result[-1] == messages[-1]
+
+    @pytest.mark.anyio
     async def test_pin_is_not_rebuilt_as_a_kept_user_message(self):
         comp = SummarizingCompaction(
             model='test:m',
