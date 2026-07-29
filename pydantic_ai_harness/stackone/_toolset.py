@@ -1,22 +1,20 @@
 """StackOne wire contract and toolset.
 
-This module owns the StackOne wire contract: endpoint path, header names, and
-the tool naming convention. A StackOne API change should be a diff to this
-file only.
-
-Wire contract (https://docs.stackone.com/mcp/quickstart), verified 2026-07-29:
+Wire contract, verified 2026-07-29:
 
 - `POST {base_url}/mcp` -- MCP over streamable HTTP; lists and executes tools.
   `?tool-mode=search_execute` switches from one-tool-per-action to two
   search/execute meta-tools.
 - Auth is `Authorization: Basic base64('{api_key}:')` plus an `x-account-id`
-  header selecting the linked account.
+  header selecting the linked account. StackOne requires HTTPS.
 - Tool names follow `{connector}_{action}_{entity}`, e.g.
   `bamboohr_list_employees`.
+- Search/execute names end in `_search_actions` and `_execute_action`;
+  the first returns runtime `action_id` values consumed by the second.
 
-Re-check these assumptions with the initialize and tools/list requests in the
-linked quickstart, once with the default URL and once with
-`?tool-mode=search_execute`.
+Sources: https://docs.stackone.com/mcp/quickstart and
+https://docs.stackone.com/mcp/auth-security. Re-check with the documented
+initialize and tools/list requests in both tool modes.
 """
 
 from __future__ import annotations
@@ -24,14 +22,17 @@ from __future__ import annotations
 import base64
 import os
 from collections.abc import Callable, Mapping, Sequence
+from copy import copy
 from fnmatch import fnmatch
-from typing import Literal, TypeGuard
+from typing import Any, Literal, TypeGuard
 from urllib.parse import unquote_plus, urlsplit, urlunsplit
 
 from pydantic import AnyUrl
 from pydantic_ai.exceptions import UserError
 from pydantic_ai.tools import AgentDepsT, RunContext, ToolDefinition
-from pydantic_ai.toolsets import AbstractToolset, WrapperToolset
+from pydantic_ai.toolsets import AbstractToolset, ToolsetTool, WrapperToolset
+from pydantic_core import to_json
+from typing_extensions import Self
 
 try:
     from pydantic_ai.mcp import MCPToolset, MCPToolsetClient
@@ -58,6 +59,8 @@ ToolMode = Literal['individual', 'search_execute']
 
 _MCP_PATH = '/mcp'
 _SEARCH_EXECUTE_QUERY = 'tool-mode=search_execute'
+DEFAULT_MAX_OUTPUT_BYTES = 50 * 1024
+DEFAULT_MAX_OUTPUT_LINES = 2000
 
 
 def _is_sequence(value: object) -> TypeGuard[Sequence[object]]:
@@ -88,10 +91,18 @@ def validate_configuration(tool_mode: object, actions: object) -> tuple[ToolMode
 
     if resolved_mode == 'search_execute' and resolved_actions:
         raise UserError(
-            '`actions` filters cannot apply in `search_execute` mode: individual action names '
-            'never reach the agent. Use `individual` mode to filter actions.'
+            '`actions` filters cannot apply in `search_execute` mode because that mode registers '
+            'only the search and execute tools. Use `individual` mode to filter action tools.'
         )
     return resolved_mode, resolved_actions
+
+
+def validate_output_limits(max_output_bytes: object, max_output_lines: object) -> tuple[int, int]:
+    if isinstance(max_output_bytes, bool) or not isinstance(max_output_bytes, int) or max_output_bytes <= 0:
+        raise UserError('`max_output_bytes` must be a positive integer.')
+    if isinstance(max_output_lines, bool) or not isinstance(max_output_lines, int) or max_output_lines <= 0:
+        raise UserError('`max_output_lines` must be a positive integer.')
+    return max_output_bytes, max_output_lines
 
 
 def resolve_tool_mode(tool_mode: ToolMode | None, actions: Sequence[str]) -> ToolMode:
@@ -139,6 +150,42 @@ def _with_tool_mode(url: str, tool_mode: ToolMode) -> str:
     return urlunsplit(parts._replace(query='&'.join(query)))
 
 
+def _validate_https_url(url: str, *, name: str) -> None:
+    parts = urlsplit(url)
+    if parts.scheme.lower() != 'https' or parts.hostname is None:
+        raise UserError(f'`{name}` must be an absolute HTTPS URL.')
+
+
+def _truncate_utf8(text: str, max_bytes: int) -> str:
+    return text.encode('utf-8')[:max_bytes].decode('utf-8', errors='ignore')
+
+
+def _limit_tool_output(value: object, *, max_bytes: int, max_lines: int) -> object:
+    is_text = isinstance(value, str)
+    if is_text:
+        text = value
+        data = value.encode('utf-8')
+    else:
+        data = to_json(value)
+        text = data.decode('utf-8', errors='replace')
+
+    line_count = len(text.splitlines()) or 1
+    if len(data) <= max_bytes and line_count <= max_lines:
+        return value
+
+    action = 'truncated' if is_text else 'omitted'
+    marker = f'[StackOne output {action} at {max_bytes} bytes or {max_lines} lines]'
+    marker = _truncate_utf8(marker, max_bytes)
+    if not is_text or max_lines == 1 or len(marker.encode('utf-8')) >= max_bytes:
+        return marker
+
+    preview_lines = text.splitlines()[: max_lines - 1]
+    preview = '\n'.join(preview_lines)
+    preview_budget = max_bytes - len(marker.encode('utf-8')) - 1
+    preview = _truncate_utf8(preview, preview_budget)
+    return f'{preview}\n{marker}' if preview else marker
+
+
 def _action_filter(actions: Sequence[str]) -> Callable[[RunContext[AgentDepsT], ToolDefinition], bool]:
     """A `FilteredToolset` predicate matching tool names against the given globs.
 
@@ -156,15 +203,13 @@ def _action_filter(actions: Sequence[str]) -> Callable[[RunContext[AgentDepsT], 
 class StackOneToolset(WrapperToolset[AgentDepsT]):
     """StackOne actions on one linked SaaS account, as an agent toolset.
 
-    A thin wrapper over an `MCPToolset` connected to StackOne's MCP endpoint,
-    with StackOne auth and account headers applied and `actions` globs turned
-    into a `FilteredToolset`. Being composed from core toolsets at construction
-    keeps it visible to anything that rewrites toolsets, such as durable
-    execution wrappers.
+    A thin wrapper over an `MCPToolset` connected to StackOne's MCP endpoint.
+    URL clients receive StackOne auth and account headers. `actions` globs
+    become a `FilteredToolset`. Prebuilt clients keep their own transport
+    configuration.
 
-    Most users want the `StackOne` capability, which adds usage instructions
-    and agent-spec support; use this class directly for toolset-level control,
-    e.g. combinators like `approval_required()`.
+    Use the `StackOne` capability for usage instructions and agent-spec support.
+    Use this class for toolset combinators such as `approval_required()`.
     """
 
     def __init__(
@@ -177,41 +222,41 @@ class StackOneToolset(WrapperToolset[AgentDepsT]):
         tool_mode: ToolMode | None = None,
         metadata: Mapping[str, object] | None = None,
         client: MCPToolsetClient | None = None,
+        max_output_bytes: int = DEFAULT_MAX_OUTPUT_BYTES,
+        max_output_lines: int = DEFAULT_MAX_OUTPUT_LINES,
         id: str = 'stackone',
     ) -> None:
-        """Build the toolset.
+        """Build a StackOne MCP toolset.
 
         Args:
-            account_id: The linked account to act on (one account is one provider connection).
-            api_key: StackOne API key. Defaults to the `STACKONE_API_KEY` environment variable.
-            base_url: StackOne API host. Point at a regional or staging host if needed.
-            actions: `fnmatch` globs over full tool names (case-insensitive), e.g. `['*_list_*']`.
-                Only apply in `individual` mode; explicitly requesting `search_execute`
-                alongside `actions` raises `UserError`.
-            tool_mode: `individual` registers one tool per enabled action; `search_execute`
-                registers two server-side meta-tools that search the catalog and execute
-                actions by id, keeping the prompt footprint constant for large catalogs.
-                `None` picks `search_execute`, or `individual` when `actions` are given.
-            metadata: Metadata merged onto every tool, available to tool-selection
-                machinery such as `CodeMode(tools={'code_mode': True})` or custom
-                `prepare_tools` hooks.
-            client: Replacement for the default `{base_url}/mcp` connection: anything
-                `MCPToolset` accepts (URL, `FastMCP` server, prebuilt `fastmcp.Client`).
-                Auth headers and the `search_execute` query parameter are only applied
-                when the client is an HTTP URL. For a signed URL, include the resolved
-                `tool-mode` query parameter before signing so this wrapper can preserve
-                the URL unchanged.
-            id: Stable toolset id. Give each instance a distinct id when an agent uses
-                several StackOne toolsets.
+            account_id: Linked account used for StackOne requests.
+            api_key: API key, or `STACKONE_API_KEY` when omitted.
+            base_url: HTTPS StackOne API host.
+            actions: Case-insensitive globs over individual action tool names. Selects
+                `individual`; incompatible with explicit `search_execute`.
+            tool_mode: Individual tools or the search/execute pair. Inferred when omitted.
+            metadata: Metadata merged onto each tool definition.
+            client: URL, `FastMCP`, or prebuilt client accepted by `MCPToolset`.
+                Non-URL clients must configure their own transport and auth.
+            max_output_bytes: Serialized result byte cap. Oversized text is truncated;
+                structured and binary results are omitted.
+            max_output_lines: Serialized result line cap with the same lossy behavior.
+            id: Toolset ID; use distinct values for multiple accounts.
         """
         tool_mode, actions = validate_configuration(tool_mode, actions)
+        max_output_bytes, max_output_lines = validate_output_limits(max_output_bytes, max_output_lines)
         mode = resolve_tool_mode(tool_mode, actions)
-        resolved = client if client is not None else f'{base_url.rstrip("/")}{_MCP_PATH}'
+        if client is None:
+            _validate_https_url(base_url, name='base_url')
+            resolved: MCPToolsetClient = f'{base_url.rstrip("/")}{_MCP_PATH}'
+        else:
+            resolved = client
         headers: dict[str, str] | None = None
         is_url = isinstance(resolved, AnyUrl) or (
-            isinstance(resolved, str) and resolved.startswith(('http://', 'https://'))
+            isinstance(resolved, str) and urlsplit(resolved).scheme.lower() in ('http', 'https')
         )
         if is_url:
+            _validate_https_url(str(resolved), name='client')
             resolved = _with_tool_mode(str(resolved), mode)
             headers = {'Authorization': _basic_auth(resolve_api_key(api_key)), 'x-account-id': account_id}
         toolset: AbstractToolset[AgentDepsT] = MCPToolset(resolved, id=id, headers=headers)
@@ -219,4 +264,34 @@ class StackOneToolset(WrapperToolset[AgentDepsT]):
             toolset = toolset.filtered(_action_filter(actions))
         if metadata:
             toolset = toolset.with_metadata(**metadata)
+        self._max_output_bytes = max_output_bytes
+        self._max_output_lines = max_output_lines
         super().__init__(wrapped=toolset)
+
+    def _with_wrapped(self, wrapped: AbstractToolset[AgentDepsT]) -> Self:
+        result = copy(self)
+        result.wrapped = wrapped
+        return result
+
+    async def for_run(self, ctx: RunContext[AgentDepsT]) -> AbstractToolset[AgentDepsT]:
+        wrapped = await self.wrapped.for_run(ctx)
+        return self if wrapped is self.wrapped else self._with_wrapped(wrapped)
+
+    async def for_run_step(self, ctx: RunContext[AgentDepsT]) -> AbstractToolset[AgentDepsT]:
+        wrapped = await self.wrapped.for_run_step(ctx)
+        return self if wrapped is self.wrapped else self._with_wrapped(wrapped)
+
+    def visit_and_replace(
+        self, visitor: Callable[[AbstractToolset[AgentDepsT]], AbstractToolset[AgentDepsT]]
+    ) -> AbstractToolset[AgentDepsT]:
+        return self._with_wrapped(self.wrapped.visit_and_replace(visitor))
+
+    async def call_tool(
+        self, name: str, tool_args: dict[str, Any], ctx: RunContext[AgentDepsT], tool: ToolsetTool[AgentDepsT]
+    ) -> Any:
+        result = await self.wrapped.call_tool(name, tool_args, ctx, tool)
+        return _limit_tool_output(
+            result,
+            max_bytes=self._max_output_bytes,
+            max_lines=self._max_output_lines,
+        )

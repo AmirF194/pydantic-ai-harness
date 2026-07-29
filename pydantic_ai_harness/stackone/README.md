@@ -76,7 +76,7 @@ StackOne(account_id='your-linked-account-id', actions=['workday_get_worker'])  #
 ```
 
 Passing `actions` selects `individual` mode automatically. Explicitly combining `actions` with
-`tool_mode='search_execute'` raises an error because individual action names are not exposed in that mode.
+`tool_mode='search_execute'` raises an error because that mode registers only the search and execute tools.
 
 ## Choose a tool mode
 
@@ -100,24 +100,17 @@ StackOne(account_id='your-linked-account-id', defer_loading=True)
 
 ### Bound large tool results
 
-StackOne returns the provider's MCP result without applying an integration-specific size limit. Compose it with
-[`ToolOutputLimits`](../tool_output_limits/) when list or export actions may return enough data to dominate the model
-context. The default policy spills large results to a local file and gives the model a bounded preview plus a
-`read_tool_result` tool:
+Each result is capped at 50 KiB or 2,000 lines. Oversized text keeps a prefix; oversized structured or binary results
+are omitted. A marker identifies the reduction when the byte cap can fit it. Raise or lower both limits to trade
+context use against data loss:
 
 ```python
-import os
-
-from pydantic_ai import Agent
 from pydantic_ai_harness.stackone import StackOne
-from pydantic_ai_harness.tool_output_limits import ToolOutputLimits
 
-agent = Agent(
-    'openai:gpt-5.6-sol',
-    capabilities=[
-        StackOne(account_id=os.environ['STACKONE_ACCOUNT_ID']),
-        ToolOutputLimits(),
-    ],
+StackOne(
+    account_id='your-linked-account-id',
+    max_output_bytes=20_000,
+    max_output_lines=500,
 )
 ```
 
@@ -169,3 +162,7 @@ Pass `custom_capability_types` so the spec loader knows how to instantiate `Stac
 
 Use the lower-level `StackOneToolset` directly when you need
 [`Agent(toolsets=[...])`](https://pydantic.dev/docs/ai/tools-toolsets/toolsets/) or other toolset wrappers.
+
+Custom `base_url` and URL-valued `client` values must use HTTPS. The toolset adds auth headers and resolves the
+`tool-mode` query parameter for URL values, so include that parameter before signing. Prebuilt clients are used as-is;
+configure their HTTPS transport, auth, account header, and tool mode yourself.

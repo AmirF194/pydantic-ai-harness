@@ -9,18 +9,21 @@ from pydantic_ai.capabilities import AbstractCapability
 from pydantic_ai.tools import AgentDepsT
 
 from pydantic_ai_harness.stackone._toolset import (
+    DEFAULT_MAX_OUTPUT_BYTES,
+    DEFAULT_MAX_OUTPUT_LINES,
     STACKONE_BASE_URL,
     MCPToolsetClient,
     StackOneToolset,
     ToolMode,
     resolve_tool_mode,
     validate_configuration,
+    validate_output_limits,
 )
 
 _INDIVIDUAL_INSTRUCTIONS = (
     "The StackOne tools operate on the user's linked SaaS account (HRIS, ATS, CRM, and more). "
     'Tool names follow `{connector}_{action}_{entity}`, for example `bamboohr_list_employees`. '
-    'Results are JSON from the underlying provider. Prefer list actions with filters over unbounded listings.'
+    "Results follow each tool's output schema. Prefer list actions with filters over unbounded listings."
 )
 _SEARCH_EXECUTE_INSTRUCTIONS = (
     'StackOne is available through two tools: a search tool (name ending in `_search_actions`) that finds '
@@ -34,11 +37,8 @@ _SEARCH_EXECUTE_INSTRUCTIONS = (
 class StackOne(AbstractCapability[AgentDepsT]):
     """Actions on the user's SaaS account (HRIS, ATS, CRM, and more) via StackOne.
 
-    StackOne (https://docs.stackone.com) is an integration platform exposing
-    actions across 400+ SaaS providers through linked accounts. This
-    capability connects the agent to one linked account's actions over
-    StackOne's MCP endpoint, handling authentication, tool filtering, and
-    usage instructions.
+    Connects an agent to one linked account's actions over StackOne's MCP
+    endpoint, with authentication, tool filtering, and usage instructions.
     """
 
     account_id: str
@@ -56,9 +56,9 @@ class StackOne(AbstractCapability[AgentDepsT]):
     """StackOne API key. Defaults to the `STACKONE_API_KEY` environment variable."""
 
     base_url: str = STACKONE_BASE_URL
-    """StackOne API host. Point at a regional or staging host if needed."""
+    """HTTPS StackOne API host. Point at a regional or staging host if needed."""
 
-    actions: Sequence[str] = ()
+    actions: str | Sequence[str] = ()
     """`fnmatch` globs over full tool names (case-insensitive), e.g. `['*_list_*']`.
     Giving `actions` switches the default `tool_mode` to `individual`, where the globs apply."""
 
@@ -75,14 +75,25 @@ class StackOne(AbstractCapability[AgentDepsT]):
     """Metadata merged onto every tool, available to tool-selection machinery such as
     `CodeMode(tools={'code_mode': True})` or custom `prepare_tools` hooks."""
 
-    client: MCPToolsetClient | None = None
-    """Replacement for the default `{base_url}/mcp` connection; see `StackOneToolset`."""
+    client: MCPToolsetClient | None = field(default=None, repr=False)
+    """Replacement for the default `{base_url}/mcp` connection. URL values must use HTTPS;
+    prebuilt clients keep their own transport and auth configuration."""
+
+    max_output_bytes: int = DEFAULT_MAX_OUTPUT_BYTES
+    """Maximum serialized bytes returned by one tool call. Oversized text is truncated;
+    structured and binary results are omitted."""
+
+    max_output_lines: int = DEFAULT_MAX_OUTPUT_LINES
+    """Maximum result lines, with the same lossy behavior as `max_output_bytes`."""
 
     def __post_init__(self) -> None:
         self.tool_mode, self.actions = validate_configuration(self.tool_mode, self.actions)
+        self.max_output_bytes, self.max_output_lines = validate_output_limits(
+            self.max_output_bytes, self.max_output_lines
+        )
 
     def get_toolset(self) -> StackOneToolset[AgentDepsT]:
-        """Build the StackOne toolset, failing fast if no API key is configured."""
+        """Build the StackOne toolset."""
         return StackOneToolset[AgentDepsT](
             account_id=self.account_id,
             api_key=self.api_key,
@@ -91,6 +102,8 @@ class StackOne(AbstractCapability[AgentDepsT]):
             tool_mode=self.tool_mode,
             metadata=self.metadata,
             client=self.client,
+            max_output_bytes=self.max_output_bytes,
+            max_output_lines=self.max_output_lines,
             id=self.id or 'stackone',
         )
 
@@ -115,13 +128,10 @@ class StackOne(AbstractCapability[AgentDepsT]):
         tool_mode: ToolMode | None = None,
         include_instructions: bool = True,
         metadata: Mapping[str, object] | None = None,
+        max_output_bytes: int = DEFAULT_MAX_OUTPUT_BYTES,
+        max_output_lines: int = DEFAULT_MAX_OUTPUT_LINES,
     ) -> StackOne[AgentDepsT]:
-        """Construct the capability from serializable spec options.
-
-        The runtime-only `client` field is intentionally excluded. Spec-loaded
-        instances connect to the configured StackOne HTTP endpoint.
-        """
-        tool_mode, normalized_actions = validate_configuration(tool_mode, actions)
+        """Construct from serializable options, excluding the runtime-only `client`."""
         return cls(
             account_id=account_id,
             id=id,
@@ -129,18 +139,15 @@ class StackOne(AbstractCapability[AgentDepsT]):
             defer_loading=defer_loading,
             api_key=api_key,
             base_url=base_url,
-            actions=normalized_actions,
+            actions=actions,
             tool_mode=tool_mode,
             include_instructions=include_instructions,
             metadata=metadata,
+            max_output_bytes=max_output_bytes,
+            max_output_lines=max_output_lines,
         )
 
     @classmethod
     def get_serialization_name(cls) -> str:
-        """Serialization name for agent-spec support.
-
-        Configuration fields are YAML-expressible. Omit the runtime-only
-        `client`, keep the API key out of spec files, and rely on the
-        `STACKONE_API_KEY` environment variable instead.
-        """
+        """Return the agent-spec capability name."""
         return 'StackOne'

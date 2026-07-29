@@ -61,9 +61,16 @@ class TestStackOne:
         monkeypatch.setenv('STACKONE_API_KEY', 'env-key')
         assert StackOne(account_id='45320').get_toolset() is not None
 
-    def test_api_key_is_hidden_from_repr(self):
-        capability = StackOne(account_id='45320', api_key='secret')
-        assert 'secret' not in repr(capability)
+    def test_secrets_are_hidden_from_repr(self):
+        capability = StackOne(
+            account_id='45320',
+            api_key='api-secret',
+            client='https://user:url-secret@example.com/mcp?signature=query-secret',
+        )
+        representation = repr(capability)
+        assert 'api-secret' not in representation
+        assert 'url-secret' not in representation
+        assert 'query-secret' not in representation
 
     def test_construction_does_not_warn(self, recwarn: pytest.WarningsRecorder):
         StackOne(account_id='45320', api_key='key', actions=['*_list_*'])
@@ -94,6 +101,8 @@ capabilities:
             ({'actions': {'*': False}}, '`actions` must be a string pattern'),
             ({'actions': 1}, '`actions` must be a string pattern'),
             ({'actions': None}, '`actions` must be a string pattern'),
+            ({'max_output_bytes': 0}, '`max_output_bytes` must be a positive integer'),
+            ({'max_output_lines': True}, '`max_output_lines` must be a positive integer'),
         ],
     )
     def test_agent_spec_rejects_invalid_configuration(self, arguments: dict[str, object], match: str):

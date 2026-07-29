@@ -58,6 +58,11 @@ def stackone_server() -> FastMCP:
         """Create an employee in BambooHR."""
         return {'id': '3', 'name': name}
 
+    @server.tool()
+    def bamboohr_export_employees(lines: int = 1, separator: str = '\n') -> str:
+        """Export employee records."""
+        return separator.join(f'employee-{index}' for index in range(lines))
+
     return server
 
 
