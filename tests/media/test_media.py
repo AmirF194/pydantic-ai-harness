@@ -211,13 +211,16 @@ def _is_marker_dict(node: object) -> TypeGuard[dict[str, object]]:
     return isinstance(node, dict)
 
 
-async def _restore_as_pre_uri_key_reader(node: dict[str, object], store: MediaStore) -> dict[str, object]:
-    """Behavior of `_restore_external` as shipped before `_URI_KEY` existed.
+def _is_object_list(node: object) -> TypeGuard[list[object]]:
+    """Narrow a JSON array without propagating `json.loads`'s `Any`."""
+    return isinstance(node, list)
 
-    Pinning the old reader here is what makes the plain-`uri` mirror testable:
-    it is the evidence that a snapshot written by this version still restores
-    after a rollback to a release that only knows `uri`. Its missing-`uri`
-    guard is left out; the markers under test always carry one.
+
+async def _restore_as_pre_pr_reader(node: dict[str, object], store: MediaStore) -> dict[str, object]:
+    """Behavior of `_restore_external` before this PR added text markers.
+
+    The previous reader treats every marker as binary. Its missing-`uri` guard
+    is left out because the markers under test always carry one.
     """
     import base64
 
@@ -258,6 +261,27 @@ class TestExternalizeRestoreWalker:
         restored_text = _json.dumps(restored)
         assert '"kind": "binary"' in restored_text
         assert b64_payload in restored_text  # bytes restored exactly
+
+    async def test_binary_restore_reuses_write_context(self, tmp_path: Path) -> None:
+        """A context-dependent storage key is found with the binary media type."""
+        import base64
+
+        seen_contexts: list[MediaContext] = []
+
+        def key_strategy(uri: str, context: MediaContext) -> str:
+            seen_contexts.append(context)
+            return f'{context.media_type or "none"}/{parse_media_uri(uri)}'
+
+        store = DiskMediaStore(tmp_path, key_strategy=key_strategy)
+        node = {
+            'kind': 'binary',
+            'data': base64.b64encode(b'\x00' * 128).decode('ascii'),
+            'media_type': 'image/png',
+        }
+
+        externalized = await externalize_media(node, media_store=store, threshold_bytes=64)
+        assert await restore_media(externalized, media_store=store) == node
+        assert seen_contexts == [MediaContext(media_type='image/png'), MediaContext(media_type='image/png')]
 
     async def test_threshold_boundary_keeps_small_inline(self, tmp_path: Path) -> None:
         import base64
@@ -374,6 +398,21 @@ class TestExternalizeRestoreWalker:
 
         restored = await restore_media(externalized, media_store=store)
         assert restored == node  # content re-inlined, every other field preserved
+
+    async def test_text_restore_reuses_write_context(self, tmp_path: Path) -> None:
+        """A context-dependent storage key is found with `text/plain`."""
+        seen_contexts: list[MediaContext] = []
+
+        def key_strategy(uri: str, context: MediaContext) -> str:
+            seen_contexts.append(context)
+            return f'{context.media_type or "none"}/{parse_media_uri(uri)}'
+
+        store = DiskMediaStore(tmp_path, key_strategy=key_strategy)
+        node = {'content': 'x' * 128, 'part_kind': 'text'}
+
+        externalized = await externalize_media(node, media_store=store, threshold_bytes=64)
+        assert await restore_media(externalized, media_store=store) == node
+        assert seen_contexts == [MediaContext(media_type='text/plain'), MediaContext(media_type='text/plain')]
 
     async def test_small_text_part_stays_inline(self, tmp_path: Path) -> None:
         store = DiskMediaStore(tmp_path)
@@ -570,13 +609,36 @@ class TestExternalizeRestoreWalker:
         assert _is_marker_dict(marker)
         assert marker['uri'] == marker['__harness_external_uri__']
 
-        rolled_back = await _restore_as_pre_uri_key_reader(marker, store)
+        rolled_back = await _restore_as_pre_pr_reader(marker, store)
         # The old reader keeps keys it does not know; pydantic ignores the extra
         # field on validation, so the part is intact apart from it.
         assert {k: v for k, v in rolled_back.items() if k != '__harness_external_uri__'} == node
 
         # The current reader drops the mirror, so the marker still round-trips exactly.
         assert await restore_media(marker, media_store=store) == node
+
+    async def test_text_marker_requires_current_reader_after_downgrade(self, tmp_path: Path) -> None:
+        """The pre-PR binary reader cannot reconstruct externally stored text."""
+        import json as _json
+
+        from pydantic_ai.messages import ModelMessagesTypeAdapter, ModelResponse, TextPart
+
+        store = DiskMediaStore(tmp_path)
+        original: object = _json.loads(
+            ModelMessagesTypeAdapter.dump_json([ModelResponse(parts=[TextPart(content='x' * 128)])])
+        )
+        marker: object = await externalize_media(original, media_store=store, threshold_bytes=64)
+        assert _is_object_list(marker)
+        message: object = marker[0]
+        assert _is_marker_dict(message)
+        parts = message['parts']
+        assert _is_object_list(parts)
+        text_marker: object = parts[0]
+        assert _is_marker_dict(text_marker)
+
+        parts[0] = await _restore_as_pre_pr_reader(text_marker, store)
+        with pytest.raises(ValueError, match='Field required'):
+            ModelMessagesTypeAdapter.validate_python(marker)
 
     async def test_genuine_uri_suppresses_the_compat_mirror(self, tmp_path: Path) -> None:
         """A node with its own `uri` gets no mirror, so rollback fails loudly instead of lying."""
@@ -588,7 +650,7 @@ class TestExternalizeRestoreWalker:
         assert marker['__harness_external_uri__'] != marker['uri']
 
         with pytest.raises(ValueError, match='not a media URI'):
-            await _restore_as_pre_uri_key_reader(marker, store)
+            await _restore_as_pre_pr_reader(marker, store)
 
         assert await restore_media(marker, media_store=store) == node
 

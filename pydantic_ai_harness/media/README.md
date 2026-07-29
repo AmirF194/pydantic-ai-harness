@@ -58,6 +58,8 @@ full = await restore_media(lean, media_store=store)
 
 `externalize_media` externalizes both large `BinaryContent` and large text: any message part whose string `content` is at least `threshold_bytes` UTF-8 bytes (`TextPart`, `ThinkingPart`, a string-returning `ToolReturnPart`, a string-valued `UserPromptPart`), plus any `TextContent` element travelling inside a `UserPromptPart.content` sequence or a `ToolReturn`. The same `threshold_bytes` governs both; there is no separate text knob. Payloads below the threshold stay inline, and `restore_media` re-inlines binary and text symmetrically. `media_uri_for` and `parse_media_uri` give you the raw URI round-trip if you need to key media yourself.
 
+The current reader restores binary markers written before text externalization. That compatibility is upgrade-only: a release that predates text externalization treats every marker as binary, so it cannot validate a snapshot containing an externalized text marker. Keep a current reader for persisted snapshots that contain those markers.
+
 ## API
 
 | Symbol | Purpose |

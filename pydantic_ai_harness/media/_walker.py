@@ -181,9 +181,10 @@ async def _maybe_externalize_text(
 def _write_reference(marker: dict[str, object], node: dict[str, object], uri: str) -> None:
     """Record the blob reference on `marker`, mirroring it to `uri` when that key is free.
 
-    `_URI_KEY` is authoritative. The plain `uri` mirror exists so a reader from
-    before `_URI_KEY` (which resolves `node['uri']` and raises without it) can
-    still restore snapshots written here -- without it, upgrading is one-way.
+    `_URI_KEY` is authoritative. The plain `uri` mirror keeps binary markers
+    readable by a compatible reader from before `_URI_KEY`, which resolves
+    `node['uri']` and raises without it. It cannot make text markers readable
+    by that binary-only reader.
 
     The mirror is written only when the source node had no `uri` of its own,
     because a genuine `uri` is data that has to round-trip and overwriting it
@@ -252,7 +253,14 @@ async def _restore_external(node: dict[str, object], media_store: MediaStore) ->
         dropped.add('uri')
     if not isinstance(uri_value, str):
         raise ValueError(f'externalized media marker missing string uri: {node!r}')
-    raw = await media_store.get(uri_value)
+    is_text = node.get(_TEXT_MARKER) is True
+    if is_text:
+        context = MediaContext(media_type='text/plain')
+    else:
+        media_type_value = node.get('media_type')
+        media_type = media_type_value if isinstance(media_type_value, str) else None
+        context = MediaContext(media_type=media_type)
+    raw = await media_store.get(uri_value, context=context)
     # Inverse of `_maybe_externalize_*`: drop the marker and reference keys,
     # restore the externalized field, keep every other field the original part
     # carried. Preserved fields are recursively restored so a nested marker
@@ -262,7 +270,7 @@ async def _restore_external(node: dict[str, object], media_store: MediaStore) ->
         if key in dropped:
             continue
         restored[key] = await restore_media(value, media_store=media_store)
-    if node.get(_TEXT_MARKER) is True:
+    if is_text:
         restored['content'] = raw.decode('utf-8', errors='surrogatepass')
     else:
         restored['data'] = base64.b64encode(raw).decode('ascii')

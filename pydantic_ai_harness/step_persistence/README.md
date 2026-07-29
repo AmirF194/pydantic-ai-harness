@@ -428,7 +428,11 @@ Text externalization is not Mongo-only and has no opt-out short of
 `media_store=None`: the walker is shared, so an existing `FileStepStore` or
 `SqliteStepStore` deployment starts writing blobs for large text parts as well
 as binary ones from this release on. Snapshots written before it still restore
--- the reader recognises the older marker shape.
+-- the reader recognises the older binary marker shape. This compatibility is
+upgrade-only: a release that predates text externalization treats every marker
+as binary, so it cannot validate a snapshot containing an externalized text
+marker. Keep a current reader for persisted snapshots that contain those
+markers.
 
 | StepStore           | Default `media_store`                  | Where blobs live                      |
 | ------------------- | --------------------------------------- | ------------------------------------- |
