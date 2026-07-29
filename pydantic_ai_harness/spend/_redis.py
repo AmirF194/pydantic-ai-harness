@@ -8,6 +8,7 @@ nothing extra.
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import timedelta
@@ -134,13 +135,18 @@ class RedisSpendStore:
 
         Each `HINCRBY` returns its own new value, so the result needs no second
         read. The four are not one atomic group, which does not matter: no
-        decision compares these fields against each other.
+        decision compares these fields against each other. Since they touch
+        different fields and none depends on another's result, they are issued
+        together rather than as four sequential round trips on the hot path of
+        every model request.
         """
         name = self._name(key)
-        nanos = await self.client.hincrby(name, _USD_FIELD, _to_nanos(usd))
-        total_tokens = await self.client.hincrby(name, _TOKENS_FIELD, tokens)
-        total_requests = await self.client.hincrby(name, _REQUESTS_FIELD, requests)
-        total_unpriced = await self.client.hincrby(name, _UNPRICED_FIELD, unpriced)
+        nanos, total_tokens, total_requests, total_unpriced = await asyncio.gather(
+            self.client.hincrby(name, _USD_FIELD, _to_nanos(usd)),
+            self.client.hincrby(name, _TOKENS_FIELD, tokens),
+            self.client.hincrby(name, _REQUESTS_FIELD, requests),
+            self.client.hincrby(name, _UNPRICED_FIELD, unpriced),
+        )
         if ttl is not None:
             await self.client.expire(name, int(ttl.total_seconds()))
         return Spent(
