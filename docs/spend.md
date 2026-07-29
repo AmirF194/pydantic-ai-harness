@@ -13,7 +13,7 @@ Track what an agent costs, and stop it when a budget is gone.
 
 A loop that calls a model until a condition it never reaches will keep calling until something stops it. `UsageLimits` in Pydantic AI is that stop for one run: it caps tokens and requests, in token counts, for the duration of a single `run()`. What it does not cover is money, a period longer than one run, a per-tenant share of a shared allowance, or a counter that several worker processes agree on. A daily ceiling spread across a queue's workers is exactly the case where each worker independently believes it has the whole budget.
 
-Provider usage APIs do not close that gap. OpenAI's and Anthropic's report minutes to hours late; Logfire, measured, lands around 25 seconds behind. Those numbers are fine for reconciling a ledger and useless for refusing the request a runaway loop is about to make.
+Provider usage APIs do not close that gap. They are billing and observability pipelines: usage is aggregated after the fact and read by polling, so a number there moves only once the requests behind it have already been made. That is enough to reconcile a ledger and not enough to refuse the request a runaway loop is about to make.
 
 ## The solution
 
@@ -152,9 +152,23 @@ Returning `None` falls through to the registry. When nothing can price a respons
 
 State lives across runs deliberately, so `for_run` is not overridden: a daily budget that reset every run would not be a daily budget. Per-run isolation comes from `Budget(window='run')`, whose key carries the run id.
 
-The capability declares itself innermost. `after_model_request` runs innermost first, so anywhere else in the chain a capability listed after this one could raise `ModelRetry` on a response that was already generated and billed, and the counter would never see it. Being innermost is what makes "counted exactly once" true rather than dependent on the order you happened to write.
+The capability declares itself innermost, so `after_model_request` reaches it before any capability that does not. Without that, a capability listed after this one -- which is how anyone would write it -- could raise `ModelRetry` on a response that was already generated and billed, and the counter would never see it.
 
-**Durable execution.** The capability hooks run in the workflow; the model request itself is the activity. A store that talks over the network therefore reads and writes from workflow code, which Temporal replays -- so a shared store is not workflow-safe here. Use the in-process store inside the workflow, and enforce the shared budget before starting it:
+That covers the ordinary case, not every case. Pydantic AI orders innermost capabilities against non-innermost ones only, and among themselves the one listed *later* runs `after_model_request` *first*. `TemporalDurability` and `InputGuardrail` also declare themselves innermost, so either of them listed after `SpendLimits` sees a response before the counter does and can still reject a billed one. List `SpendLimits` last among your innermost capabilities when that matters.
+
+**Durable execution.** The capability hooks run in the workflow; the model request itself is the activity. Temporal's workflow sandbox restricts the clock these hooks read, so the workflow runner has to pass this package through:
+
+```python {test="skip"}
+from temporalio.worker.workflow_sandbox import SandboxedWorkflowRunner, SandboxRestrictions
+
+runner = SandboxedWorkflowRunner(
+    restrictions=SandboxRestrictions.default.with_passthrough_modules('pydantic_ai_harness')
+)
+```
+
+Without it the first model request fails with `Cannot access datetime.datetime.now.__call__ from inside a workflow`; `SpendLimits` catches that and re-raises it naming this setting.
+
+A store that talks over the network also reads and writes from workflow code, which Temporal replays -- so a shared store is not workflow-safe here. Use the in-process store inside the workflow, and enforce the shared budget before starting it:
 
 ```python
 async def start_if_funded(limits: SpendLimits[None], tenant_id: str) -> None:
@@ -168,6 +182,18 @@ the budgets it cannot resolve, and `any()` over what is left is a brake that pas
 inspected nothing -- which is exactly what a `SpendLimits` whose budgets are all scoped returns when
 the scope is missing. `exhausted` raises there instead, naming the budgets that need a
 `scope` or a run context. Use `status` for a reading, `exhausted` for a decision.
+
+The in-process store lives in the worker process, not in the workflow's replayable state, so a
+`Budget(window='run')` inside a durable workflow counts against whichever worker happened to
+serve each step. Its counter is also dropped 24 hours after its last write, which is the
+horizon a `run` key carries; a workflow that idles longer than that -- one waiting on a human
+approval -- starts the next step with its per-run ceiling back. The horizon is fixed today.
+
+For a per-run token ceiling and nothing else, Pydantic AI's own
+[`UsageLimits(total_tokens_limit=...)`](https://pydantic.dev/docs/ai/core-concepts/agent/#usage-limits)
+does the same job in-process with no store and no capability. Reach for `Budget(tokens=...,
+window='run')` when the same configuration also has to express money, a longer window, a
+tenant scope, or a counter shared between processes.
 
 ## Tracing
 
@@ -187,40 +213,26 @@ A refusal emits a `spend budget exhausted` span with `spend.budget` and `spend.w
 
 `store`, `price`, `on_spend`, `clock`, and a budget's `scope` take callables or live objects. A spec naming them is rejected rather than silently ignored, because a spec that promises per-tenant scoping and does not deliver it is worse than one that refuses to load.
 
-## API
-
-```python {test="skip"}
-SpendLimits(
-    budgets: Sequence[Budget] = (),
-    store: SpendStore = ...,  # a fresh InMemorySpendStore per capability
-    price: Callable[[ModelResponse], Decimal | None] | None = None,
-    on_spend: Callable[[SpendSnapshot], None | Awaitable[None]] | None = None,
-    on_unpriced: Literal['zero', 'raise'] = 'zero',
-    expose_tools: bool = False,
-    clock: Callable[[], datetime] = utc_now,
-)
-
-Budget(
-    usd: Decimal | None = None,
-    tokens: int | None = None,
-    window: Literal['run', 'conversation', 'day', 'month', 'total'] = 'day',
-    scope: Callable[[RunContext[Any]], str] | None = None,
-    warn_at: float | None = None,
-    name: str = 'default',
-)
-
-
-class SpendStore(Protocol):
-    async def get(self, key: str) -> Spent: ...
-    async def add(
-        self, key: str, *, usd: Decimal, tokens: int, requests: int, unpriced: int, ttl: timedelta | None
-    ) -> Spent: ...
-
-
-InMemorySpendStore(clock: Callable[[], datetime] = utc_now)
-RedisSpendStore(client: RedisClient, prefix: str = 'pydantic-ai-harness:spend')
-```
-
-`SpendLimitExceeded` subclasses `UsageLimitExceeded`, so code that already stops on a usage limit stops here too, while code that needs to tell a spent daily budget from an over-long run can catch it specifically. `UnpricedModelError` subclasses `UserError`.
-
 Source: [`pydantic_ai_harness/spend/`](https://github.com/pydantic/pydantic-ai-harness/tree/main/pydantic_ai_harness/spend/).
+
+## API reference
+
+::: pydantic_ai_harness.spend.SpendLimits
+
+::: pydantic_ai_harness.spend.Budget
+
+::: pydantic_ai_harness.spend.SpendSnapshot
+
+::: pydantic_ai_harness.spend.BudgetStatus
+
+::: pydantic_ai_harness.spend.Spent
+
+::: pydantic_ai_harness.spend.SpendStore
+
+::: pydantic_ai_harness.spend.InMemorySpendStore
+
+::: pydantic_ai_harness.spend.RedisSpendStore
+
+::: pydantic_ai_harness.spend.SpendLimitExceeded
+
+::: pydantic_ai_harness.spend.UnpricedModelError
