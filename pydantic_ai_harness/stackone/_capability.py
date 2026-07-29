@@ -9,17 +9,16 @@ from pydantic_ai.capabilities import AbstractCapability
 from pydantic_ai.tools import AgentDepsT
 
 from pydantic_ai_harness.stackone._toolset import (
-    DEFAULT_MAX_OUTPUT_BYTES,
-    DEFAULT_MAX_OUTPUT_LINES,
     STACKONE_BASE_URL,
     MCPToolsetClient,
     StackOneToolset,
     ToolMode,
     resolve_tool_mode,
     validate_configuration,
-    validate_output_limits,
 )
 
+_DEFAULT_ID = 'stackone'
+_DEFAULT_DESCRIPTION = 'Use actions from a linked business application through StackOne.'
 _INDIVIDUAL_INSTRUCTIONS = (
     "The StackOne tools operate on the user's linked SaaS account (HRIS, ATS, CRM, and more). "
     'Tool names follow `{connector}_{action}_{entity}`, for example `bamboohr_list_employees`. '
@@ -46,10 +45,10 @@ class StackOne(AbstractCapability[AgentDepsT]):
 
     _: KW_ONLY
 
-    id: str | None = 'stackone'
+    id: str | None = _DEFAULT_ID
     """Stable capability and toolset ID. Override it when one agent uses several StackOne accounts."""
 
-    description: str | None = 'Use actions from a linked business application through StackOne.'
+    description: str | None = _DEFAULT_DESCRIPTION
     """Routing description used when the capability is loaded on demand."""
 
     api_key: str | None = field(default=None, repr=False)
@@ -77,20 +76,11 @@ class StackOne(AbstractCapability[AgentDepsT]):
 
     client: MCPToolsetClient | None = field(default=None, repr=False)
     """Replacement for the default `{base_url}/mcp` connection. URL values must use HTTPS;
-    prebuilt clients keep their own transport and auth configuration."""
-
-    max_output_bytes: int = DEFAULT_MAX_OUTPUT_BYTES
-    """Maximum serialized bytes returned by one tool call. Oversized text is truncated;
-    structured and binary results are omitted."""
-
-    max_output_lines: int = DEFAULT_MAX_OUTPUT_LINES
-    """Maximum result lines, with the same lossy behavior as `max_output_bytes`."""
+    prebuilt clients keep their own transport, auth, and account selection, so `account_id`
+    is not applied to them."""
 
     def __post_init__(self) -> None:
         self.tool_mode, self.actions = validate_configuration(self.tool_mode, self.actions)
-        self.max_output_bytes, self.max_output_lines = validate_output_limits(
-            self.max_output_bytes, self.max_output_lines
-        )
 
     def get_toolset(self) -> StackOneToolset[AgentDepsT]:
         """Build the StackOne toolset."""
@@ -102,9 +92,7 @@ class StackOne(AbstractCapability[AgentDepsT]):
             tool_mode=self.tool_mode,
             metadata=self.metadata,
             client=self.client,
-            max_output_bytes=self.max_output_bytes,
-            max_output_lines=self.max_output_lines,
-            id=self.id or 'stackone',
+            id=self.id or _DEFAULT_ID,
         )
 
     def get_instructions(self) -> str | None:
@@ -119,8 +107,8 @@ class StackOne(AbstractCapability[AgentDepsT]):
         cls,
         account_id: str,
         *,
-        id: str | None = 'stackone',
-        description: str | None = 'Use actions from a linked business application through StackOne.',
+        id: str | None = _DEFAULT_ID,
+        description: str | None = _DEFAULT_DESCRIPTION,
         defer_loading: bool = False,
         api_key: str | None = None,
         base_url: str = STACKONE_BASE_URL,
@@ -128,8 +116,6 @@ class StackOne(AbstractCapability[AgentDepsT]):
         tool_mode: ToolMode | None = None,
         include_instructions: bool = True,
         metadata: Mapping[str, object] | None = None,
-        max_output_bytes: int = DEFAULT_MAX_OUTPUT_BYTES,
-        max_output_lines: int = DEFAULT_MAX_OUTPUT_LINES,
     ) -> StackOne[AgentDepsT]:
         """Construct from serializable options, excluding the runtime-only `client`."""
         return cls(
@@ -143,8 +129,6 @@ class StackOne(AbstractCapability[AgentDepsT]):
             tool_mode=tool_mode,
             include_instructions=include_instructions,
             metadata=metadata,
-            max_output_bytes=max_output_bytes,
-            max_output_lines=max_output_lines,
         )
 
     @classmethod

@@ -47,7 +47,7 @@ from pydantic_ai import Agent
 from pydantic_ai_harness.stackone import StackOne
 
 agent = Agent(
-    'openai:gpt-5.6-sol',
+    'openai:gpt-5',
     capabilities=[
         StackOne(account_id=os.environ['STACKONE_ACCOUNT_ID']),
     ],
@@ -100,17 +100,20 @@ StackOne(account_id='your-linked-account-id', defer_loading=True)
 
 ### Bound large tool results
 
-Each result is capped at 50 KiB or 2,000 lines. Oversized text keeps a prefix; oversized structured or binary results
-are omitted. A marker identifies the reduction when the byte cap can fit it. Raise or lower both limits to trade
-context use against data loss:
+Provider actions can return large exports. Combine StackOne with the
+[Tool Output Limits](../tool_output_limits/README.md) capability to reduce oversized tool returns agent-wide:
 
 ```python
+from pydantic_ai import Agent
 from pydantic_ai_harness.stackone import StackOne
+from pydantic_ai_harness.tool_output_limits import ToolOutputLimits
 
-StackOne(
-    account_id='your-linked-account-id',
-    max_output_bytes=20_000,
-    max_output_lines=500,
+agent = Agent(
+    'openai:gpt-5',
+    capabilities=[
+        StackOne(account_id='your-linked-account-id'),
+        ToolOutputLimits(),
+    ],
 )
 ```
 
@@ -131,7 +134,7 @@ stackone_tools = StackOneToolset(
     actions=['workday_create_worker'],
 ).approval_required()
 
-agent = Agent('openai:gpt-5.6-sol', toolsets=[stackone_tools])
+agent = Agent('openai:gpt-5', toolsets=[stackone_tools])
 ```
 
 Handle the resulting deferred approval requests as described in the linked guide.
@@ -144,7 +147,7 @@ The capability also works with Pydantic AI's
 
 ```yaml
 # agent.yaml
-model: openai:gpt-5.6-sol
+model: openai:gpt-5
 capabilities:
   - StackOne:
       account_id: 'your-linked-account-id'
@@ -163,6 +166,8 @@ Pass `custom_capability_types` so the spec loader knows how to instantiate `Stac
 Use the lower-level `StackOneToolset` directly when you need
 [`Agent(toolsets=[...])`](https://pydantic.dev/docs/ai/tools-toolsets/toolsets/) or other toolset wrappers.
 
-Custom `base_url` and URL-valued `client` values must use HTTPS. The toolset adds auth headers and resolves the
-`tool-mode` query parameter for URL values, so include that parameter before signing. Prebuilt clients are used as-is;
-configure their HTTPS transport, auth, account header, and tool mode yourself.
+Custom `base_url` and URL-valued `client` values must use HTTPS. The toolset adds auth headers and appends the
+`tool-mode` query parameter for URL values when it is absent. It raises an error when the URL's `tool-mode` conflicts
+with the configured mode because rewriting would invalidate signed URLs. When using `search_execute` with a signed
+URL, include `tool-mode=search_execute` before signing. Prebuilt clients are used as-is; configure their HTTPS
+transport, auth, account selection, and tool mode yourself.

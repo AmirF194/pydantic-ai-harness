@@ -9,11 +9,10 @@ import pytest
 from pydantic import AnyUrl
 from pydantic_ai.exceptions import UserError
 from pydantic_ai.mcp import MCPToolsetClient
-from pydantic_ai.messages import BinaryContent
 from pydantic_ai.tools import RunContext
 from pydantic_ai.toolsets import FunctionToolset
 
-from pydantic_ai_harness.stackone import StackOneToolset
+from pydantic_ai_harness.stackone import StackOneToolset, ToolMode
 
 if TYPE_CHECKING:
     from mcp.server.fastmcp import FastMCP
@@ -137,27 +136,32 @@ class TestStackOneToolset:
         )
         assert mcp_recorder.calls[1].client == individual_url
 
-    def test_custom_url_conflicting_tool_mode_is_replaced(self, mcp_recorder: MCPToolsetRecorder):
-        StackOneToolset(
-            account_id='1',
-            api_key='key',
-            tool_mode='search_execute',
-            client=(
+    @pytest.mark.parametrize(
+        ('tool_mode', 'client'),
+        [
+            (
+                'search_execute',
                 'https://proxy.example/mcp?opaque=a%2fb%20c&flag&not-tool-mode=individual'
-                '&tool%2Dmode=individual#fragment'
+                '&tool%2Dmode=individual#fragment',
             ),
-        )
-        assert (
-            mcp_recorder.calls[0].client == 'https://proxy.example/mcp?opaque=a%2fb%20c&flag&not-tool-mode=individual'
-            '&tool-mode=search_execute#fragment'
-        )
-        StackOneToolset(
-            account_id='1',
-            api_key='key',
-            tool_mode='individual',
-            client='https://proxy.example/mcp?region=eu&tool-mode=search_execute',
-        )
-        assert mcp_recorder.calls[1].client == 'https://proxy.example/mcp?region=eu'
+            ('individual', 'https://proxy.example/mcp?region=eu&tool-mode=search_execute'),
+            (
+                'search_execute',
+                'https://proxy.example/mcp?tool-mode=search_execute&tool%2Dmode=search%5Fexecute',
+            ),
+        ],
+    )
+    def test_custom_url_conflicting_tool_mode_is_rejected(self, tool_mode: ToolMode, client: str):
+        with pytest.raises(
+            UserError,
+            match='conflicts with the configured `tool_mode`.*rewriting would invalidate signed URLs',
+        ):
+            StackOneToolset(
+                account_id='1',
+                api_key='key',
+                tool_mode=tool_mode,
+                client=client,
+            )
 
     def test_no_headers_for_non_url_clients(self, stackone_server: FastMCP, mcp_recorder: MCPToolsetRecorder):
         StackOneToolset(account_id='45320', api_key='key', client=stackone_server)
@@ -196,14 +200,6 @@ class TestStackOneToolset:
         with pytest.raises(UserError, match='cannot apply in `search_execute` mode'):
             StackOneToolset(account_id='1', api_key='key', tool_mode='search_execute', actions=['*_list_*'])
 
-    def test_rejects_invalid_output_limits(self):
-        with pytest.raises(UserError, match='`max_output_bytes` must be a positive integer'):
-            StackOneToolset(account_id='1', api_key='key', max_output_bytes=0)
-        with pytest.raises(UserError, match='`max_output_bytes` must be a positive integer'):
-            StackOneToolset(account_id='1', api_key='key', max_output_bytes=True)
-        with pytest.raises(UserError, match='`max_output_lines` must be a positive integer'):
-            StackOneToolset(account_id='1', api_key='key', max_output_lines=0)
-
     async def test_actions_filter_is_case_insensitive(self, stackone_server: FastMCP, run_context: RunContext[None]):
         toolset = StackOneToolset(account_id='1', api_key='key', client=stackone_server, actions=['*_LIST_*'])
         async with toolset:
@@ -219,166 +215,21 @@ class TestStackOneToolset:
             )
         assert 'Grace' in str(result)
 
-    async def test_output_byte_limit_includes_marker(self, stackone_server: FastMCP, run_context: RunContext[None]):
-        toolset = StackOneToolset(
-            account_id='1',
-            client=stackone_server,
-            max_output_bytes=64,
-            max_output_lines=10,
-        )
-        async with toolset:
-            tools = await toolset.get_tools(run_context)
-            result = await toolset.call_tool(
-                'bamboohr_export_employees',
-                {'lines': 20},
-                run_context,
-                tools['bamboohr_export_employees'],
-            )
-        assert isinstance(result, str)
-        assert len(result.encode()) <= 64
-        assert result.count('\n') + 1 <= 10
-        assert 'truncated' in result
-
-    async def test_output_line_limit_includes_marker(self, stackone_server: FastMCP, run_context: RunContext[None]):
-        toolset = StackOneToolset(
-            account_id='1',
-            client=stackone_server,
-            max_output_bytes=1_000,
-            max_output_lines=2,
-        )
-        async with toolset:
-            tools = await toolset.get_tools(run_context)
-            result = await toolset.call_tool(
-                'bamboohr_export_employees',
-                {'lines': 20},
-                run_context,
-                tools['bamboohr_export_employees'],
-            )
-        assert isinstance(result, str)
-        assert result.count('\n') + 1 == 2
-        assert result.endswith('lines]')
-
-    async def test_output_line_limit_handles_carriage_returns(
+    async def test_visit_and_replace_returns_stackone_toolset(
         self, stackone_server: FastMCP, run_context: RunContext[None]
     ):
-        toolset = StackOneToolset(
-            account_id='1',
-            client=stackone_server,
-            max_output_bytes=1_000,
-            max_output_lines=2,
-        )
-        async with toolset:
-            tools = await toolset.get_tools(run_context)
-            result = await toolset.call_tool(
-                'bamboohr_export_employees',
-                {'lines': 20, 'separator': '\r'},
-                run_context,
-                tools['bamboohr_export_employees'],
-            )
-        assert isinstance(result, str)
-        assert len(result.splitlines()) == 2
-        assert result.endswith('lines]')
-
-    async def test_structured_output_is_preserved_when_within_limits(
-        self, stackone_server: FastMCP, run_context: RunContext[None]
-    ):
-        toolset = StackOneToolset(account_id='1', client=stackone_server, tool_mode='individual')
-        async with toolset:
-            tools = await toolset.get_tools(run_context)
-            result = await toolset.call_tool(
-                'bamboohr_create_employee',
-                {'name': 'Grace'},
-                run_context,
-                tools['bamboohr_create_employee'],
-            )
-        assert not isinstance(result, str)
-        assert 'Grace' in str(result)
-
-    async def test_oversized_structured_output_is_omitted(
-        self, stackone_server: FastMCP, run_context: RunContext[None]
-    ):
-        toolset = StackOneToolset(
-            account_id='1',
-            client=stackone_server,
-            tool_mode='individual',
-            max_output_bytes=50,
-        )
-        async with toolset:
-            tools = await toolset.get_tools(run_context)
-            result = await toolset.call_tool(
-                'bamboohr_create_employee',
-                {'name': 'Grace Hopper' * 20},
-                run_context,
-                tools['bamboohr_create_employee'],
-            )
-        assert isinstance(result, str)
-        assert len(result.encode()) <= 50
-        assert result.startswith('[StackOne output omitted')
-
-    async def test_oversized_binary_output_is_omitted(
-        self, monkeypatch: pytest.MonkeyPatch, run_context: RunContext[None]
-    ):
-        def binary_result() -> BinaryContent:
-            """Return an image."""
-            return BinaryContent(data=b'x' * 100, media_type='image/png')
-
-        function_toolset = FunctionToolset[None]([binary_result])
-
-        def build_toolset(
-            client: MCPToolsetClient, *, id: str, headers: dict[str, str] | None
-        ) -> FunctionToolset[None]:
-            return function_toolset
-
-        monkeypatch.setattr('pydantic_ai_harness.stackone._toolset.MCPToolset', build_toolset)
-        toolset = StackOneToolset(account_id='1', client='server.py', max_output_bytes=50)
-        async with toolset:
-            tools = await toolset.get_tools(run_context)
-            result = await toolset.call_tool('binary_result', {}, run_context, tools['binary_result'])
-        assert isinstance(result, str)
-        assert len(result.encode()) <= 50
-        assert result.startswith('[StackOne output omitted')
-
-    async def test_toolset_rewrite_preserves_output_limits(
-        self, stackone_server: FastMCP, run_context: RunContext[None]
-    ):
-        toolset = StackOneToolset(
-            account_id='1',
-            client=stackone_server,
-            max_output_bytes=64,
-            max_output_lines=10,
-        )
+        toolset = StackOneToolset(account_id='1', client=stackone_server)
         rewritten = toolset.visit_and_replace(lambda inner: inner)
         assert isinstance(rewritten, StackOneToolset)
         async with rewritten:
             tools = await rewritten.get_tools(run_context)
             result = await rewritten.call_tool(
-                'bamboohr_export_employees',
-                {'lines': 20},
+                'bamboohr_create_employee',
+                {'name': 'Grace'},
                 run_context,
-                tools['bamboohr_export_employees'],
+                tools['bamboohr_create_employee'],
             )
-        assert isinstance(result, str)
-        assert len(result.encode()) <= 64
-        assert 'truncated' in result
-
-    async def test_tiny_output_limit_remains_strict(self, stackone_server: FastMCP, run_context: RunContext[None]):
-        toolset = StackOneToolset(
-            account_id='1',
-            client=stackone_server,
-            max_output_bytes=5,
-            max_output_lines=1,
-        )
-        async with toolset:
-            tools = await toolset.get_tools(run_context)
-            result = await toolset.call_tool(
-                'bamboohr_export_employees',
-                {'lines': 2},
-                run_context,
-                tools['bamboohr_export_employees'],
-            )
-        assert isinstance(result, str)
-        assert len(result.encode()) <= 5
-        assert '\n' not in result
+        assert 'Grace' in str(result)
 
     async def test_prebuilt_fastmcp_client(self, stackone_server: FastMCP, run_context: RunContext[None]):
         from fastmcp import Client

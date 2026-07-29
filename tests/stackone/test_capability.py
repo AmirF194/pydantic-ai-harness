@@ -17,12 +17,14 @@ from pydantic_ai.messages import (
     ModelResponse,
     TextPart,
     ToolCallPart,
+    ToolReturnPart,
 )
 from pydantic_ai.models.function import AgentInfo, FunctionModel
 from pydantic_ai.models.test import TestModel
 from pydantic_ai.tools import RunContext
 
 from pydantic_ai_harness.stackone import StackOne
+from pydantic_ai_harness.tool_output_limits import Band, ToolOutputLimits, Truncate
 
 if TYPE_CHECKING:
     from mcp.server.fastmcp import FastMCP
@@ -96,13 +98,6 @@ capabilities:
         ('arguments', 'match'),
         [
             ({'tool_mode': 'search-execute'}, '`tool_mode` must be'),
-            ({'actions': [1]}, '`actions` must contain only string patterns'),
-            ({'actions': b'*_list_*'}, '`actions` must be a string pattern'),
-            ({'actions': {'*': False}}, '`actions` must be a string pattern'),
-            ({'actions': 1}, '`actions` must be a string pattern'),
-            ({'actions': None}, '`actions` must be a string pattern'),
-            ({'max_output_bytes': 0}, '`max_output_bytes` must be a positive integer'),
-            ({'max_output_lines': True}, '`max_output_lines` must be a positive integer'),
         ],
     )
     def test_agent_spec_rejects_invalid_configuration(self, arguments: dict[str, object], match: str):
@@ -124,6 +119,37 @@ capabilities:
         result = await agent.run('list employees')
         assert 'bamboohr_list_employees' in tool_call_names(result.all_messages())
         assert 'Ada' in result.output
+
+    async def test_tool_output_limits_reduces_large_stackone_result(self, stackone_server: FastMCP):
+        def model_fn(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+            if not any(isinstance(part, ToolReturnPart) for message in messages for part in message.parts):
+                return ModelResponse(parts=[ToolCallPart(tool_name='bamboohr_export_employees', args={'lines': 500})])
+            return ModelResponse(parts=[TextPart('done')])
+
+        agent = Agent(
+            FunctionModel(model_fn),
+            capabilities=[
+                StackOne(
+                    account_id='45320',
+                    api_key='key',
+                    client=stackone_server,
+                    tool_mode='individual',
+                ),
+                ToolOutputLimits(bands=[Band(over=64, action=Truncate())]),
+            ],
+        )
+        result = await agent.run('export employees')
+        returns = [
+            part
+            for message in result.all_messages()
+            for part in message.parts
+            if isinstance(part, ToolReturnPart) and part.tool_name == 'bamboohr_export_employees'
+        ]
+        assert len(returns) == 1
+        content = returns[0].content
+        assert isinstance(content, str)
+        assert 'truncated' in content
+        assert len(content) < len('\n'.join(f'employee-{index}' for index in range(500)))
 
     @pytest.mark.parametrize('actions', [['*_list_*'], '*_list_*'])
     async def test_actions_glob_filter(self, stackone_server: FastMCP, actions: list[str] | str):

@@ -24,14 +24,13 @@ import os
 from collections.abc import Callable, Mapping, Sequence
 from copy import copy
 from fnmatch import fnmatch
-from typing import Any, Literal, TypeGuard
-from urllib.parse import unquote_plus, urlsplit, urlunsplit
+from typing import Literal
+from urllib.parse import parse_qsl, urlsplit, urlunsplit
 
 from pydantic import AnyUrl
 from pydantic_ai.exceptions import UserError
 from pydantic_ai.tools import AgentDepsT, RunContext, ToolDefinition
-from pydantic_ai.toolsets import AbstractToolset, ToolsetTool, WrapperToolset
-from pydantic_core import to_json
+from pydantic_ai.toolsets import AbstractToolset, WrapperToolset
 from typing_extensions import Self
 
 try:
@@ -59,50 +58,22 @@ ToolMode = Literal['individual', 'search_execute']
 
 _MCP_PATH = '/mcp'
 _SEARCH_EXECUTE_QUERY = 'tool-mode=search_execute'
-DEFAULT_MAX_OUTPUT_BYTES = 50 * 1024
-DEFAULT_MAX_OUTPUT_LINES = 2000
 
 
-def _is_sequence(value: object) -> TypeGuard[Sequence[object]]:
-    return isinstance(value, Sequence)
-
-
-def validate_configuration(tool_mode: object, actions: object) -> tuple[ToolMode | None, tuple[str, ...]]:
-    if tool_mode is None:
-        resolved_mode = None
-    elif tool_mode == 'individual':
-        resolved_mode = 'individual'
-    elif tool_mode == 'search_execute':
-        resolved_mode = 'search_execute'
-    else:
+def validate_configuration(
+    tool_mode: ToolMode | None, actions: str | Sequence[str]
+) -> tuple[ToolMode | None, tuple[str, ...]]:
+    if tool_mode not in (None, 'individual', 'search_execute'):
         raise UserError('`tool_mode` must be `individual`, `search_execute`, or `None`.')
 
-    if isinstance(actions, str):
-        resolved_actions = (actions,)
-    elif _is_sequence(actions) and not isinstance(actions, bytes):
-        action_patterns: list[str] = []
-        for action in actions:
-            if not isinstance(action, str):
-                raise UserError('`actions` must contain only string patterns.')
-            action_patterns.append(action)
-        resolved_actions = tuple(action_patterns)
-    else:
-        raise UserError('`actions` must be a string pattern or a sequence of string patterns.')
+    resolved_actions = (actions,) if isinstance(actions, str) else tuple(actions)
 
-    if resolved_mode == 'search_execute' and resolved_actions:
+    if tool_mode == 'search_execute' and resolved_actions:
         raise UserError(
             '`actions` filters cannot apply in `search_execute` mode because that mode registers '
             'only the search and execute tools. Use `individual` mode to filter action tools.'
         )
-    return resolved_mode, resolved_actions
-
-
-def validate_output_limits(max_output_bytes: object, max_output_lines: object) -> tuple[int, int]:
-    if isinstance(max_output_bytes, bool) or not isinstance(max_output_bytes, int) or max_output_bytes <= 0:
-        raise UserError('`max_output_bytes` must be a positive integer.')
-    if isinstance(max_output_lines, bool) or not isinstance(max_output_lines, int) or max_output_lines <= 0:
-        raise UserError('`max_output_lines` must be a positive integer.')
-    return max_output_bytes, max_output_lines
+    return tool_mode, resolved_actions
 
 
 def resolve_tool_mode(tool_mode: ToolMode | None, actions: Sequence[str]) -> ToolMode:
@@ -138,52 +109,24 @@ def _basic_auth(api_key: str) -> str:
 
 def _with_tool_mode(url: str, tool_mode: ToolMode) -> str:
     parts = urlsplit(url)
-    fields = parts.query.split('&') if parts.query else []
-    tool_mode_fields = [field for field in fields if unquote_plus(field.partition('=')[0]) == 'tool-mode']
-    if len(tool_mode_fields) == 1 and unquote_plus(tool_mode_fields[0].partition('=')[2]) == tool_mode:
+    tool_mode_values = [value for key, value in parse_qsl(parts.query, keep_blank_values=True) if key == 'tool-mode']
+    if tool_mode_values:
+        if tool_mode_values == [tool_mode]:
+            return url
+        raise UserError(
+            "The URL's `tool-mode` conflicts with the configured `tool_mode`; the URL is not rewritten because "
+            'rewriting would invalidate signed URLs.'
+        )
+    if tool_mode == 'individual':
         return url
-    query = [field for field in fields if unquote_plus(field.partition('=')[0]) != 'tool-mode']
-    if tool_mode == 'individual' and query == fields:
-        return url
-    if tool_mode == 'search_execute':
-        query.append(_SEARCH_EXECUTE_QUERY)
-    return urlunsplit(parts._replace(query='&'.join(query)))
+    query = f'{parts.query}&{_SEARCH_EXECUTE_QUERY}' if parts.query else _SEARCH_EXECUTE_QUERY
+    return urlunsplit(parts._replace(query=query))
 
 
 def _validate_https_url(url: str, *, name: str) -> None:
     parts = urlsplit(url)
     if parts.scheme.lower() != 'https' or parts.hostname is None:
         raise UserError(f'`{name}` must be an absolute HTTPS URL.')
-
-
-def _truncate_utf8(text: str, max_bytes: int) -> str:
-    return text.encode('utf-8')[:max_bytes].decode('utf-8', errors='ignore')
-
-
-def _limit_tool_output(value: object, *, max_bytes: int, max_lines: int) -> object:
-    is_text = isinstance(value, str)
-    if is_text:
-        text = value
-        data = value.encode('utf-8')
-    else:
-        data = to_json(value)
-        text = data.decode('utf-8', errors='replace')
-
-    line_count = len(text.splitlines()) or 1
-    if len(data) <= max_bytes and line_count <= max_lines:
-        return value
-
-    action = 'truncated' if is_text else 'omitted'
-    marker = f'[StackOne output {action} at {max_bytes} bytes or {max_lines} lines]'
-    marker = _truncate_utf8(marker, max_bytes)
-    if not is_text or max_lines == 1 or len(marker.encode('utf-8')) >= max_bytes:
-        return marker
-
-    preview_lines = text.splitlines()[: max_lines - 1]
-    preview = '\n'.join(preview_lines)
-    preview_budget = max_bytes - len(marker.encode('utf-8')) - 1
-    preview = _truncate_utf8(preview, preview_budget)
-    return f'{preview}\n{marker}' if preview else marker
 
 
 def _action_filter(actions: Sequence[str]) -> Callable[[RunContext[AgentDepsT], ToolDefinition], bool]:
@@ -222,8 +165,6 @@ class StackOneToolset(WrapperToolset[AgentDepsT]):
         tool_mode: ToolMode | None = None,
         metadata: Mapping[str, object] | None = None,
         client: MCPToolsetClient | None = None,
-        max_output_bytes: int = DEFAULT_MAX_OUTPUT_BYTES,
-        max_output_lines: int = DEFAULT_MAX_OUTPUT_LINES,
         id: str = 'stackone',
     ) -> None:
         """Build a StackOne MCP toolset.
@@ -237,14 +178,11 @@ class StackOneToolset(WrapperToolset[AgentDepsT]):
             tool_mode: Individual tools or the search/execute pair. Inferred when omitted.
             metadata: Metadata merged onto each tool definition.
             client: URL, `FastMCP`, or prebuilt client accepted by `MCPToolset`.
-                Non-URL clients must configure their own transport and auth.
-            max_output_bytes: Serialized result byte cap. Oversized text is truncated;
-                structured and binary results are omitted.
-            max_output_lines: Serialized result line cap with the same lossy behavior.
+                Non-URL clients keep their own transport, auth, and account selection,
+                so `account_id` is not applied to them.
             id: Toolset ID; use distinct values for multiple accounts.
         """
         tool_mode, actions = validate_configuration(tool_mode, actions)
-        max_output_bytes, max_output_lines = validate_output_limits(max_output_bytes, max_output_lines)
         mode = resolve_tool_mode(tool_mode, actions)
         if client is None:
             _validate_https_url(base_url, name='base_url')
@@ -267,10 +205,11 @@ class StackOneToolset(WrapperToolset[AgentDepsT]):
             toolset = toolset.filtered(_action_filter(actions))
         if metadata:
             toolset = toolset.with_metadata(**metadata)
-        self._max_output_bytes = max_output_bytes
-        self._max_output_lines = max_output_lines
         super().__init__(wrapped=toolset)
 
+    # `WrapperToolset` rewrites use `dataclasses.replace(self, wrapped=...)`, which calls
+    # `StackOneToolset.__init__(wrapped=...)`; this constructor does not accept `wrapped`.
+    # These overrides copy the wrapper instead.
     def _with_wrapped(self, wrapped: AbstractToolset[AgentDepsT]) -> Self:
         result = copy(self)
         result.wrapped = wrapped
@@ -288,13 +227,3 @@ class StackOneToolset(WrapperToolset[AgentDepsT]):
         self, visitor: Callable[[AbstractToolset[AgentDepsT]], AbstractToolset[AgentDepsT]]
     ) -> AbstractToolset[AgentDepsT]:
         return self._with_wrapped(self.wrapped.visit_and_replace(visitor))
-
-    async def call_tool(
-        self, name: str, tool_args: dict[str, Any], ctx: RunContext[AgentDepsT], tool: ToolsetTool[AgentDepsT]
-    ) -> Any:
-        result = await self.wrapped.call_tool(name, tool_args, ctx, tool)
-        return _limit_tool_output(
-            result,
-            max_bytes=self._max_output_bytes,
-            max_lines=self._max_output_lines,
-        )
