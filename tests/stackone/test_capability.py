@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import TYPE_CHECKING
 
 import pytest
 from pydantic_ai import Agent
+from pydantic_ai.agent.spec import AgentSpec
 from pydantic_ai.exceptions import UserError
 from pydantic_ai.messages import (
     LoadCapabilityReturnPart,
@@ -41,6 +43,14 @@ def request_instructions(messages: list[ModelMessage]) -> str:
 class TestStackOne:
     def test_serialization_name(self):
         assert StackOne.get_serialization_name() == 'StackOne'
+
+    def test_agent_spec_schema_excludes_runtime_client_and_accepts_scalar_actions(self):
+        schema = AgentSpec.model_json_schema_with_capabilities([StackOne])
+        schema_text = json.dumps(schema, sort_keys=True)
+        assert '"client"' not in schema_text
+        assert (
+            '"actions": {"anyOf": [{"type": "string"}, {"items": {"type": "string"}, "type": "array"}]' in schema_text
+        )
 
     def test_missing_api_key_fails_at_agent_construction(self, monkeypatch: pytest.MonkeyPatch):
         monkeypatch.delenv('STACKONE_API_KEY', raising=False)

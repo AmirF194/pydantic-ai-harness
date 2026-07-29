@@ -102,6 +102,40 @@ class StackOne(AbstractCapability[AgentDepsT]):
         return _SEARCH_EXECUTE_INSTRUCTIONS if mode == 'search_execute' else _INDIVIDUAL_INSTRUCTIONS
 
     @classmethod
+    def from_spec(
+        cls,
+        account_id: str,
+        *,
+        id: str | None = 'stackone',
+        description: str | None = 'Use actions from a linked business application through StackOne.',
+        defer_loading: bool = False,
+        api_key: str | None = None,
+        base_url: str = STACKONE_BASE_URL,
+        actions: str | Sequence[str] = (),
+        tool_mode: ToolMode | None = None,
+        include_instructions: bool = True,
+        metadata: Mapping[str, object] | None = None,
+    ) -> StackOne[AgentDepsT]:
+        """Construct the capability from serializable spec options.
+
+        The runtime-only `client` field is intentionally excluded. Spec-loaded
+        instances connect to the configured StackOne HTTP endpoint.
+        """
+        tool_mode, normalized_actions = validate_configuration(tool_mode, actions)
+        return cls(
+            account_id=account_id,
+            id=id,
+            description=description,
+            defer_loading=defer_loading,
+            api_key=api_key,
+            base_url=base_url,
+            actions=normalized_actions,
+            tool_mode=tool_mode,
+            include_instructions=include_instructions,
+            metadata=metadata,
+        )
+
+    @classmethod
     def get_serialization_name(cls) -> str:
         """Serialization name for agent-spec support.
 

@@ -103,6 +103,29 @@ from pydantic_ai_harness.stackone import StackOne
 StackOne(account_id='your-linked-account-id', defer_loading=True)
 ```
 
+### Bound large tool results
+
+StackOne returns the provider's MCP result without applying an integration-specific size limit. Compose it with
+[`ToolOutputLimits`](tool-output-limits.md) when list or export actions may return enough data to dominate the model
+context. The default policy spills large results to a local file and gives the model a bounded preview plus a
+`read_tool_result` tool:
+
+```python
+import os
+
+from pydantic_ai import Agent
+from pydantic_ai_harness.stackone import StackOne
+from pydantic_ai_harness.tool_output_limits import ToolOutputLimits
+
+agent = Agent(
+    'openai:gpt-5.6-sol',
+    capabilities=[
+        StackOne(account_id=os.environ['STACKONE_ACCOUNT_ID']),
+        ToolOutputLimits(),
+    ],
+)
+```
+
 ### Require approval
 
 Approval is not enabled automatically. For operations that need human confirmation, use the public
