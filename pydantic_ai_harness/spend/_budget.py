@@ -157,7 +157,7 @@ def _run_identity(identity: str | None, window: Window) -> str:
 def scope_key(budget: Budget, ctx: RunContext[Any] | None, explicit: str | None) -> str:
     """The scope segment of a budget's store key.
 
-    `explicit` is what `SpendGuard.status` was given, for use outside a run. It
+    `explicit` is what `SpendLimits.status` was given, for use outside a run. It
     is ignored by a budget that declares no `scope`, since such a budget counts
     globally.
     """

@@ -1,7 +1,7 @@
 """Track what an agent spends, and stop it when a budget is gone.
 
 `UsageLimits` in Pydantic AI caps tokens and requests for the duration of one
-run. `SpendGuard` covers what that leaves: money, periods longer than a run,
+run. `SpendLimits` covers what that leaves: money, periods longer than a run,
 partitioning by tenant or user, and a counter that several worker processes
 share. It prices each response with
 [`ModelResponse.cost()`][pydantic_ai.messages.ModelResponse.cost], adds it to
@@ -47,18 +47,18 @@ _UNPRICED_POLICIES = frozenset({'zero', 'raise'})
 
 
 @dataclass
-class SpendGuard(AbstractCapability[AgentDepsT]):
+class SpendLimits(AbstractCapability[AgentDepsT]):
     """Accumulate spend per window and refuse a request once a window is exhausted.
 
     ```python
     from decimal import Decimal
 
     from pydantic_ai import Agent
-    from pydantic_ai_harness.spend import Budget, SpendGuard
+    from pydantic_ai_harness.spend import Budget, SpendLimits
 
     agent = Agent(
         'openai:gpt-5.4',
-        capabilities=[SpendGuard(budgets=[Budget(usd=Decimal('100'), window='day')])],
+        capabilities=[SpendLimits(budgets=[Budget(usd=Decimal('100'), window='day')])],
     )
     ```
 
@@ -143,13 +143,13 @@ class SpendGuard(AbstractCapability[AgentDepsT]):
                 seen.add(slot)
         if self.on_unpriced not in _UNPRICED_POLICIES:
             raise UserError(
-                f'SpendGuard.on_unpriced must be one of {sorted(_UNPRICED_POLICIES)}; got {self.on_unpriced!r}.'
+                f'SpendLimits.on_unpriced must be one of {sorted(_UNPRICED_POLICIES)}; got {self.on_unpriced!r}.'
             )
 
     @classmethod
     def get_serialization_name(cls) -> str | None:
-        """The name a spec refers to this capability by, pinned against a class rename."""
-        return 'SpendGuard'
+        """Serialization name for agent-spec support."""
+        return 'SpendLimits'
 
     def get_ordering(self) -> CapabilityOrdering:
         """Sit innermost, so no capability can reject a response before it is counted.
@@ -230,7 +230,7 @@ class SpendGuard(AbstractCapability[AgentDepsT]):
             # model was asked to do, and an audit that skipped exactly the
             # unpriced responses would be missing the ones worth knowing about.
             raise UnpricedModelError(
-                f'No price for model {response.model_name or "<unnamed>"}. Supply `SpendGuard.price`, '
+                f'No price for model {response.model_name or "<unnamed>"}. Supply `SpendLimits.price`, '
                 "or set on_unpriced='zero' to count the request as free."
             )
         return response
@@ -251,9 +251,9 @@ class SpendGuard(AbstractCapability[AgentDepsT]):
         unless `scope` names the partition to read, since its callable has no
         run context to resolve against.
 
-        Reach for [`exhausted`][pydantic_ai_harness.spend.SpendGuard.exhausted] when the
+        Reach for [`exhausted`][pydantic_ai_harness.spend.SpendLimits.exhausted] when the
         answer gates something: `any(s.exhausted for s in ...)` over a tuple that happens to
-        be empty is a brake that reads as enforcement and inspects nothing, and a guard whose
+        be empty is a brake that reads as enforcement and inspects nothing, and a `SpendLimits` whose
         budgets are all scoped returns exactly that tuple.
         """
         statuses, _ = await self._resolve(ctx, scope)
@@ -297,7 +297,7 @@ class SpendGuard(AbstractCapability[AgentDepsT]):
         return any(status.exhausted for status in statuses)
 
     @classmethod
-    def from_spec(cls, *args: Any, **kwargs: Any) -> SpendGuard[Any]:
+    def from_spec(cls, *args: Any, **kwargs: Any) -> SpendLimits[Any]:
         """Build from an agent spec, covering the fields a spec can express.
 
         `budgets` arrive as mappings and become `Budget` instances, with `usd`
@@ -309,7 +309,7 @@ class SpendGuard(AbstractCapability[AgentDepsT]):
         unsupported = sorted({'store', 'price', 'on_spend', 'clock'} & kwargs.keys())
         if unsupported:
             raise UserError(
-                f'SpendGuard cannot be built from a spec with {unsupported}: these take callables or a live '
+                f'SpendLimits cannot be built from a spec with {unsupported}: these take callables or a live '
                 'store. Construct the capability in code to use them.'
             )
         budgets = [_budget_from_spec(entry) for entry in kwargs.pop('budgets', [])]
@@ -379,7 +379,7 @@ class SpendGuard(AbstractCapability[AgentDepsT]):
                     # A credit would move a budget away from its ceiling, which
                     # turns a bug in the pricing function into a gate that never
                     # closes. Corrections belong in the store, not here.
-                    raise UserError(f'`SpendGuard.price` returned a negative amount ({supplied}) for a response.')
+                    raise UserError(f'`SpendLimits.price` returned a negative amount ({supplied}) for a response.')
                 return supplied, True
         if response.model_name:
             try:
@@ -430,10 +430,10 @@ def _is_spec_mapping(entry: object) -> TypeGuard[Mapping[str, Any]]:
 def _budget_from_spec(entry: Any) -> Budget:
     """Build one `Budget` from its spec mapping."""
     if not _is_spec_mapping(entry):
-        raise UserError(f'Each SpendGuard budget in a spec must be a mapping; got {entry!r}.')
+        raise UserError(f'Each SpendLimits budget in a spec must be a mapping; got {entry!r}.')
     fields = dict(entry)
     if 'scope' in fields:
-        raise UserError('A SpendGuard budget scope is a callable and cannot be expressed in a spec.')
+        raise UserError('A SpendLimits budget scope is a callable and cannot be expressed in a spec.')
     # Every number a spec can carry, not just `usd`: the others reached
     # `Budget.__post_init__` as strings and compared str to int there, which
     # surfaces as a bare TypeError naming no field.
@@ -442,5 +442,5 @@ def _budget_from_spec(entry: Any) -> Budget:
             try:
                 fields[name] = convert(str(fields[name]))
             except (TypeError, ValueError) as error:
-                raise UserError(f'SpendGuard budget {name!r} is not a number: {fields[name]!r}.') from error
+                raise UserError(f'SpendLimits budget {name!r} is not a number: {fields[name]!r}.') from error
     return Budget(**fields)

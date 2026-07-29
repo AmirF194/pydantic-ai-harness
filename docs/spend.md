@@ -17,17 +17,17 @@ Provider usage APIs do not close that gap. OpenAI's and Anthropic's report minut
 
 ## The solution
 
-`SpendGuard` prices every model response with [`ModelResponse.cost()`](https://pydantic.dev/docs/ai/api/messages/), adds it to each window you configure, and refuses the next request once a window is spent.
+`SpendLimits` prices every model response with [`ModelResponse.cost()`](https://pydantic.dev/docs/ai/api/messages/), adds it to each window you configure, and refuses the next request once a window is spent.
 
 ```python
 from decimal import Decimal
 
 from pydantic_ai import Agent
-from pydantic_ai_harness.spend import Budget, SpendGuard
+from pydantic_ai_harness.spend import Budget, SpendLimits
 
 agent = Agent(
     'openai:gpt-5.4',
-    capabilities=[SpendGuard(budgets=[Budget(usd=Decimal('100'), window='day')])],
+    capabilities=[SpendLimits(budgets=[Budget(usd=Decimal('100'), window='day')])],
 )
 ```
 
@@ -40,9 +40,9 @@ A budget is a ceiling, a period, and optionally a partition. They compose, so se
 ```python
 from decimal import Decimal
 
-from pydantic_ai_harness.spend import Budget, SpendGuard
+from pydantic_ai_harness.spend import Budget, SpendLimits
 
-SpendGuard(
+SpendLimits(
     budgets=[
         Budget(usd=Decimal('5'), window='run'),  # one runaway run
         Budget(usd=Decimal('100'), window='day'),  # the whole deployment, per day
@@ -67,9 +67,9 @@ Budgets that share a `name`, `window`, and `scope` share one counter, which is h
 **A budget with no ceiling is a counter.** It accumulates and reports and never refuses anything, which is how per-tenant accounting with no cap is expressed:
 
 ```python
-from pydantic_ai_harness.spend import Budget, SpendGuard
+from pydantic_ai_harness.spend import Budget, SpendLimits
 
-SpendGuard(budgets=[Budget(window='month', scope=lambda ctx: ctx.deps.tenant_id, name='chargeback')])
+SpendLimits(budgets=[Budget(window='month', scope=lambda ctx: ctx.deps.tenant_id, name='chargeback')])
 ```
 
 ## What the gate guarantees
@@ -83,7 +83,7 @@ Not: that spend stays under the ceiling. The request that crosses the line compl
 ```python
 from decimal import Decimal
 
-from pydantic_ai_harness.spend import Budget, SpendGuard, SpendSnapshot
+from pydantic_ai_harness.spend import Budget, SpendLimits, SpendSnapshot
 
 
 def show(snapshot: SpendSnapshot) -> None:
@@ -92,7 +92,7 @@ def show(snapshot: SpendSnapshot) -> None:
         print(f'  {status.budget.name}: ${status.remaining_usd} left')
 
 
-SpendGuard(budgets=[Budget(usd=Decimal('100'))], on_spend=show)
+SpendLimits(budgets=[Budget(usd=Decimal('100'))], on_spend=show)
 ```
 
 `on_spend` fires after every response, sync or async, with a `SpendSnapshot` -- including one that `on_unpriced='raise'` is about to reject, since a report that skipped exactly the unpriced responses would be missing the ones worth knowing about. It carries the response's `usage` unchanged, so cache reads and writes are available without this capability modelling them.
@@ -100,8 +100,8 @@ SpendGuard(budgets=[Budget(usd=Decimal('100'))], on_spend=show)
 `status()` reads the same numbers without a run, which is what a cost display in a UI wants:
 
 ```python
-async def report(guard: SpendGuard[None]) -> None:
-    for status in await guard.status(scope='acme'):
+async def report(limits: SpendLimits[None]) -> None:
+    for status in await limits.status(scope='acme'):
         print(status.budget.name, status.spent.usd, status.exhausted)
 ```
 
@@ -118,15 +118,15 @@ from decimal import Decimal
 
 from redis.asyncio import Redis
 
-from pydantic_ai_harness.spend import Budget, RedisSpendStore, SpendGuard
+from pydantic_ai_harness.spend import Budget, RedisSpendStore, SpendLimits
 
 store = RedisSpendStore(Redis.from_url('redis://localhost'))
-guard = SpendGuard(budgets=[Budget(usd=Decimal('100'), window='day')], store=store)
+limits = SpendLimits(budgets=[Budget(usd=Decimal('100'), window='day')], store=store)
 ```
 
 It adds no dependency: `RedisClient` is a protocol of the three coroutines used, so any compatible client satisfies it. Amounts are stored as integer billionths of a dollar and incremented with `HINCRBY`, because `INCRBYFLOAT` accumulates rounding error over the tens of thousands of requests a busy day produces. Billionths rather than millionths because the residue does not average out: an agent repeats requests of near-identical shape, so the same fraction rounds the same way every time.
 
-The default store is built per capability, so two `SpendGuard` instances do not quietly share one counter. Pass the same store object to both when you want them to.
+The default store is built per capability, so two `SpendLimits` instances do not quietly share one counter. Pass the same store object to both when you want them to.
 
 A store that fails does not fail quietly. An error reading the counter refuses the request, which is the safe direction. An error writing it propagates out of the run after the model has already answered and been charged, and the increment may be half applied. That is deliberate: a swallowed write would drift the counter down and weaken the gate, which is worse than a visible failure. If your deployment would rather keep the answer than the count, wrap the store and decide there.
 
@@ -141,9 +141,9 @@ A model the registry does not know -- a local deployment, a negotiated rate -- i
 ```python
 from decimal import Decimal
 
-from pydantic_ai_harness.spend import SpendGuard
+from pydantic_ai_harness.spend import SpendLimits
 
-SpendGuard(price=lambda response: Decimal('0.002') if response.model_name == 'internal-7b' else None)
+SpendLimits(price=lambda response: Decimal('0.002') if response.model_name == 'internal-7b' else None)
 ```
 
 Returning `None` falls through to the registry. When nothing can price a response, `on_unpriced` decides: `'zero'` (the default) counts it as free and increments `Spent.unpriced_requests` so the gap is visible, and `'raise'` fails the run with `UnpricedModelError`. Either way the response is recorded first and the tokens are counted, so a token ceiling still holds for a model with no price and an application that catches the error does not carry on against an understated counter.
@@ -157,15 +157,15 @@ The capability declares itself innermost. `after_model_request` runs innermost f
 **Durable execution.** The capability hooks run in the workflow; the model request itself is the activity. A store that talks over the network therefore reads and writes from workflow code, which Temporal replays -- so a shared store is not workflow-safe here. Use the in-process store inside the workflow, and enforce the shared budget before starting it:
 
 ```python
-async def start_if_funded(guard: SpendGuard[None], tenant_id: str) -> None:
-    if await guard.exhausted(scope=tenant_id):
+async def start_if_funded(limits: SpendLimits[None], tenant_id: str) -> None:
+    if await limits.exhausted(scope=tenant_id):
         raise RuntimeError('daily budget exhausted')
     await workflow_handle.execute(...)
 ```
 
-`exhausted` rather than `any(s.exhausted for s in await guard.status(...))`: `status` omits
+`exhausted` rather than `any(s.exhausted for s in await limits.status(...))`: `status` omits
 the budgets it cannot resolve, and `any()` over what is left is a brake that passes having
-inspected nothing -- which is exactly what a guard whose budgets are all scoped returns when
+inspected nothing -- which is exactly what a `SpendLimits` whose budgets are all scoped returns when
 the scope is missing. `exhausted` raises there instead, naming the budgets that need a
 `scope` or a run context. Use `status` for a reading, `exhausted` for a decision.
 
@@ -178,7 +178,7 @@ A refusal emits a `spend budget exhausted` span with `spend.budget` and `spend.w
 `Agent.from_spec` supports the part of the configuration a spec can express:
 
 ```yaml
-- SpendGuard:
+- SpendLimits:
     budgets:
       - {usd: '100', window: day}
       - {usd: '2000', window: month, warn_at: 0.8}
@@ -190,7 +190,7 @@ A refusal emits a `spend budget exhausted` span with `spend.budget` and `spend.w
 ## API
 
 ```python {test="skip"}
-SpendGuard(
+SpendLimits(
     budgets: Sequence[Budget] = (),
     store: SpendStore = ...,  # a fresh InMemorySpendStore per capability
     price: Callable[[ModelResponse], Decimal | None] | None = None,

@@ -25,6 +25,6 @@ class UnpricedModelError(UserError):
 
     Either the model is absent from the `genai-prices` registry (a local or
     custom deployment) or the response carries no model name. Supply
-    `SpendGuard.price` to price it yourself, or use `on_unpriced='zero'` to
+    `SpendLimits.price` to price it yourself, or use `on_unpriced='zero'` to
     count the request as free and surface it as `Spent.unpriced_requests`.
     """

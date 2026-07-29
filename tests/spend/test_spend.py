@@ -26,8 +26,8 @@ from pydantic_ai_harness.spend import (
     Budget,
     InMemorySpendStore,
     RedisSpendStore,
-    SpendGuard,
     SpendLimitExceeded,
+    SpendLimits,
     SpendSnapshot,
     Spent,
     UnpricedModelError,
@@ -101,7 +101,7 @@ def _response(
     )
 
 
-async def _record(guard: SpendGuard[Any], *, ctx: RunContext[Any] | None = None, **kwargs: Any) -> ModelResponse:
+async def _record(guard: SpendLimits[Any], *, ctx: RunContext[Any] | None = None, **kwargs: Any) -> ModelResponse:
     response = _response(**kwargs)
     return await guard.after_model_request(
         ctx if ctx is not None else _run_ctx(),
@@ -110,7 +110,7 @@ async def _record(guard: SpendGuard[Any], *, ctx: RunContext[Any] | None = None,
     )
 
 
-async def _gate(guard: SpendGuard[Any], *, ctx: RunContext[Any] | None = None) -> None:
+async def _gate(guard: SpendLimits[Any], *, ctx: RunContext[Any] | None = None) -> None:
     await guard.before_model_request(ctx if ctx is not None else _run_ctx(), _request_context())
 
 
@@ -136,7 +136,7 @@ def _scripted_usage() -> FunctionModel:
     return FunctionModel(respond)
 
 
-def _agent(guard: SpendGuard[None], *, usage: RequestUsage | None = None) -> Agent[None, str]:
+def _agent(guard: SpendLimits[None], *, usage: RequestUsage | None = None) -> Agent[None, str]:
     def respond(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
         return ModelResponse(
             parts=[TextPart(content='ok')],
@@ -151,7 +151,7 @@ def _no_price(response: ModelResponse) -> Decimal | None:
     return None
 
 
-async def _call_get_spend(guard: SpendGuard[None]) -> str:
+async def _call_get_spend(guard: SpendLimits[None]) -> str:
     """Drive `get_spend` the way the model would, and return what it reported."""
     calls = iter(
         [
@@ -223,7 +223,7 @@ class TestWindows:
 
     async def test_day_rolls_over_to_a_fresh_counter(self):
         clock = Clock()
-        guard = SpendGuard(budgets=[Budget(window='day')], clock=clock, price=lambda r: Decimal('1'))
+        guard = SpendLimits(budgets=[Budget(window='day')], clock=clock, price=lambda r: Decimal('1'))
 
         await _record(guard)
         assert (await guard.status())[0].spent.usd == Decimal('1')
@@ -233,21 +233,21 @@ class TestWindows:
 
     async def test_month_bucket_is_year_and_month(self):
         clock = Clock()
-        guard = SpendGuard(budgets=[Budget(window='month')], clock=clock)
+        guard = SpendLimits(budgets=[Budget(window='month')], clock=clock)
         await _record(guard)
 
         assert (await guard.status())[0].key.endswith('|2026-07')
 
     async def test_total_never_rolls_over(self):
         clock = Clock()
-        guard = SpendGuard(budgets=[Budget(window='total')], clock=clock, price=lambda r: Decimal('1'))
+        guard = SpendLimits(budgets=[Budget(window='total')], clock=clock, price=lambda r: Decimal('1'))
         await _record(guard)
         clock.advance(timedelta(days=400))
 
         assert (await guard.status())[0].spent.usd == Decimal('1')
 
     async def test_run_window_keys_on_the_run_id(self):
-        guard = SpendGuard(budgets=[Budget(window='run')], price=lambda r: Decimal('1'))
+        guard = SpendLimits(budgets=[Budget(window='run')], price=lambda r: Decimal('1'))
         await _record(guard, ctx=_run_ctx(run_id='a'))
         await _record(guard, ctx=_run_ctx(run_id='b'))
 
@@ -255,7 +255,7 @@ class TestWindows:
         assert statuses[0].spent.usd == Decimal('1')
 
     async def test_conversation_window_keys_on_the_conversation_id(self):
-        guard = SpendGuard(budgets=[Budget(window='conversation')], price=lambda r: Decimal('1'))
+        guard = SpendLimits(budgets=[Budget(window='conversation')], price=lambda r: Decimal('1'))
         await _record(guard, ctx=_run_ctx(conversation_id='c1'))
         await _record(guard, ctx=_run_ctx(conversation_id='c1'))
 
@@ -266,7 +266,7 @@ class TestWindows:
         [('run', {'run_id': None}), ('conversation', {'conversation_id': None})],
     )
     async def test_a_missing_identity_is_refused_rather_than_shared(self, window: Any, ctx_kwargs: Any):
-        guard = SpendGuard(budgets=[Budget(window=window)])
+        guard = SpendLimits(budgets=[Budget(window=window)])
 
         with pytest.raises(UserError, match='reports none'):
             await _record(guard, ctx=_run_ctx(**ctx_kwargs))
@@ -277,7 +277,7 @@ class TestKeyCollisions:
 
     async def test_budgets_sharing_a_window_share_one_counter(self):
         """A USD and a token ceiling on the same window are two limits on one counter."""
-        guard = SpendGuard(
+        guard = SpendLimits(
             budgets=[Budget(usd=Decimal('10'), window='day'), Budget(tokens=99_999, window='day')],
             price=lambda r: Decimal('1'),
         )
@@ -297,7 +297,7 @@ class TestKeyCollisions:
                 reads.append(key)
                 return await super().get(key)
 
-        guard = SpendGuard(
+        guard = SpendLimits(
             budgets=[Budget(usd=Decimal('10'), window='day'), Budget(tokens=99_999, window='day')],
             store=Counting(),
         )
@@ -307,14 +307,14 @@ class TestKeyCollisions:
 
     async def test_a_run_id_cannot_impersonate_another_window(self):
         """Bucket values are not drawn from disjoint sets, so the window is part of the key."""
-        guard = SpendGuard(budgets=[Budget(window='run'), Budget(window='total')])
+        guard = SpendLimits(budgets=[Budget(window='run'), Budget(window='total')])
         ctx = _run_ctx(run_id='total')
 
         run_budget, total_budget = await guard.status(ctx)
         assert run_budget.key != total_budget.key
 
     async def test_a_run_and_a_conversation_with_one_id_stay_apart(self):
-        guard = SpendGuard(budgets=[Budget(window='run'), Budget(window='conversation')])
+        guard = SpendLimits(budgets=[Budget(window='run'), Budget(window='conversation')])
         ctx = _run_ctx(run_id='same', conversation_id='same')
 
         run_budget, conversation_budget = await guard.status(ctx)
@@ -325,7 +325,7 @@ class TestScope:
     """`scope` partitions one counter; it does not select a store."""
 
     async def test_tenants_count_separately(self):
-        guard = SpendGuard(
+        guard = SpendLimits(
             budgets=[Budget(usd=Decimal('1'), scope=lambda ctx: str(ctx.deps))],
             price=lambda r: Decimal('0.4'),
         )
@@ -337,7 +337,7 @@ class TestScope:
         assert (await guard.status(scope='bob'))[0].spent.usd == Decimal('0.4')
 
     async def test_an_unscoped_budget_ignores_the_requested_scope(self):
-        guard = SpendGuard(budgets=[Budget(window='day')], price=lambda r: Decimal('1'))
+        guard = SpendLimits(budgets=[Budget(window='day')], price=lambda r: Decimal('1'))
         await _record(guard)
 
         assert (await guard.status(scope='anything'))[0].spent.usd == Decimal('1')
@@ -345,7 +345,7 @@ class TestScope:
     @pytest.mark.parametrize('resolved', ['', 'a|b', '*'])
     async def test_a_scope_key_that_would_collide_is_refused(self, resolved: str):
         """`'*'` included: it is how an unscoped budget is keyed, so it would share that counter."""
-        guard = SpendGuard(budgets=[Budget(scope=lambda ctx: resolved)])
+        guard = SpendLimits(budgets=[Budget(scope=lambda ctx: resolved)])
 
         with pytest.raises(UserError, match='must be non-empty and must not be'):
             await _record(guard)
@@ -355,7 +355,7 @@ class TestEnforcement:
     """The gate refuses the next request once a window is spent."""
 
     async def test_a_usd_ceiling_stops_the_run(self):
-        guard = SpendGuard(budgets=[Budget(usd=Decimal('0.02'))], price=lambda r: Decimal('0.01'))
+        guard = SpendLimits(budgets=[Budget(usd=Decimal('0.02'))], price=lambda r: Decimal('0.01'))
         agent = _agent(guard)
 
         await agent.run('hi')
@@ -364,7 +364,7 @@ class TestEnforcement:
             await agent.run('hi')
 
     async def test_a_token_ceiling_stops_the_run(self):
-        guard = SpendGuard(budgets=[Budget(tokens=1000)])
+        guard = SpendLimits(budgets=[Budget(tokens=1000)])
         agent = _agent(guard)
 
         await agent.run('hi')
@@ -372,14 +372,14 @@ class TestEnforcement:
             await agent.run('hi')
 
     async def test_it_is_catchable_as_a_usage_limit(self):
-        guard = SpendGuard(budgets=[Budget(usd=Decimal('0.001'))], price=lambda r: Decimal('1'))
+        guard = SpendLimits(budgets=[Budget(usd=Decimal('0.001'))], price=lambda r: Decimal('1'))
         await _record(guard)
 
         with pytest.raises(UsageLimitExceeded):
             await _gate(guard)
 
     async def test_a_counting_budget_never_stops_the_run(self):
-        guard = SpendGuard(budgets=[Budget(window='total')], price=lambda r: Decimal('1000'))
+        guard = SpendLimits(budgets=[Budget(window='total')], price=lambda r: Decimal('1000'))
         agent = _agent(guard)
 
         await agent.run('hi')
@@ -392,11 +392,11 @@ class TestEnforcement:
             async def get(self, key: str) -> Spent:  # pragma: no cover - must never be reached
                 raise AssertionError('the gate read the store with no budgets configured')
 
-        guard = SpendGuard(store=Exploding())
+        guard = SpendLimits(store=Exploding())
         await _gate(guard)
 
     async def test_budgets_survive_across_runs(self):
-        guard = SpendGuard(budgets=[Budget(usd=Decimal('0.01'), window='day')], price=lambda r: Decimal('0.01'))
+        guard = SpendLimits(budgets=[Budget(usd=Decimal('0.01'), window='day')], price=lambda r: Decimal('0.01'))
         agent = _agent(guard)
 
         await agent.run('hi')
@@ -421,7 +421,7 @@ class TestOrdering:
                     raise ModelRetry('try again')
                 return response
 
-        guard = SpendGuard(budgets=[Budget(window='total')], price=lambda r: Decimal('1'))
+        guard = SpendLimits(budgets=[Budget(window='total')], price=lambda r: Decimal('1'))
         agent = Agent(_scripted_usage(), deps_type=type(None), capabilities=[guard, RejectFirst()])
         result = await agent.run('hi')
 
@@ -429,14 +429,14 @@ class TestOrdering:
         assert (await guard.status())[0].spent.requests == 2
 
     def test_it_declares_innermost(self):
-        assert SpendGuard[None]().get_ordering() == CapabilityOrdering(position='innermost')
+        assert SpendLimits[None]().get_ordering() == CapabilityOrdering(position='innermost')
 
 
 class TestPricing:
     """What a response cost, and whether that number is real."""
 
     async def test_the_registry_prices_a_known_model(self):
-        guard = SpendGuard(budgets=[Budget(window='total')])
+        guard = SpendLimits(budgets=[Budget(window='total')])
         await _record(guard)
 
         status = (await guard.status())[0]
@@ -444,13 +444,13 @@ class TestPricing:
         assert status.spent.unpriced_requests == 0
 
     async def test_the_price_override_wins(self):
-        guard = SpendGuard(budgets=[Budget(window='total')], price=lambda r: Decimal('7'))
+        guard = SpendLimits(budgets=[Budget(window='total')], price=lambda r: Decimal('7'))
         await _record(guard)
 
         assert (await guard.status())[0].spent.usd == Decimal('7')
 
     async def test_an_override_returning_none_falls_through_to_the_registry(self):
-        guard = SpendGuard(budgets=[Budget(window='total')], price=_no_price)
+        guard = SpendLimits(budgets=[Budget(window='total')], price=_no_price)
         await _record(guard)
 
         assert (await guard.status())[0].spent.usd > 0
@@ -460,7 +460,7 @@ class TestPricing:
         [{'model_name': None}, {'model_name': 'not-a-real-model', 'provider_name': None}],
     )
     async def test_an_unpriceable_response_still_counts_tokens(self, kwargs: Any):
-        guard = SpendGuard(budgets=[Budget(window='total')])
+        guard = SpendLimits(budgets=[Budget(window='total')])
         await _record(guard, **kwargs)
 
         status = (await guard.status())[0]
@@ -470,7 +470,7 @@ class TestPricing:
 
     async def test_a_usage_shape_the_registry_rejects_is_treated_as_unpriced(self):
         """`genai-prices` raises ValueError on some shapes; letting it escape would skip `on_unpriced`."""
-        guard = SpendGuard(budgets=[Budget(window='total')])
+        guard = SpendLimits(budgets=[Budget(window='total')])
         response = ModelResponse(
             parts=[TextPart(content='x')],
             usage=RequestUsage(input_tokens=10, cache_read_tokens=500, output_tokens=5),
@@ -485,20 +485,20 @@ class TestPricing:
 
     async def test_a_negative_price_is_refused(self):
         """A credit would move a budget away from its ceiling, so the gate would never close."""
-        guard = SpendGuard(budgets=[Budget(window='total')], price=lambda r: Decimal('-1'))
+        guard = SpendLimits(budgets=[Budget(window='total')], price=lambda r: Decimal('-1'))
 
         with pytest.raises(UserError, match='returned a negative amount'):
             await _record(guard)
 
     async def test_raising_on_a_model_the_registry_does_not_know(self):
-        guard = SpendGuard(budgets=[Budget(window='total')], on_unpriced='raise')
+        guard = SpendLimits(budgets=[Budget(window='total')], on_unpriced='raise')
 
         with pytest.raises(UnpricedModelError, match='not-a-real-model'):
             await _record(guard, model_name='not-a-real-model', provider_name=None)
 
     async def test_a_refused_response_is_still_counted(self):
         """The tokens were really spent, so dropping them would understate a token ceiling."""
-        guard = SpendGuard(budgets=[Budget(tokens=5000, window='day')], on_unpriced='raise')
+        guard = SpendLimits(budgets=[Budget(tokens=5000, window='day')], on_unpriced='raise')
 
         with pytest.raises(UnpricedModelError):
             await _record(guard, model_name=None)
@@ -511,7 +511,7 @@ class TestPricing:
     async def test_a_refused_response_still_reaches_on_spend(self):
         """An audit that skipped exactly the unpriced responses would miss the ones that matter."""
         seen: list[SpendSnapshot] = []
-        guard = SpendGuard(budgets=[Budget(window='total')], on_unpriced='raise', on_spend=seen.append)
+        guard = SpendLimits(budgets=[Budget(window='total')], on_unpriced='raise', on_spend=seen.append)
 
         with pytest.raises(UnpricedModelError):
             await _record(guard, model_name=None)
@@ -521,7 +521,7 @@ class TestPricing:
         assert seen[0].usage.input_tokens == 1000
 
     async def test_raising_on_an_unpriceable_response(self):
-        guard = SpendGuard(budgets=[Budget(window='total')], on_unpriced='raise')
+        guard = SpendLimits(budgets=[Budget(window='total')], on_unpriced='raise')
 
         with pytest.raises(UnpricedModelError, match='<unnamed>'):
             await _record(guard, model_name=None)
@@ -534,13 +534,13 @@ class TestConfigurationFromData:
     def test_an_unknown_window_is_refused(self, window: str):
         """A `Literal` is not enforced at runtime, so a spec typo would reach `assert_never`."""
         with pytest.raises(UserError, match='window must be one of'):
-            SpendGuard[None].from_spec(budgets=[{'window': window}])
+            SpendLimits[None].from_spec(budgets=[{'window': window}])
 
     @pytest.mark.parametrize('policy', ['raises', 'Zero', ''])
     def test_an_unknown_unpriced_policy_is_refused(self, policy: str):
         """Anything but `'raise'` behaves as `'zero'`, so a typo would quietly make responses free."""
         with pytest.raises(UserError, match='on_unpriced must be one of'):
-            SpendGuard[None](on_unpriced=policy)  # pyright: ignore[reportArgumentType]
+            SpendLimits[None](on_unpriced=policy)  # pyright: ignore[reportArgumentType]
 
 
 class TestObservability:
@@ -548,7 +548,7 @@ class TestObservability:
 
     async def test_on_spend_receives_the_response_usage_verbatim(self):
         seen: list[SpendSnapshot] = []
-        guard = SpendGuard(budgets=[Budget(window='total')], on_spend=seen.append)
+        guard = SpendLimits(budgets=[Budget(window='total')], on_spend=seen.append)
         await _record(guard)
 
         assert len(seen) == 1
@@ -562,13 +562,13 @@ class TestObservability:
         async def record(snapshot: SpendSnapshot) -> None:
             seen.append(snapshot.usd)
 
-        guard = SpendGuard(price=lambda r: Decimal('3'), on_spend=record)
+        guard = SpendLimits(price=lambda r: Decimal('3'), on_spend=record)
         await _record(guard)
 
         assert seen == [Decimal('3')]
 
     async def test_status_reports_what_is_left(self):
-        guard = SpendGuard(
+        guard = SpendLimits(
             budgets=[Budget(usd=Decimal('10'), tokens=5000, warn_at=0.5)],
             price=lambda r: Decimal('6'),
         )
@@ -581,7 +581,7 @@ class TestObservability:
         assert status.exhausted is False
 
     async def test_a_token_ceiling_reports_as_exhausted(self):
-        guard = SpendGuard(budgets=[Budget(tokens=1000)])
+        guard = SpendLimits(budgets=[Budget(tokens=1000)])
         await _record(guard)
 
         status = (await guard.status())[0]
@@ -590,13 +590,13 @@ class TestObservability:
         assert status.remaining_usd is None
 
     async def test_a_token_warning_fires_without_a_usd_limit(self):
-        guard = SpendGuard(budgets=[Budget(tokens=2000, warn_at=0.5)])
+        guard = SpendLimits(budgets=[Budget(tokens=2000, warn_at=0.5)])
         await _record(guard)
 
         assert (await guard.status())[0].warning is True
 
     async def test_no_warning_threshold_means_no_warning(self):
-        guard = SpendGuard(budgets=[Budget(usd=Decimal('0.0001'))], price=lambda r: Decimal('1'))
+        guard = SpendLimits(budgets=[Budget(usd=Decimal('0.0001'))], price=lambda r: Decimal('1'))
         await _record(guard)
 
         status = (await guard.status())[0]
@@ -604,7 +604,7 @@ class TestObservability:
         assert status.exhausted is True
 
     async def test_status_without_a_run_omits_what_it_cannot_resolve(self):
-        guard = SpendGuard(
+        guard = SpendLimits(
             budgets=[
                 Budget(name='daily', window='day'),
                 Budget(name='per-run', window='run'),
@@ -622,7 +622,7 @@ class TestTracing:
 
     async def test_a_refusal_records_a_span(self):
         tracer, exporter = _recording_tracer()
-        guard = SpendGuard(budgets=[Budget(usd=Decimal('0.001'), window='day')], price=lambda r: Decimal('1'))
+        guard = SpendLimits(budgets=[Budget(usd=Decimal('0.001'), window='day')], price=lambda r: Decimal('1'))
         await _record(guard)
 
         with pytest.raises(SpendLimitExceeded):
@@ -634,7 +634,7 @@ class TestTracing:
 
     async def test_the_scope_key_is_content(self):
         tracer, exporter = _recording_tracer()
-        guard = SpendGuard(
+        guard = SpendLimits(
             budgets=[Budget(usd=Decimal('0.001'), scope=lambda ctx: str(ctx.deps))],
             price=lambda r: Decimal('1'),
         )
@@ -647,7 +647,7 @@ class TestTracing:
 
     async def test_accrual_records_nothing(self):
         tracer, exporter = _recording_tracer()
-        guard = SpendGuard(budgets=[Budget(window='total')])
+        guard = SpendLimits(budgets=[Budget(window='total')])
         await _record(guard, ctx=_run_ctx(tracer=tracer))
 
         assert exporter.get_finished_spans() == ()
@@ -802,7 +802,7 @@ class TestRedisStore:
         assert client.expiries == {'acme:k': 7200}
 
     async def test_it_drives_the_gate(self):
-        guard = SpendGuard(
+        guard = SpendLimits(
             budgets=[Budget(usd=Decimal('0.02'), window='day')],
             store=RedisSpendStore(FakeRedis()),
             price=lambda r: Decimal('0.01'),
@@ -819,7 +819,7 @@ class TestToolset:
     """The agent-facing tool is off unless asked for."""
 
     def test_no_toolset_by_default(self):
-        assert SpendGuard[None]().get_toolset() is None
+        assert SpendLimits[None]().get_toolset() is None
 
     async def test_the_tool_is_offered_to_the_model(self):
         offered: list[list[str]] = []
@@ -828,14 +828,14 @@ class TestToolset:
             offered.append(sorted(tool.name for tool in info.function_tools))
             return ModelResponse(parts=[TextPart(content='done')])
 
-        guard = SpendGuard(budgets=[Budget(window='total')], expose_tools=True)
+        guard = SpendLimits(budgets=[Budget(window='total')], expose_tools=True)
         agent = Agent(FunctionModel(respond), deps_type=type(None), capabilities=[guard])
         await agent.run('hi')
 
         assert offered == [['get_spend']]
 
     async def test_the_tool_reports_each_budget(self):
-        guard = SpendGuard[None](
+        guard = SpendLimits[None](
             budgets=[Budget(name='daily', usd=Decimal('10'), window='day'), Budget(name='lifetime', window='total')],
             price=lambda r: Decimal('2'),
             expose_tools=True,
@@ -847,14 +847,14 @@ class TestToolset:
         assert 'lifetime (total): $2 spent, no limit' in report
 
     async def test_the_tool_says_so_when_nothing_is_budgeted(self):
-        assert await _call_get_spend(SpendGuard[None](expose_tools=True)) == 'No budgets are configured.'
+        assert await _call_get_spend(SpendLimits[None](expose_tools=True)) == 'No budgets are configured.'
 
 
 class TestExhaustedGate:
     """The pre-flight check a durable workflow makes, which must not pass by inspecting nothing."""
 
     async def test_it_refuses_to_answer_about_a_budget_it_cannot_read(self):
-        guard = SpendGuard(
+        guard = SpendLimits(
             budgets=[Budget(usd=Decimal('5'), scope=lambda ctx: str(ctx.deps), name='tenant')],
             price=lambda r: Decimal('1'),
         )
@@ -863,7 +863,7 @@ class TestExhaustedGate:
             await guard.exhausted()
 
     async def test_it_answers_when_the_scope_is_named(self):
-        guard = SpendGuard(
+        guard = SpendLimits(
             budgets=[Budget(usd=Decimal('0.5'), scope=lambda ctx: str(ctx.deps), name='tenant')],
             price=lambda r: Decimal('1'),
         )
@@ -874,7 +874,7 @@ class TestExhaustedGate:
 
     async def test_status_still_reports_what_it_can(self):
         """The lenient reading a cost display wants stays lenient."""
-        guard = SpendGuard(
+        guard = SpendLimits(
             budgets=[Budget(usd=Decimal('5'), scope=lambda ctx: str(ctx.deps), name='tenant')],
             price=lambda r: Decimal('1'),
         )
@@ -887,7 +887,7 @@ class TestNegativeCells:
 
     async def test_raise_lets_a_priced_response_through(self):
         """`on_unpriced='raise'` is about the unpriced ones; dropping `not priced` failed every run."""
-        guard = SpendGuard[None](
+        guard = SpendLimits[None](
             budgets=[Budget(usd=Decimal('100'))],
             price=lambda response: Decimal('1'),
             on_unpriced='raise',
@@ -900,7 +900,7 @@ class TestNegativeCells:
     async def test_a_scope_stays_out_of_the_span_without_content(self):
         """Dropping the `trace_include_content` half puts a tenant id in every trace."""
         tracer, exporter = _recording_tracer()
-        guard = SpendGuard(
+        guard = SpendLimits(
             budgets=[Budget(usd=Decimal('0.001'), scope=lambda ctx: str(ctx.deps))],
             price=lambda r: Decimal('1'),
         )
@@ -913,7 +913,7 @@ class TestNegativeCells:
 
     async def test_a_budget_below_its_warning_fraction_does_not_warn(self):
         """Only the crossed case was asserted, so `warning=True` for every budget also passed."""
-        guard = SpendGuard(budgets=[Budget(usd=Decimal('100'), warn_at=0.8)], price=lambda r: Decimal('1'))
+        guard = SpendLimits(budgets=[Budget(usd=Decimal('100'), warn_at=0.8)], price=lambda r: Decimal('1'))
         await _record(guard)
 
         [status] = await guard.status()
@@ -921,7 +921,7 @@ class TestNegativeCells:
         assert status.warning is False
 
     async def test_a_budget_over_its_warning_fraction_warns(self):
-        guard = SpendGuard(budgets=[Budget(usd=Decimal('100'), warn_at=0.8)], price=lambda r: Decimal('90'))
+        guard = SpendLimits(budgets=[Budget(usd=Decimal('100'), warn_at=0.8)], price=lambda r: Decimal('90'))
         await _record(guard)
 
         [status] = await guard.status()
@@ -935,12 +935,12 @@ class TestDuplicateBudgets:
     def test_two_budgets_with_the_same_usd_ceiling_slot_are_refused(self):
         """They read as independent limits and behave as the smaller one."""
         with pytest.raises(UserError, match='would share one counter'):
-            SpendGuard[None](budgets=[Budget(usd=Decimal('5')), Budget(usd=Decimal('100'))])
+            SpendLimits[None](budgets=[Budget(usd=Decimal('5')), Budget(usd=Decimal('100'))])
 
     def test_a_collision_a_later_budget_displaced_is_still_refused(self):
         """Remembering one budget per slot missed any collision the next budget overwrote."""
         with pytest.raises(UserError, match='would share one counter'):
-            SpendGuard[None](
+            SpendLimits[None](
                 budgets=[
                     Budget(usd=Decimal('100'), window='day'),
                     Budget(usd=Decimal('2000'), window='month'),
@@ -950,7 +950,7 @@ class TestDuplicateBudgets:
 
     async def test_two_scopes_that_resolve_alike_are_refused_when_the_keys_are_known(self):
         """Two lambdas are two objects and one key, which construction cannot see."""
-        guard = SpendGuard[None](
+        guard = SpendLimits[None](
             budgets=[
                 Budget(usd=Decimal('5'), window='day', scope=lambda ctx: 'acme', name='tenant'),
                 Budget(usd=Decimal('100'), window='day', scope=lambda ctx: 'acme', name='tenant'),
@@ -962,12 +962,12 @@ class TestDuplicateBudgets:
             await _agent(guard).run('hi')
 
     def test_a_usd_and_a_token_ceiling_may_share_a_counter(self):
-        guard = SpendGuard[None](budgets=[Budget(usd=Decimal('5')), Budget(tokens=100)])
+        guard = SpendLimits[None](budgets=[Budget(usd=Decimal('5')), Budget(tokens=100)])
 
         assert len(guard.budgets) == 2
 
     def test_different_names_keep_them_apart(self):
-        guard = SpendGuard[None](
+        guard = SpendLimits[None](
             budgets=[Budget(usd=Decimal('5'), name='tight'), Budget(usd=Decimal('100'), name='loose')]
         )
 
@@ -979,10 +979,10 @@ class TestSpec:
 
     def test_the_spec_name_is_pinned(self):
         """Declared rather than inherited, so renaming the class cannot move the spec API."""
-        assert SpendGuard.get_serialization_name() == 'SpendGuard'
+        assert SpendLimits.get_serialization_name() == 'SpendLimits'
 
     def test_budgets_are_built_from_mappings(self):
-        guard = SpendGuard[None].from_spec(
+        guard = SpendLimits[None].from_spec(
             budgets=[{'usd': '100', 'window': 'day'}, {'tokens': 5000, 'name': 'tokens'}],
             on_unpriced='raise',
         )
@@ -993,22 +993,22 @@ class TestSpec:
 
     def test_a_callable_field_is_refused(self):
         with pytest.raises(UserError, match=r"\['on_spend', 'price'\]"):
-            SpendGuard[None].from_spec(price=_no_price, on_spend=print)
+            SpendLimits[None].from_spec(price=_no_price, on_spend=print)
 
     def test_a_budget_must_be_a_mapping(self):
         with pytest.raises(UserError, match='must be a mapping'):
-            SpendGuard[None].from_spec(budgets=['100'])
+            SpendLimits[None].from_spec(budgets=['100'])
 
     def test_every_number_a_spec_carries_is_coerced(self):
         """Only `usd` was converted, so the others reached `__post_init__` and compared str to int."""
-        guard = SpendGuard[None].from_spec(budgets=[{'usd': '1', 'tokens': '5000', 'warn_at': '0.8'}])
+        guard = SpendLimits[None].from_spec(budgets=[{'usd': '1', 'tokens': '5000', 'warn_at': '0.8'}])
 
         assert guard.budgets[0] == Budget(usd=Decimal('1'), tokens=5000, warn_at=0.8)
 
     def test_a_number_that_is_not_a_number_is_named(self):
         with pytest.raises(UserError, match="budget 'tokens' is not a number"):
-            SpendGuard[None].from_spec(budgets=[{'tokens': 'lots'}])
+            SpendLimits[None].from_spec(budgets=[{'tokens': 'lots'}])
 
     def test_a_budget_scope_is_refused(self):
         with pytest.raises(UserError, match='cannot be expressed in a spec'):
-            SpendGuard[None].from_spec(budgets=[{'scope': 'tenant'}])
+            SpendLimits[None].from_spec(budgets=[{'scope': 'tenant'}])

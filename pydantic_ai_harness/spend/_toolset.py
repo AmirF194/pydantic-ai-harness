@@ -8,15 +8,15 @@ from pydantic_ai.tools import AgentDepsT, RunContext
 from pydantic_ai.toolsets import FunctionToolset
 
 if TYPE_CHECKING:
-    from pydantic_ai_harness.spend._capability import SpendGuard
+    from pydantic_ai_harness.spend._capability import SpendLimits
 
 
-def build_toolset(guard: SpendGuard[AgentDepsT]) -> FunctionToolset[AgentDepsT]:
+def build_toolset(limits: SpendLimits[AgentDepsT]) -> FunctionToolset[AgentDepsT]:
     """A one-tool toolset reporting what the agent has spent so far."""
 
     async def get_spend(ctx: RunContext[AgentDepsT]) -> str:
         """Report spend so far against each budget, and how much of each is left."""
-        statuses = await guard.status(ctx)
+        statuses = await limits.status(ctx)
         if not statuses:
             return 'No budgets are configured.'
         return '\n'.join(
