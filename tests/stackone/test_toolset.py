@@ -76,6 +76,11 @@ class TestStackOneToolset:
         with pytest.raises(UserError, match='`base_url` must be an absolute HTTPS URL'):
             StackOneToolset(account_id='45320', api_key='key', base_url=base_url)
 
+    @pytest.mark.parametrize('suffix', ['?region=eu', '#region-eu'])
+    def test_rejects_base_url_query_and_fragment(self, suffix: str):
+        with pytest.raises(UserError, match='`base_url` must not contain a query or fragment'):
+            StackOneToolset(account_id='45320', api_key='key', base_url=f'https://proxy.example{suffix}')
+
     @pytest.mark.parametrize('client', ['http://api.stackone.com/mcp', AnyUrl('http://api.stackone.com/mcp')])
     def test_rejects_insecure_http_client(self, client: str | AnyUrl):
         with pytest.raises(UserError, match='`client` must be an absolute HTTPS URL'):

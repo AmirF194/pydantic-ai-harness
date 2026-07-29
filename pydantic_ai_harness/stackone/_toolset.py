@@ -248,7 +248,10 @@ class StackOneToolset(WrapperToolset[AgentDepsT]):
         mode = resolve_tool_mode(tool_mode, actions)
         if client is None:
             _validate_https_url(base_url, name='base_url')
-            resolved: MCPToolsetClient = f'{base_url.rstrip("/")}{_MCP_PATH}'
+            parts = urlsplit(base_url)
+            if parts.query or parts.fragment:
+                raise UserError('`base_url` must not contain a query or fragment.')
+            resolved: MCPToolsetClient = urlunsplit(parts._replace(path=f'{parts.path.rstrip("/")}{_MCP_PATH}'))
         else:
             resolved = client
         headers: dict[str, str] | None = None
