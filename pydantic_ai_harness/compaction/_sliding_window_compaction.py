@@ -16,6 +16,7 @@ from pydantic_ai_harness.compaction._receipts import (
     ReceiptInfo,
     discover_transcript_handle,
     format_receipt,
+    is_receipt_part,
     make_receipt_part,
     record_receipt,
 )
@@ -84,7 +85,7 @@ class SlidingWindowCompaction(AbstractCapability[AgentDepsT]):
 
     receipts: bool = False
     """When ``True``, prepend a deterministic compaction receipt recording how much history
-    was dropped, with a transcript handle when a ``TranscriptStore`` capability is attached.
+    was dropped, with a transcript handle when a ``TranscriptHandleProvider`` capability is attached.
 
     Opt-in for now: the receipt text is content, so defaulting it on is deferred to the
     benchmark eval-rig pass.  The mechanism itself is structural.
@@ -109,9 +110,10 @@ class SlidingWindowCompaction(AbstractCapability[AgentDepsT]):
     ) -> list[ModelMessage]:
         """Drop the oldest messages down to the configured tail."""
         if self.keep_tokens is not None:
-            cutoff = find_token_cutoff(messages, self.keep_tokens, self.tokenizer)
+            reservation = self._receipt_token_reservation(messages, ctx) if self.receipts else 0
+            cutoff = find_token_cutoff(messages, max(0, self.keep_tokens - reservation), self.tokenizer)
         else:
-            cutoff = find_safe_cutoff(messages, self.keep_messages)
+            cutoff = find_safe_cutoff(messages, max(0, self.keep_messages - int(self.receipts)))
 
         if cutoff <= 0:
             return messages
@@ -121,8 +123,32 @@ class SlidingWindowCompaction(AbstractCapability[AgentDepsT]):
             trimmed = prepend_first_user_message(messages, cutoff, trimmed)
         trimmed = reinject_pinned(messages, trimmed)
         if self.receipts:
-            trimmed = [self._receipt_message(messages[:cutoff], ctx), *trimmed]
+            trimmed = [self._receipt_message(messages[:cutoff], ctx), *self._without_receipts(trimmed)]
         return trimmed
+
+    def _receipt_token_reservation(self, messages: list[ModelMessage], ctx: RunContext[AgentDepsT]) -> int:
+        """Reserve enough tokens for any receipt this compaction can emit."""
+        text = format_receipt(
+            dropped_messages=len(messages),
+            dropped_tokens=estimate_token_count(messages, self.tokenizer),
+            by='the harness',
+            handle=discover_transcript_handle(ctx),
+            has_summary=False,
+        )
+        return estimate_token_count([ModelRequest(parts=[make_receipt_part(text)])], self.tokenizer)
+
+    @staticmethod
+    def _without_receipts(messages: list[ModelMessage]) -> list[ModelMessage]:
+        """Remove prior receipt-only requests before inserting the current receipt."""
+        return [
+            message
+            for message in messages
+            if not (
+                isinstance(message, ModelRequest)
+                and message.parts
+                and all(is_receipt_part(part) for part in message.parts)
+            )
+        ]
 
     def _receipt_message(self, dropped: list[ModelMessage], ctx: RunContext[AgentDepsT]) -> ModelRequest:
         """Build (and record for tracing) a receipt for the *dropped* prefix."""

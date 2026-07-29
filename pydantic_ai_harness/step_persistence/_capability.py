@@ -159,10 +159,9 @@ class StepPersistence(AbstractCapability[AgentDepsT]):
     def compaction_transcript_handle(self) -> str | None:
         """Retrieval handle to this run's transcript, for compaction receipts.
 
-        Satisfies the compaction `TranscriptStore` protocol structurally (no import coupling):
-        a compaction strategy discovers this capability via `RunContext.capabilities` and uses
-        the returned `run_id` to look the full transcript up in `self.store`. Returns `None`
-        before `for_run` has materialised the id.
+        Satisfies the compaction `TranscriptHandleProvider` protocol structurally (no import
+        coupling). A compaction strategy discovers this capability via `RunContext.capabilities`
+        and records its run id. Returns `None` before `for_run` has materialised the id.
         """
         return self.run_id
 

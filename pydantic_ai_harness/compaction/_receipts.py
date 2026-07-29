@@ -4,8 +4,8 @@ After a strategy that crosses a compaction *boundary* (older history summarized 
 rewrites the conversation, it can append a standard receipt so the model knows its memory of
 everything before that point is secondhand and can re-verify rather than confabulate. The
 receipt carries no timestamp -- it is a pure function of its inputs, so its bytes are
-deterministic and testable -- and, when a transcript store is attached and discoverable, a
-retrieval handle to the full pre-compaction transcript.
+deterministic and testable -- and, when a handle provider is attached and discoverable, an
+identifier for persisted run history.
 
 Wording note: the exact receipt text is content, so it is shipped minimal/neutral and flagged
 pending the benchmark eval-rig pass. The mechanism (presence, determinism, handle discovery,
@@ -19,7 +19,7 @@ from dataclasses import dataclass
 from typing import Protocol, runtime_checkable
 
 from pydantic_ai._run_context import AgentDepsT
-from pydantic_ai.messages import UserPromptPart
+from pydantic_ai.messages import TextContent, UserPromptPart
 from pydantic_ai.tools import RunContext
 
 _RECEIPT_MARKER = '[History before this point'
@@ -35,24 +35,23 @@ RECEIPT_EVENT_NAME = 'compaction.receipt'
 
 
 @runtime_checkable
-class TranscriptStore(Protocol):
-    """A capability that can hand out a retrieval handle to the pre-compaction transcript.
+class TranscriptHandleProvider(Protocol):
+    """A capability that can hand out a handle for its persisted run history.
 
     Any capability implementing this method is discovered from `RunContext.capabilities`; the
-    first non-`None` handle is used. `StepPersistence` implements it (returning its `run_id`),
-    so attaching it makes the transcript retrievable without any wiring.
+    first non-`None` handle is used. `StepPersistence` implements it by returning its `run_id`.
     """
 
     def compaction_transcript_handle(self) -> str | None: ...  # pragma: no cover
 
 
 def discover_transcript_handle(ctx: RunContext[AgentDepsT]) -> str | None:
-    """Return a transcript handle from the first discoverable `TranscriptStore`, else `None`."""
+    """Return a transcript handle from the first provider, else `None`."""
     capabilities = getattr(ctx, 'capabilities', None)
     if not capabilities:
         return None
     for capability in capabilities.values():
-        if isinstance(capability, TranscriptStore):
+        if isinstance(capability, TranscriptHandleProvider):
             handle = capability.compaction_transcript_handle()
             if handle:
                 return handle
@@ -88,23 +87,29 @@ def format_receipt(
             f'was dropped by {by}. That context is no longer in the window; '
             're-verify critical facts against primary sources.'
         )
-    transcript = f' Full transcript: {handle}.' if handle else ''
+    transcript = f' Persisted run handle: {handle}.' if handle else ''
     return f'{_RECEIPT_MARKER} ({dropped_messages} messages, ~{dropped_tokens} tokens) {core}{transcript}]'
+
+
+_RECEIPT_METADATA = 'pydantic-ai-harness.compaction.receipt.v1'
+"""Model-invisible metadata identifying a receipt content item."""
 
 
 def make_receipt_part(text: str) -> UserPromptPart:
     """Wrap receipt *text* in a `UserPromptPart` for placement in the surviving history.
 
-    A `UserPromptPart` (not a `SystemPromptPart`) so a later compaction's leading-system-prompt
-    extraction stops at it rather than folding a stale receipt into the preserved system block.
+    The text remains user-role context while its metadata lets compaction distinguish it from a
+    user turn.
     """
-    return UserPromptPart(content=text)
+    return UserPromptPart(content=[TextContent(text, metadata=_RECEIPT_METADATA)])
 
 
 def is_receipt_part(part: object) -> bool:
-    """Return True if *part* is a receipt part (by marker prefix)."""
+    """Return True if *part* carries the receipt metadata marker."""
     return (
-        isinstance(part, UserPromptPart) and isinstance(part.content, str) and part.content.startswith(_RECEIPT_MARKER)
+        isinstance(part, UserPromptPart)
+        and not isinstance(part.content, str)
+        and any(isinstance(item, TextContent) and item.metadata == _RECEIPT_METADATA for item in part.content)
     )
 
 

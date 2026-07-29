@@ -1,18 +1,11 @@
 """Pin contract: mark message content that every shipped compaction strategy must preserve.
 
-A *pin* is a lightweight, harness-side convention: content wrapped in a recognizable
-`<pinned>` envelope that compaction treats as load-bearing -- it is never summarized away or
+A *pin* is a lightweight, harness-side convention: content marked with model-invisible
+`TextContent.metadata` that compaction treats as load-bearing -- it is never summarized away or
 dropped, and if a strategy would have discarded it, the strategy re-injects it verbatim.
-Planning's plan does not need pinning (it is re-injected ephemerally every request in
-`wrap_model_request`, so it already survives compaction by construction); the motivating
-consumers here are durable task state and a scratchpad the model wants guaranteed to ride
-along -- see the README.
-
-Marking mechanism / core gap: message-part types do not share a universal `metadata` field
-(only `ToolReturnPart` has one today), so there is no clean per-part flag to set. Rather than
-depend on a part subtype, pins use a sentinel-in-content envelope -- the same shape the
-existing `LimitWarner`/summary markers already use. If core later grows a universal part-level
-`metadata`/`pinned` seam, migrate the marker onto it.
+Planning's plan does not need pinning because it is re-injected ephemerally every request in
+`wrap_model_request`; the motivating consumers here are durable task state and a scratchpad the
+model wants guaranteed to ride along.
 """
 
 from __future__ import annotations
@@ -24,30 +17,29 @@ from pydantic_ai.messages import (
     ModelRequest,
     ModelRequestPart,
     SystemPromptPart,
+    TextContent,
     UserPromptPart,
 )
 
-_PIN_OPEN = '<pinned>'
-"""Sentinel opening the pinned envelope; also the detection prefix."""
-
-_PIN_CLOSE = '</pinned>'
+_PIN_METADATA = 'pydantic-ai-harness.compaction.pin.v1'
+"""Model-invisible metadata identifying a pinned user-content item."""
 
 
 def pin(content: str) -> UserPromptPart:
-    """Wrap *content* in a pinned envelope that every shipped compaction strategy preserves.
+    """Mark *content* so every shipped compaction strategy preserves it.
 
     The returned `UserPromptPart` can be placed in a `ModelRequest` in the run's message
     history (e.g. by a capability or by the user); compaction keeps it verbatim.
     """
-    return UserPromptPart(content=f'{_PIN_OPEN}\n{content}\n{_PIN_CLOSE}')
+    return UserPromptPart(content=[TextContent(content, metadata=_PIN_METADATA)])
 
 
 def is_pinned(part: object) -> bool:
-    """Return True if *part* is a text part carrying the pinned envelope."""
+    """Return True if *part* carries the pin metadata marker."""
     return (
-        isinstance(part, (UserPromptPart, SystemPromptPart))
-        and isinstance(part.content, str)
-        and part.content.startswith(_PIN_OPEN)
+        isinstance(part, UserPromptPart)
+        and not isinstance(part.content, str)
+        and any(isinstance(item, TextContent) and item.metadata == _PIN_METADATA for item in part.content)
     )
 
 

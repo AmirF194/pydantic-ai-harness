@@ -19,9 +19,10 @@ from pydantic_ai.messages import (
     ToolReturnPart,
     UserPromptPart,
 )
+from pydantic_ai.models.fallback import FallbackModel
 from pydantic_ai.tools import RunContext
 
-from pydantic_ai_harness.compaction._pinning import reinject_pinned
+from pydantic_ai_harness.compaction._pinning import is_pinned, reinject_pinned
 from pydantic_ai_harness.compaction._receipts import (
     ReceiptInfo,
     discover_transcript_handle,
@@ -92,10 +93,13 @@ _INCREMENTAL_UPDATE_INSTRUCTION = (
 # resuming model treats it as a handoff from a different model.  Wording flagged pending eval-rig.
 _BRIDGE_PREFIX = 'This summary was produced by a different model than the one continuing the task.'
 
+_KEPT_USER_MESSAGE_METADATA = 'pydantic-ai-harness.compaction.kept-user-message.v1'
+"""Model-request metadata marking a user turn retained by `keep_user_messages`."""
+
 
 def _model_name(model: str | Model | None) -> str | None:
     """Best-effort model-name string from a model spec or object."""
-    if model is None:
+    if model is None:  # pragma: no cover - Pydantic AI always supplies the running model
         return None
     if isinstance(model, str):
         return model
@@ -115,14 +119,17 @@ def _is_receipt_message(msg: ModelMessage) -> bool:
     return isinstance(msg, ModelRequest) and bool(msg.parts) and all(is_receipt_part(p) for p in msg.parts)
 
 
-def _model_family(name: str | None) -> str | None:
+def _model_family(model: str | Model | None) -> str | None:
     """Reduce a model name to a coarse family token (e.g. ``openai:gpt-4o`` -> ``gpt``).
 
     A neutral structural heuristic: drop any ``provider:`` prefix, then take the leading token
     before the first ``-`` or ``/``.  Good enough to tell ``gpt`` from ``claude``; the exact
     family taxonomy is left to the eval-rig pass.
     """
-    if not name:
+    if isinstance(model, FallbackModel):
+        return _model_family(model.models[0])
+    name = _model_name(model)
+    if not name:  # pragma: no cover - empty model identifiers fail before compaction
         return None
     tail = name.split(':')[-1]
     for sep in ('/', '-'):
@@ -130,15 +137,19 @@ def _model_family(name: str | None) -> str | None:
     return tail or None
 
 
-def _format_messages(messages: Sequence[ModelMessage]) -> str:
+def _format_messages(messages: Sequence[ModelMessage], *, skip_previous_summary: bool = False) -> str:
     """Render messages into a human-readable string for summarization."""
     lines: list[str] = []
     for msg in messages:
         if isinstance(msg, ModelRequest):
+            if _is_kept_user_message(msg):
+                continue
             for part in msg.parts:
                 if isinstance(part, UserPromptPart):
                     lines.append(f'User: {_user_prompt_text(part)}')
-                elif isinstance(part, SystemPromptPart):
+                elif isinstance(part, SystemPromptPart) and not (
+                    skip_previous_summary and part.content.startswith(_SUMMARY_PREFIX)
+                ):
                     lines.append(f'System: {part.content}')
                 elif isinstance(part, ToolReturnPart):
                     content_str = str(part.content)[:500]
@@ -174,8 +185,10 @@ def _extract_system_prompts(messages: list[ModelMessage]) -> list[SystemPromptPa
         if not isinstance(msg, ModelRequest):
             break
         for part in msg.parts:
-            if isinstance(part, SystemPromptPart):
+            if isinstance(part, SystemPromptPart) and not part.content.startswith(_SUMMARY_PREFIX):
                 parts.append(part)
+            elif is_pinned(part) or is_receipt_part(part):
+                continue
             else:
                 return parts
     return parts
@@ -187,13 +200,23 @@ def _extract_previous_summary(messages: list[ModelMessage]) -> str | None:
     Looks for a ``SystemPromptPart`` whose content starts with the summary prefix,
     which indicates it was produced by a prior compaction pass.
     """
-    for msg in messages:
+    for msg in reversed(messages):
         if not isinstance(msg, ModelRequest):
             continue
-        for part in msg.parts:
+        for part in reversed(msg.parts):
             if isinstance(part, SystemPromptPart) and part.content.startswith(_SUMMARY_PREFIX):
-                return part.content[len(_SUMMARY_PREFIX) :]
+                return _without_bridge_prefix(part.content[len(_SUMMARY_PREFIX) :])
     return None
+
+
+def _without_bridge_prefix(summary: str) -> str:
+    """Remove the bridge notice before an incremental summary becomes the next anchor."""
+    return summary.removeprefix(f'{_BRIDGE_PREFIX}\n\n')
+
+
+def _is_kept_user_message(message: ModelRequest) -> bool:
+    """Return whether *message* is an earlier `keep_user_messages` retention copy."""
+    return message.metadata is not None and message.metadata.get(_KEPT_USER_MESSAGE_METADATA) is True
 
 
 @dataclass
@@ -270,7 +293,7 @@ class SummarizingCompaction(AbstractCapability[AgentDepsT]):
     summary-of-summary decay.
     """
 
-    bridge_prefix: bool = True
+    bridge_prefix: bool = False
     """When ``True`` and the summarizer's model family differs from the family that produced
     the history, prepend a neutral one-line note marking the summary as a cross-model handoff
     (Codex prior art, anti-confabulation).  Only fires on a genuine family mismatch, so it is
@@ -289,8 +312,8 @@ class SummarizingCompaction(AbstractCapability[AgentDepsT]):
 
     receipts: bool = False
     """When ``True``, append a deterministic compaction receipt after the summary noting how
-    much history was summarized, that the summary is secondhand, and -- when a ``TranscriptStore``
-    capability is attached -- a handle to the full transcript.
+    much history was summarized, that the summary is secondhand, and -- when a
+    ``TranscriptHandleProvider`` capability is attached -- a persisted-run handle.
 
     Opt-in for now: the receipt text is content, so defaulting it on is deferred to the
     benchmark eval-rig pass.  The mechanism itself is structural.
@@ -357,7 +380,14 @@ class SummarizingCompaction(AbstractCapability[AgentDepsT]):
         for msg in to_summarize:
             if not isinstance(msg, ModelRequest):
                 continue
-            user_parts = [p for p in msg.parts if isinstance(p, UserPromptPart)]
+            if _is_kept_user_message(msg):
+                out.append(msg)
+                continue
+            user_parts = [
+                part
+                for part in msg.parts
+                if isinstance(part, UserPromptPart) and not is_pinned(part) and not is_receipt_part(part)
+            ]
             if not user_parts:
                 continue
             kept: list[ModelRequestPart] = []
@@ -368,7 +398,8 @@ class SummarizingCompaction(AbstractCapability[AgentDepsT]):
                 else:
                     bounded, changed = self._bound_sequence(part.content)
                     kept.append(replace(part, content=bounded) if changed else part)
-            out.append(ModelRequest(parts=kept))
+            metadata = {**(msg.metadata or {}), _KEPT_USER_MESSAGE_METADATA: True}
+            out.append(replace(msg, parts=kept, metadata=metadata))
         return out
 
     def _truncate(self, text: str, max_chars: int | None = None) -> str:
@@ -376,7 +407,13 @@ class SummarizingCompaction(AbstractCapability[AgentDepsT]):
         from pydantic_ai_harness.tool_output_limits._payload import truncate_text
 
         limit = self.keep_user_messages_max_chars if max_chars is None else max_chars
-        return truncate_text(text, limit, TruncationStrategy.head)
+        truncated = truncate_text(text, limit, TruncationStrategy.head)
+        if len(truncated) <= limit:
+            return truncated
+        marker = '[...]'
+        if limit <= len(marker):
+            return marker[:limit]
+        return f'{text[: limit - len(marker)]}{marker}'
 
     def _bound_sequence(self, content: Sequence[UserContent]) -> tuple[list[UserContent], bool]:
         """Apply the same per-part character budget to a sequence-shaped user prompt.
@@ -394,8 +431,11 @@ class SummarizingCompaction(AbstractCapability[AgentDepsT]):
             if text is None:
                 bounded.append(item)
                 continue
+            if remaining == 0:
+                changed = True
+                continue
             truncated = self._truncate(text, remaining)
-            remaining = max(0, remaining - len(text))
+            remaining -= len(truncated)
             if truncated == text:
                 bounded.append(item)
                 continue
@@ -407,11 +447,10 @@ class SummarizingCompaction(AbstractCapability[AgentDepsT]):
         """Prefix *summary* with a cross-model handoff note when families differ."""
         if not self.bridge_prefix:
             return summary
-        run_family = _model_family(_history_model_name(messages) or _model_name(ctx.model))
-        summarizer_name = _model_name(self.model) if self.model is not None else _model_name(ctx.model)
-        summarizer_family = _model_family(summarizer_name)
+        run_family = _model_family(_history_model_name(messages) or ctx.model)
+        summarizer_family = _model_family(self.model if self.model is not None else ctx.model)
         if run_family and summarizer_family and run_family != summarizer_family:
-            return f'{_BRIDGE_PREFIX}\n\n{summary}'
+            return f'{_BRIDGE_PREFIX}\n\n{_without_bridge_prefix(summary)}'
         return summary
 
     def _insert_receipt(
@@ -425,7 +464,7 @@ class SummarizingCompaction(AbstractCapability[AgentDepsT]):
         deduped = [msg for msg in result if not _is_receipt_message(msg)]
         dropped_tokens = estimate_token_count(to_summarize, self.tokenizer)
         handle = discover_transcript_handle(ctx)
-        summarizer = _model_family(_model_name(self.model) if self.model is not None else _model_name(ctx.model))
+        summarizer = _model_family(self.model if self.model is not None else ctx.model)
         by = summarizer or 'the summarizer model'
         record_receipt(
             ReceiptInfo(
@@ -475,7 +514,7 @@ class SummarizingCompaction(AbstractCapability[AgentDepsT]):
         """Generate a summary for the given messages using the configured model."""
         from pydantic_ai import Agent
 
-        formatted = _format_messages(messages)
+        formatted = _format_messages(messages, skip_previous_summary=previous_summary is not None)
         prompt = self.summary_prompt.format(messages=formatted)
 
         if previous_summary is not None:

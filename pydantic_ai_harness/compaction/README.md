@@ -165,8 +165,9 @@ from the edit point onward -- the next request pays a cache-write. Use `ClearToo
 `SummarizingCompaction(model=...)` accepts a model name or `Model`; when left `None` it inherits the
 running agent's model. No token caps are imposed on the summary call.
 
-By default `incremental=True` extends an existing summary from a prior compaction rather than
-regenerating it from scratch, and `preserve_first_user_message=True` keeps the original task turn even
+By default `incremental=True` updates the newest existing summary from a prior compaction as an
+anchor rather than regenerating it from scratch. This changes the summary-call prompt from earlier
+releases; set `incremental=False` to retain the prior regeneration behavior. `preserve_first_user_message=True` keeps the original task turn even
 when it falls outside the window. Pass `keep_tokens` to trim the retained tail to a token budget instead
 of `keep_messages`.
 
@@ -226,23 +227,24 @@ Compaction is a memory wipe the model cannot veto and often cannot detect, which
 *resumption drift* -- the model confabulates continuity with history it no longer has. A
 receipt makes the wipe legible: after a boundary-crossing strategy rewrites history it can
 append a short, deterministic note recording how much was compacted, warning that what
-survives is secondhand, and -- when a transcript store is attached -- a handle to the full
-pre-compaction transcript.
+survives is secondhand, and -- when a handle provider is attached -- an identifier for persisted
+run history.
 
 ```python
 SummarizingCompaction(max_messages=60, keep_messages=20, receipts=True)
 SlidingWindowCompaction(max_messages=80, keep_messages=40, receipts=True)
 ```
 
-- **Deterministic by construction.** The receipt carries no timestamp; its bytes are a pure
-  function of the compaction, so it is safe to assert on and does not churn the cache.
+- **Deterministic receipt text.** The receipt text carries no timestamp and is a pure function
+  of the compaction. The message part still has its ordinary request timestamp.
 - **Honest wording.** `SummarizingCompaction` leaves a summary, so its receipt says the summary
   above is secondhand; `SlidingWindowCompaction` drops history outright, so its receipt says that context
   is gone. The blank-in-place strategies (`ClearToolResults`, `DeduplicateFileReads`,
   `ClampOversizedMessages`) keep every message and cross no boundary, so they emit no receipt.
 - **Transcript handle.** Attach any capability exposing `compaction_transcript_handle() -> str | None`
-  (the `TranscriptStore` protocol) and the receipt gains a `Full transcript: <handle>` pointer.
-  `StepPersistence` implements it (returning its `run_id`), so attaching it is enough.
+  (the `TranscriptHandleProvider` protocol) and the receipt gains a `Persisted run handle:` pointer.
+  `StepPersistence` implements it (returning its `run_id`), so attaching it is enough. The handle
+  identifies stored run history; it does not guarantee that an un-compacted transcript remains retained.
 - **Observability.** Each receipt is also emitted as a `compaction.receipt` event on the
   `compact_messages` span.
 
@@ -262,10 +264,8 @@ pinned = pin('Durable task state the model must never lose across compaction.')
 
 A pinned part is never summarized away or dropped; if a strategy would have discarded it, the
 strategy re-injects it verbatim near the top of the surviving history. This is the least
-invasive marking available today: message-part types share no universal `metadata` field (only
-`ToolReturnPart` has one), so pins use a sentinel-in-content envelope -- the same shape the
-existing warning/summary markers use. **Core gap:** if pydantic-ai core later grows a
-part-level `metadata`/`pinned` seam, the marker should migrate onto it.
+invasive marking available today: pins use model-invisible `TextContent.metadata`, so their
+contents remain ordinary user context while compaction can distinguish them from user turns.
 
 `Planning` does **not** need pinning: its plan is re-injected ephemerally every request in
 `wrap_model_request`, so it already survives compaction by construction. Pinning is for durable
@@ -292,11 +292,12 @@ successive compactions). It is fed back as an anchored `<previous-summary>` bloc
 *update* instruction -- preserve still-true details, remove stale ones, merge in new facts --
 so the summary is a living document updated in place under a fixed structure.
 
-`bridge_prefix=True` (default) prepends a one-line note to the summary **only** when the
+`bridge_prefix=True` prepends a one-line note to the summary **only** when the
 summarizer's model family differs from the family that produced the history (derived from the
 history's `model_name` and the summarizer config), marking the summary as a cross-model
 handoff so the resuming model builds on it rather than confabulating that it did the work
-itself. It never fires in the common same-model case, so it is cheap.
+itself. It never fires in the common same-model case, so it is cheap. It defaults to `False`
+because the note is prompt content.
 
 > The update instruction and bridge-prefix wording are content, shipped minimal/neutral and
 > flagged pending the eval-rig pass; the anchoring and family-gating mechanisms are structural.

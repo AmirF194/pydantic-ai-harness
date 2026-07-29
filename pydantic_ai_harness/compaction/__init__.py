@@ -8,8 +8,8 @@ from pydantic_ai_harness._warn import warn_class_renamed
 from pydantic_ai_harness.compaction._clamp_oversized_messages import ClampOversizedMessages
 from pydantic_ai_harness.compaction._clear_tool_results import ClearToolResults
 from pydantic_ai_harness.compaction._deduplicate_file_reads import DeduplicateFileReads
-from pydantic_ai_harness.compaction._pinning import is_pinned, pin
-from pydantic_ai_harness.compaction._receipts import TranscriptStore, format_receipt
+from pydantic_ai_harness.compaction._pinning import is_pinned, pin, reinject_pinned
+from pydantic_ai_harness.compaction._receipts import TranscriptHandleProvider
 from pydantic_ai_harness.compaction._shared import CompactionStrategy, estimate_token_count
 from pydantic_ai_harness.compaction._sliding_window_compaction import SlidingWindowCompaction
 from pydantic_ai_harness.compaction._summarizing_compaction import SummarizingCompaction
@@ -24,13 +24,13 @@ __all__ = [
     'SlidingWindowCompaction',
     'SummarizingCompaction',
     'TieredCompaction',
-    'TranscriptStore',
+    'TranscriptHandleProvider',
     'WarnNearLimits',
     'WarningKind',
     'estimate_token_count',
-    'format_receipt',
     'is_pinned',
     'pin',
+    'reinject_pinned',
 ]
 
 _RENAMED = {
