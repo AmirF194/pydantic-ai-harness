@@ -12,6 +12,8 @@ covering the keywords the canonical schema actually uses.
 
 from __future__ import annotations
 
+import hashlib
+import json
 from collections.abc import Iterator
 from typing import Any
 
@@ -29,6 +31,19 @@ LOCKSTEP = (
     'platform repo in lockstep, or a UI-created variable and an SDK-created one will store different '
     'schemas for the same agent.'
 )
+
+CANONICAL_SCHEMA_SHA256 = '5fcbbc940c4fdf22ef0a04cb62a5f97d9e4fadfd0dfd96047c564bdec64f2b41'
+"""SHA-256 of this schema's canonical JSON, pinned identically by the platform's `agent-config.test.ts`.
+
+Every other assertion in this module checks a property, and properties are exactly what let the two
+copies of this contract drift: they were written independently and did drift, in a description and in
+whether `id` accepted `null` -- a real difference in what each side would let you save, settled by
+whichever one happened to create the variable first. A digest cannot drift quietly, and there is no
+package the two repos share to hold the schema once.
+
+When this fails, decide which side is right *before* repinning, then change both. This side is the
+canonical copy, so normally the platform's is what moves.
+"""
 
 INSTRUCTIONS_SCHEMA: dict[str, Any] = AGENT_CONFIG_JSON_SCHEMA['properties']['instructions']
 SETTINGS_SCHEMA: dict[str, Any] = AGENT_CONFIG_JSON_SCHEMA['properties']['settings']
@@ -136,6 +151,11 @@ def subschemas(schema: dict[str, Any]) -> Iterator[dict[str, Any]]:
     options: list[dict[str, Any]] = schema.get('anyOf', [])
     for option in options:
         yield from subschemas(option)
+
+
+def test_schema_matches_the_digest_the_logfire_ui_pins() -> None:
+    digest = hashlib.sha256(json.dumps(AGENT_CONFIG_JSON_SCHEMA, sort_keys=True, separators=(',', ':')).encode())
+    assert digest.hexdigest() == CANONICAL_SCHEMA_SHA256, LOCKSTEP
 
 
 def test_every_model_field_is_described() -> None:
