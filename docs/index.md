@@ -39,6 +39,7 @@ uv add "pydantic-ai-harness[modal]"             # Modal Sandbox (adds the Modal 
 uv add "pydantic-ai-harness[logfire]"           # Agent Control + Managed Prompt (Logfire-managed agent config)
 uv add "pydantic-ai-harness[exa]"               # Exa Search (web research via the Exa API)
 uv add "pydantic-ai-harness[skills]"            # Skills (loads SKILL.md frontmatter)
+uv add "pydantic-ai-harness[stackone]"          # StackOne (actions on linked business applications)
 uv add "pydantic-ai-harness[acp]"               # ACP (Agent Client Protocol SDK)
 uv add "pydantic-ai-harness[mongodb]"           # MongoDB backends for Step Persistence and Media (adds pymongo)
 ```
@@ -136,6 +137,7 @@ Each capability is a self-contained battery you drop into an agent's `capabiliti
 | [Guardrails](guardrails.md) | Validates user input before a run starts and model output after it completes -- block or redact, with structured results. | -- |
 | [Agent Control](agent-control.md) | Drives an agent's instructions, model, model settings, and LLM-facing tool definitions from one [Logfire-managed variable](https://logfire.pydantic.dev/docs/reference/advanced/managed-variables/), so behavior changes version, roll out, and roll back as one unit without redeploying -- with the code-defined agent as the fallback. | `logfire` |
 | [Managed Prompt](managed-prompt.md) | Backs an agent's instructions with a [Logfire-managed prompt](https://logfire.pydantic.dev/docs/reference/advanced/prompt-management/), so you can version, label, and roll out prompt changes from the Logfire UI without redeploying -- with a code default that keeps the agent working when no remote value is available. | `logfire` |
+| [StackOne](stackone.md) | Actions on the user's SaaS accounts (HRIS, ATS, CRM, and more) via the [StackOne](https://www.stackone.com) integration platform: API-key auth, account scoping, action filtering, and a search/execute mode for large catalogs. | `stackone` |
 | [ACP](acp.md) *(experimental)* | Serves an agent to editors (Zed, etc.) over the [Agent Client Protocol](https://agentclientprotocol.com) -- streamed text, diff-rendered edits, and tool approval. | `acp` |
 
 Most capabilities are stable within the [version policy](#version-policy) below. [ACP](acp.md) is the exception -- it is still experimental, imported from `pydantic_ai_harness.experimental.acp`, and may change or be removed in a future release.

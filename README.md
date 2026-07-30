@@ -32,6 +32,7 @@ uv add "pydantic-ai-harness[modal]"             # ModalSandbox (adds the Modal S
 uv add "pydantic-ai-harness[logfire]"           # AgentControl + ManagedPrompt (Logfire-managed agent config)
 uv add "pydantic-ai-harness[exa]"               # ExaSearch + ExaAgent (web research via the Exa API)
 uv add "pydantic-ai-harness[skills]"            # Skills (loads SKILL.md frontmatter)
+uv add "pydantic-ai-harness[stackone]"          # StackOne (actions on linked business applications)
 uv add "pydantic-ai-harness[acp]"               # ACP (serve an agent to editors over the Agent Client Protocol)
 uv add "pydantic-ai-harness[mongodb]"           # MongoDB backends for step persistence + media externalization (adds pymongo)
 ```
@@ -158,6 +159,7 @@ We studied leading coding agents, agent frameworks, and Claw-style assistants to
 | | **Docs lookup** | On-demand `read_pyai_docs` tool for Pydantic AI docs | :white_check_mark: [Docs](pydantic_ai_harness/pydantic_ai_docs/) | |
 | | **Web research** | Web search returning relevant page excerpts, full single-page retrieval, and opt-in deep search with cited answers, backed by [Exa](https://exa.ai) | :white_check_mark: [Docs](pydantic_ai_harness/exa/) | |
 | | **Hosted research agent** | Delegate open-ended research to the [Exa](https://exa.ai) Agent API as deferred tool calls -- resolved inline or by the host application | :white_check_mark: [Docs](pydantic_ai_harness/exa/) | |
+| | **StackOne** | Actions on the user's SaaS accounts (HRIS, ATS, CRM, and more) via [StackOne](https://www.stackone.com) -- account scoping, action filtering, and a search/execute mode for large catalogs | :white_check_mark: [Docs](pydantic_ai_harness/stackone/) | |
 | | **Browser automation** | Delegate open-ended web tasks to a [browser-use](https://github.com/browser-use/browser-use) agent | :construction: [PR&nbsp;#419](https://github.com/pydantic/pydantic-ai-harness/pull/419) | |
 | | **Verification loop** | Require fresh verification evidence (tests, checks) before a run can finish | :construction: [PR&nbsp;#355](https://github.com/pydantic/pydantic-ai-harness/pull/355) | |
 | | **Code review** | Run a local [Macroscope](https://docs.macroscope.com/cli) review (`macroscope codereview`) and hand findings to the agent | :white_check_mark: [Docs](pydantic_ai_harness/macroscope/) | |
@@ -166,6 +168,8 @@ We studied leading coding agents, agent frameworks, and Claw-style assistants to
 | **Context management** | **Sliding window** | Trim conversation history to stay within token limits | :white_check_mark: [Docs](pydantic_ai_harness/compaction/) | [summarization-pydantic-ai](https://github.com/vstorm-co/summarization-pydantic-ai) (vstorm&#8209;co) |
 | | **Context compaction** | LLM-powered summarization of older messages | :white_check_mark: [Docs](pydantic_ai_harness/compaction/) | [summarization-pydantic-ai](https://github.com/vstorm-co/summarization-pydantic-ai) (vstorm&#8209;co) |
 | | **Limit warnings** | Warn agent before hitting context/iteration limits | :white_check_mark: [Docs](pydantic_ai_harness/compaction/) | [summarization-pydantic-ai](https://github.com/vstorm-co/summarization-pydantic-ai) (vstorm&#8209;co) |
+| | **Window-relative triggers** | Express every compaction threshold as a fraction of the model's real context window | :white_check_mark: [Docs](pydantic_ai_harness/compaction/) | |
+| | **Context usage reporting** | Report how full the context is, for a live gauge in your UI | :white_check_mark: [Docs](pydantic_ai_harness/compaction/) | [pydantic-deep](https://github.com/vstorm-co/pydantic-deepagents) (vstorm&#8209;co) |
 | | **Tool output limits** | Truncate, summarize, or spill large tool outputs | :white_check_mark: [Docs](pydantic_ai_harness/tool_output_limits/) | |
 | | **Cache-bust monitoring** | Warn when a run's prompt-cache prefix collapses between model requests | :white_check_mark: [Docs](pydantic_ai_harness/warn_on_cache_busts/) | |
 | | **System reminders** | Inject periodic reminders to counteract instruction drift | :construction: [PR&nbsp;#414](https://github.com/pydantic/pydantic-ai-harness/pull/414) | |
