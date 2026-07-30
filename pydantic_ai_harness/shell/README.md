@@ -3,6 +3,8 @@
 Give an agent the ability to run shell commands, with allow/deny controls and
 managed background processes.
 
+> The API may change between releases. Where practical, breaking changes ship with a deprecation warning.
+
 [Source](https://github.com/pydantic/pydantic-ai-harness/tree/main/pydantic_ai_harness/shell/)
 
 ## The problem
@@ -49,16 +51,28 @@ which all land at the end -- survive truncation.
 
 | Field | Effect |
 |---|---|
-| `allowed_commands` | If non-empty, only these executables may run (allowlist). |
-| `denied_commands` | These executables are always rejected (denylist). |
+| `allowed_commands` | Select allowlist mode. Only these executables may run; an empty collection allows none. |
+| `denied_commands` | Select denylist mode. These executables are rejected; an empty collection disables command-name filtering. |
 | `denied_operators` | Shell operators (e.g. `>`, `>>`, `|`) that are rejected when present. |
 | `allow_interactive` | If `False` (default), commands that expect a TTY (`vi`, `sudo`, `ssh`, ...) are blocked. |
 
-`allowed_commands` and `denied_commands` are mutually exclusive -- set one, not
-both. `denied_commands` defaults to a list of destructive commands (`rm`,
-`rmdir`, `mkfs`, `dd`, `format`, `shutdown`, `reboot`, `halt`, `poweroff`,
-`init`); pass an empty list to disable. The executable name is extracted with
-`shlex`, so arguments don't bypass the check.
+Choose one command mode. Omitting both controls selects denylist mode with a
+built-in list of destructive commands (`rm`, `rmdir`, `mkfs`, `dd`, `format`,
+`shutdown`, `reboot`, `halt`, `poweroff`, `init`). Passing
+`allowed_commands` selects allowlist mode, including when the collection is
+empty. Passing `denied_commands` selects denylist mode; an empty collection
+allows every executable name. Supplying both controls, even when one or both
+collections are empty, raises a `ValueError` during `Shell` construction.
+
+When upgrading code that supplied both controls, remove the inactive empty
+collection: change `allowed_commands=['ls'], denied_commands=[]` to
+`allowed_commands=['ls']`, and change `allowed_commands=[],
+denied_commands=['rm']` to `denied_commands=['rm']`. Use
+`denied_commands=[]` by itself when no executable names should be blocked.
+
+`denied_operators` and `allow_interactive` are independent controls and apply
+in either command mode. The executable name is extracted with `shlex`, so
+arguments don't bypass the check.
 
 A denied or blocked command surfaces to the model as a `ModelRetry` (the model
 can retry with an allowed command) rather than aborting the run.
@@ -143,11 +157,25 @@ to stdout) so command output can never spoof the tracked directory.
 
 ## Configuration
 
+Command mode is selected by which control is supplied:
+
 ```python
+from pydantic_ai_harness import Shell
+
+Shell()                                      # built-in destructive-command denylist
+Shell(allowed_commands=['ls', 'cat', 'rg'])  # allow only these executables
+Shell(allowed_commands=[])                   # allow no executables
+Shell(denied_commands=['curl', 'ssh'])        # deny these executables
+Shell(denied_commands=[])                    # no command-name filtering
+```
+
+The remaining fields and their defaults are:
+
+```python
+from pydantic_ai_harness import Shell
+
 Shell(
     cwd='.',                       # str | Path -- working directory
-    allowed_commands=[],           # allowlist (mutually exclusive with denied)
-    denied_commands=[...],         # denylist (defaults to destructive commands)
     denied_operators=[],           # blocked shell operators
     default_timeout=30.0,          # seconds, per run_command
     max_output_chars=50_000,       # output cap returned to the model
