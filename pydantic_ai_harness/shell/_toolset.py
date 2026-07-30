@@ -233,7 +233,7 @@ class ShellToolset(FunctionToolset[AgentDepsT]):
         prefix = '\n'.join(metadata)
         output_budget = self._max_output_chars - len(prefix) - 1
         if output_budget <= 0:
-            return truncate_head(f'{prefix}\n{output}', self._max_output_chars)
+            return truncate_head(f'{prefix}\n', self._max_output_chars)
         return f'{prefix}\n{truncate_tail(output, output_budget)}'
 
     def _unknown_command_error(self, command_id: str) -> str:
