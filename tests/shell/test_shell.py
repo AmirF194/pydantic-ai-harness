@@ -803,6 +803,15 @@ class TestBackgroundCommands:
         assert len(stop_result) == 200
         assert 'output truncated' in stop_result
 
+    async def test_new_string_tool_is_capped_at_dispatch(self, shell_dir: Path) -> None:
+        ts = _shell_toolset(shell_dir, max_output_chars=1)
+
+        def text() -> str:
+            return 'xx'
+
+        ts.add_function(text)
+        assert await _call_shell_tool(ts, 'text') == 'x'
+
     async def test_non_string_tool_result_is_unchanged(self, shell_dir: Path) -> None:
         ts = _shell_toolset(shell_dir, max_output_chars=1)
 
