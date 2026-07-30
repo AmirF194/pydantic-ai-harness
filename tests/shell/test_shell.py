@@ -797,10 +797,13 @@ class TestBackgroundCommands:
         try:
             check_result = await _call_shell_tool(ts, 'check_command', command_id=command_id)
             assert len(check_result) == 200
+            assert check_result.startswith('[status: running]\n')
             assert 'output truncated' in check_result
         finally:
             stop_result = await _call_shell_tool(ts, 'stop_command', command_id=command_id)
         assert len(stop_result) == 200
+        assert stop_result.startswith('[stopped:')
+        assert '\n[exit code:' in stop_result
         assert 'output truncated' in stop_result
 
     async def test_new_string_tool_is_capped_at_dispatch(self, shell_dir: Path) -> None:

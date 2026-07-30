@@ -26,6 +26,7 @@ from pydantic_ai_harness._output import truncate_tail
 
 _IO_DRAIN_TIMEOUT: float = 2.0
 _KILL_GRACE_PERIOD: float = 2.0
+_CONTROL_PREFIX_RE = re.compile(r'\A(?:\[status:[^\n]*\]|\[stopped:[^\n]*\])\n(?:\[exit code:[^\n]*\]\n)?')
 
 _P = ParamSpec('_P')
 
@@ -165,7 +166,12 @@ class ShellToolset(FunctionToolset[AgentDepsT]):
         result = await super().call_tool(name, tool_args, ctx, tool)
         if name == 'start_command' or not isinstance(result, str):
             return result
-        return truncate_tail(result, self._max_output_chars)
+        control_prefix = _CONTROL_PREFIX_RE.match(result)
+        return truncate_tail(
+            result,
+            self._max_output_chars,
+            preserve_prefix_chars=control_prefix.end() if control_prefix else 0,
+        )
 
     def _resolve_env(self) -> dict[str, str] | None:
         """Compute the environment passed to spawned subprocesses.
