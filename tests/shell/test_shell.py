@@ -1170,6 +1170,13 @@ class TestShellCapability:
         assert shell.allowed_commands is None
         assert shell.denied_commands == ('curl', 'ssh')
 
+    @pytest.mark.parametrize('allowed_commands', [{'echo'}, frozenset({'echo'})])
+    def test_set_allowlist_construction(self, allowed_commands: set[str] | frozenset[str]) -> None:
+        shell = Shell(allowed_commands=allowed_commands)
+
+        assert shell.allowed_commands == ('echo',)
+        assert shell.denied_commands is None
+
     def test_empty_allowlist_selects_allow_mode(self) -> None:
         shell = Shell(allowed_commands=[])
 

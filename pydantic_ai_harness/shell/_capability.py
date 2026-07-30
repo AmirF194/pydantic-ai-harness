@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Mapping, Sequence, Set
 from dataclasses import dataclass
 from pathlib import Path
 from typing import overload
@@ -94,7 +94,7 @@ class Shell(AbstractCapability[AgentDepsT]):
         self,
         cwd: str | Path = '.',
         *,
-        allowed_commands: Sequence[str],
+        allowed_commands: Sequence[str] | Set[str],
         denied_commands: None = None,
         denied_operators: Sequence[str] = (),
         default_timeout: float = 30.0,
@@ -114,7 +114,7 @@ class Shell(AbstractCapability[AgentDepsT]):
         cwd: str | Path = '.',
         *,
         allowed_commands: None = None,
-        denied_commands: Sequence[str] | None = None,
+        denied_commands: Sequence[str] | Set[str] | None = None,
         denied_operators: Sequence[str] = (),
         default_timeout: float = 30.0,
         max_output_chars: int = 50_000,
@@ -131,8 +131,8 @@ class Shell(AbstractCapability[AgentDepsT]):
         self,
         cwd: str | Path = '.',
         *,
-        allowed_commands: Sequence[str] | None = None,
-        denied_commands: Sequence[str] | None = None,
+        allowed_commands: Sequence[str] | Set[str] | None = None,
+        denied_commands: Sequence[str] | Set[str] | None = None,
         denied_operators: Sequence[str] = (),
         default_timeout: float = 30.0,
         max_output_chars: int = 50_000,
