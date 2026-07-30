@@ -103,6 +103,13 @@ Two consequences are worth knowing:
 - Durable steps cannot nest. A tool that starts another durable agent run is rejected with an
   explanatory error rather than deadlocking.
 
+The loop is reused across invocations of a warm execution environment, so loop-bound resources like
+a provider's cached HTTP client stay valid between them. A run abandoned by a suspension or an error
+is therefore cancelled before the handler returns, and `run_durable` waits `cancel_timeout` seconds
+(5 by default) for it to unwind. Raise that for a workload whose cleanup is genuinely slow;
+exceeding it is safe either way, because the loop is then retired rather than reused, and the next
+invocation starts on a fresh one instead of sharing with work that outlived its execution.
+
 ## What gets checkpointed
 
 Step names are built from the agent's `name` and each toolset's `id`:
@@ -211,3 +218,5 @@ request is already applied inside the durable step. Attach it alongside other ca
 ::: pydantic_ai_harness.aws_lambda.AWSLambdaDurability
 
 ::: pydantic_ai_harness.aws_lambda.run_durable
+
+::: pydantic_ai_harness.aws_lambda.AgentLoopGone

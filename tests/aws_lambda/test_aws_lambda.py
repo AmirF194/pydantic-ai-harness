@@ -2,12 +2,18 @@
 
 from __future__ import annotations
 
+import asyncio
 import re
+import threading
+import time
+from collections.abc import AsyncGenerator
+from contextlib import asynccontextmanager
 from typing import Any
 
 import pytest
 from aws_durable_execution_sdk_python.exceptions import ExecutionError
 from pydantic_ai import Agent, RunContext
+from pydantic_ai._run_context import get_current_run_context  # pyright: ignore[reportPrivateUsage]
 from pydantic_ai.exceptions import ApprovalRequired, CallDeferred, ModelRetry, UserError
 from pydantic_ai.messages import (
     AgentStreamEvent,
@@ -24,7 +30,11 @@ from pydantic_ai.models.test import TestModel
 from pydantic_ai.tools import DeferredToolRequests, ToolDefinition
 from pydantic_ai.toolsets import FunctionToolset
 
-from pydantic_ai_harness.aws_lambda import AWSLambdaDurability, run_durable
+from pydantic_ai_harness.aws_lambda import (
+    AWSLambdaDurability,
+    _bridge,  # pyright: ignore[reportPrivateUsage]
+    run_durable,
+)
 
 from .conftest import FakeDurableContext
 
@@ -396,6 +406,20 @@ class TestCoverageOfRemainingPaths:
 
         assert ctx.step_names == ['a__model.request']
 
+    def test_a_model_instance_default_keeps_one_step_name(self) -> None:
+        """The twin of the string case, by a different route. An agent built from a `Model`
+        instance leaves `ModelRequestContext.model_id` unset, so there is no provenance string to
+        compare against and the base resolves the id through its model registry -- which already
+        answers `None` for the agent's own model. The name is short because nothing named it, not
+        because the suffix was suppressed."""
+        model = FunctionModel(lambda messages, info: ModelResponse(parts=[TextPart('done')]))
+        agent = Agent(model, name='a', capabilities=[AWSLambdaDurability()])
+        ctx = FakeDurableContext()
+
+        run_durable(lambda: agent.run('go'), context=ctx)
+
+        assert ctx.step_names == ['a__model.request']
+
     def test_cancel_suspended_response_is_checkpointed(self) -> None:
         # The model returns a suspended response, the agent re-issues it as a continuation, the
         # continuation fails, and the graph tears the suspended job down via
@@ -419,6 +443,26 @@ class TestCoverageOfRemainingPaths:
 
         assert len(cancelled) == 1
         assert 'a__model.cancel_suspended_response' in ctx.step_names
+
+
+def shutdown(loop: asyncio.AbstractEventLoop) -> None:
+    """Stop and close a loop a test built, so it does not outlive the test as a leak.
+
+    The bridge deliberately never closes a loop itself -- a retired one may still be unwinding an
+    abandoned run -- so tests that make their own `_AgentLoop` clean up after it here.
+    """
+    if loop.is_running():
+        loop.call_soon_threadsafe(loop.stop)
+        deadline = time.monotonic() + 5
+        while loop.is_running() and time.monotonic() < deadline:  # pragma: no branch - stops promptly
+            time.sleep(0.01)
+    # Unwind anything the loop was still holding, so closing it does not log a pending task.
+    outstanding = asyncio.all_tasks(loop)
+    if outstanding:
+        for task in outstanding:
+            task.cancel()
+        loop.run_until_complete(asyncio.gather(*outstanding, return_exceptions=True))
+    loop.close()
 
 
 class TestBridgeFailureModes:
@@ -457,6 +501,104 @@ class TestBridgeFailureModes:
 
         with pytest.raises(Suspend):
             run_durable(lambda: agent.run('go'), context=ctx)
+
+    def test_a_dead_agent_loop_fails_the_step_instead_of_blocking_forever(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A step body blocks the handler thread on a result only the agent loop can deliver. If
+        that loop stops, nothing will ever resolve it, and an unconditional wait would hang until
+        Lambda timed the function out with an opaque error. Steps can legitimately run for minutes,
+        so the wait polls for the loop's liveness rather than imposing a deadline of its own."""
+        loops = _bridge._AgentLoop()  # pyright: ignore[reportPrivateUsage]
+        monkeypatch.setattr(_bridge, '_agent_loop', loops)
+        monkeypatch.setattr(_bridge, '_LOOP_LIVENESS_POLL_SECONDS', 0.05)
+
+        async def model_fn(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+            # Stop the loop from inside the step body, then suspend: the task never completes, so
+            # the done-callback that would resolve the handler thread's future can never run.
+            asyncio.get_running_loop().stop()
+            await asyncio.Event().wait()
+            return ModelResponse(parts=[TextPart('unreachable')])  # pragma: no cover - never resumed
+
+        agent = Agent(FunctionModel(model_fn), name='a', capabilities=[AWSLambdaDurability()])
+        ctx = FakeDurableContext()
+        dead = loops.get()
+
+        with pytest.raises(_bridge.AgentLoopGone, match='agent event loop stopped'):
+            run_durable(lambda: agent.run('go'), context=ctx, cancel_timeout=0.05)
+
+        shutdown(dead)
+
+    def test_a_step_that_outlasts_the_liveness_poll_keeps_waiting(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The poll interval is not a deadline. A step that runs longer than it simply keeps
+        waiting, because the loop that owes it a result is still there to deliver one."""
+        monkeypatch.setattr(_bridge, '_LOOP_LIVENESS_POLL_SECONDS', 0.01)
+
+        async def act() -> str:
+            await asyncio.sleep(0.05)
+            return 'sunny'
+
+        agent = build_agent(act)
+        ctx = FakeDurableContext()
+
+        result = run_durable(lambda: agent.run('go'), context=ctx)
+
+        assert result.output == 'done'
+
+    def test_an_unwind_that_outlives_the_cancel_timeout_retires_the_loop(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The loop is shared across warm invocations, so a run abandoned by a suspension is
+        cancelled before the handler returns. When that unwind does not finish in time, the loop is
+        given up rather than reused, so the leftover cleanup cannot overlap the next invocation."""
+        loops = _bridge._AgentLoop()  # pyright: ignore[reportPrivateUsage]
+        monkeypatch.setattr(_bridge, '_agent_loop', loops)
+
+        class Suspend(BaseException):
+            pass
+
+        class SuspendingContext(FakeDurableContext):
+            def step(self, func, name=None, config=None):  # type: ignore[no-untyped-def]
+                raise Suspend('retry scheduled')
+
+        holding_cleanup = threading.Event()
+        cleanup_reached = threading.Event()
+
+        async def run_with_slow_cleanup() -> str:
+            try:
+                return await agent.run('go')  # type: ignore[return-value]
+            finally:
+                # Cleanup that outlasts the cancel timeout, blocking the loop it runs on -- the
+                # leak into the next warm invocation that retiring the loop is there to prevent.
+                cleanup_reached.set()
+                holding_cleanup.wait(timeout=10)
+
+        agent = build_agent(act)
+        abandoned = loops.get()
+
+        try:
+            with pytest.raises(Suspend):
+                run_durable(run_with_slow_cleanup, context=SuspendingContext(), cancel_timeout=0.05)
+
+            assert cleanup_reached.is_set()
+            # The handler returned while the abandoned run still holds `abandoned`, so the next
+            # invocation must not be handed that loop.
+            replacement = loops.get()
+            assert replacement is not abandoned
+        finally:
+            holding_cleanup.set()
+
+        shutdown(replacement)
+        shutdown(abandoned)
+
+    def test_retiring_a_loop_that_was_already_replaced_leaves_the_current_one_alone(self) -> None:
+        loops = _bridge._AgentLoop()  # pyright: ignore[reportPrivateUsage]
+        live = loops.get()
+        foreign = asyncio.new_event_loop()
+
+        loops.retire(foreign)
+
+        assert loops.get() is live
+        shutdown(foreign)
+        shutdown(live)
 
 
 class TestRuntimeToolsets:
@@ -502,6 +644,51 @@ class TestEnqueueGuard:
 
         agent = Agent(tool_then_text(), name='a', capabilities=[AWSLambdaDurability()])
         agent.tool(act)
+        ctx = FakeDurableContext()
+
+        with pytest.raises(UserError, match='enqueue'):
+            run_durable(lambda: agent.run('go'), context=ctx)
+
+    def test_enqueue_via_the_ambient_run_context_inside_a_step_raises(self) -> None:
+        """Guarding only the context handed to user code leaves the ambient getter as a way around
+        the guard, and a message enqueued through it is dropped just as silently on replay."""
+
+        def act() -> None:
+            ambient = get_current_run_context()
+            assert ambient is not None
+            ambient.enqueue('later')
+
+        agent = Agent(tool_then_text(), name='a', capabilities=[AWSLambdaDurability()])
+        agent.tool_plain(act)
+        ctx = FakeDurableContext()
+
+        with pytest.raises(UserError, match='enqueue'):
+            run_durable(lambda: agent.run('go'), context=ctx)
+
+    def test_enqueue_from_a_streaming_model_body_raises(self) -> None:
+        """The model body runs inside the model step too, so a custom streaming model that enqueues
+        would have its messages dropped on replay -- the stream is served from the checkpoint and
+        the body never runs again."""
+
+        class EnqueueingModel(FunctionModel):
+            @asynccontextmanager
+            async def request_stream(  # type: ignore[override]
+                self,
+                messages: list[ModelMessage],
+                model_settings: Any,
+                model_request_parameters: Any,
+                run_context: RunContext[Any] | None = None,
+            ) -> AsyncGenerator[Any]:
+                assert run_context is not None
+                run_context.enqueue('later')
+                yield  # pragma: no cover - the enqueue above always raises
+
+        async def handler(ctx: RunContext[object], stream: Any) -> None:  # pragma: no cover - never reached
+            async for _event in stream:
+                pass
+
+        model = EnqueueingModel(lambda messages, info: ModelResponse(parts=[TextPart('done')]))
+        agent = Agent(model, name='a', capabilities=[AWSLambdaDurability(event_stream_handler=handler)])
         ctx = FakeDurableContext()
 
         with pytest.raises(UserError, match='enqueue'):
