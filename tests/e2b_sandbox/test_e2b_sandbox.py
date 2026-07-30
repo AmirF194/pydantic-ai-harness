@@ -237,6 +237,90 @@ class TestFiles:
             with pytest.raises(ModelRetry, match='grew beyond'):
                 await tools.read_file('/growing')
 
+    @pytest.mark.parametrize(
+        ('size_bytes', 'max_read_bytes', 'match'),
+        [
+            (2 * 1024, 1024, r'2\.0KB.*1\.0KB'),
+            (2 * 1024 * 1024, 1024 * 1024, r'2\.0MB.*1\.0MB'),
+        ],
+    )
+    async def test_read_limit_formats_large_sizes(
+        self,
+        fake_e2b: FakeE2B,
+        size_bytes: int,
+        max_read_bytes: int,
+        match: str,
+    ) -> None:
+        async with _toolset(max_read_bytes=max_read_bytes) as tools:
+            fake_e2b.sandboxes[0].files.stat_sizes['/large'] = size_bytes
+            with pytest.raises(ModelRetry, match=match):
+                await tools.read_file('/large')
+
+    @pytest.mark.parametrize(
+        ('offset', 'limit', 'match'),
+        [
+            (0, None, 'offset must be >= 1'),
+            (None, 0, 'limit must be >= 1'),
+            (4, None, 'beyond end of file'),
+        ],
+    )
+    async def test_read_rejects_invalid_windows(
+        self,
+        fake_e2b: FakeE2B,
+        offset: int | None,
+        limit: int | None,
+        match: str,
+    ) -> None:
+        async with _toolset() as tools:
+            fake_e2b.sandboxes[0].files.files['/notes'] = b'alpha\nbeta\ngamma'
+            with pytest.raises(ModelRetry, match=match):
+                await tools.read_file('/notes', offset=offset, limit=limit)
+
+    async def test_read_handles_trailing_newline_and_safety_caps(self, fake_e2b: FakeE2B) -> None:
+        async with _toolset(max_output_lines=1, max_output_bytes=5) as tools:
+            files = fake_e2b.sandboxes[0].files.files
+            files['/newline'] = b'alpha\n'
+            assert await tools.read_file('/newline') == 'alpha'
+            files['/line-cap'] = b'a\nb'
+            assert await tools.read_file('/line-cap') == ('a\n\n[Showing lines 1-1 of 2. Use offset=2 to continue.]')
+
+        async with _toolset(max_output_bytes=5) as tools:
+            files = fake_e2b.sandboxes[1].files.files
+            files['/byte-cap'] = b'aa\nbbb'
+            assert await tools.read_file('/byte-cap') == (
+                'aa\n\n[Showing lines 1-1 of 2 (5B limit). Use offset=2 to continue.]'
+            )
+
+    @pytest.mark.parametrize(
+        ('data', 'expected'),
+        [
+            (
+                b'123456\nnext',
+                '[Line 1 is 6B, exceeds the 5B limit and was omitted. Use offset=2 to continue.]',
+            ),
+            (
+                b'123456',
+                '[Line 1 is 6B, exceeds the 5B limit and was omitted.]',
+            ),
+        ],
+    )
+    async def test_read_omits_oversized_first_line(
+        self,
+        fake_e2b: FakeE2B,
+        data: bytes,
+        expected: str,
+    ) -> None:
+        async with _toolset(max_output_bytes=5) as tools:
+            fake_e2b.sandboxes[0].files.files['/wide'] = data
+            assert await tools.read_file('/wide') == expected
+
+    async def test_list_omits_oversized_first_entry(self, fake_e2b: FakeE2B) -> None:
+        async with _toolset(max_output_bytes=5) as tools:
+            fake_e2b.sandboxes[0].files.listings['/home/user'] = [
+                FakeEntryInfo('123456', '/home/user/123456', FakeFileType('file'), 0),
+            ]
+            assert await tools.list_directory() == '[... first line exceeds the 5B limit, output omitted ...]'
+
     async def test_binary_and_unpaired_surrogate_retry(self, fake_e2b: FakeE2B) -> None:
         async with _toolset() as tools:
             fake_e2b.sandboxes[0].files.files['/binary'] = b'\xff'

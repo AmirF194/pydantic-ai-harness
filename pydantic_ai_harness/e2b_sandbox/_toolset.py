@@ -15,13 +15,13 @@ from pydantic_ai.tools import AgentDepsT
 from pydantic_ai.toolsets import AbstractToolset, FunctionToolset
 from typing_extensions import Self
 
-from pydantic_ai_harness._sandbox_tool_output import guard_read_size, render_file_window, truncate_output
 from pydantic_ai_harness.e2b_sandbox._session import (
     DEFAULT_SANDBOX_TIMEOUT,
     E2BSandboxError,
     E2BSandboxSession,
     E2BSandboxTerminalError,
 )
+from pydantic_ai_harness.e2b_sandbox._tool_output import guard_read_size, render_file_window, truncate_output
 
 
 class E2BSandboxToolset(FunctionToolset[AgentDepsT]):

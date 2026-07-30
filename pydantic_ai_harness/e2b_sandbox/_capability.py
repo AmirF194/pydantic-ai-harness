@@ -15,12 +15,12 @@ from pydantic_ai.tools import AgentDepsT
 from pydantic_ai.toolsets import AgentToolset
 from typing_extensions import Self
 
-from pydantic_ai_harness._sandbox_tool_output import DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES
 from pydantic_ai_harness.e2b_sandbox._session import (
     DEFAULT_SANDBOX_TIMEOUT,
     DEFAULT_WORKDIR,
     E2BSandboxSession,
 )
+from pydantic_ai_harness.e2b_sandbox._tool_output import DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES
 from pydantic_ai_harness.e2b_sandbox._toolset import E2BSandboxToolset
 
 if TYPE_CHECKING:
