@@ -245,7 +245,7 @@ class LocalStackToolset(FunctionToolset[AgentDepsT]):
         """Truncate output to the configured cap, keeping the tail.
 
         Errors and the `[stderr]` section land at the end, so the head is
-        dropped and the final `max_output_chars` are kept.
+        dropped and as much of the tail as fits beside the marker is kept.
         """
         return truncate_tail(text, self._max_output_chars)
 

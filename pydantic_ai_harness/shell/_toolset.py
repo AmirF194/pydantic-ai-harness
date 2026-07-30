@@ -224,7 +224,7 @@ class ShellToolset(FunctionToolset[AgentDepsT]):
 
         The most useful output -- errors, stack traces, exit info, and the
         `[stderr]` section (which callers append last) -- lands at the end, so
-        the head is dropped and the final `max_output_chars` are kept.
+        the head is dropped and as much of the tail as fits beside the marker is kept.
         """
         return truncate_tail(text, self._max_output_chars)
 
@@ -527,15 +527,13 @@ class ShellToolset(FunctionToolset[AgentDepsT]):
         stopped = f'[stopped: {bg.command!r}]'
         parts = [stopped]
         if bg.exit_code is not None:
-            exit_code = f'[exit code: {bg.exit_code}]'
-            stopped_budget = self._max_output_chars - len(exit_code) - 1
-            if stopped_budget >= len('[stopped:]'):
-                parts[0] = truncate_head(stopped, stopped_budget)
-            parts.append(exit_code)
+            parts.append(f'[exit code: {bg.exit_code}]')
         output_sections: list[str] = []
         if stdout:
             output_sections.append(f'[stdout]\n{stdout}')
         if stderr:
             output_sections.append(f'[stderr]\n{stderr}')
         output = '\n'.join(output_sections) if output_sections else '(no output)'
+        if len('\n'.join([*parts, output])) > self._max_output_chars:
+            parts[0] = '[stopped]'
         return self._join_metadata_and_output(parts, output)

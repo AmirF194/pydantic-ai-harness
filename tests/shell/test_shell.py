@@ -959,7 +959,7 @@ class TestBackgroundCommands:
         finally:
             stop_result = await ts.stop_command(command_id)
         assert len(stop_result) <= 200
-        assert stop_result.startswith('[stopped:')
+        assert stop_result.startswith('[stopped]')
         assert '[exit code:' in stop_result
         assert 'output truncated' in stop_result
 
@@ -984,7 +984,7 @@ class TestBackgroundCommands:
 
         stop_result = await ts.stop_command(command_id)
         assert len(stop_result) <= 200
-        assert stop_result.startswith('[stopped:')
+        assert stop_result.startswith('[stopped]')
         assert '[exit code: 7]' in stop_result
         assert 'output truncated' in stop_result
 
@@ -1006,7 +1006,7 @@ class TestBackgroundCommands:
             assert check_result == '[status: r'
         finally:
             stop_result = await ts.stop_command(command_id)
-            assert stop_result == '[stopped: '
+            assert stop_result == '[stopped]\n'
 
     async def test_long_stopped_command_keeps_exit_code_within_cap(self, shell_dir: Path) -> None:
         ts = ShellToolset(
@@ -1019,14 +1019,14 @@ class TestBackgroundCommands:
             persist_cwd=False,
             allow_interactive=False,
         )
-        start_result = await ts.start_command(f'exit 7 # {"x" * 400}')
+        start_result = await ts.start_command(f'printf "TAIL_ERROR"; exit 7 # {"x" * 400}')
         command_id = _parse_command_id(start_result)
         await anyio.sleep(0.5)
 
         stop_result = await ts.stop_command(command_id)
         assert len(stop_result) <= 200
-        assert stop_result.startswith('[stopped:')
-        assert stop_result.endswith('[exit code: 7]')
+        assert stop_result.startswith('[stopped]\n[exit code: 7]')
+        assert stop_result.endswith('TAIL_ERROR')
 
     async def test_start_and_check_finished(self, shell_dir: Path) -> None:
         ts = ShellToolset(
