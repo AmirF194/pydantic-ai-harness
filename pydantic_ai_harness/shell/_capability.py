@@ -3,14 +3,14 @@
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence, Set
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import overload
 
 from pydantic_ai.capabilities import AbstractCapability
 from pydantic_ai.tools import AgentDepsT
 
-from pydantic_ai_harness.shell._command_policy import normalize_command_policy
+from pydantic_ai_harness.shell._command_policy import CommandPolicy, normalize_command_policy
 from pydantic_ai_harness.shell._toolset import ShellToolset
 
 LLM_API_KEY_ENV_PATTERNS: tuple[str, ...] = (
@@ -43,18 +43,18 @@ class Shell(AbstractCapability[AgentDepsT]):
     cwd: str | Path
     """Working directory for command execution."""
 
-    allowed_commands: tuple[str, ...] | None
-    """Command names allowed in allowlist mode, or `None` in denylist mode."""
+    allowed_commands: Sequence[str]
+    """Command names allowed in allowlist mode, or empty in denylist mode."""
 
-    denied_commands: tuple[str, ...] | None
-    """Command names rejected in denylist mode, or `None` in allowlist mode.
+    denied_commands: Sequence[str]
+    """Command names rejected in denylist mode, or empty in allowlist mode.
 
     When neither command control is supplied, this contains the built-in list
     of destructive commands. Pass an empty collection to disable command-name
     filtering.
     """
 
-    denied_operators: tuple[str, ...]
+    denied_operators: Sequence[str]
     """Shell operators that are blocked (e.g. '>', '>>', '|' for restrictive mode)."""
 
     default_timeout: float
@@ -78,7 +78,7 @@ class Shell(AbstractCapability[AgentDepsT]):
     tokens) out of commands the agent runs.
     """
 
-    denied_env_patterns: tuple[str, ...]
+    denied_env_patterns: Sequence[str]
     """Glob patterns for environment variable names to strip before spawning.
 
     Follows the `denied_*` naming convention but matches by glob (`fnmatch`,
@@ -88,6 +88,8 @@ class Shell(AbstractCapability[AgentDepsT]):
     when both are set, so patterns filter an explicit `env` too. See
     `LLM_API_KEY_ENV_PATTERNS` for a ready-made provider-credential denylist.
     """
+
+    _command_policy: CommandPolicy = field(init=False, repr=False, compare=False)
 
     @overload
     def __init__(  # pragma: no cover - overload is enforced by static type checking
@@ -148,8 +150,8 @@ class Shell(AbstractCapability[AgentDepsT]):
         policy = normalize_command_policy(allowed_commands, denied_commands)
 
         self.cwd = cwd
-        self.allowed_commands = policy.commands if policy.mode == 'allow' else None
-        self.denied_commands = policy.commands if policy.mode == 'deny' else None
+        self.allowed_commands = policy.commands if policy.mode == 'allow' else ()
+        self.denied_commands = policy.commands if policy.mode == 'deny' else ()
         self.denied_operators = tuple(denied_operators)
         self.default_timeout = default_timeout
         self.max_output_chars = max_output_chars
@@ -160,10 +162,11 @@ class Shell(AbstractCapability[AgentDepsT]):
         self.id = id
         self.description = description
         self.defer_loading = defer_loading
+        self._command_policy = policy
 
     def get_toolset(self) -> ShellToolset[AgentDepsT]:
         """Build and return the shell toolset."""
-        policy = normalize_command_policy(self.allowed_commands, self.denied_commands)
+        policy = self._normalize_current_command_policy()
         if policy.mode == 'allow':
             return ShellToolset[AgentDepsT](
                 cwd=Path(self.cwd),
@@ -188,3 +191,17 @@ class Shell(AbstractCapability[AgentDepsT]):
             env=self.env,
             denied_env_patterns=self.denied_env_patterns,
         )
+
+    def _normalize_current_command_policy(self) -> CommandPolicy:
+        if self.allowed_commands and self.denied_commands:
+            return normalize_command_policy(self.allowed_commands, self.denied_commands)
+        if self.allowed_commands:
+            policy = normalize_command_policy(self.allowed_commands, None)
+        elif self.denied_commands:
+            policy = normalize_command_policy(None, self.denied_commands)
+        elif self._command_policy.mode == 'allow':
+            policy = normalize_command_policy(self.allowed_commands, None)
+        else:
+            policy = normalize_command_policy(None, self.denied_commands)
+        self._command_policy = policy
+        return policy

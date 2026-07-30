@@ -1143,8 +1143,7 @@ class TestShellCapability:
         shell = Shell()
         assert shell.cwd == '.'
         assert shell.default_timeout == 30.0
-        assert shell.allowed_commands is None
-        assert shell.denied_commands is not None
+        assert shell.allowed_commands == ()
         assert 'rm' in shell.denied_commands
 
     def test_custom_construction(self) -> None:
@@ -1155,7 +1154,7 @@ class TestShellCapability:
         )
         assert shell.default_timeout == 60.0
         assert shell.allowed_commands == ('echo', 'cat')
-        assert shell.denied_commands is None
+        assert shell.denied_commands == ()
 
     def test_capability_fields_are_preserved(self) -> None:
         shell = Shell(id='shell', description='Run repository commands.', defer_loading=True)
@@ -1167,7 +1166,7 @@ class TestShellCapability:
     def test_explicit_denylist_construction(self) -> None:
         shell = Shell(denied_commands=['curl', 'ssh'])
 
-        assert shell.allowed_commands is None
+        assert shell.allowed_commands == ()
         assert shell.denied_commands == ('curl', 'ssh')
 
     @pytest.mark.parametrize('allowed_commands', [{'echo'}, frozenset({'echo'})])
@@ -1175,22 +1174,35 @@ class TestShellCapability:
         shell = Shell(allowed_commands=allowed_commands)
 
         assert shell.allowed_commands == ('echo',)
-        assert shell.denied_commands is None
+        assert shell.denied_commands == ()
 
     def test_empty_allowlist_selects_allow_mode(self) -> None:
         shell = Shell(allowed_commands=[])
 
         assert shell.allowed_commands == ()
-        assert shell.denied_commands is None
+        assert shell.denied_commands == ()
         with pytest.raises(PermissionError, match='not in the allowed list'):
             shell.get_toolset()._check_command('echo hello')
 
     def test_empty_denylist_selects_deny_mode(self) -> None:
         shell = Shell(denied_commands=[])
 
-        assert shell.allowed_commands is None
+        assert shell.allowed_commands == ()
         assert shell.denied_commands == ()
         shell.get_toolset()._check_command('rm -rf /')
+
+    def test_sequence_fields_remain_mutable_configuration(self) -> None:
+        shell = Shell(allowed_commands=['echo'])
+        shell.allowed_commands = ['cat']
+        shell.denied_commands = []
+        shell.denied_operators = ['>']
+        shell.denied_env_patterns = ['OPENAI_*']
+
+        allowed_commands: Sequence[str] = shell.allowed_commands
+        assert allowed_commands == ['cat']
+        shell.get_toolset()._check_command('cat file.txt')
+        with pytest.raises(PermissionError, match='not in the allowed list'):
+            shell.get_toolset()._check_command('echo hello')
 
     @pytest.mark.parametrize(
         ('allowed_commands', 'denied_commands'),
@@ -1235,7 +1247,6 @@ class TestShellCapability:
 
     def test_default_denied_commands(self) -> None:
         shell = Shell()
-        assert shell.denied_commands is not None
         assert 'rm' in shell.denied_commands
         assert 'dd' in shell.denied_commands
         assert 'shutdown' in shell.denied_commands
