@@ -21,17 +21,16 @@ from __future__ import annotations
 
 import base64
 import os
-from collections.abc import Callable, Mapping, Sequence
-from copy import copy
+from collections.abc import Mapping, Sequence
+from dataclasses import replace
 from fnmatch import fnmatch
 from typing import Literal
 from urllib.parse import parse_qsl, urlsplit, urlunsplit
 
 from pydantic import AnyUrl
 from pydantic_ai.exceptions import UserError
-from pydantic_ai.tools import AgentDepsT, RunContext, ToolDefinition
-from pydantic_ai.toolsets import AbstractToolset, WrapperToolset
-from typing_extensions import Self
+from pydantic_ai.tools import AgentDepsT, RunContext
+from pydantic_ai.toolsets import ToolsetTool
 
 try:
     from pydantic_ai.mcp import MCPToolset, MCPToolsetClient
@@ -129,27 +128,13 @@ def _validate_https_url(url: str, *, name: str) -> None:
         raise UserError(f'`{name}` must be an absolute HTTPS URL.')
 
 
-def _action_filter(actions: Sequence[str]) -> Callable[[RunContext[AgentDepsT], ToolDefinition], bool]:
-    """A `FilteredToolset` predicate matching tool names against the given globs.
-
-    The lowered globs are computed once here rather than per tool per step,
-    which is how often `FilteredToolset` evaluates the predicate.
-    """
-    lowered = tuple(glob.lower() for glob in actions)
-
-    def action_filter(ctx: RunContext[AgentDepsT], tool_def: ToolDefinition) -> bool:
-        return any(fnmatch(tool_def.name.lower(), glob) for glob in lowered)
-
-    return action_filter
-
-
-class StackOneToolset(WrapperToolset[AgentDepsT]):
+class StackOneToolset(MCPToolset[AgentDepsT]):
     """StackOne actions on one linked SaaS account, as an agent toolset.
 
-    A thin wrapper over an `MCPToolset` connected to StackOne's MCP endpoint.
-    URL clients receive StackOne auth and account headers. `actions` globs
-    become a `FilteredToolset`. Prebuilt clients keep their own transport
-    configuration.
+    An `MCPToolset` connected to StackOne's MCP endpoint. URL clients receive
+    StackOne auth and account headers. Action filtering and metadata merging
+    apply to the tools listed by the server. Prebuilt clients keep their own
+    transport configuration. Instances support the full `MCPToolset` surface.
 
     Use the `StackOne` capability for usage instructions and agent-spec support.
     Use this class for toolset combinators such as `approval_required()`.
@@ -200,30 +185,27 @@ class StackOneToolset(WrapperToolset[AgentDepsT]):
             _validate_https_url(str(resolved), name='client')
             resolved = _with_tool_mode(str(resolved), mode)
             headers = {'Authorization': _basic_auth(resolve_api_key(api_key)), 'x-account-id': account_id}
-        toolset: AbstractToolset[AgentDepsT] = MCPToolset(resolved, id=id, headers=headers)
-        if mode == 'individual' and actions:
-            toolset = toolset.filtered(_action_filter(actions))
-        if metadata:
-            toolset = toolset.with_metadata(**metadata)
-        super().__init__(wrapped=toolset)
+        super().__init__(resolved, id=id, headers=headers)
+        self._lowered_actions: tuple[str, ...] = tuple(glob.lower() for glob in actions)
+        self._metadata = metadata
 
-    # `WrapperToolset` rewrites use `dataclasses.replace(self, wrapped=...)`, which calls
-    # `StackOneToolset.__init__(wrapped=...)`; this constructor does not accept `wrapped`.
-    # These overrides copy the wrapper instead.
-    def _with_wrapped(self, wrapped: AbstractToolset[AgentDepsT]) -> Self:
-        result = copy(self)
-        result.wrapped = wrapped
-        return result
-
-    async def for_run(self, ctx: RunContext[AgentDepsT]) -> AbstractToolset[AgentDepsT]:
-        wrapped = await self.wrapped.for_run(ctx)
-        return self if wrapped is self.wrapped else self._with_wrapped(wrapped)
-
-    async def for_run_step(self, ctx: RunContext[AgentDepsT]) -> AbstractToolset[AgentDepsT]:
-        wrapped = await self.wrapped.for_run_step(ctx)
-        return self if wrapped is self.wrapped else self._with_wrapped(wrapped)
-
-    def visit_and_replace(
-        self, visitor: Callable[[AbstractToolset[AgentDepsT]], AbstractToolset[AgentDepsT]]
-    ) -> AbstractToolset[AgentDepsT]:
-        return self._with_wrapped(self.wrapped.visit_and_replace(visitor))
+    async def get_tools(self, ctx: RunContext[AgentDepsT]) -> dict[str, ToolsetTool[AgentDepsT]]:
+        tools = await super().get_tools(ctx)
+        if self._lowered_actions:
+            tools = {
+                name: tool
+                for name, tool in tools.items()
+                if any(fnmatch(tool.tool_def.name.lower(), glob) for glob in self._lowered_actions)
+            }
+        if self._metadata:
+            tools = {
+                name: replace(
+                    tool,
+                    tool_def=replace(
+                        tool.tool_def,
+                        metadata={**(tool.tool_def.metadata or {}), **self._metadata},
+                    ),
+                )
+                for name, tool in tools.items()
+            }
+        return tools
