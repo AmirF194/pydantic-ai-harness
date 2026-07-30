@@ -165,6 +165,50 @@ class ShellToolset(FunctionToolset[AgentDepsT]):
         self.add_function(self.check_command, name='check_command')
         self.add_function(self.stop_command, name='stop_command')
 
+    @classmethod
+    def _from_policy(
+        cls,
+        policy: CommandPolicy,
+        *,
+        cwd: Path,
+        denied_operators: Sequence[str],
+        default_timeout: float,
+        max_output_chars: int,
+        persist_cwd: bool,
+        allow_interactive: bool,
+        env: Mapping[str, str] | None,
+        denied_env_patterns: Sequence[str],
+    ) -> ShellToolset[AgentDepsT]:
+        """Build a toolset from an already-normalized policy.
+
+        The public constructor keeps the `allowed_commands`/`denied_commands`
+        kwargs, so this is the one place that splits a policy back into the
+        mode-specific kwarg.
+        """
+        if policy.mode == 'allow':
+            return cls(
+                cwd=cwd,
+                allowed_commands=policy.commands,
+                denied_operators=denied_operators,
+                default_timeout=default_timeout,
+                max_output_chars=max_output_chars,
+                persist_cwd=persist_cwd,
+                allow_interactive=allow_interactive,
+                env=env,
+                denied_env_patterns=denied_env_patterns,
+            )
+        return cls(
+            cwd=cwd,
+            denied_commands=policy.commands,
+            denied_operators=denied_operators,
+            default_timeout=default_timeout,
+            max_output_chars=max_output_chars,
+            persist_cwd=persist_cwd,
+            allow_interactive=allow_interactive,
+            env=env,
+            denied_env_patterns=denied_env_patterns,
+        )
+
     async def for_run(self, ctx: RunContext[AgentDepsT]) -> AbstractToolset[AgentDepsT]:
         """Return a fresh instance per run so cwd and background processes are isolated.
 
@@ -174,22 +218,9 @@ class ShellToolset(FunctionToolset[AgentDepsT]):
         an override two concurrent runs would corrupt each other's cwd and kill
         each other's background processes.
         """
-        if self._command_policy.mode == 'allow':
-            return ShellToolset(
-                cwd=self._initial_cwd,
-                allowed_commands=self._command_policy.commands,
-                denied_operators=self._denied_operators,
-                default_timeout=self._default_timeout,
-                max_output_chars=self._max_output_chars,
-                persist_cwd=self._persist_cwd,
-                allow_interactive=self._allow_interactive,
-                env=self._env,
-                denied_env_patterns=self._denied_env_patterns,
-            )
-
-        return ShellToolset(
+        return type(self)._from_policy(
+            self._command_policy,
             cwd=self._initial_cwd,
-            denied_commands=self._command_policy.commands,
             denied_operators=self._denied_operators,
             default_timeout=self._default_timeout,
             max_output_chars=self._max_output_chars,

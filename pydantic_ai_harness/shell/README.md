@@ -69,6 +69,10 @@ collection: change `allowed_commands=['ls'], denied_commands=[]` to
 `allowed_commands=['ls']`, and change `allowed_commands=[],
 denied_commands=['rm']` to `denied_commands=['rm']`. Use
 `denied_commands=[]` by itself when no executable names should be blocked.
+The same rule applies to direct `ShellToolset` construction, which previously
+required both kwargs. Two more changes from earlier releases: `allowed_commands=[]`
+previously meant no allowlist filtering and now allows nothing, and all `Shell`
+arguments after `cwd` are now keyword-only.
 
 `denied_operators` and `allow_interactive` are independent controls and apply
 in either command mode. The executable name is extracted with `shlex`, so
@@ -165,7 +169,7 @@ from pydantic_ai_harness import Shell
 Shell()                                      # built-in destructive-command denylist
 Shell(allowed_commands=['ls', 'cat', 'rg'])  # allow only these executables
 Shell(allowed_commands=[])                   # allow no executables
-Shell(denied_commands=['curl', 'ssh'])        # deny these executables
+Shell(denied_commands=['curl', 'ssh'])       # deny these executables
 Shell(denied_commands=[])                    # no command-name filtering
 ```
 
@@ -176,13 +180,13 @@ from pydantic_ai_harness import Shell
 
 Shell(
     cwd='.',                       # str | Path -- working directory
-    denied_operators=[],           # blocked shell operators
+    denied_operators=(),           # blocked shell operators
     default_timeout=30.0,          # seconds, per run_command
     max_output_chars=50_000,       # output cap returned to the model
     persist_cwd=False,             # make cd sticky across calls
     allow_interactive=False,       # allow TTY-style commands
     env=None,                      # explicit env, replacing inheritance (None = inherit)
-    denied_env_patterns=[],        # glob patterns stripped from the inherited env
+    denied_env_patterns=(),        # glob patterns stripped from the inherited env
 )
 ```
 

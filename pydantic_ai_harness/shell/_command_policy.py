@@ -6,24 +6,26 @@ from collections.abc import Collection
 from dataclasses import dataclass
 from typing import Literal
 
-_DEFAULT_DENIED_COMMANDS: tuple[str, ...] = (
-    'rm',
-    'rmdir',
-    'mkfs',
-    'dd',
-    'format',
-    'shutdown',
-    'reboot',
-    'halt',
-    'poweroff',
-    'init',
+_DEFAULT_DENIED_COMMANDS: frozenset[str] = frozenset(
+    {
+        'rm',
+        'rmdir',
+        'mkfs',
+        'dd',
+        'format',
+        'shutdown',
+        'reboot',
+        'halt',
+        'poweroff',
+        'init',
+    }
 )
 
 
 @dataclass(frozen=True)
 class CommandPolicy:
     mode: Literal['allow', 'deny']
-    commands: tuple[str, ...]
+    commands: frozenset[str]
 
     def denial_message(self, executable: str) -> str | None:
         if self.mode == 'allow' and executable not in self.commands:
@@ -47,13 +49,13 @@ def normalize_command_policy(
     return CommandPolicy('deny', _DEFAULT_DENIED_COMMANDS)
 
 
-def _normalize_commands(name: str, commands: Collection[object]) -> tuple[str, ...]:
+def _normalize_commands(name: str, commands: Collection[object]) -> frozenset[str]:
     if isinstance(commands, str):
         raise TypeError(f'{name} must be a collection of command names, not a string.')
 
-    normalized: list[str] = []
+    normalized: set[str] = set()
     for command in commands:
         if not isinstance(command, str):
             raise TypeError(f'{name} must contain only command names as strings.')
-        normalized.append(command)
-    return tuple(normalized)
+        normalized.add(command)
+    return frozenset(normalized)

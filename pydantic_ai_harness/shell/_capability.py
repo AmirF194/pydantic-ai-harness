@@ -3,14 +3,14 @@
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence, Set
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import overload
 
 from pydantic_ai.capabilities import AbstractCapability
 from pydantic_ai.tools import AgentDepsT
 
-from pydantic_ai_harness.shell._command_policy import CommandPolicy, normalize_command_policy
+from pydantic_ai_harness.shell._command_policy import normalize_command_policy
 from pydantic_ai_harness.shell._toolset import ShellToolset
 
 LLM_API_KEY_ENV_PATTERNS: tuple[str, ...] = (
@@ -40,36 +40,41 @@ class Shell(AbstractCapability[AgentDepsT]):
     or `denied_commands` to control what the agent can invoke.
     """
 
-    cwd: str | Path
+    cwd: str | Path = '.'
     """Working directory for command execution."""
 
-    allowed_commands: Sequence[str]
-    """Command names allowed in allowlist mode, or empty in denylist mode."""
+    allowed_commands: frozenset[str] | None = None
+    """Command names allowed in allowlist mode, or `None` in denylist mode.
 
-    denied_commands: Sequence[str]
-    """Command names rejected in denylist mode, or empty in allowlist mode.
+    Exactly one of `allowed_commands` and `denied_commands` is a set at any
+    time; the `None` side records which mode is selected. To switch modes on
+    an existing instance, assign one side a set and the other `None`.
+    """
 
-    When neither command control is supplied, this contains the built-in list
+    denied_commands: frozenset[str] | None = None
+    """Command names rejected in denylist mode, or `None` in allowlist mode.
+
+    When neither command control is supplied, this contains the built-in set
     of destructive commands. Pass an empty collection to disable command-name
     filtering.
     """
 
-    denied_operators: Sequence[str]
+    denied_operators: Sequence[str] = ()
     """Shell operators that are blocked (e.g. '>', '>>', '|' for restrictive mode)."""
 
-    default_timeout: float
+    default_timeout: float = 30.0
     """Default timeout in seconds for command execution."""
 
-    max_output_chars: int
+    max_output_chars: int = 50_000
     """Maximum characters of output returned to the model."""
 
-    persist_cwd: bool
+    persist_cwd: bool = False
     """If True, track cd commands and adjust the working directory for subsequent calls."""
 
-    allow_interactive: bool
+    allow_interactive: bool = False
     """If True, allow interactive commands (vi, nano, ssh, etc.). Blocked by default."""
 
-    env: Mapping[str, str] | None
+    env: Mapping[str, str] | None = None
     """Explicit environment for spawned subprocesses, replacing inheritance.
 
     When `None` (default) the subprocess inherits the parent environment. Set
@@ -78,7 +83,7 @@ class Shell(AbstractCapability[AgentDepsT]):
     tokens) out of commands the agent runs.
     """
 
-    denied_env_patterns: Sequence[str]
+    denied_env_patterns: Sequence[str] = ()
     """Glob patterns for environment variable names to strip before spawning.
 
     Follows the `denied_*` naming convention but matches by glob (`fnmatch`,
@@ -88,8 +93,6 @@ class Shell(AbstractCapability[AgentDepsT]):
     when both are set, so patterns filter an explicit `env` too. See
     `LLM_API_KEY_ENV_PATTERNS` for a ready-made provider-credential denylist.
     """
-
-    _command_policy: CommandPolicy = field(init=False, repr=False, compare=False)
 
     @overload
     def __init__(  # pragma: no cover - overload is enforced by static type checking
@@ -150,8 +153,8 @@ class Shell(AbstractCapability[AgentDepsT]):
         policy = normalize_command_policy(allowed_commands, denied_commands)
 
         self.cwd = cwd
-        self.allowed_commands = policy.commands if policy.mode == 'allow' else ()
-        self.denied_commands = policy.commands if policy.mode == 'deny' else ()
+        self.allowed_commands = policy.commands if policy.mode == 'allow' else None
+        self.denied_commands = policy.commands if policy.mode == 'deny' else None
         self.denied_operators = tuple(denied_operators)
         self.default_timeout = default_timeout
         self.max_output_chars = max_output_chars
@@ -162,27 +165,12 @@ class Shell(AbstractCapability[AgentDepsT]):
         self.id = id
         self.description = description
         self.defer_loading = defer_loading
-        self._command_policy = policy
 
     def get_toolset(self) -> ShellToolset[AgentDepsT]:
         """Build and return the shell toolset."""
-        policy = self._normalize_current_command_policy()
-        if policy.mode == 'allow':
-            return ShellToolset[AgentDepsT](
-                cwd=Path(self.cwd),
-                allowed_commands=policy.commands,
-                denied_operators=self.denied_operators,
-                default_timeout=self.default_timeout,
-                max_output_chars=self.max_output_chars,
-                persist_cwd=self.persist_cwd,
-                allow_interactive=self.allow_interactive,
-                env=self.env,
-                denied_env_patterns=self.denied_env_patterns,
-            )
-
-        return ShellToolset[AgentDepsT](
+        return ShellToolset[AgentDepsT]._from_policy(  # pyright: ignore[reportPrivateUsage]
+            normalize_command_policy(self.allowed_commands, self.denied_commands),
             cwd=Path(self.cwd),
-            denied_commands=policy.commands,
             denied_operators=self.denied_operators,
             default_timeout=self.default_timeout,
             max_output_chars=self.max_output_chars,
@@ -191,17 +179,3 @@ class Shell(AbstractCapability[AgentDepsT]):
             env=self.env,
             denied_env_patterns=self.denied_env_patterns,
         )
-
-    def _normalize_current_command_policy(self) -> CommandPolicy:
-        if self.allowed_commands and self.denied_commands:
-            return normalize_command_policy(self.allowed_commands, self.denied_commands)
-        if self.allowed_commands:
-            policy = normalize_command_policy(self.allowed_commands, None)
-        elif self.denied_commands:
-            policy = normalize_command_policy(None, self.denied_commands)
-        elif self._command_policy.mode == 'allow':
-            policy = normalize_command_policy(self.allowed_commands, None)
-        else:
-            policy = normalize_command_policy(None, self.denied_commands)
-        self._command_policy = policy
-        return policy

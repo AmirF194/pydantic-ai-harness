@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import os
 import shlex
 import sys
@@ -190,6 +191,20 @@ class TestCommandValidation:
         )
         with pytest.raises(PermissionError, match='not in the allowed list'):
             ts._check_command('cat file.txt')
+
+    async def test_run_command_enforces_allowlist(self, shell_dir: Path) -> None:
+        ts = ShellToolset(
+            cwd=shell_dir,
+            allowed_commands=['echo'],
+            denied_operators=[],
+            default_timeout=10.0,
+            max_output_chars=50_000,
+            persist_cwd=False,
+            allow_interactive=False,
+        )
+        assert 'hello' in await ts.run_command('echo hello')
+        with pytest.raises(ModelRetry, match='not in the allowed list'):
+            await ts.run_command('cat file.txt')
 
     async def test_empty_allowlist_blocks_every_executable(self, shell_dir: Path) -> None:
         ts = ShellToolset(
@@ -512,6 +527,33 @@ class TestForRunIsolation:
         assert isinstance(run_toolset, ShellToolset)
         with pytest.raises(PermissionError, match='not in the allowed list'):
             run_toolset._check_command('echo hello')
+
+    async def test_for_run_preserves_allow_mode_configuration(self, shell_dir: Path) -> None:
+        toolset = ShellToolset[None](
+            cwd=shell_dir,
+            allowed_commands=['echo'],
+            denied_operators=['>'],
+            default_timeout=45.0,
+            max_output_chars=123,
+            persist_cwd=True,
+            allow_interactive=True,
+            env={'MARKER': 'x'},
+            denied_env_patterns=['OPENAI_*'],
+        )
+
+        run_toolset = await toolset.for_run(_run_context())
+
+        assert isinstance(run_toolset, ShellToolset)
+        with pytest.raises(PermissionError, match='not in the allowed list'):
+            run_toolset._check_command('cat file.txt')
+        with pytest.raises(PermissionError, match='Shell operator'):
+            run_toolset._check_command('echo hi > out.txt')
+        assert run_toolset._default_timeout == 45.0
+        assert run_toolset._max_output_chars == 123
+        assert run_toolset._persist_cwd is True
+        assert run_toolset._allow_interactive is True
+        assert run_toolset._env == {'MARKER': 'x'}
+        assert run_toolset._denied_env_patterns == ['OPENAI_*']
 
     async def test_persist_cwd_isolated_across_runs(self, persist_toolset: ShellToolset[None], shell_dir: Path) -> None:
         run1 = await persist_toolset.for_run(_run_context())
@@ -1143,7 +1185,8 @@ class TestShellCapability:
         shell = Shell()
         assert shell.cwd == '.'
         assert shell.default_timeout == 30.0
-        assert shell.allowed_commands == ()
+        assert shell.allowed_commands is None
+        assert shell.denied_commands is not None
         assert 'rm' in shell.denied_commands
 
     def test_custom_construction(self) -> None:
@@ -1153,8 +1196,8 @@ class TestShellCapability:
             default_timeout=60.0,
         )
         assert shell.default_timeout == 60.0
-        assert shell.allowed_commands == ('echo', 'cat')
-        assert shell.denied_commands == ()
+        assert shell.allowed_commands == frozenset({'echo', 'cat'})
+        assert shell.denied_commands is None
 
     def test_capability_fields_are_preserved(self) -> None:
         shell = Shell(id='shell', description='Run repository commands.', defer_loading=True)
@@ -1166,43 +1209,90 @@ class TestShellCapability:
     def test_explicit_denylist_construction(self) -> None:
         shell = Shell(denied_commands=['curl', 'ssh'])
 
-        assert shell.allowed_commands == ()
-        assert shell.denied_commands == ('curl', 'ssh')
+        assert shell.allowed_commands is None
+        assert shell.denied_commands == frozenset({'curl', 'ssh'})
 
     @pytest.mark.parametrize('allowed_commands', [{'echo'}, frozenset({'echo'})])
     def test_set_allowlist_construction(self, allowed_commands: set[str] | frozenset[str]) -> None:
         shell = Shell(allowed_commands=allowed_commands)
 
-        assert shell.allowed_commands == ('echo',)
-        assert shell.denied_commands == ()
+        assert shell.allowed_commands == frozenset({'echo'})
+        assert shell.denied_commands is None
 
     def test_empty_allowlist_selects_allow_mode(self) -> None:
         shell = Shell(allowed_commands=[])
 
-        assert shell.allowed_commands == ()
-        assert shell.denied_commands == ()
+        assert shell.allowed_commands == frozenset()
+        assert shell.denied_commands is None
         with pytest.raises(PermissionError, match='not in the allowed list'):
             shell.get_toolset()._check_command('echo hello')
 
     def test_empty_denylist_selects_deny_mode(self) -> None:
         shell = Shell(denied_commands=[])
 
-        assert shell.allowed_commands == ()
-        assert shell.denied_commands == ()
+        assert shell.allowed_commands is None
+        assert shell.denied_commands == frozenset()
         shell.get_toolset()._check_command('rm -rf /')
 
-    def test_sequence_fields_remain_mutable_configuration(self) -> None:
-        shell = Shell(allowed_commands=['echo'])
-        shell.allowed_commands = ['cat']
-        shell.denied_commands = []
-        shell.denied_operators = ['>']
-        shell.denied_env_patterns = ['OPENAI_*']
+    def test_empty_modes_are_distinct(self) -> None:
+        allow_nothing = Shell(allowed_commands=[])
+        allow_everything = Shell(denied_commands=[])
 
-        allowed_commands: Sequence[str] = shell.allowed_commands
-        assert allowed_commands == ['cat']
+        assert allow_nothing != allow_everything
+        assert repr(allow_nothing) != repr(allow_everything)
+
+    def test_dataclasses_replace_round_trip(self) -> None:
+        replaced = dataclasses.replace(Shell(), cwd='/tmp')
+        assert replaced.cwd == '/tmp'
+        assert replaced.allowed_commands is None
+        assert replaced.denied_commands is not None
+        assert 'rm' in replaced.denied_commands
+
+        allow = dataclasses.replace(Shell(allowed_commands=['echo']), default_timeout=5.0)
+        assert allow.default_timeout == 5.0
+        assert allow.allowed_commands == frozenset({'echo'})
+        assert allow.denied_commands is None
+
+    def test_mode_flip_to_denylist_by_assignment(self) -> None:
+        shell = Shell(allowed_commands=['echo'])
+        shell.allowed_commands = None
+        shell.denied_commands = frozenset({'rm'})
+
+        shell.get_toolset()._check_command('cat file.txt')
+        with pytest.raises(PermissionError, match="'rm' is denied"):
+            shell.get_toolset()._check_command('rm -rf /')
+
+    def test_mode_flip_to_allowlist_by_assignment(self) -> None:
+        shell = Shell()
+        shell.denied_commands = None
+        shell.allowed_commands = frozenset({'cat'})
+
         shell.get_toolset()._check_command('cat file.txt')
         with pytest.raises(PermissionError, match='not in the allowed list'):
             shell.get_toolset()._check_command('echo hello')
+
+    def test_allow_mode_preserves_independent_controls(self, tmp_path: Path) -> None:
+        shell = Shell(
+            cwd=tmp_path,
+            allowed_commands=['echo', 'vi'],
+            denied_operators=['>'],
+            default_timeout=45.0,
+            max_output_chars=123,
+            persist_cwd=True,
+            env={'MARKER': 'x'},
+            denied_env_patterns=['OPENAI_*'],
+        )
+        ts = shell.get_toolset()
+
+        with pytest.raises(PermissionError, match='Shell operator'):
+            ts._check_command('echo hi > out.txt')
+        with pytest.raises(PermissionError, match='Interactive commands'):
+            ts._check_command('vi notes.txt')
+        assert ts._default_timeout == 45.0
+        assert ts._max_output_chars == 123
+        assert ts._persist_cwd is True
+        assert ts._env == {'MARKER': 'x'}
+        assert ts._denied_env_patterns == ['OPENAI_*']
 
     @pytest.mark.parametrize(
         ('allowed_commands', 'denied_commands'),
@@ -1235,7 +1325,7 @@ class TestShellCapability:
 
     def test_get_toolset_rejects_conflicting_mutated_state(self) -> None:
         shell = Shell()
-        shell.allowed_commands = ('echo',)
+        shell.allowed_commands = frozenset({'echo'})
 
         with pytest.raises(ValueError, match='Specify allowed_commands or denied_commands'):
             shell.get_toolset()
@@ -1247,6 +1337,7 @@ class TestShellCapability:
 
     def test_default_denied_commands(self) -> None:
         shell = Shell()
+        assert shell.denied_commands is not None
         assert 'rm' in shell.denied_commands
         assert 'dd' in shell.denied_commands
         assert 'shutdown' in shell.denied_commands
@@ -1257,7 +1348,10 @@ class TestShellCapability:
 
         agent = Agent.from_file(spec, custom_capability_types=[Shell])
 
-        assert isinstance(agent, Agent)
+        shells = [c for c in agent.root_capability.capabilities if isinstance(c, Shell)]
+        assert len(shells) == 1
+        assert shells[0].allowed_commands == frozenset({'ls', 'cat', 'rg'})
+        assert shells[0].denied_commands is None
 
     def test_agent_rejects_conflicting_spec_file(self, tmp_path: Path) -> None:
         spec = tmp_path / 'agent.yaml'
@@ -1273,6 +1367,7 @@ class TestShellCapability:
 
         assert 'spec_Shell' in schema['$defs']
         assert 'allowed_commands' in schema['$defs']['spec_params_Shell']['properties']
+        assert 'denied_commands' in schema['$defs']['spec_params_Shell']['properties']
 
     @pytest.mark.anyio(backends=['asyncio'])
     async def test_agent_integration(self, tmp_path: Path) -> None:
