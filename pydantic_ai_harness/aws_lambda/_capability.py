@@ -200,7 +200,8 @@ def _build_mcp_toolset(
 
     async def get_tools_operation(ctx: RunContext[AgentDepsT]) -> dict[str, ToolDefinition]:
         async def operation() -> _JsonValue:
-            tools = await toolset.get_tools(ctx)
+            with _durable_step_scope(ctx) as step_ctx:
+                tools = await toolset.get_tools(step_ctx)
             return _tool_defs_adapter.dump_python({n: t.tool_def for n, t in tools.items()}, mode='json')
 
         payload = await _require_bridge().run_step(f'{name}.get_tools', operation, _step_config(base_config))
@@ -208,7 +209,9 @@ def _build_mcp_toolset(
 
     async def get_instructions_operation(ctx: RunContext[AgentDepsT]) -> _Instructions:
         async def operation() -> _JsonValue:
-            return _instructions_adapter.dump_python(await toolset.get_instructions(ctx), mode='json')
+            with _durable_step_scope(ctx) as step_ctx:
+                instructions = await toolset.get_instructions(step_ctx)
+            return _instructions_adapter.dump_python(instructions, mode='json')
 
         payload = await _require_bridge().run_step(f'{name}.get_instructions', operation, _step_config(base_config))
         return _instructions_adapter.validate_python(payload)
@@ -251,7 +254,10 @@ def _build_dynamic_toolset(
 
     async def get_tools_operation(ctx: RunContext[AgentDepsT]) -> DynamicToolsResult:
         async def operation() -> _JsonValue:
-            return _dynamic_tools_adapter.dump_python(await get_dynamic_tools(toolset, ctx), mode='json')
+            # The strongest case for guarding discovery: the toolset function here is user code.
+            with _durable_step_scope(ctx) as step_ctx:
+                tools = await get_dynamic_tools(toolset, step_ctx)
+            return _dynamic_tools_adapter.dump_python(tools, mode='json')
 
         payload = await _require_bridge().run_step(f'{name}.get_tools', operation, _step_config(base_config))
         return _dynamic_tools_adapter.validate_python(payload)
