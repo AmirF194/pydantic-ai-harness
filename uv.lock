@@ -2329,6 +2329,7 @@ email = [
 name = "pydantic-ai-harness"
 source = { editable = "." }
 dependencies = [
+    { name = "genai-prices" },
     { name = "httpx" },
     { name = "pydantic-ai-slim" },
 ]
@@ -2396,6 +2397,7 @@ lint = [
 requires-dist = [
     { name = "agent-client-protocol", marker = "extra == 'acp'", specifier = ">=0.11,<0.12" },
     { name = "exa-py", marker = "extra == 'exa'", specifier = ">=2.16.0" },
+    { name = "genai-prices", specifier = ">=0.0.71" },
     { name = "httpx", specifier = ">=0.28.1" },
     { name = "logfire", marker = "extra == 'logfire'", specifier = ">=4.31.0" },
     { name = "modal", marker = "extra == 'modal'", specifier = ">=1.5.0" },
