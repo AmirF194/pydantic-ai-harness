@@ -259,8 +259,12 @@ async def test_an_empty_model_is_refused_by_validation_and_the_config_degrades(c
     config = published_value('agent__empty_model', published)
     capability = AgentControl('empty_model', instructions='CODE: base prompt.', label='production')
     agent = Agent(TestModel(), instructions='code', capabilities=[capability])
-    with variables_provider(capfire, config):
-        with pytest.warns(RuntimeWarning, match="'agent__empty_model' value failed validation"):
-            result = await agent.run('hello')
+    # Deliberately not asserting the warning logfire emits on a failed resolution: whether it warns, and
+    # with what, is its business and varies across the range this package supports -- the floor emits
+    # nothing, which failed the `lowest-versions` job while the locked version passed. What has to hold
+    # is the fallback itself.
+    with variables_provider(capfire, config), warnings.catch_warnings():
+        warnings.simplefilter('ignore')
+        result = await agent.run('hello')
     instructions = [m.instructions for m in result.all_messages() if isinstance(m, ModelRequest)]
     assert instructions == ['code\n\nCODE: base prompt.']
