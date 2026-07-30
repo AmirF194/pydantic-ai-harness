@@ -1,15 +1,12 @@
 """Shared helpers for model-visible tool output."""
 
 
-def truncate_tail(text: str, max_chars: int, *, preserve_prefix_chars: int = 0) -> str:
+def truncate_tail(text: str, max_chars: int) -> str:
     """Limit text to `max_chars`, including an accurate truncation marker."""
     if max_chars <= 0:
         return ''
     if len(text) <= max_chars:
         return text
-    if preserve_prefix_chars:
-        prefix_chars = min(preserve_prefix_chars, max_chars)
-        return text[:prefix_chars] + truncate_tail(text[preserve_prefix_chars:], max_chars - prefix_chars)
 
     def marker(tail_chars: int) -> str:
         return f'[... output truncated, showing last {tail_chars} chars]\n'

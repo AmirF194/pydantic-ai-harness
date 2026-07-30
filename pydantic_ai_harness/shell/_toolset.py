@@ -26,7 +26,6 @@ from pydantic_ai_harness._output import truncate_tail
 
 _IO_DRAIN_TIMEOUT: float = 2.0
 _KILL_GRACE_PERIOD: float = 2.0
-_CONTROL_PREFIX_RE = re.compile(r'\A(?:\[status:[^\n]*\]|\[stopped:[^\n]*\])\n(?:\[exit code:[^\n]*\]\n)?')
 
 _P = ParamSpec('_P')
 
@@ -166,12 +165,7 @@ class ShellToolset(FunctionToolset[AgentDepsT]):
         result = await super().call_tool(name, tool_args, ctx, tool)
         if name == 'start_command' or not isinstance(result, str):
             return result
-        control_prefix = _CONTROL_PREFIX_RE.match(result)
-        return truncate_tail(
-            result,
-            self._max_output_chars,
-            preserve_prefix_chars=control_prefix.end() if control_prefix else 0,
-        )
+        return truncate_tail(result, self._max_output_chars)
 
     def _resolve_env(self) -> dict[str, str] | None:
         """Compute the environment passed to spawned subprocesses.
@@ -481,15 +475,14 @@ class ShellToolset(FunctionToolset[AgentDepsT]):
         stdout, stderr = self._read_bg_output(bg)
 
         status = 'finished' if bg.finished else 'running'
-        parts = [f'[status: {status}]']
-        if bg.finished and bg.exit_code is not None:
-            parts.append(f'[exit code: {bg.exit_code}]')
         output_sections: list[str] = []
         if stdout:
             output_sections.append(f'[stdout]\n{stdout}')
         if stderr:
             output_sections.append(f'[stderr]\n{stderr}')
-        parts.append('\n'.join(output_sections) if output_sections else '(no output yet)')
+        parts = ['\n'.join(output_sections) if output_sections else '(no output yet)', f'[status: {status}]']
+        if bg.finished and bg.exit_code is not None:
+            parts.append(f'[exit code: {bg.exit_code}]')
         return '\n'.join(parts)
 
     async def stop_command(self, command_id: str) -> str:
@@ -518,13 +511,12 @@ class ShellToolset(FunctionToolset[AgentDepsT]):
         del self._background[command_id]
         await bg.proc.aclose()
 
-        parts = [f'[stopped: {bg.command!r}]']
-        if bg.exit_code is not None:
-            parts.append(f'[exit code: {bg.exit_code}]')
         output_sections: list[str] = []
         if stdout:
             output_sections.append(f'[stdout]\n{stdout}')
         if stderr:
             output_sections.append(f'[stderr]\n{stderr}')
-        parts.append('\n'.join(output_sections) if output_sections else '(no output)')
+        parts = ['\n'.join(output_sections) if output_sections else '(no output)', '[stopped]']
+        if bg.exit_code is not None:
+            parts.append(f'[exit code: {bg.exit_code}]')
         return '\n'.join(parts)

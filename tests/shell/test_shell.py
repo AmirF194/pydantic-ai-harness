@@ -768,6 +768,7 @@ class TestBackgroundCommands:
         stop_result = await ts.stop_command(command_id)
         assert 'stopped' in stop_result
         assert 'hello_bg' in stop_result
+        assert stop_result.splitlines()[-2:] == ['[stopped]', '[exit code: 0]']
 
     async def test_start_and_check_running(self, shell_dir: Path) -> None:
         ts = ShellToolset(
@@ -785,6 +786,7 @@ class TestBackgroundCommands:
 
         check_result = await ts.check_command(command_id)
         assert 'running' in check_result
+        assert check_result.endswith('[status: running]')
 
         await ts.stop_command(command_id)
 
@@ -797,14 +799,15 @@ class TestBackgroundCommands:
         try:
             check_result = await _call_shell_tool(ts, 'check_command', command_id=command_id)
             assert len(check_result) == 200
-            assert check_result.startswith('[status: running]\n')
             assert 'output truncated' in check_result
+            assert check_result.endswith('[status: running]')
         finally:
             stop_result = await _call_shell_tool(ts, 'stop_command', command_id=command_id)
         assert len(stop_result) == 200
-        assert stop_result.startswith('[stopped:')
-        assert '\n[exit code:' in stop_result
         assert 'output truncated' in stop_result
+        stop_lines = stop_result.splitlines()
+        assert stop_lines[-2] == '[stopped]'
+        assert stop_lines[-1].startswith('[exit code:')
 
     async def test_new_string_tool_is_capped_at_dispatch(self, shell_dir: Path) -> None:
         ts = _shell_toolset(shell_dir, max_output_chars=1)
@@ -845,6 +848,7 @@ class TestBackgroundCommands:
         check_result = await ts.check_command(command_id)
         assert 'finished' in check_result
         assert 'done_quick' in check_result
+        assert check_result.splitlines()[-2:] == ['[status: finished]', '[exit code: 0]']
 
         await ts.stop_command(command_id)
 
@@ -1404,7 +1408,7 @@ class TestStopCommandAlreadyFinished:
 
         # stop_command should skip the kill branch and handle None exit_code
         result = await ts.stop_command(command_id)
-        assert '[stopped:' in result
+        assert result.endswith('[stopped]')
         assert '[exit code:' not in result
 
 
