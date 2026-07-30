@@ -9,7 +9,6 @@ into the agent's instructions (including template rendering) and the resolution 
 
 from __future__ import annotations
 
-import importlib.metadata
 from dataclasses import dataclass
 from typing import Any
 from unittest.mock import patch
@@ -34,12 +33,13 @@ pytestmark = pytest.mark.anyio
 
 DEFAULT = 'You are a helpful assistant.'
 
-# pydantic-ai 2.0.0 reworked Instrumentation: the agent run span was renamed from
-# `agent run` to `invoke_agent agent`, the tool span from `running tool` to
-# `execute_tool noop`, and several span attribute keys were renamed. Harness still
-# supports the 1.x floor (`pydantic-ai-slim>=1.105.0`), so version-tolerant tests
-# keep both the locked 1.x jobs and the `test on latest` (2.0.0) job green.
-_PYDANTIC_AI_GE_2 = int(importlib.metadata.version('pydantic-ai-slim').split('.')[0]) >= 2
+# pydantic-ai 2.0.0 renamed the agent run span from `agent run` to `invoke_agent agent` and the tool
+# span from `running tool` to `execute_tool noop`. The floor has been `pydantic-ai-slim>=2.14.1` since
+# then, so the 1.x branch these were guarded on could no longer be reached -- and the guard read the
+# version through `importlib.metadata`, which reports the wrong package's version while this PR
+# resolves pydantic-ai from a git source, turning a dead branch into a failing one.
+_AGENT_SPAN = 'invoke_agent agent'
+_TOOL_SPAN = 'execute_tool noop'
 
 
 def instructions_seen(result_messages: list[ModelMessage]) -> list[str]:
@@ -179,10 +179,8 @@ async def test_baggage_propagates_to_run_and_child_spans(capfire: CaptureLogfire
     assert baggage_key not in resolution['attributes']
 
     # Every run / model-request / tool span the run produces is tagged with the resolved value.
-    agent_span = 'invoke_agent agent' if _PYDANTIC_AI_GE_2 else 'agent run'
-    tool_span = 'execute_tool noop' if _PYDANTIC_AI_GE_2 else 'running tool'
     tagged = {s['name'] for s in spans if s['attributes'].get(baggage_key) == '<code_default>'}
-    assert {agent_span, tool_span, 'chat test'} <= tagged
+    assert {_AGENT_SPAN, _TOOL_SPAN, 'chat test'} <= tagged
 
 
 async def test_resolved_once_per_run_across_multiple_model_requests() -> None:
@@ -319,8 +317,7 @@ async def test_provider_backed_resolution_uses_remote_value_and_label(capfire: C
     assert resolution['attributes']['label'] == 'production'
     # Child spans are tagged with the resolved label via baggage.
     tagged = {s['name'] for s in spans if s['attributes'].get('logfire.variables.prompt__remote_slug') == 'production'}
-    agent_span = 'invoke_agent agent' if _PYDANTIC_AI_GE_2 else 'agent run'
-    assert {agent_span, 'chat test'} <= tagged
+    assert {_AGENT_SPAN, 'chat test'} <= tagged
 
 
 def test_logfire_instance_with_prebuilt_variable_warns() -> None:
