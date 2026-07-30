@@ -20,7 +20,8 @@ except ImportError as _import_error:  # pragma: no cover
         '`pip install "pydantic-ai-harness[aws-lambda]"`'
     ) from _import_error
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Generator, Mapping, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass, fields, replace
 from typing import TYPE_CHECKING, Any, ClassVar
 
@@ -28,6 +29,7 @@ from aws_durable_execution_sdk_python.config import StepConfig
 from pydantic import TypeAdapter
 from pydantic_ai import FunctionToolset, ToolsetTool
 from pydantic_ai._enqueue import PendingMessage  # pyright: ignore[reportPrivateUsage]
+from pydantic_ai._run_context import set_current_run_context  # pyright: ignore[reportPrivateUsage]
 from pydantic_ai.agent import EventStreamHandler
 from pydantic_ai.agent.abstract import AbstractAgent
 from pydantic_ai.capabilities.abstract import WrapModelRequestHandler, WrapRunHandler
@@ -108,23 +110,28 @@ def _step_config(config: Mapping[str, Any] | None) -> StepConfig | None:
     return StepConfig(**config)
 
 
-def _guard_enqueue(ctx: RunContext[AgentDepsT]) -> RunContext[AgentDepsT]:
-    """Make `ctx.enqueue()` raise inside any code that runs within a durable step.
+@contextmanager
+def _durable_step_scope(ctx: RunContext[AgentDepsT]) -> Generator[RunContext[AgentDepsT]]:
+    """Run user code inside a durable step with `enqueue()` disabled.
 
     A replay serves the recorded step output without re-running the code, so messages enqueued
-    from inside the step -- whether a tool call or an `event_stream_handler` delivering events
-    inside the model step or its own handler step -- would be dropped.
+    from inside the step -- a tool call, an `event_stream_handler` delivering events inside the
+    model step or in its own handler step, a streaming model's own body -- would be dropped.
 
-    On `pydantic-ai` 2.16.0 this collapses onto the base's `_durable_run_context` /
-    `_durable_run_context_scope` (pydantic/pydantic-ai#6671), which guards both the passed and the
-    ambient run context from one place; this local guard covers the passed context on the 2.15.0 floor.
+    Both the yielded context and the ambient `get_current_run_context()` are guarded, matching the
+    base's `_durable_run_context_scope` (pydantic/pydantic-ai#6671), so it makes no difference
+    whether user code reads the context it was handed or the ambient getter. This module keeps its
+    own spelling of the scope only because the durable toolsets are built by module-level factories
+    that hold no reference to the capability.
     """
     pending: list[PendingMessage] = EnqueueGuard(
         '`ctx.enqueue()` is not supported inside an AWS Lambda durable step because a replay '
         'serves the recorded step output and would drop the enqueued messages. Enqueue messages '
         'from handler-level code instead.'
     )
-    return replace(ctx, pending_messages=pending)
+    guarded = replace(ctx, pending_messages=pending)
+    with set_current_run_context(guarded):
+        yield guarded
 
 
 def _serialize_call_tool_result(result: CallToolResult) -> _JsonValue:
@@ -165,7 +172,8 @@ def _build_function_toolset(
         config: Mapping[str, Any],
     ) -> Any:
         async def operation() -> _JsonValue:
-            result = await wrap_tool_call_result(toolset.call_tool(tool_name, tool_args, _guard_enqueue(ctx), tool))
+            with _durable_step_scope(ctx) as step_ctx:
+                result = await wrap_tool_call_result(toolset.call_tool(tool_name, tool_args, step_ctx, tool))
             return _serialize_call_tool_result(result)
 
         payload = await _require_bridge().run_step(
@@ -213,7 +221,8 @@ def _build_mcp_toolset(
         config: Mapping[str, Any],
     ) -> Any:
         async def operation() -> _JsonValue:
-            result = await wrap_tool_call_result(toolset.call_tool(tool_name, tool_args, _guard_enqueue(ctx), tool))
+            with _durable_step_scope(ctx) as step_ctx:
+                result = await wrap_tool_call_result(toolset.call_tool(tool_name, tool_args, step_ctx, tool))
             return _serialize_call_tool_result(result)
 
         payload = await _require_bridge().run_step(
@@ -258,7 +267,8 @@ def _build_dynamic_toolset(
             # Arg re-validation happens inside `call_dynamic_tool`: a `ValidationError` from it is
             # deterministic, so letting it leave the step un-checkpointed is safe and `ToolManager`
             # turns it into a retry prompt.
-            result = await wrap_tool_call_result(call_dynamic_tool(toolset, tool_name, tool_args, _guard_enqueue(ctx)))
+            with _durable_step_scope(ctx) as step_ctx:
+                result = await wrap_tool_call_result(call_dynamic_tool(toolset, tool_name, tool_args, step_ctx))
             return _serialize_call_tool_result(result)
 
         payload = await _require_bridge().run_step(
@@ -365,6 +375,12 @@ class AWSLambdaDurability(BaseDurabilityCapability[AgentDepsT]):
     def _bind_to_agent(self, agent: AbstractAgent[AgentDepsT, Any]) -> None:
         # Lambda durable steps are ad-hoc `context.step(...)` calls, so there is nothing to
         # register up front beyond the durable toolset wrappers.
+        #
+        # Only a *string* default needs recording. A model supplied as an instance leaves
+        # `ModelRequestContext.model_id` unset, so `_model_id_for_request` resolves it through the
+        # base's model registry, which already answers `None` for the agent's own model -- there is
+        # no suffix to suppress. A string default is the one case that takes the provenance fast
+        # path instead and so arrives here carrying its own name.
         self._default_model_id = agent.model if isinstance(agent.model, str) else None
         self._register_toolsets(agent)
 
@@ -385,10 +401,9 @@ class AWSLambdaDurability(BaseDurabilityCapability[AgentDepsT]):
         handler = self._event_stream_handler
         assert handler is not None  # pragma: no cover - only dispatched when a handler is set
 
-        guarded = _guard_enqueue(ctx)
-
         async def operation() -> None:
-            await handler(guarded, self._single_event_stream(event))
+            with _durable_step_scope(ctx) as step_ctx:
+                await handler(step_ctx, self._single_event_stream(event))
 
         # Checkpoint the handler call so its side effects are not repeated when the execution resumes.
         await _require_bridge().run_step(
@@ -438,12 +453,16 @@ class AWSLambdaDurability(BaseDurabilityCapability[AgentDepsT]):
 
         async def request_stream_segment(request: ModelRequestContext) -> StreamedActivityResult:
             async def operation() -> _JsonValue:
-                async with request.model.request_stream(
-                    request.messages, request.model_settings, request.model_request_parameters, ctx
-                ) as streamed:
-                    events = await capture_event_stream(
-                        run_context=_guard_enqueue(ctx), stream=streamed, handler=self._event_stream_handler
-                    )
+                # One scope over both: the model body runs inside this step too, so a streaming
+                # model that enqueues from its own body would have those messages dropped on
+                # replay exactly like a handler that enqueues while draining the event stream.
+                with _durable_step_scope(ctx) as step_ctx:
+                    async with request.model.request_stream(
+                        request.messages, request.model_settings, request.model_request_parameters, step_ctx
+                    ) as streamed:
+                        events = await capture_event_stream(
+                            run_context=step_ctx, stream=streamed, handler=self._event_stream_handler
+                        )
                 return {
                     'response': _response_adapter.dump_python(streamed.get(), mode='json'),
                     'events': _events_adapter.dump_python(events, mode='json'),

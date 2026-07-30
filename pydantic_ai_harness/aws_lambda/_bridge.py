@@ -28,6 +28,7 @@ import contextvars
 import threading
 from collections.abc import Callable, Coroutine
 from concurrent.futures import Future
+from concurrent.futures import TimeoutError as FutureTimeoutError
 from dataclasses import dataclass
 from queue import Queue
 from typing import TYPE_CHECKING, Any, Generic, Protocol, TypeVar
@@ -41,12 +42,33 @@ T = TypeVar('T')
 
 ENGINE_NAME = 'AWS Lambda'
 
-_CANCEL_TIMEOUT_SECONDS = 5.0
-"""How long `run_durable` waits for an abandoned run to finish unwinding.
+DEFAULT_CANCEL_TIMEOUT_SECONDS = 5.0
+"""Default for `run_durable(cancel_timeout=...)`: how long to wait for an abandoned run to unwind.
 
 Bounded so a tool whose cleanup hangs cannot wedge the handler, which is the failure mode the
-bridge exists to avoid everywhere else.
+bridge exists to avoid everywhere else. The value is a heuristic -- long enough for ordinary
+`__aexit__`/`finally` cleanup (closing an HTTP client, cancelling a task group), short enough to
+leave the handler room to return. Raise it for a workload with genuinely slow cleanup; the wait
+timing out is handled rather than ignored, so the ceiling is a latency knob, not a correctness one.
 """
+
+_LOOP_LIVENESS_POLL_SECONDS = 5.0
+"""How often the handler thread re-checks that the agent loop is still alive while blocked.
+
+A step body blocks the handler thread on a result the agent loop will deliver. Steps can
+legitimately run for minutes, so the wait cannot simply time out; instead it wakes periodically to
+check that the loop that owes it a result still exists.
+"""
+
+
+class AgentLoopGone(BaseException):
+    """The agent loop stopped while a durable step was in flight, so its result can never arrive.
+
+    A `BaseException` rather than an `Exception` on purpose: `consume()` routes ordinary step
+    failures back into the agent run so it can handle them, and that is precisely what cannot work
+    here -- the loop that would receive them is the thing that is gone. Like the SDK's own control
+    flow, this has to leave the handler instead.
+    """
 
 
 class DurableStepContext(Protocol):
@@ -70,7 +92,8 @@ class _AgentLoop:
     Reusing it keeps loop-bound async resources (a provider's cached HTTP client, for example)
     valid between invocations, which a fresh loop per invocation would invalidate. The tradeoff is
     that a run abandoned mid-flight would otherwise survive into the next invocation, so
-    `run_durable` cancels the run it started before returning.
+    `run_durable` cancels the run it started before returning, and retires the loop if that
+    cancellation does not finish in time.
     """
 
     def __init__(self) -> None:
@@ -85,6 +108,19 @@ class _AgentLoop:
                 threading.Thread(target=loop.run_forever, daemon=True, name='pydantic-ai-lambda-agent').start()
                 self._loop = loop
             return loop
+
+    def retire(self, loop: asyncio.AbstractEventLoop) -> None:
+        """Stop handing `loop` to later invocations.
+
+        Called when an abandoned run outlives the cancellation wait. The loop is deliberately left
+        running: the run is still unwinding on it, and stopping it out from under a `finally` or
+        `__aexit__` would strand whatever that cleanup holds. Dropping the reference means the next
+        invocation builds a fresh loop with its own loop-bound resources, so the leftover cleanup
+        cannot reach into the execution that follows it -- which is the whole reason for the wait.
+        """
+        with self._lock:
+            if self._loop is loop:
+                self._loop = None
 
 
 _agent_loop = _AgentLoop()
@@ -163,7 +199,21 @@ class StepBridge:
                 task.add_done_callback(lambda finished: _forward(finished, result))
 
             loop.call_soon_threadsafe(schedule)
-            return result.result()
+            while True:
+                try:
+                    return result.result(timeout=_LOOP_LIVENESS_POLL_SECONDS)
+                except FutureTimeoutError:
+                    # A step can legitimately run for minutes, so the wait itself must not time
+                    # out. What it must not do is block forever on a loop that is no longer there
+                    # to deliver the result: the loop is what runs the done-callback, so if it has
+                    # stopped, nothing will ever resolve `result`.
+                    if loop.is_running() or result.done():
+                        continue
+                    raise AgentLoopGone(
+                        f'The {ENGINE_NAME} agent event loop stopped while durable step {name!r} was in '
+                        'flight, so its result can never arrive. This should not happen; please report '
+                        'it at https://github.com/pydantic/pydantic-ai-harness/issues.'
+                    ) from None
 
         async with self._order:
             future: asyncio.Future[T] = loop.create_future()
@@ -253,7 +303,12 @@ def in_durable_context() -> bool:
     return _active_bridge.get() is not None
 
 
-def run_durable(agent_run: Callable[[], Coroutine[Any, Any, T]], *, context: DurableStepContext) -> T:
+def run_durable(
+    agent_run: Callable[[], Coroutine[Any, Any, T]],
+    *,
+    context: DurableStepContext,
+    cancel_timeout: float = DEFAULT_CANCEL_TIMEOUT_SECONDS,
+) -> T:
     """Run an async agent call from a synchronous Lambda durable handler.
 
     Hosts `agent_run()` on a background event loop and services its durable steps on the calling
@@ -264,6 +319,10 @@ def run_durable(agent_run: Callable[[], Coroutine[Any, Any, T]], *, context: Dur
         agent_run: Callable returning the coroutine to run, e.g. `lambda: agent.run(prompt)`.
             It is called once per handler invocation, including each replay.
         context: The `DurableContext` the durable handler was invoked with.
+        cancel_timeout: Seconds to wait for a run abandoned by a suspension or an error to finish
+            unwinding before returning. Raise it for a workload whose cleanup is genuinely slow.
+            Exceeding it is safe: the background event loop is retired instead of reused, so the
+            leftover cleanup cannot overlap the next warm invocation.
 
     Example:
         ```python {test="skip"}
@@ -304,8 +363,15 @@ def run_durable(agent_run: Callable[[], Coroutine[Any, Any, T]], *, context: Dur
             bridge.finish(error=exc)
 
     def schedule_run() -> None:
-        tasks.append(run_context.run(lambda: loop.create_task(run())))
-        started.set()
+        try:
+            tasks.append(run_context.run(lambda: loop.create_task(run())))
+        except BaseException as exc:  # pragma: no cover - task creation failing is not reproducible
+            # Nothing else will ever call `bridge.finish()` if the run never started, so
+            # `consume()` below would block until Lambda timed the function out. Resolve it here.
+            bridge.finish(error=exc)
+        finally:
+            # Always, so the `finally` below cannot wait on a flag a failed scheduling never set.
+            started.set()
 
     try:
         loop.call_soon_threadsafe(schedule_run)
@@ -317,16 +383,22 @@ def run_durable(agent_run: Callable[[], Coroutine[Any, Any, T]], *, context: Dur
         # cancellation, and letting that overlap the next invocation would touch shared provider
         # resources after the execution it belonged to was abandoned.
         started.wait()
-        task = tasks[0]
-        finished = threading.Event()
-
-        def cancel_and_notify() -> None:
-            if task.done():
-                finished.set()
-                return
-            task.add_done_callback(lambda _: finished.set())
-            task.cancel()
-
-        loop.call_soon_threadsafe(cancel_and_notify)
-        finished.wait(timeout=_CANCEL_TIMEOUT_SECONDS)
         _active_bridge.reset(token)
+        if tasks:  # pragma: no branch - only empty when scheduling itself failed
+            task = tasks[0]
+            finished = threading.Event()
+
+            def cancel_and_notify() -> None:
+                if task.done():
+                    finished.set()
+                    return
+                task.add_done_callback(lambda _: finished.set())
+                task.cancel()
+
+            loop.call_soon_threadsafe(cancel_and_notify)
+            if not finished.wait(timeout=cancel_timeout):
+                # Cleanup is still running and we are out of budget to wait for it. Returning while
+                # it holds the shared loop is the leak this wait exists to prevent, so give the loop
+                # up: the next invocation gets a fresh one instead of inheriting this one's
+                # half-torn-down state.
+                _agent_loop.retire(loop)
