@@ -17,10 +17,3 @@ def truncate_tail(text: str, max_chars: int) -> str:
     if tail_chars == 0:
         return text[-max_chars:]
     return marker(tail_chars) + text[-tail_chars:]
-
-
-def truncate_head(text: str, max_chars: int) -> str:
-    """Limit control text to `max_chars`, keeping its identifying prefix."""
-    if max_chars <= 0:
-        return ''
-    return text[:max_chars]

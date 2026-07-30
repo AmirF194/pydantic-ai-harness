@@ -20,9 +20,9 @@ import anyio.abc
 from pydantic_ai import RunContext
 from pydantic_ai.exceptions import ModelRetry
 from pydantic_ai.tools import AgentDepsT
-from pydantic_ai.toolsets import AbstractToolset, FunctionToolset
+from pydantic_ai.toolsets import AbstractToolset, FunctionToolset, ToolsetTool
 
-from pydantic_ai_harness._output import truncate_head, truncate_tail
+from pydantic_ai_harness._output import truncate_tail
 
 _IO_DRAIN_TIMEOUT: float = 2.0
 _KILL_GRACE_PERIOD: float = 2.0
@@ -154,6 +154,19 @@ class ShellToolset(FunctionToolset[AgentDepsT]):
             denied_env_patterns=self._denied_env_patterns,
         )
 
+    async def call_tool(
+        self,
+        name: str,
+        tool_args: dict[str, Any],
+        ctx: RunContext[AgentDepsT],
+        tool: ToolsetTool[AgentDepsT],
+    ) -> Any:
+        """Enforce the model-visible output cap at the tool dispatch seam."""
+        result = await super().call_tool(name, tool_args, ctx, tool)
+        if name == 'start_command' or not isinstance(result, str):
+            return result
+        return truncate_tail(result, self._max_output_chars)
+
     def _resolve_env(self) -> dict[str, str] | None:
         """Compute the environment passed to spawned subprocesses.
 
@@ -216,27 +229,6 @@ class ShellToolset(FunctionToolset[AgentDepsT]):
             raise PermissionError(f'Command {executable!r} is denied.')
         if self._allowed_commands and executable not in self._allowed_commands:
             raise PermissionError(f'Command {executable!r} is not in the allowed list.')
-
-    def _truncate(self, text: str) -> str:
-        """Truncate output to the configured cap, keeping the tail.
-
-        The most useful output -- errors, stack traces, exit info, and the
-        `[stderr]` section (which callers append last) -- lands at the end, so
-        the head is dropped and as much of the tail as fits beside the marker is kept.
-        """
-        return truncate_tail(text, self._max_output_chars)
-
-    def _join_metadata_and_output(self, metadata: Sequence[str], output: str) -> str:
-        """Keep background-command metadata when there is room inside the output cap."""
-        prefix = '\n'.join(metadata)
-        output_budget = self._max_output_chars - len(prefix) - 1
-        if output_budget <= 0:
-            return truncate_head(f'{prefix}\n', self._max_output_chars)
-        return f'{prefix}\n{truncate_tail(output, output_budget)}'
-
-    def _unknown_command_error(self, command_id: str) -> str:
-        """Report an unknown ID without allowing its value to hide the error."""
-        return truncate_head(f'[Error: unknown command ID {command_id!r}]', self._max_output_chars)
 
     def _build_cwd_capture(self, command: str) -> tuple[str, Path | None]:
         """Wrap a command to record its final working directory out-of-band.
@@ -366,7 +358,7 @@ class ShellToolset(FunctionToolset[AgentDepsT]):
                 with anyio.CancelScope(shield=True):
                     await proc.wait()
                     await self._drain_with_timeout(stdout_chunks, stderr_chunks, proc)
-                return truncate_head(f'[Command timed out after {timeout}s]', self._max_output_chars)
+                return f'[Command timed out after {timeout}s]'
             finally:
                 await proc.aclose()
 
@@ -387,7 +379,7 @@ class ShellToolset(FunctionToolset[AgentDepsT]):
 
             if exit_code != 0:
                 output = f'{output}\n[exit code: {exit_code}]'
-            return self._truncate(output)
+            return output
         finally:
             if cwd_file is not None:
                 cwd_file.unlink(missing_ok=True)
@@ -474,7 +466,7 @@ class ShellToolset(FunctionToolset[AgentDepsT]):
         """
         bg = self._background.get(command_id)
         if bg is None:
-            return self._unknown_command_error(command_id)
+            return f'[Error: unknown command ID {command_id!r}]'
 
         if not bg.finished and bg.proc.returncode is not None:
             bg.exit_code = bg.proc.returncode
@@ -491,8 +483,8 @@ class ShellToolset(FunctionToolset[AgentDepsT]):
             output_sections.append(f'[stdout]\n{stdout}')
         if stderr:
             output_sections.append(f'[stderr]\n{stderr}')
-        output = '\n'.join(output_sections) if output_sections else '(no output yet)'
-        return self._join_metadata_and_output(parts, output)
+        parts.append('\n'.join(output_sections) if output_sections else '(no output yet)')
+        return '\n'.join(parts)
 
     async def stop_command(self, command_id: str) -> str:
         """Stop a background command and return its final output.
@@ -505,7 +497,7 @@ class ShellToolset(FunctionToolset[AgentDepsT]):
         """
         bg = self._background.get(command_id)
         if bg is None:
-            return self._unknown_command_error(command_id)
+            return f'[Error: unknown command ID {command_id!r}]'
 
         if not bg.finished:
             await self._kill_process_group(bg.proc)
@@ -528,7 +520,5 @@ class ShellToolset(FunctionToolset[AgentDepsT]):
             output_sections.append(f'[stdout]\n{stdout}')
         if stderr:
             output_sections.append(f'[stderr]\n{stderr}')
-        output = '\n'.join(output_sections) if output_sections else '(no output)'
-        if len('\n'.join([*parts, output])) > self._max_output_chars:
-            parts[0] = '[stopped]'
-        return self._join_metadata_and_output(parts, output)
+        parts.append('\n'.join(output_sections) if output_sections else '(no output)')
+        return '\n'.join(parts)
