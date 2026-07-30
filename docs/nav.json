@@ -22,6 +22,7 @@
       { "label": "Modal Sandbox", "slug": "modal-sandbox" },
       { "label": "Runtime Authoring", "slug": "runtime-authoring" },
       { "label": "Guardrails", "slug": "guardrails" },
+      { "label": "Agent Control", "slug": "agent-control" },
       { "label": "Managed Prompt", "slug": "managed-prompt" },
       { "label": "ACP", "slug": "acp" }
     ]

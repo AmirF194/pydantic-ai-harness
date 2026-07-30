@@ -114,6 +114,7 @@ _CAPABILITY_PAGE_META = {
     'code-mode.md': ('code_mode', 'Code Mode'),
     'filesystem.md': ('filesystem', 'FileSystem'),
     'shell.md': ('shell', 'Shell'),
+    'agent-control.md': ('logfire', 'Agent Control'),
     'managed-prompt.md': ('logfire', 'Managed Prompt'),
     'memory.md': ('memory', 'Memory'),
     'modal-sandbox.md': ('modal_sandbox', 'Modal Sandbox'),

@@ -3,8 +3,9 @@
 The stored schema is permissive at every level so a newer writer's keys and values reach the SDK at
 all, which makes this module the other half of that contract: whatever gets through has to degrade
 the narrowest unit that contains it. An `AgentConfig` that fails validation is reverted *whole* by
-Logfire's resolution fallback, so a value this SDK can't act on must cost one setting or one tool
-override -- never the instructions, the model, and every other override along with it.
+Logfire's resolution fallback, so a value this SDK can't act on must cost one setting, one
+instruction block, or one tool override -- never the instructions, the model, and every other
+override along with it.
 """
 
 from __future__ import annotations
@@ -13,18 +14,23 @@ import warnings
 from typing import Any
 
 import pytest
+from logfire.testing import CaptureLogfire
 from pydantic import ValidationError
 from pydantic_ai import Agent
-from pydantic_ai.messages import ModelMessage, ModelResponse, TextPart
+from pydantic_ai.messages import ModelMessage, ModelRequest, ModelResponse, TextPart
 from pydantic_ai.models.function import AgentInfo, FunctionModel
+from pydantic_ai.models.test import TestModel
 
 from pydantic_ai_harness.logfire import (
     AgentConfig,
     AgentConfigSettings,
     AgentControl,
+    InstructionBlock,
     ToolDefinitionOverride,
     _agent_control,
 )
+
+from ._helpers import published_value, variables_provider
 
 pytestmark = pytest.mark.anyio
 
@@ -35,21 +41,50 @@ def _forget_warned_drops() -> None:
     _agent_control._warned_drops.clear()
 
 
-def full_value(**settings: Any) -> dict[str, Any]:
-    """A config with every section populated, so a drop's blast radius is visible in the rest."""
+# Both list sections start out with more than one entry, so a dropped entry's siblings are what shows
+# the drop was narrow. Kept as module constants because `assert_other_sections_survived` defaults to
+# the validated form of the same content.
+FULL_INSTRUCTIONS: Any = ['Be concise.', {'id': 'agent', 'instructions': 'You are a refund specialist.'}]
+FULL_TOOL_DEFINITIONS: Any = [{'name': 'get_weather', 'description': 'Look it up.'}]
+
+SURVIVING_INSTRUCTIONS = [
+    InstructionBlock(instructions='Be concise.'),
+    InstructionBlock(id='agent', instructions='You are a refund specialist.'),
+]
+SURVIVING_TOOL_DEFINITIONS = [ToolDefinitionOverride(name='get_weather', description='Look it up.')]
+
+
+def full_value(
+    *, instructions: Any = FULL_INSTRUCTIONS, tool_definitions: Any = FULL_TOOL_DEFINITIONS, **settings: Any
+) -> dict[str, Any]:
+    """A config with every section populated, so a drop's blast radius is visible in the rest.
+
+    Keyword arguments are merged into the `settings` section; a test whose malformed value belongs to
+    one of the list sections replaces that section instead, leaving the others as the control group.
+    """
     return {
-        'instructions': 'Be concise.',
+        'instructions': instructions,
         'model': 'openai:gpt-5',
         'settings': {'temperature': 0.4, **settings},
-        'tool_definitions': {'get_weather': {'description': 'Look it up.'}},
+        'tool_definitions': tool_definitions,
     }
 
 
-def assert_other_sections_survived(config: AgentConfig) -> None:
-    assert config.instructions == 'Be concise.'
+def assert_other_sections_survived(
+    config: AgentConfig,
+    *,
+    instructions: list[InstructionBlock] = SURVIVING_INSTRUCTIONS,
+    tool_definitions: list[ToolDefinitionOverride] = SURVIVING_TOOL_DEFINITIONS,
+) -> None:
+    """Assert nothing but the entry under test was lost.
+
+    A drop inside a list section keeps the section itself, so a test that drops one of its entries
+    passes what should remain of it; every other section is expected untouched.
+    """
+    assert config.instructions == instructions
     assert config.model == 'openai:gpt-5'
     assert config.settings is not None and config.settings.temperature == 0.4
-    assert config.tool_definitions == {'get_weather': ToolDefinitionOverride(description='Look it up.')}
+    assert config.tool_definitions == tool_definitions
 
 
 def test_unrecognized_thinking_drops_only_that_setting() -> None:
@@ -81,43 +116,77 @@ def test_recognized_values_are_untouched() -> None:
 
 def test_unknown_keys_still_flow_through_untouched() -> None:
     # The key-level tolerance this SDK already promised: only *known* fields with unrecognized values
-    # are dropped, so a newer UI's keys keep reaching `extra='allow'` and the ignored top level.
+    # are dropped, so a newer UI's keys keep reaching `extra='allow'` and the ignored top level. An
+    # unknown key inside a list entry is ignored by the entry's own model, costing nothing either.
     with warnings.catch_warnings(record=True) as caught:
         config = AgentConfig.model_validate(
             {
                 'future_section': {'anything': 1},
                 'settings': {'future_setting': 'raw json', 'thinking': 'high'},
-                'tool_definitions': {'get_weather': {'future_override': ['x'], 'description': 'Look it up.'}},
+                'tool_definitions': [{'name': 'get_weather', 'future_override': ['x'], 'description': 'Look it up.'}],
+                'instructions': [{'id': 'agent', 'instructions': 'Be concise.', 'future_field': 1}],
             }
         )
     assert caught == []
     assert config.settings is not None
     assert config.settings.model_extra == {'future_setting': 'raw json'}
     assert config.settings.thinking == 'high'
-    assert config.tool_definitions == {'get_weather': ToolDefinitionOverride(description='Look it up.')}
+    assert config.tool_definitions == SURVIVING_TOOL_DEFINITIONS
+    assert config.instructions == [InstructionBlock(id='agent', instructions='Be concise.')]
 
 
 def test_invalid_override_drops_only_that_tool() -> None:
-    with pytest.warns(UserWarning, match=r"override for 'get_weather' is invalid -- new_name=''"):
+    with pytest.warns(UserWarning, match=r"override \{'name': 'get_forecast'.*\} is invalid -- new_name=''"):
         config = AgentConfig.model_validate(
-            {
-                'instructions': 'Be concise.',
-                'tool_definitions': {
-                    'get_weather': {'new_name': '', 'description': 'Dropped with its entry.'},
-                    'get_forecast': {'new_name': 'forecast'},
-                },
-            }
+            full_value(
+                tool_definitions=[
+                    *FULL_TOOL_DEFINITIONS,
+                    {'name': 'get_forecast', 'new_name': '', 'description': 'Dropped with its entry.'},
+                ]
+            )
         )
-    assert config.instructions == 'Be concise.'
-    assert config.tool_definitions == {'get_forecast': ToolDefinitionOverride(new_name='forecast')}
+    assert_other_sections_survived(config)
 
 
 def test_override_that_is_not_an_object_drops_only_that_tool() -> None:
-    with pytest.warns(UserWarning, match=r"override for 'get_weather' is invalid -- override='nope'"):
+    with pytest.warns(UserWarning, match=r"override 'nope' is invalid -- override='nope'"):
+        config = AgentConfig.model_validate(full_value(tool_definitions=[*FULL_TOOL_DEFINITIONS, 'nope']))
+    assert_other_sections_survived(config)
+
+
+def test_override_that_names_no_tool_drops_only_that_entry() -> None:
+    # `name` is what an overlay is addressed by, so an entry without one cannot be applied to
+    # anything. The stored schema requires it at write time; this is the same rule one SDK version
+    # later, for a value that was written before the schema said so.
+    with pytest.warns(UserWarning, match=r"override \{'description': 'Nothing to patch\.'\} is invalid -- name="):
         config = AgentConfig.model_validate(
-            {'tool_definitions': {'get_weather': 'nope', 'get_forecast': {'description': 'Kept.'}}}
+            full_value(tool_definitions=[*FULL_TOOL_DEFINITIONS, {'description': 'Nothing to patch.'}])
         )
-    assert config.tool_definitions == {'get_forecast': ToolDefinitionOverride(description='Kept.')}
+    assert_other_sections_survived(config)
+
+
+def test_instruction_entry_that_is_not_a_string_or_object_drops_only_itself() -> None:
+    with pytest.warns(UserWarning, match=r'Managed instruction entry 5 is invalid -- entry=5'):
+        config = AgentConfig.model_validate(full_value(instructions=[*FULL_INSTRUCTIONS, 5]))
+    assert_other_sections_survived(config)
+
+
+def test_instruction_entry_with_empty_text_drops_only_itself() -> None:
+    # `''` is a half-filled field, not a way to blank a block: `instructions: null` is how a block is
+    # dropped, and keeping the two distinguishable is worth losing the entry that confuses them.
+    with pytest.warns(UserWarning, match=r"entry \{'id': 'agent:today', 'instructions': ''\} is invalid"):
+        config = AgentConfig.model_validate(
+            full_value(instructions=[*FULL_INSTRUCTIONS, {'id': 'agent:today', 'instructions': ''}])
+        )
+    assert_other_sections_survived(config)
+
+
+def test_instruction_entry_with_neither_id_nor_text_drops_only_itself() -> None:
+    # Validates as an `InstructionBlock` but says nothing: no `id` to address and no text to add. A
+    # `dynamic` flag alone is exactly the shape a UI produces from a half-filled row.
+    with pytest.warns(UserWarning, match=r"entry \{'dynamic': True\} has neither an `id` to address"):
+        config = AgentConfig.model_validate(full_value(instructions=[*FULL_INSTRUCTIONS, {'dynamic': True}]))
+    assert_other_sections_survived(config)
 
 
 def test_repeated_resolutions_warn_once() -> None:
@@ -134,15 +203,32 @@ def test_repeated_resolutions_warn_once() -> None:
 
 
 def test_malformed_sections_are_left_to_pydantic() -> None:
-    # Neither validator can assume it was handed a mapping. A section that isn't one is malformed
-    # rather than merely newer -- the stored schema rejects it at write time -- so it stays a
-    # validation error, and the whole value degrades to code through Logfire's resolution fallback.
+    # No validator can assume it was handed the shape it degrades entries within. A section that is
+    # not a list (or a mapping, for `settings`) is malformed rather than merely newer -- the stored
+    # schema rejects it at write time -- so it stays a validation error, and the whole value degrades
+    # to code through Logfire's resolution fallback. `tool_definitions` as a mapping is the one that
+    # can really turn up: it is the shape this section had before entries named the tool they patch.
+    malformed: list[dict[str, Any]] = [
+        {'settings': 'nope'},
+        {'tool_definitions': {'get_weather': {}}},
+        {'instructions': 5},
+    ]
     with warnings.catch_warnings(record=True) as caught:
-        for value in ({'settings': 'nope'}, {'tool_definitions': ['nope']}):
+        for value in malformed:
             with pytest.raises(ValidationError):
                 AgentConfig.model_validate(value)
         with pytest.raises(ValidationError):
             AgentConfigSettings.model_validate(['nope'])
+    assert caught == []
+
+
+def test_a_bare_empty_instructions_string_fails_the_whole_config() -> None:
+    # An entry inside a list is dropped because its siblings can still be applied. A bare string *is*
+    # the whole section, so there is no sibling to rescue and nothing to prefer over the ordinary
+    # validation error -- which reverts the config to code, the right outcome for a value this empty.
+    with warnings.catch_warnings(record=True) as caught:
+        with pytest.raises(ValidationError, match='String should have at least 1 character'):
+            AgentConfig.model_validate({'instructions': ''})
     assert caught == []
 
 
@@ -157,3 +243,24 @@ async def test_agent_keeps_managed_config_around_a_dropped_setting() -> None:
         config = AgentConfig.model_validate({'settings': {'temperature': 0.4, 'thinking': 'ultra'}})
     await Agent(FunctionModel(capture), capabilities=[AgentControl('skew', default=config)]).run('hello')
     assert seen == [{'temperature': 0.4}]
+
+
+async def test_an_empty_model_is_refused_by_validation_and_the_config_degrades(capfire: CaptureLogfire) -> None:
+    # The one value that cannot be degraded field-by-field. Reproduced before `model` was constrained:
+    # `{'model': ''}` is a perfectly well-formed `AgentConfig`, so nothing downstream caught it and
+    # Pydantic AI raised `UserError: Unknown model:` on *every* run of the agent -- and the Logfire UI
+    # produced it from two clicks. Refusing it in the model is what turns that into a resolution
+    # fallback: the whole config reverts to code, which is the correct blast radius for a value this
+    # malformed, and the sibling `instructions` published alongside it are deliberately lost with it.
+    with pytest.raises(ValidationError, match='String should have at least 1 character'):
+        AgentConfig.model_validate({'model': ''})
+
+    published = {'model': '', 'instructions': 'MANAGED: never reaches the model.'}
+    config = published_value('agent__empty_model', published)
+    capability = AgentControl('empty_model', instructions='CODE: base prompt.', label='production')
+    agent = Agent(TestModel(), instructions='code', capabilities=[capability])
+    with variables_provider(capfire, config):
+        with pytest.warns(RuntimeWarning, match="'agent__empty_model' value failed validation"):
+            result = await agent.run('hello')
+    instructions = [m.instructions for m in result.all_messages() if isinstance(m, ModelRequest)]
+    assert instructions == ['code\n\nCODE: base prompt.']

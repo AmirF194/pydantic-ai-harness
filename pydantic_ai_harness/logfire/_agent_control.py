@@ -6,14 +6,14 @@ import json
 import warnings
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field, replace
-from typing import TYPE_CHECKING, Any, ClassVar, Literal, TypeAlias, cast, get_args, get_origin
+from typing import TYPE_CHECKING, Annotated, Any, ClassVar, Literal, TypeAlias, TypeVar, cast, get_args, get_origin
 
 import logfire
 from logfire.variables import Variable
 from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, ValidationError, field_validator, model_validator
 from pydantic_ai import AbstractToolset, RunContext, TemplateStr, ToolDefinition, WrapperToolset
 from pydantic_ai.exceptions import UserError
-from pydantic_ai.messages import ModelRequest
+from pydantic_ai.messages import InstructionPart
 from pydantic_ai.models import ModelRequestContext
 from pydantic_ai.settings import ModelSettings
 from pydantic_ai.tools import AgentDepsT
@@ -29,6 +29,8 @@ if TYPE_CHECKING:
     from pydantic_ai.run import AgentRunResult
 
 _AGENT_VARIABLE_PREFIX = 'agent__'
+
+_EntryT = TypeVar('_EntryT')
 
 # Drop warnings already emitted in this process, keyed by the message itself. See `_warn_dropped`.
 _warned_drops: set[str] = set()
@@ -156,15 +158,75 @@ def _lower_settings(value: AgentConfigSettings) -> ModelSettings:
     return cast(ModelSettings, settings)
 
 
+NonEmptyStr: TypeAlias = Annotated[str, Field(min_length=1)]
+"""A managed string that has to say something.
+
+`''` is never a meaningful managed value -- not "no model", not "no instructions", just a value someone
+left half-filled -- and `None` already means "leave this to code". Rejecting it keeps the two apart at
+every level: the stored JSON schema won't accept the write, and a value that reaches an older SDK
+anyway degrades that one field instead of the whole config.
+"""
+
+
+class InstructionBlock(BaseModel):
+    """One entry in `AgentConfig.instructions`: a block to add, or a patch on a block the agent assembles.
+
+    Instructions are the one section that composes rather than replaces, so an entry has to say *which*
+    text it means. An entry with no `id` adds a block; an entry with an `id` addresses the instruction
+    blocks Pydantic AI has already assembled under that key.
+
+    | Entry | Effect |
+    |---|---|
+    | `'text'` (a bare string in the list) | Adds a block. Shorthand for `InstructionBlock(instructions='text')`. |
+    | `InstructionBlock(instructions='text')` | Adds a block. |
+    | `InstructionBlock(id=key, instructions='text')` | Replaces the text of every block keyed `key`. |
+    | `InstructionBlock(id=key)` | Drops every block keyed `key`. |
+
+    An `id` nothing matches is inert, exactly like an unknown tool name: one config is applied across
+    deployments that need not all install the same toolsets. Two entries naming the same `id` keep the
+    first, with a warning.
+    """
+
+    id: str | None = None
+    """The [`InstructionPart.id`][pydantic_ai.messages.InstructionPart.id] to address, or `None` to add a block.
+
+    Pydantic AI keys each block it can name, and those keys are what this field takes: `'agent'` for the
+    agent's own literal instructions, `'toolset:<id>'` and `'capability:<id>'` for everything a toolset
+    or capability contributes, and `'agent:<declared id>'` / `'capability:<id>:<declared id>'` for a
+    single declared block. Blocks Pydantic AI cannot key -- a callable passed to `Agent(instructions=...)`,
+    a toolset with no `id` of its own -- cannot be addressed at all.
+    """
+    instructions: NonEmptyStr | None = None
+    """The block's text, or `None` to drop the addressed block.
+
+    `None` is how a block is disabled, which is why `''` is rejected rather than taken as a quiet way to
+    blank one: an entry meaning "send nothing here" and an entry someone left half-filled should not look
+    identical. An entry with neither `id` nor `instructions` says nothing and is dropped with a warning.
+    """
+    dynamic: bool | None = None
+    """Whether the addressed block is recomputed per request. Informational; ignored when a value is applied.
+
+    Written into a variable's `example` by the baseline snapshot, where it earns its keep: it is how the
+    Logfire UI can warn that replacing a computed block -- today's date, the signed-in user -- pins
+    whatever it happened to evaluate to when the snapshot was taken.
+    """
+
+
 class ToolDefinitionOverride(BaseModel):
     """A patch over a tool's LLM-facing definition.
 
     Overrides change only what the model is shown. Schema structure, validation, and execution
-    remain code-defined. The dictionary key in `AgentConfig.tool_definitions` looks up the tool by
-    its original code-side name. An entry that doesn't validate is dropped from
-    `AgentConfig.tool_definitions` with a warning, leaving its siblings in place.
+    remain code-defined. `name` looks the tool up by its original code-side name. An entry that
+    doesn't validate is dropped from `AgentConfig.tool_definitions` with a warning, leaving its
+    siblings in place; two entries naming the same tool keep the first, with a warning.
     """
 
+    name: str = Field(min_length=1)
+    """The tool's original code-side name, which is what this entry patches.
+
+    A tool no toolset advertises is inert rather than an error, for the same reason an unmatched
+    instruction `id` is.
+    """
     new_name: str | None = Field(default=None, min_length=1)
     """Replacement name shown to the model; `None` keeps the original.
 
@@ -180,12 +242,77 @@ class ToolDefinitionOverride(BaseModel):
     """
 
 
-def _override_errors(error: ValidationError) -> str:
-    """Render a rejected tool override's failure -- offending field, value, and reason -- for one warning."""
+def _entry_errors(error: ValidationError, *, whole: str) -> str:
+    """Render a rejected entry's failure -- offending field, value, and reason -- for one warning.
+
+    `whole` names the entry itself, for a failure that isn't about any one field (something that isn't an
+    object at all): the two sections share this renderer, so neither may be labelled with the other's noun.
+    """
     return '; '.join(
-        f'{".".join(str(part) for part in details["loc"]) or "override"}={details["input"]!r} ({details["msg"]})'
+        f'{".".join(str(part) for part in details["loc"]) or whole}={details["input"]!r} ({details["msg"]})'
         for details in error.errors()
     )
+
+
+def _first_by_key(entries: list[tuple[str, _EntryT]], subject: str) -> dict[str, _EntryT]:
+    """Index entries by key, keeping the first of any duplicates with a warning.
+
+    Both list sections address things by key, so both can be written with the same key twice -- by a
+    hand-edited value, or by a UI bug. Keeping the first matches how a colliding rename is resolved in
+    `_ToolDefinitionOverridesToolset`: the run stays predictable and the ignored entry is named, rather
+    than the last writer silently winning depending on how the JSON happened to be ordered.
+    """
+    indexed: dict[str, _EntryT] = {}
+    for key, entry in entries:
+        if key in indexed:
+            _warn_dropped(
+                f'Managed agent config names {subject} {key!r} more than once; keeping the first entry '
+                f'and ignoring the rest.'
+            )
+            continue
+        indexed[key] = entry
+    return indexed
+
+
+def _instruction_blocks(config: AgentConfig) -> list[InstructionBlock]:
+    """The `instructions` section as blocks, whichever of its two shapes was written."""
+    instructions = config.instructions
+    if instructions is None:
+        return []
+    if isinstance(instructions, str):
+        return [InstructionBlock(instructions=instructions)]
+    return [InstructionBlock(instructions=entry) if isinstance(entry, str) else entry for entry in instructions]
+
+
+def _added_instructions(config: AgentConfig) -> str | None:
+    """The text of every entry that adds a block, joined in list order.
+
+    Added blocks are contributed through `get_instructions` as one string rather than injected into the
+    assembled parts, so they land exactly where a capability's instructions have always landed -- after
+    the agent's own static text, before dynamic toolset text -- and the list form changes nothing about
+    ordering or prompt-cache boundaries for a config that only adds text.
+    """
+    # Validation already rejects an entry with neither an `id` nor text, so the `is not None` here is
+    # narrowing `instructions` for the join rather than a case that can turn up.
+    added = [
+        block.instructions
+        for block in _instruction_blocks(config)
+        if block.id is None and block.instructions is not None
+    ]
+    return '\n\n'.join(added) or None
+
+
+def _instruction_overrides(config: AgentConfig) -> dict[str, str | None]:
+    """Replacement text per addressed [`InstructionPart.id`][pydantic_ai.messages.InstructionPart.id], `None` to drop it."""
+    return _first_by_key(
+        [(block.id, block.instructions) for block in _instruction_blocks(config) if block.id is not None],
+        'instruction id',
+    )
+
+
+def _tool_overrides(config: AgentConfig) -> dict[str, ToolDefinitionOverride]:
+    """Tool definition overrides indexed by the code-side tool name each one patches."""
+    return _first_by_key([(override.name, override) for override in config.tool_definitions or []], 'tool')
 
 
 class AgentConfig(BaseModel):
@@ -206,24 +333,78 @@ class AgentConfig(BaseModel):
 
     model_config = ConfigDict(protected_namespaces=())
 
-    instructions: str | None = None
-    """Instructions added to the ones the agent defines in code, when present.
+    instructions: NonEmptyStr | list[NonEmptyStr | InstructionBlock] | None = None
+    """Instruction blocks to add to -- or swap out of -- the ones the agent assembles in code.
 
     A capability contributes instructions, it cannot take them over: Pydantic AI appends every
-    contribution to the agent's own, so text that also lives in `Agent(instructions=...)` reaches the
-    model twice. The code-side home for a managed base prompt is `AgentControl.instructions` (or
+    contribution to the agent's own. Blocks with no `id` are therefore *added*, which is why a bare
+    string means one added block and text that also lives in `Agent(instructions=...)` reaches the model
+    twice. The code-side home for a managed base prompt is `AgentControl.instructions` (or
     `AgentControl.default`), which this value supersedes rather than adds to; see
     [`AgentControl`][pydantic_ai_harness.logfire.AgentControl].
 
-    `{{...}}` runtime placeholders are rendered against `deps` only when
-    `AgentControl.render_template` is set.
+    Blocks *with* an `id` reach what no capability owns -- the agent's own literal, a toolset's, an MCP
+    server's -- by addressing the assembled
+    [`instruction_parts`][pydantic_ai.models.ModelRequestParameters.instruction_parts] directly; see
+    [`InstructionBlock`][pydantic_ai_harness.logfire.InstructionBlock].
+
+    A bare string is exactly `[InstructionBlock(instructions='text')]` and is kept as written rather
+    than rewritten into the list form, so a published value stays the shape its author chose and
+    successive versions stay readable as a diff. An entry that doesn't validate is dropped with a
+    warning, leaving its siblings and the rest of the config alone.
+
+    `{{...}}` runtime placeholders are rendered against `deps` only when `AgentControl.render_template`
+    is set.
     """
-    model: str | None = None
-    """A Pydantic AI model string such as `'openai:gpt-5'`; `None` keeps the code model."""
+    model: NonEmptyStr | None = None
+    """A Pydantic AI model string such as `'openai:gpt-5'`; `None` keeps the code model.
+
+    Non-empty for a blunt reason: `''` is not "no model", it is a model named `''`, and Pydantic AI
+    rejects it with `Unknown model:` on every request the agent makes. Publishing one would take the
+    agent down, and the resolution fallback cannot catch it because the config itself is perfectly valid.
+    """
     settings: AgentConfigSettings | None = None
     """Canonical model settings patch; see `AgentConfigSettings`."""
-    tool_definitions: dict[str, ToolDefinitionOverride] | None = None
-    """LLM-facing overlays keyed by each tool's original code-side name."""
+    tool_definitions: list[ToolDefinitionOverride] | None = None
+    """LLM-facing overlays, each naming the tool it patches; see `ToolDefinitionOverride`."""
+
+    @field_validator('instructions', mode='before')
+    @classmethod
+    def _drop_invalid_instructions(cls, data: Any) -> Any:
+        """Drop an instruction entry that doesn't validate, keeping its siblings and the rest of the config.
+
+        An entry is the natural unit of degradation here, the same way a tool override is: each one adds
+        or addresses exactly one block, so an entry this SDK can't make sense of -- an empty string where
+        text was meant, an entry that says neither what nor where, something that is neither a string nor
+        an object -- can be left out while every other block still applies. Without this, one bad entry
+        would fail the whole `AgentConfig` and revert the model, the settings, and every tool override to
+        code alongside it.
+
+        A bare string is left alone for the field itself to validate: it is one block by definition, so
+        there is no sibling to save by rescuing it, and preserving the shape keeps a published value
+        looking the way its author wrote it. Entries in a list are returned already validated so the
+        field doesn't validate them a second time.
+        """
+        if not isinstance(data, list):
+            return data
+        blocks: list[InstructionBlock] = []
+        for entry in cast(list[Any], data):
+            try:
+                block = InstructionBlock.model_validate({'instructions': entry} if isinstance(entry, str) else entry)
+            except ValidationError as error:
+                _warn_dropped(
+                    f'Managed instruction entry {entry!r} is invalid -- {_entry_errors(error, whole="entry")}; '
+                    f'ignoring that entry and keeping the rest of the managed config.'
+                )
+                continue
+            if block.id is None and block.instructions is None:
+                _warn_dropped(
+                    f'Managed instruction entry {entry!r} has neither an `id` to address nor text to add; '
+                    f'ignoring that entry and keeping the rest of the managed config.'
+                )
+                continue
+            blocks.append(block)
+        return blocks
 
     @field_validator('tool_definitions', mode='before')
     @classmethod
@@ -231,24 +412,23 @@ class AgentConfig(BaseModel):
         """Drop an override entry that doesn't validate, keeping its siblings and the rest of the config.
 
         A tool override is the natural unit here: each entry patches exactly one tool, so an entry the
-        SDK can't validate -- an empty `new_name`, a field carrying a shape it doesn't know, something
-        that isn't an object at all -- can be left out while every other tool keeps its managed
+        SDK can't validate -- a missing or empty `name`, a field carrying a shape it doesn't know,
+        something that isn't an object at all -- can be left out while every other tool keeps its managed
         definition. Without this, one bad entry would fail the whole `AgentConfig` and revert the
         agent's instructions, model, and settings to code as well. (Merely *unknown* keys inside an
         entry are ignored by `ToolDefinitionOverride` itself and cost nothing.)
 
         Entries are returned already validated so the field doesn't validate them a second time.
         """
-        if not isinstance(data, dict):
+        if not isinstance(data, list):
             return data
-        entries = cast(dict[str, Any], data)
-        overrides: dict[str, ToolDefinitionOverride] = {}
-        for name, entry in entries.items():
+        overrides: list[ToolDefinitionOverride] = []
+        for entry in cast(list[Any], data):
             try:
-                overrides[name] = ToolDefinitionOverride.model_validate(entry)
+                overrides.append(ToolDefinitionOverride.model_validate(entry))
             except ValidationError as error:
                 _warn_dropped(
-                    f'Managed tool definition override for {name!r} is invalid -- {_override_errors(error)}; '
+                    f'Managed tool definition override {entry!r} is invalid -- {_entry_errors(error, whole="override")}; '
                     f'ignoring that override and keeping the rest of the managed config.'
                 )
         return overrides
@@ -258,11 +438,51 @@ AGENT_CONFIG_JSON_SCHEMA: dict[str, Any] = {
     'type': 'object',
     'properties': {
         'instructions': {
-            'type': 'string',
-            'description': 'Instructions added to the ones the agent defines in code, not a replacement for them.',
+            'description': (
+                'Instruction blocks added to the ones the agent assembles in code, not a replacement for '
+                'them. A bare string is one added block. An entry with an `id` swaps out the block the '
+                'agent already sends under that key instead of adding one.'
+            ),
+            'anyOf': [
+                {'type': 'string', 'minLength': 1},
+                {
+                    'type': 'array',
+                    'items': {
+                        'anyOf': [
+                            {'type': 'string', 'minLength': 1},
+                            {
+                                'type': 'object',
+                                'properties': {
+                                    'id': {
+                                        'type': 'string',
+                                        'minLength': 1,
+                                        'description': (
+                                            "The instruction block to address: 'agent', 'toolset:<id>', "
+                                            "'capability:<id>', or one of those plus ':<declared id>'. "
+                                            'Omit to add a block instead.'
+                                        ),
+                                    },
+                                    'instructions': {
+                                        'anyOf': [{'type': 'string', 'minLength': 1}, {'type': 'null'}],
+                                        'description': 'The text to send, or null to drop the addressed block.',
+                                    },
+                                    'dynamic': {
+                                        'type': 'boolean',
+                                        'description': (
+                                            'Whether the addressed block is recomputed per request. '
+                                            'Informational, set on the code-side baseline; ignored here.'
+                                        ),
+                                    },
+                                },
+                            },
+                        ]
+                    },
+                },
+            ],
         },
         'model': {
             'type': 'string',
+            'minLength': 1,
             'description': "A Pydantic AI model string, such as 'openai:gpt-5'.",
         },
         'settings': {
@@ -301,14 +521,20 @@ AGENT_CONFIG_JSON_SCHEMA: dict[str, Any] = {
             },
         },
         'tool_definitions': {
-            'type': 'object',
+            'type': 'array',
             'description': (
-                "LLM-facing overlays keyed by each tool's code-side name. Parameter names, types, "
-                'requiredness, validation, and implementation stay code-defined.'
+                'LLM-facing overlays, each naming the tool it patches by its code-side name. Parameter '
+                'names, types, requiredness, validation, and implementation stay code-defined.'
             ),
-            'additionalProperties': {
+            'items': {
                 'type': 'object',
+                'required': ['name'],
                 'properties': {
+                    'name': {
+                        'type': 'string',
+                        'minLength': 1,
+                        'description': "The tool's code-side name, which is what this entry patches.",
+                    },
                     'new_name': {
                         'type': 'string',
                         'minLength': 1,
@@ -343,8 +569,14 @@ written by a newer UI does not fail validation and revert the whole config to co
 `additionalProperties: false` anywhere in the stored schema would defeat that by rejecting the key at
 write time instead. For the same reason the fields whose accepted values grow over releases
 (`thinking`, `service_tier`) are typed rather than enumerated, and the known `settings` keys are named
-for the editor's benefit while unnamed ones stay writable. The one constraint kept is `new_name`'s
-`minLength`, which is structural rather than versioned: an empty tool name is never valid.
+for the editor's benefit while unnamed ones stay writable.
+
+The constraints it does keep are structural rather than versioned, and each one closes a hole a
+permissive schema would otherwise leave open. Every `minLength: 1` says the same thing as
+[`NonEmptyStr`][pydantic_ai_harness.logfire._agent_control.NonEmptyStr]: `''` is a half-filled field,
+never a value, and `model: ''` in particular takes an agent down with `Unknown model:` on every
+request. `tool_definitions` items require a `name` because an overlay that names no tool cannot be
+applied to anything, so accepting it would only let the UI save a row that silently does nothing.
 """
 
 
@@ -456,25 +688,36 @@ class AgentControl(ManagedVariableCapability[AgentDepsT, AgentConfig]):
     or `tool_definitions` -- is managed from Logfire, while an absent section keeps the code-defined
     behavior. Removing a section in Logfire deliberately reverts that section to code.
 
-    Instructions are the one section that **adds to** the agent instead of patching it: a capability
-    can only contribute instructions, so the managed text is appended to whatever the agent already
-    sends. That is deliberate -- replacing everything would also drop toolset and MCP instructions, a
-    skill catalog, and dynamic `@agent.instructions` functions, all of which have to keep composing --
-    but it decides where a managed base prompt belongs:
+    Instructions are the one section that **composes with** the agent instead of patching it, so it
+    works in two ways, and which one an entry uses is the difference between a prompt that reads well
+    and one sent to the model twice.
+
+    An entry with **no `id` adds** a block. A capability can only ever contribute instructions -- it
+    cannot take them over -- so this is what a bare `instructions` string has always done, and it is
+    also why the agent's own text is not something a managed value can edit away:
 
     - `Agent(instructions=...)` is never managed. Anything published in Logfire is *added* to it, so
-      text kept here cannot be edited or removed from the UI. Seeding a managed config from an agent's
-      observed system prompt while the same text stays on the agent sends it to the model twice.
+      text kept there cannot be edited or removed by adding more. Seeding a managed config from an
+      agent's observed system prompt while the same text stays on the agent sends it to the model twice.
     - `AgentControl.instructions` (shorthand for `default=AgentConfig(instructions=...)`) is the
       code-side base prompt. `get_instructions` contributes the published value *or* the default and
       never both, so publishing supersedes this text instead of duplicating it -- which is what makes
       it, not the agent, the place for a base prompt you intend to manage.
     - The published `instructions` in Logfire takes over from that default the moment it is set.
 
-    Everything else composes around whichever of the two is contributed. Pydantic AI groups static
+    An entry **with an `id` swaps out** the block Pydantic AI assembled under that key -- replacing its
+    text, or dropping it with `instructions=None`. This is how a managed config reaches text no
+    capability owns: the agent's own literal, a toolset's, an MCP server's, one `@agent.instructions`
+    function out of several. It is applied in `before_model_request`, after every contribution has been
+    assembled, so an override addresses what the model was actually about to be sent; see
+    [`InstructionBlock`][pydantic_ai_harness.logfire.InstructionBlock] for the keys and
+    [`InstructionPart.id`][pydantic_ai.messages.InstructionPart.id] for which blocks have one at all.
+
+    Added blocks compose the way a capability's instructions always have. Pydantic AI groups static
     instruction text ahead of dynamic text so providers can cache the stable prefix, and keeps source
-    order within each group, which puts the managed instructions after the agent's own literal and
-    `@agent.instructions` text and before dynamic toolset instructions.
+    order within each group, which puts them after the agent's own literal and `@agent.instructions`
+    text and before dynamic toolset instructions. An override leaves its block's position and its
+    `dynamic` flag alone, so no override moves the prompt-cache boundary.
 
     When `name` is omitted, the variable name is derived from the agent's telemetry name using the
     same normalization as the Logfire UI, which is lossy: `checkout-assistant` and `checkout_assistant`
@@ -487,6 +730,10 @@ class AgentControl(ManagedVariableCapability[AgentDepsT, AgentConfig]):
     The managed `model` is sourced during model selection, so it slots in with the right precedence:
     a call-site `run(model=...)` beats it, it beats the agent's constructor model, and a fully
     model-less `Agent(None, ...)` -- named or nameless -- can be driven entirely from managed config.
+    Another capability that supplies its own model or settings also beats this one, because
+    capabilities nearer the model call are merged last. That is deliberate: this capability sets the
+    remotely controlled baseline, and code that deliberately overrides it for a run should win, the
+    same way `run(model=...)` does.
     A named capability supplies the model statically (resolved once at run setup); a nameless one
     supplies a selector that derives its variable from the agent when the model is first selected,
     then reuses that choice for the rest of the run. Callable `targeting_key`/`attributes` don't
@@ -512,10 +759,10 @@ class AgentControl(ManagedVariableCapability[AgentDepsT, AgentConfig]):
     baseline to diff managed values against, so it is worth knowing what it really is: for instructions
     or a toolset that vary with `deps`, run input, or the step within a run, it is one point-in-time
     sample rather than a description of the agent. An agent that never reaches a model request never
-    auto-creates at all. Its `instructions` are the whole assembled block the model was sent -- the
-    agent's own text, this capability's contribution, and any toolset instructions -- so publishing
-    that sample verbatim while the same text still lives on the agent is exactly the duplication
-    described above.
+    auto-creates at all. Its `instructions` are every block the model was sent -- the agent's own text,
+    this capability's contribution, each toolset's -- listed separately with the `id` that addresses it
+    and a `dynamic` flag, which is what lets the UI offer an override per block instead of one
+    copy-the-whole-prompt button that would produce exactly the duplication described above.
 
     ```python
     import logfire
@@ -548,7 +795,7 @@ class AgentControl(ManagedVariableCapability[AgentDepsT, AgentConfig]):
 
     Mutually exclusive with the `instructions` shorthand below.
     """
-    instructions: str | None = None
+    instructions: NonEmptyStr | list[NonEmptyStr | InstructionBlock] | None = None
     """Code-side base prompt, exactly equivalent to `default=AgentConfig(instructions=...)`.
 
     The base prompt belongs here rather than on `Agent(instructions=...)`, which a published config
@@ -561,7 +808,11 @@ class AgentControl(ManagedVariableCapability[AgentDepsT, AgentConfig]):
     `Agent(model_settings=...)`, and a tool's own docstring remain the natural code-side homes.
     """
     render_template: bool = False
-    """Render managed instruction `{{...}}` placeholders against run dependencies when enabled."""
+    """Render `{{...}}` placeholders in *added* instruction text against run dependencies when enabled.
+
+    An entry that addresses an existing block by `id` is applied to the assembled request and is never
+    templated: it replaces a block with exactly the text that was published.
+    """
 
     _auto_create_in_wrap_run: ClassVar[bool] = False
 
@@ -576,7 +827,19 @@ class AgentControl(ManagedVariableCapability[AgentDepsT, AgentConfig]):
                 )
             # Normalized into `default` so the resolved value -- and every reader of it -- sees one
             # code-side config, and `get_instructions` keeps a single path through `resolved.value`.
-            self.default = AgentConfig(instructions=self.instructions)
+            try:
+                self.default = AgentConfig(instructions=self.instructions)
+            except ValidationError as error:
+                # A published value that fails validation is a remote-data problem and degrades to code;
+                # this one is a mistake in the code itself, so it gets the same treatment as passing both
+                # `instructions` and `default` rather than a raw Pydantic traceback out of `__post_init__`.
+                # Pydantic's own message names the union branches it tried, which is noise here: there is
+                # only one way to get this wrong.
+                raise UserError(
+                    f'`AgentControl` was given {self.instructions!r} as `instructions`, which has no text to '
+                    f'contribute. Pass instruction text, a list of blocks, or leave it out entirely to keep '
+                    f'the code-defined instructions.'
+                ) from error
         self._setup_variable(
             self.name,
             prefix=_AGENT_VARIABLE_PREFIX,
@@ -586,7 +849,11 @@ class AgentControl(ManagedVariableCapability[AgentDepsT, AgentConfig]):
         )
 
     def get_instructions(self) -> Callable[[RunContext[AgentDepsT]], str | None]:
-        """Contribute managed instructions -- appended to the agent's own -- optionally rendered against `deps`.
+        """Contribute the managed instruction blocks that *add* text, optionally rendered against `deps`.
+
+        Entries that address an existing block by `id` are not contributed here -- there is nothing to
+        append for them -- and are applied to the assembled parts in
+        [`before_model_request`][pydantic_ai_harness.logfire.AgentControl.before_model_request] instead.
 
         `resolved.value` is either the published config or this capability's `default`, never a merge
         of the two, so a code-side base prompt set through `instructions`/`default` is superseded by a
@@ -595,9 +862,11 @@ class AgentControl(ManagedVariableCapability[AgentDepsT, AgentConfig]):
 
         def instructions(ctx: RunContext[AgentDepsT]) -> str | None:
             resolved = self.resolved
-            if resolved is None or resolved.value.instructions is None:
+            if resolved is None:
                 return None
-            value = resolved.value.instructions
+            value = _added_instructions(resolved.value)
+            if value is None:
+                return None
             return TemplateStr[AgentDepsT](value).render(ctx.deps) if self.render_template else value
 
         return instructions
@@ -681,9 +950,9 @@ class AgentControl(ManagedVariableCapability[AgentDepsT, AgentConfig]):
         return _ToolDefinitionOverridesToolset(wrapped=toolset, get_overrides=self._current_overrides)
 
     def _current_overrides(self) -> Mapping[str, ToolDefinitionOverride]:
-        """Return the active run's overrides, or an empty mapping outside a resolved run."""
+        """Return the active run's overrides by tool name, or an empty mapping outside a resolved run."""
         resolved = self.resolved
-        return {} if resolved is None else resolved.value.tool_definitions or {}
+        return {} if resolved is None else _tool_overrides(resolved.value)
 
     async def wrap_run(self, ctx: RunContext[AgentDepsT], *, handler: WrapRunHandler) -> AgentRunResult[Any]:
         """Add applied-section baggage inside the base's once-per-run resolution context."""
@@ -706,13 +975,52 @@ class AgentControl(ManagedVariableCapability[AgentDepsT, AgentConfig]):
     async def before_model_request(
         self, ctx: RunContext[AgentDepsT], request_context: ModelRequestContext
     ) -> ModelRequestContext:
-        """Capture the code-side creation baseline on the first eligible model request.
+        """Swap out the instruction blocks the managed config addresses, and capture the code-side baseline.
 
-        The managed model itself is sourced at run setup by
-        [`get_model`][pydantic_ai_harness.logfire.AgentControl.get_model], so this hook only snapshots
-        the code-side agent for auto-create and leaves the request untouched.
+        This is the last point at which every contribution has been assembled, which is what makes it the
+        only place an override can reach text no capability owns -- the agent's own literal, a toolset's,
+        an MCP server's. The managed model and settings need no such hook; they are sourced through
+        [`get_model`][pydantic_ai_harness.logfire.AgentControl.get_model] and `get_model_settings`, where
+        Pydantic AI already gives them the right precedence.
         """
         self._auto_create_snapshot(request_context)
+        return self._apply_instruction_overrides(request_context)
+
+    def _apply_instruction_overrides(self, request_context: ModelRequestContext) -> ModelRequestContext:
+        """Replace or drop the assembled instruction parts the managed config addresses by `id`.
+
+        `dynamic` is deliberately carried over untouched. Pydantic AI sorts static blocks ahead of
+        dynamic ones so a provider can cache the stable prefix, so re-flagging a replaced block would
+        move the cache boundary for every request -- a silent cost regression in exchange for nothing.
+        Replacing a dynamic block's text does pin it, which is what the baseline snapshot's `dynamic`
+        flag exists to warn about before anyone publishes that.
+
+        A part with no `id` is unaddressable by construction and passes through. An `id` that matches no
+        part is inert.
+
+        The new parameters are assigned onto the given context rather than returned on a
+        `dataclasses.replace` copy of it, which would look tidier and be wrong: `ModelRequestContext`
+        declares `model_id` and `streaming` as `init=False`, the agent graph sets both immediately
+        before calling this hook, and `replace()` re-initializes them to `None`/`False`. Losing them
+        costs a streamed run its streaming flag and a durable-execution worker the selection token it
+        re-resolves an aliased model from. Reported upstream.
+        """
+        resolved = self.resolved
+        if resolved is None:
+            return request_context
+        overrides = _instruction_overrides(resolved.value)
+        parameters = request_context.model_request_parameters
+        if not overrides or not parameters.instruction_parts:
+            return request_context
+        parts: list[InstructionPart] = []
+        for part in parameters.instruction_parts:
+            if part.id is None or part.id not in overrides:
+                parts.append(part)
+                continue
+            replacement = overrides[part.id]
+            if replacement is not None:
+                parts.append(replace(part, content=replacement))
+        request_context.model_request_parameters = replace(parameters, instruction_parts=parts)
         return request_context
 
     def _auto_create_snapshot(self, request_context: ModelRequestContext) -> None:
@@ -723,25 +1031,32 @@ class AgentControl(ManagedVariableCapability[AgentDepsT, AgentConfig]):
         so this effective request is the code baseline. The snapshot is built synchronously while the
         HTTP creation itself remains in the background.
 
+        Instructions are snapshotted per block, straight off
+        [`instruction_parts`][pydantic_ai.models.ModelRequestParameters.instruction_parts], keeping each
+        block's `id` and `dynamic` flag. That is the whole reason the UI can offer an override at all:
+        the joined prompt telemetry records has no seams in it, so a baseline built from that could only
+        ever be copied wholesale -- which, since managed instructions *add*, is how you get the agent's
+        own text sent to the model twice with a frozen `Today is <date>` in the middle of it.
+
         "First" is first in the process, not first in some canonical run: dynamic instructions and
         dynamic toolsets make the snapshot a sample of one request, whichever run and step got there
         first. It is stored as the variable's `example` and never revised, so the baseline stays
         stable for the UI to diff against rather than drifting with traffic.
+
+        An `example` is a description of the code, not a value to apply -- nothing resolves it -- which
+        is what lets it use these same fields to say *what exists* rather than *what to change*.
         """
         resolved = self.resolved
         if resolved is None:
             return
         if not self._should_auto_create_for(resolved):
             return
-        instructions = next(
-            (
-                message.instructions
-                for message in reversed(request_context.messages)
-                if isinstance(message, ModelRequest)
-            ),
-            None,
-        )
-        tool_definitions: dict[str, ToolDefinitionOverride] = {}
+        instructions: list[NonEmptyStr | InstructionBlock] = [
+            InstructionBlock(id=part.id, instructions=part.content, dynamic=part.dynamic)
+            for part in request_context.model_request_parameters.instruction_parts or []
+            if part.content.strip()
+        ]
+        tool_definitions: list[ToolDefinitionOverride] = []
         for tool in request_context.model_request_parameters.function_tools:
             descriptions: dict[str, str] = {}
             properties = tool.parameters_json_schema.get('properties')
@@ -753,11 +1068,13 @@ class AgentControl(ManagedVariableCapability[AgentDepsT, AgentConfig]):
                         description = parameter_schema.get('description')
                         if isinstance(description, str):
                             descriptions[name] = description
-            tool_definitions[tool.name] = ToolDefinitionOverride(
-                description=tool.description or None, parameter_descriptions=descriptions or None
+            tool_definitions.append(
+                ToolDefinitionOverride(
+                    name=tool.name, description=tool.description or None, parameter_descriptions=descriptions or None
+                )
             )
         example = AgentConfig(
-            instructions=instructions,
+            instructions=instructions or None,
             model=f'{request_context.model.system}:{request_context.model.model_name}',
             settings=AgentConfigSettings.model_validate(request_context.model_settings)
             if request_context.model_settings

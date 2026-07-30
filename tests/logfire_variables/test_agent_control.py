@@ -2,19 +2,21 @@ from __future__ import annotations
 
 import json
 import warnings
+from dataclasses import dataclass
 from typing import Any, cast
 
 import logfire
 import pytest
 from logfire.testing import CaptureLogfire
-from logfire.variables import LabeledValue, Rollout, Variable, VariableConfig, VariablesConfig
+from logfire.variables import Rollout, Variable, VariableConfig, VariablesConfig
 from pydantic_ai import Agent, RunContext, Tool
 from pydantic_ai.exceptions import UserError
-from pydantic_ai.messages import ModelMessage, ModelRequest, ModelResponse, TextPart, ToolCallPart
+from pydantic_ai.messages import InstructionPart, ModelMessage, ModelRequest, ModelResponse, TextPart, ToolCallPart
 from pydantic_ai.models.function import AgentInfo, FunctionModel
 from pydantic_ai.models.test import TestModel
 from pydantic_ai.tools import ToolDefinition
 from pydantic_ai.toolsets import FunctionToolset
+from pydantic_ai.usage import RunUsage
 
 from pydantic_ai_harness import AgentControl as RootAgentControl
 from pydantic_ai_harness.logfire import (
@@ -22,15 +24,23 @@ from pydantic_ai_harness.logfire import (
     AgentConfig,
     AgentConfigSettings,
     AgentControl,
+    InstructionBlock,
     ToolDefinitionOverride,
+    _agent_control,
     _managed_variable,
 )
 
-from ._helpers import advertised, capture_tools, get_weather, variables_provider
+from ._helpers import advertised, capture_tools, get_weather, published_value, variables_provider
 
 pytestmark = pytest.mark.anyio
 
 assert RootAgentControl is AgentControl
+
+
+@pytest.fixture(autouse=True)
+def _forget_warned_drops() -> None:
+    """Start each test with an empty once-per-process guard so every drop warns independently."""
+    _agent_control._warned_drops.clear()
 
 
 def instructions_seen(messages: list[ModelMessage]) -> list[str]:
@@ -63,16 +73,7 @@ async def test_managed_instructions_are_appended_not_replaced() -> None:
 
 
 async def test_published_instructions_supersede_the_code_side_default(capfire: CaptureLogfire) -> None:
-    config = VariablesConfig(
-        variables={
-            'agent__base_prompt': VariableConfig(
-                name='agent__base_prompt',
-                labels={'production': LabeledValue(version=1, serialized_value='{"instructions": "published"}')},
-                rollout=Rollout(labels={'production': 1.0}),
-                overrides=[],
-            )
-        }
-    )
+    config = published_value('agent__base_prompt', {'instructions': 'published'})
     capability = AgentControl('base_prompt', instructions='code-side base', label='production')
     with variables_provider(capfire, config):
         result = await Agent(TestModel(), instructions='code', capabilities=[capability]).run('hello')
@@ -97,16 +98,241 @@ def test_instructions_and_default_together_raise() -> None:
         AgentControl('ambiguous', instructions='base', default=AgentConfig(model='test'))
 
 
+def test_code_side_instructions_with_no_text_raise_user_error() -> None:
+    # A published value that fails validation is remote data and degrades to code; this is a mistake in
+    # the code itself, so it gets the same `UserError` treatment as passing `instructions` and `default`
+    # together, rather than a Pydantic union traceback out of `__post_init__`.
+    with pytest.raises(UserError, match='which has no text to contribute'):
+        AgentControl('empty', instructions='')
+
+
+def test_a_code_side_list_of_empty_entries_degrades_rather_than_raising() -> None:
+    # Not an inconsistency with the above: an entry is the unit of degradation, so a list drops the bad
+    # entries and keeps whatever else it holds. There is nowhere for the validator to learn that *this*
+    # list came from code rather than from Logfire, and a warning still surfaces the drop.
+    with pytest.warns(UserWarning, match=r"entry '' is invalid -- instructions=''"):
+        capability = AgentControl('empty_entries', instructions=['', 'kept'])
+    assert capability.default == AgentConfig(instructions=[InstructionBlock(instructions='kept')])
+
+
+def weather_toolset() -> FunctionToolset[object]:
+    """A toolset with an `id` and instructions of its own, so `toolset:weather` is addressable."""
+    toolset = FunctionToolset[object]([get_weather], id='weather')
+
+    @toolset.instructions
+    def call_weather_first(_ctx: RunContext[object]) -> str:
+        return 'TOOLSET: call get_weather first.'
+
+    return toolset
+
+
+def capture_instructions(seen: list[InstructionPart]) -> FunctionModel:
+    """A model that records the instruction blocks it is shown, then ends the run.
+
+    The parts, not the joined string, are what a block-addressing config has to be judged on: only
+    they carry the `id` an override addresses and the `dynamic` flag that decides where a block sorts.
+    """
+
+    def respond(_messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        # `None` rather than `[]` is the shape an agent with no instructions at all produces.
+        seen.extend(info.model_request_parameters.instruction_parts or [])
+        return ModelResponse(parts=[TextPart('done')])
+
+    return FunctionModel(respond)
+
+
+async def run_blocks(capfire: CaptureLogfire, name: str, value: dict[str, Any]) -> list[InstructionPart]:
+    """Publish `value` for `agent__<name>`, run an agent with a block of each kind, return what it sent.
+
+    The agent covers every source a managed `id` can address: its own literal (`agent`), one declared
+    `@agent.instructions` function (`agent:today`), and a toolset with an `id` (`toolset:weather`).
+    """
+    seen: list[InstructionPart] = []
+    agent = Agent(
+        capture_instructions(seen),
+        instructions='AGENT: You are a concise checkout assistant.',
+        toolsets=[weather_toolset()],
+        capabilities=[AgentControl(name, label='production')],
+    )
+
+    @agent.instructions(id='today')
+    def today(_ctx: RunContext[object]) -> str:
+        return 'DYNAMIC: today is Monday.'
+
+    with variables_provider(capfire, published_value(f'agent__{name}', value)):
+        await agent.run('hello')
+    return seen
+
+
+def triples(parts: list[InstructionPart]) -> list[tuple[str | None, str, bool]]:
+    """Each block as the `(id, text, dynamic)` the model was sent it under."""
+    return [(part.id, part.content, part.dynamic) for part in parts]
+
+
+AGENT_BLOCK = ('agent', 'AGENT: You are a concise checkout assistant.', False)
+TODAY_BLOCK = ('agent:today', 'DYNAMIC: today is Monday.', True)
+TOOLSET_BLOCK = ('toolset:weather', 'TOOLSET: call get_weather first.', True)
+
+
+@pytest.mark.parametrize(
+    'name,value,expected',
+    [
+        pytest.param('blocks_none', {}, [AGENT_BLOCK, TODAY_BLOCK, TOOLSET_BLOCK], id='nothing-managed'),
+        pytest.param(
+            'blocks_bare',
+            {'instructions': 'MANAGED: be brief.'},
+            [AGENT_BLOCK, TODAY_BLOCK, (None, 'MANAGED: be brief.', True), TOOLSET_BLOCK],
+            id='bare-string-adds-a-block',
+        ),
+        pytest.param(
+            'blocks_list',
+            {'instructions': ['MANAGED: be brief.', 'MANAGED: cite sources.']},
+            [AGENT_BLOCK, TODAY_BLOCK, (None, 'MANAGED: be brief.\n\nMANAGED: cite sources.', True), TOOLSET_BLOCK],
+            id='two-added-blocks-join-into-one-contribution',
+        ),
+        pytest.param(
+            'blocks_mixed',
+            {'instructions': ['MANAGED: be brief.', {'id': 'agent', 'instructions': 'REMOTE: refund specialist.'}]},
+            [
+                ('agent', 'REMOTE: refund specialist.', False),
+                TODAY_BLOCK,
+                (None, 'MANAGED: be brief.', True),
+                TOOLSET_BLOCK,
+            ],
+            id='one-list-can-add-and-address',
+        ),
+        pytest.param(
+            'blocks_replace_drop',
+            {
+                'instructions': [
+                    {'id': 'agent', 'instructions': 'REMOTE: refund specialist.'},
+                    {'id': 'toolset:weather', 'instructions': None},
+                ]
+            },
+            [('agent', 'REMOTE: refund specialist.', False), TODAY_BLOCK],
+            id='replace-the-agent-literal-and-drop-a-toolsets-own',
+        ),
+        pytest.param(
+            'blocks_pin',
+            {'instructions': [{'id': 'agent:today', 'instructions': 'PINNED: it is always Monday.'}]},
+            [AGENT_BLOCK, ('agent:today', 'PINNED: it is always Monday.', True), TOOLSET_BLOCK],
+            id='pin-one-declared-dynamic-block',
+        ),
+        pytest.param(
+            'blocks_inert',
+            {'instructions': [{'id': 'toolset:nope', 'instructions': 'never sent'}]},
+            [AGENT_BLOCK, TODAY_BLOCK, TOOLSET_BLOCK],
+            id='an-id-nothing-matches-is-inert',
+        ),
+    ],
+)
+async def test_instruction_blocks_the_model_receives(
+    capfire: CaptureLogfire, name: str, value: dict[str, Any], expected: list[tuple[str | None, str, bool]]
+) -> None:
+    # The whole contract in one table: an entry with no `id` adds a block, an entry with one replaces
+    # or drops the block the agent assembled under that key, and an `id` nothing matches costs nothing.
+    #
+    # Added blocks land after the dynamic `@agent.instructions` text and before the dynamic toolset
+    # text because a capability's contribution is itself dynamic: Pydantic AI sorts static blocks
+    # ahead of dynamic ones so a provider can cache the stable prefix, and keeps source order within
+    # each group. Every added entry becomes one part, joined by a blank line, because they are
+    # contributed through `get_instructions` as a single string.
+    assert triples(await run_blocks(capfire, name, value)) == expected
+
+
+async def test_an_override_never_moves_the_static_prefix(capfire: CaptureLogfire) -> None:
+    # `dynamic` decides which side of the provider's cacheable prefix a block sorts on, and an override
+    # rewrites text in place without touching it. So overriding the agent's static literal *and* a
+    # dynamic block leaves every block's key and flag exactly where code put them: the cache boundary
+    # does not move, which is the whole reason the flag is carried over rather than recomputed.
+    baseline = await run_blocks(capfire, 'prefix_baseline', {})
+    overridden = await run_blocks(
+        capfire,
+        'prefix_overridden',
+        {
+            'instructions': [
+                {'id': 'agent', 'instructions': 'REMOTE: refund specialist.'},
+                {'id': 'agent:today', 'instructions': 'PINNED: it is always Monday.'},
+            ]
+        },
+    )
+    assert [(part.id, part.dynamic) for part in overridden] == [(part.id, part.dynamic) for part in baseline]
+    assert [part.content for part in overridden] == [
+        'REMOTE: refund specialist.',
+        'PINNED: it is always Monday.',
+        'TOOLSET: call get_weather first.',
+    ]
+
+
+async def test_two_entries_addressing_the_same_block_keep_the_first(capfire: CaptureLogfire) -> None:
+    # A hand-edited value (or a UI bug) can name one `id` twice. Keeping the first makes the run
+    # predictable and names the entry that lost, rather than letting JSON ordering decide silently.
+    with pytest.warns(UserWarning, match=r"names instruction id 'agent' more than once") as caught:
+        parts = await run_blocks(
+            capfire,
+            'blocks_duplicate',
+            {'instructions': [{'id': 'agent', 'instructions': 'FIRST'}, {'id': 'agent', 'instructions': 'SECOND'}]},
+        )
+    # Resolved once per run and applied on every request, but warned about once.
+    assert len(caught) == 1
+    assert triples(parts) == [('agent', 'FIRST', False), TODAY_BLOCK, TOOLSET_BLOCK]
+
+
+async def test_overrides_on_an_agent_with_no_instructions_are_inert(capfire: CaptureLogfire) -> None:
+    # One managed config is applied across deployments that need not all assemble the same blocks, so
+    # an agent that sends no instructions at all is not an error -- there is simply nothing to address.
+    seen: list[InstructionPart] = []
+    capability = AgentControl('no_blocks', label='production')
+    published = {'instructions': [{'id': 'agent', 'instructions': 'never sent'}]}
+    with variables_provider(capfire, published_value('agent__no_blocks', published)):
+        result = await Agent(capture_instructions(seen), capabilities=[capability]).run('hello')
+    assert seen == []
+    assert instructions_seen(result.all_messages()) == []
+
+
+async def test_added_blocks_render_placeholders_against_deps() -> None:
+    @dataclass
+    class Deps:
+        city: str
+
+    # Rendering happens on the capability's joined contribution, so a `{{...}}` placeholder works the
+    # same in a list entry as it does in a bare string. An addressed block is deliberately left alone:
+    # its text replaces something the agent assembled, and that text was never templated either.
+    capability: AgentControl[Deps] = AgentControl(
+        'render',
+        default=AgentConfig(
+            instructions=[
+                'Serve {{city}}.',
+                InstructionBlock(instructions='Be brief.'),
+                InstructionBlock(id='agent', instructions='Base for {{city}}.'),
+            ]
+        ),
+        render_template=True,
+    )
+    agent = Agent(TestModel(), instructions='code', deps_type=Deps, capabilities=[capability])
+    result = await agent.run('hello', deps=Deps(city='Paris'))
+    assert instructions_seen(result.all_messages()) == ['Base for {{city}}.\n\nServe Paris.\n\nBe brief.']
+
+
+def test_instructions_none_outside_run() -> None:
+    # Nothing is resolved until `wrap_run` opens the run's resolution context, so the contribution
+    # hook has to answer for a capability that was never entered -- as a graph built for inspection is.
+    capability = AgentControl('outside_run_instructions', instructions='base')
+    ctx = RunContext[None](deps=None, model=TestModel(), usage=RunUsage(), prompt=None, messages=[], run_step=0)
+    assert capability.resolved is None
+    assert capability.get_instructions()(ctx) is None
+
+
 async def test_tool_definition_patches() -> None:
     seen: list[ToolDefinition] = []
     capability = AgentControl(
         'tools',
         default=AgentConfig(
-            tool_definitions={
-                'get_weather': ToolDefinitionOverride(
-                    description='Managed.', parameter_descriptions={'city': 'Managed city.'}
+            tool_definitions=[
+                ToolDefinitionOverride(
+                    name='get_weather', description='Managed.', parameter_descriptions={'city': 'Managed city.'}
                 )
-            }
+            ]
         ),
     )
     await Agent(capture_tools(seen), tools=[get_weather], capabilities=[capability]).run('hello')
@@ -213,18 +439,67 @@ async def test_auto_create_uses_request_snapshot(capfire: CaptureLogfire, monkey
     assert created[0].json_schema == AGENT_CONFIG_JSON_SCHEMA
     example = json.loads(created[0].example or '{}')
     assert example == {
-        'instructions': 'Code instructions.',
+        'instructions': [{'id': 'agent', 'instructions': 'Code instructions.', 'dynamic': False}],
         'model': 'test:test',
         'settings': {'temperature': 0.3},
-        'tool_definitions': {
-            'lookup': {
+        'tool_definitions': [
+            {
+                'name': 'lookup',
                 'description': 'Look up a city.',
                 'parameter_descriptions': {'city': 'City to look up.'},
             },
-            'raw': {'parameter_descriptions': {'named': 'Named.'}},
-            'empty': {},
-        },
+            {'name': 'raw', 'parameter_descriptions': {'named': 'Named.'}},
+            {'name': 'empty'},
+        ],
     }
+
+
+async def test_auto_create_snapshots_every_instruction_block(
+    capfire: CaptureLogfire, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The baseline the Logfire UI diffs managed values against, and the reason it can offer an override
+    # per block rather than one copy-the-whole-prompt button: the joined prompt telemetry records has no
+    # seams, so a snapshot taken from that could only be copied wholesale -- which, since managed
+    # instructions *add*, would send the agent's own text twice with a frozen date in the middle.
+    _managed_variable._reset_auto_create_guard()
+    created: list[VariableConfig] = []
+
+    def create_inline(variable: Variable[object], config: VariableConfig) -> None:
+        created.append(config)
+
+    monkeypatch.setattr(_managed_variable, '_spawn_create', create_inline)
+
+    agent = Agent(
+        TestModel(),
+        name='blocks_snapshot',
+        instructions='AGENT: You are a concise checkout assistant.',
+        toolsets=[weather_toolset()],
+        capabilities=[AgentControl()],
+    )
+
+    @agent.instructions(id='today')
+    def today(_ctx: RunContext[object]) -> str:
+        return 'DYNAMIC: today is Monday.'
+
+    @agent.instructions
+    def unnamed(_ctx: RunContext[object]) -> str:
+        return 'UNNAMED: no declared id.'
+
+    with variables_provider(capfire, VariablesConfig(variables={})):
+        await agent.run('hello')
+
+    example = json.loads(created[0].example or '{}')
+    assert example['instructions'] == [
+        {'id': 'agent', 'instructions': 'AGENT: You are a concise checkout assistant.', 'dynamic': False},
+        {'id': 'agent:today', 'instructions': 'DYNAMIC: today is Monday.', 'dynamic': True},
+        # No `id` key at all: the function declared none, so Pydantic AI cannot key the block and the
+        # UI has nothing to address it by. Its absence, not a placeholder, is what tells the UI that.
+        {'instructions': 'UNNAMED: no declared id.', 'dynamic': True},
+        {'id': 'toolset:weather', 'instructions': 'TOOLSET: call get_weather first.', 'dynamic': True},
+    ]
+    # `dynamic` is what powers the one warning that matters: replacing a computed block pins whatever
+    # it evaluated to when the snapshot happened to be taken.
+    assert [block['dynamic'] for block in example['instructions']] == [False, True, True, True]
 
 
 async def test_applied_sections_baggage() -> None:
@@ -271,7 +546,7 @@ async def test_rename_round_trip_preserves_original_context_name() -> None:
 
     capability = AgentControl(
         'rename',
-        default=AgentConfig(tool_definitions={'weather': ToolDefinitionOverride(new_name='weather_now')}),
+        default=AgentConfig(tool_definitions=[ToolDefinitionOverride(name='weather', new_name='weather_now')]),
     )
     await Agent(FunctionModel(model), tools=[weather], capabilities=[capability]).run('hello')
     assert context_names == ['weather']
@@ -298,7 +573,9 @@ async def test_rename_collision_warns_and_keeps_other_patches() -> None:
     capability = AgentControl(
         'collision',
         default=AgentConfig(
-            tool_definitions={'first': ToolDefinitionOverride(new_name='second', description='Managed first.')}
+            tool_definitions=[
+                ToolDefinitionOverride(name='first', new_name='second', description='Managed first.'),
+            ]
         ),
     )
     with pytest.warns(UserWarning, match='already advertised'):
@@ -311,10 +588,10 @@ async def test_unknown_tool_and_parameter_keys_are_inert() -> None:
     capability = AgentControl(
         'unknown_tool',
         default=AgentConfig(
-            tool_definitions={
-                'missing': ToolDefinitionOverride(description='ignored'),
-                'get_weather': ToolDefinitionOverride(parameter_descriptions={'missing': 'ignored'}),
-            }
+            tool_definitions=[
+                ToolDefinitionOverride(name='missing', description='ignored'),
+                ToolDefinitionOverride(name='get_weather', parameter_descriptions={'missing': 'ignored'}),
+            ]
         ),
     )
     with warnings.catch_warnings(record=True) as caught:
@@ -322,6 +599,26 @@ async def test_unknown_tool_and_parameter_keys_are_inert() -> None:
     assert caught == []
     assert advertised(seen) == {'get_weather': None}
     assert get_weather('Paris') == 'sunny in Paris'
+
+
+async def test_two_overrides_naming_the_same_tool_keep_the_first() -> None:
+    # The same first-wins rule as a duplicated instruction `id`, and the same reason: which entry a
+    # colliding pair resolves to has to be a property of the config, not of JSON key order.
+    seen: list[ToolDefinition] = []
+    capability = AgentControl(
+        'duplicate_tool',
+        default=AgentConfig(
+            tool_definitions=[
+                ToolDefinitionOverride(name='get_weather', description='First.'),
+                ToolDefinitionOverride(name='get_weather', description='Second.'),
+            ]
+        ),
+    )
+    with pytest.warns(UserWarning, match=r"names tool 'get_weather' more than once") as caught:
+        await Agent(capture_tools(seen), tools=[get_weather], capabilities=[capability]).run('hello')
+    # Read on every `get_tools`, warned about once.
+    assert len(caught) == 1
+    assert advertised(seen) == {'get_weather': 'First.'}
 
 
 async def test_schema_without_properties_is_tolerated() -> None:
@@ -334,7 +631,7 @@ async def test_schema_without_properties_is_tolerated() -> None:
     capability = AgentControl(
         'raw_schema',
         default=AgentConfig(
-            tool_definitions={'raw_tool': ToolDefinitionOverride(parameter_descriptions={'missing': 'ignored'})}
+            tool_definitions=[ToolDefinitionOverride(name='raw_tool', parameter_descriptions={'missing': 'ignored'})]
         ),
     )
     await Agent(capture_tools(seen), tools=[tool], capabilities=[capability]).run('hello')

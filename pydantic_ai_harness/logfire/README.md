@@ -66,9 +66,17 @@ parameter descriptions) -- the baseline the Logfire UI's override editor and opt
 values against. The snapshot is taken from whichever model request comes first in the process, so
 for instructions or a toolset that vary with `deps`, run input, or the step within a run, it is one
 point-in-time sample rather than a description of the agent. An agent that never reaches a model
-request never auto-creates. Its `instructions` are the whole assembled block the model was sent, so
-publishing that sample verbatim while the same text still lives on the agent duplicates it -- see
-[Where your base prompt lives](#where-your-base-prompt-lives).
+request never auto-creates.
+
+Its `instructions` list one entry per instruction block the model was sent -- the agent's own text,
+this capability's contribution, each toolset's -- each carrying the `id` that addresses it and a
+`dynamic` flag. That is what the UI needs to offer an override per block: the joined prompt a trace
+records has no seams in it, so a baseline built from telemetry alone could only ever be copied
+wholesale, and copying it wholesale is exactly [the mistake](#where-your-base-prompt-lives) of
+sending the agent's own text to the model twice with a frozen `Today is <date>` in the middle of it.
+
+An `example` describes the code rather than being a value to apply -- nothing resolves it -- which is
+what lets it use the same fields to say *what exists* instead of *what to change*.
 
 Install the extra:
 
@@ -329,7 +337,11 @@ The variable holds an `AgentConfig`:
 
 ```json
 {
-  "instructions": "You are a concise checkout assistant. Always confirm the order total.",
+  "instructions": [
+    "Always confirm the order total.",
+    {"id": "agent", "instructions": "You are a concise checkout assistant."},
+    {"id": "toolset:legacy_crm", "instructions": null}
+  ],
   "model": "openai:gpt-5",
   "settings": {
     "temperature": 0.4,
@@ -339,20 +351,24 @@ The variable holds an `AgentConfig`:
       "anthropic": {"thinking": {"type": "enabled", "budget_tokens": 16384}}
     }
   },
-  "tool_definitions": {
-    "get_weather": {
+  "tool_definitions": [
+    {
+      "name": "get_weather",
       "new_name": "lookup_weather",
       "description": "Look up the current weather for a city.",
       "parameter_descriptions": {"city": "City name, e.g. 'London'"}
     }
-  }
+  ]
 }
 ```
 
-- `instructions` is **added to** the agent's own instructions, not a replacement for them (see
-  [Where your base prompt lives](#where-your-base-prompt-lives)). It supports `{{...}}` runtime
-  placeholders, which pass through verbatim unless `render_template=True` renders them against `deps`
-  (like `ManagedPrompt`).
+- `instructions` is a list of blocks, and each entry either **adds** text or **swaps out** one of the
+  blocks the agent already assembles. An entry with no `id` adds; an entry with an `id` replaces that
+  block's text, or drops it with `null`. A bare string is the shorthand for a single added block, so
+  `"instructions": "Be brief."` still means what it always did. See
+  [Where your base prompt lives](#where-your-base-prompt-lives).
+  Text supports `{{...}}` runtime placeholders, which pass through verbatim unless
+  `render_template=True` renders them against `deps` (like `ManagedPrompt`).
 - `model` is a pydantic-ai model string. It's a first-class field, not a setting: pydantic-ai keeps
   the model id separate from `ModelSettings` (which has no `model` key), so there's no collision
   putting them side by side.
@@ -362,29 +378,54 @@ The variable holds an `AgentConfig`:
   `openai_reasoning_effort` model setting, and a provider-specific value wins over its canonical
   counterpart). `thinking` accepts `true`/`false` or an effort level (`'minimal'` ... `'xhigh'`),
   exactly like the unified `thinking` model setting.
-- `tool_definitions` is keyed by each tool's original (code-side) name; every override field is
-  optional and unset fields keep the tool's own definition.
+- `tool_definitions` is a list too, each entry naming the tool it patches by its original (code-side)
+  `name`; every other field is optional and unset fields keep the tool's own definition.
+
+`''` is never accepted where a string carries meaning -- `model`, a block's text, `new_name`. Omission
+and `null` already mean "leave this to code", so an empty string is only ever a half-filled field, and
+`"model": ""` in particular is not "no model": Pydantic AI raises `Unknown model:` on every request the
+agent makes, and the config around it is valid, so nothing downstream would catch it.
 
 ### Where your base prompt lives
 
-`instructions` is the one section that **adds to** the agent rather than superseding it. A capability
-can only *contribute* instructions -- pydantic-ai appends every contribution to the agent's own -- so
-an `Agent(instructions='CODE')` with a managed `instructions` of `'MANAGED'` sends the model
-`"CODE\n\nMANAGED"`. That is on purpose: instructions are a composition point, and a section that
-replaced them wholesale would also silence toolset and MCP instructions, a skill catalog, and dynamic
-`@agent.instructions` functions (the ones injecting today's date or the signed-in user), all of which
-have to keep reaching the model.
+Instructions are a **composition point**, not a single field. Pydantic AI assembles them from every
+source that contributes one -- the agent's own literal, `@agent.instructions` functions injecting
+today's date or the signed-in user, each toolset and MCP server, each capability, a skill catalog --
+and a managed section that replaced the lot would silence all of them. So `instructions` works in two
+ways, and picking the wrong one is the difference between a prompt that reads well and one sent twice.
 
-So there are three places instructions can come from, and only one of them is where a *managed* base
-prompt belongs:
+**An entry with no `id` adds a block.** This is all a capability can do on its own: pydantic-ai appends
+every contribution to the agent's own, so an `Agent(instructions='CODE')` with a managed
+`'MANAGED'` sends the model `"CODE\n\nMANAGED"`.
+
+**An entry with an `id` swaps out an existing block** -- replacing its text, or dropping it with
+`null`. This is what reaches text no capability owns, the agent's own literal included. The keys come
+from pydantic-ai's [`InstructionPart.id`](https://ai.pydantic.dev/api/messages/#pydantic_ai.messages.InstructionPart.id):
+
+| `id` | Addresses |
+| --- | --- |
+| `agent` | the agent's own literal `instructions` |
+| `toolset:<id>` | everything a toolset with that `id` contributes |
+| `capability:<id>` | everything a capability with that `id` contributes |
+| `agent:<declared>` | one `@agent.instructions(id=...)` block |
+| `capability:<id>:<declared>` | one `@capability.instructions(id=...)` block |
+
+Blocks pydantic-ai cannot key have no entry that reaches them: a callable passed to
+`Agent(instructions=...)`, anything from `run(instructions=...)`, a toolset with no `id` of its own. An
+`id` that matches nothing in this deployment is inert rather than an error, so one config can be applied
+across services that don't all install the same toolsets.
+
+That gives three places instructions come from, and two ways a published config can act on each:
 
 | Where | Managed from Logfire? | What a published config does to it |
 | --- | --- | --- |
-| `Agent(instructions=...)` | No | Adds to it. The text is always sent and can't be edited or removed from the UI. |
+| `Agent(instructions=...)` | Only by `id` | Adds to it by default; `{"id": "agent", ...}` replaces or drops it. |
 | `AgentControl(instructions=...)` | It *is* the code-side default | **Supersedes** it -- the capability contributes the published value or the default, never both. |
 | The published `instructions` in Logfire | Yes | It is the value. |
 
-Put the base prompt on the capability, not on the agent:
+An `agent` override is the sharper tool, but the capability default is still the better home for a
+prompt you *intend* to manage: it supersedes rather than shadows, so there is only ever one copy of the
+text and no way for the two to drift.
 
 ```python
 from pydantic_ai import Agent
@@ -405,21 +446,33 @@ have no such trap: a managed `model`, `settings`, or `tool_definitions` supersed
 `Agent(model=...)`, `Agent(model_settings=...)`, and a tool's own docstring stay the natural code-side
 homes.
 
-> **The mistake to avoid.** Seeding a managed config from the agent's observed system prompt -- the
-> `example` snapshot the UI offers, or a prompt copied out of a trace -- while leaving the same text in
-> `Agent(instructions=...)` sends it to the model **twice**. Move the text to the capability first.
+> **The mistake to avoid.** Copying the agent's observed system prompt into a managed value as *added*
+> text -- a prompt lifted out of a trace, or the whole `example` snapshot -- while the same text stays
+> in `Agent(instructions=...)` sends every block of it to the model **twice**, and pins any dynamic
+> block (`Today is 2026-07-29.`) to whatever it said at the moment it was copied. Take the text over by
+> `id`, or move it to the capability; don't re-add it.
 
-Everything else keeps composing around whichever value the capability contributes. Pydantic AI groups
-static instruction text ahead of dynamic text (so providers can cache the stable prefix) and preserves
-source order within each group, which puts the managed instructions after the agent's own literal and
-`@agent.instructions` text and before dynamic toolset instructions. Only `agent.override(instructions=...)`
-replaces the lot, and a capability can't reach it.
+Added blocks compose the way a capability's instructions always have. Pydantic AI groups static
+instruction text ahead of dynamic text (so providers can cache the stable prefix) and preserves source
+order within each group, which puts them after the agent's own literal and `@agent.instructions` text
+and before dynamic toolset instructions. An override leaves its block's position and its `dynamic` flag
+alone -- replacing a dynamic block does not make it static -- so no override moves the cacheable prefix.
+Only `agent.override(instructions=...)` replaces the lot, and a capability can't reach it.
 
 ### Notes
 
-- **Instructions add, they never replace:** the managed value is appended to the agent's own, so a
-  base prompt you want to manage belongs on the capability (`AgentControl(instructions=...)`), which a
-  published config supersedes. See [Where your base prompt lives](#where-your-base-prompt-lives).
+- **Instructions add unless an entry names what it replaces:** an entry with no `id` is appended to the
+  agent's own, so a base prompt you want to manage belongs on the capability
+  (`AgentControl(instructions=...)`), which a published config supersedes. An entry *with* an `id` swaps
+  out that block instead. See [Where your base prompt lives](#where-your-base-prompt-lives).
+- **Overrides apply to the assembled prompt:** they are applied in `before_model_request`, the last
+  point at which every contribution exists, which is what lets an entry reach a toolset's or an MCP
+  server's text and not just the agent's. They land on
+  [`instruction_parts`](https://ai.pydantic.dev/api/models/base/#pydantic_ai.models.ModelRequestParameters.instruction_parts),
+  the source of truth for what the model is sent, so the rewritten prompt is what message history and
+  traces show too.
+- **Two entries naming the same thing keep the first,** with a warning -- the same rule as a colliding
+  tool rename, so a hand-edited value stays predictable instead of depending on JSON ordering.
 - **Tool definitions are overlays, never code:** the tool itself -- its implementation and its
   parameter schema structure -- stays exactly as written in code. Only the LLM-facing spec (name,
   description, parameter description strings) is remotely patchable, so a remote value can never
@@ -428,8 +481,9 @@ replaces the lot, and a capability can't reach it.
   tool routes back to the original implementation, and `ctx.tool_name` inside the tool is the
   original name. A rename that collides with a name another tool already advertises is dropped
   with a warning (other patches still apply) rather than breaking the run.
-- An override keyed to a tool that no longer exists is inert -- that's the drift case (the tool was
-  removed or renamed in code), and the Logfire UI is where it becomes visible.
+- An override naming a tool that no longer exists is inert -- that's the drift case (the tool was
+  removed or renamed in code), and the Logfire UI is where it becomes visible. An instruction entry
+  whose `id` matches nothing behaves the same way.
 - **Model precedence:** the managed `model` is sourced during model selection via the capability's
   `get_model` hook, so it slots in with the right precedence -- a call-site `run(model=...)` beats
   it, it beats the agent's constructor model, and a fully model-less agent (named or nameless) can be
@@ -452,9 +506,12 @@ replaces the lot, and a capability can't reach it.
   keys would break that by refusing the write.
 - **Forward compatibility covers values, not just keys:** a `thinking` effort level or a
   `service_tier` that a newer Pydantic AI accepts and this SDK has never heard of drops just that
-  setting, and a tool override that doesn't validate (an empty `new_name`, say) drops just that
-  override -- each with a warning naming the field and the offending value, emitted once per process
-  so a per-run resolution can't turn it into noise. Everything else in the config still applies. The
+  setting; a tool override that doesn't validate (a missing `name`, an empty `new_name`) drops just that
+  override; an instruction entry that doesn't validate (an empty text, an entry naming neither what nor
+  where) drops just that block -- each with a warning naming the offending value, emitted once per
+  process so a per-run resolution can't turn it into noise. Everything else in the config still
+  applies. Each list entry is a unit of degradation for the same reason: it addresses exactly one
+  thing, so dropping it costs exactly that thing. The
   alternative isn't stricter, it's blunter: an `AgentConfig` that fails validation falls back to the
   code-defined agent *whole*, so one unfamiliar enum value would silently un-manage the instructions,
   the model, and every tool override with it.

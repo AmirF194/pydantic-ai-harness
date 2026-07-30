@@ -48,7 +48,15 @@ dbos = [
 ]
 logfire = [
     'logfire>=4.31.0',
-    "pydantic-ai-slim[spec]>=2.14.1",
+    # STACKED ON pydantic-ai#6887 -- BOTH LINES BELOW CHANGE WHEN IT RELEASES.
+    # `AgentControl` reads `InstructionPart.id` to apply instruction overrides by key, which lands in the
+    # next pydantic-ai release. `>=2.21.0` is the floor this wants and is what must ship; it cannot be
+    # written yet because an unsatisfiable floor breaks `uv run` outright -- lint, format and typecheck
+    # included -- so the repo would be undevelopable rather than merely red. Until then the floor stays
+    # satisfiable and the source below resolves the real thing. On release: raise this to the release
+    # version and delete the `[tool.uv.sources]` block. Only this extra needs it; the base dependency
+    # stays put.
+    "pydantic-ai-slim[spec]>=2.20.0",
 ]
 modal = [
     "modal>=1.5.0",
@@ -94,6 +102,11 @@ lint = [
 
 [tool.hatch.version]
 source = 'uv-dynamic-versioning'
+
+# STACKED ON pydantic-ai#6887 -- DELETE THIS BLOCK WHEN IT RELEASES (see the `logfire` extra above).
+[tool.uv.sources]
+pydantic-ai-slim = { git = "https://github.com/pydantic/pydantic-ai.git", subdirectory = "pydantic_ai_slim", branch = "instruction-part-id" }
+
 
 [tool.uv-dynamic-versioning]
 vcs = 'git'

@@ -7,12 +7,14 @@ share them without copy-paste.
 
 from __future__ import annotations
 
+import json
 from collections.abc import Generator
 from contextlib import contextmanager
+from typing import Any
 
 import logfire
 from logfire.testing import CaptureLogfire
-from logfire.variables import VariablesConfig
+from logfire.variables import LabeledValue, Rollout, VariableConfig, VariablesConfig
 from opentelemetry.sdk.trace.export import SimpleSpanProcessor
 from pydantic_ai.messages import ModelMessage, ModelResponse, TextPart
 from pydantic_ai.models.function import AgentInfo, FunctionModel
@@ -40,6 +42,24 @@ def capture_tools(seen: list[ToolDefinition]) -> FunctionModel:
 def advertised(seen: list[ToolDefinition]) -> dict[str, str | None]:
     """The advertised `{name: description}` of each captured tool definition."""
     return {td.name: td.description for td in seen}
+
+
+def published_value(name: str, value: Any, *, label: str = 'production') -> VariablesConfig:
+    """A variables config in which `name` holds `value`, serialized as JSON, under one label.
+
+    The shape a Logfire project has once someone has saved a value in the UI: one labeled version at
+    full rollout, which is what a capability with a matching `label` then resolves.
+    """
+    return VariablesConfig(
+        variables={
+            name: VariableConfig(
+                name=name,
+                labels={label: LabeledValue(version=1, serialized_value=json.dumps(value))},
+                rollout=Rollout(labels={label: 1.0}),
+                overrides=[],
+            )
+        }
+    )
 
 
 @contextmanager

@@ -5,6 +5,7 @@ from pydantic_ai_harness.logfire._agent_control import (
     AgentConfig,
     AgentConfigSettings,
     AgentControl,
+    InstructionBlock,
     ToolDefinitionOverride,
 )
 from pydantic_ai_harness.logfire._managed_prompt import ManagedPrompt
@@ -15,6 +16,7 @@ __all__ = [
     'AgentControl',
     'AgentConfig',
     'AgentConfigSettings',
+    'InstructionBlock',
     'ManagedPrompt',
     'ToolDefinitionOverride',
     'resolution_reason',

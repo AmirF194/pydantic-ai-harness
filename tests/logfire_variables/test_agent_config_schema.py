@@ -19,6 +19,7 @@ from pydantic_ai_harness.logfire import (
     AGENT_CONFIG_JSON_SCHEMA,
     AgentConfig,
     AgentConfigSettings,
+    InstructionBlock,
     ToolDefinitionOverride,
 )
 
@@ -29,15 +30,25 @@ LOCKSTEP = (
     'schemas for the same agent.'
 )
 
+INSTRUCTIONS_SCHEMA: dict[str, Any] = AGENT_CONFIG_JSON_SCHEMA['properties']['instructions']
 SETTINGS_SCHEMA: dict[str, Any] = AGENT_CONFIG_JSON_SCHEMA['properties']['settings']
-TOOL_OVERRIDE_SCHEMA: dict[str, Any] = AGENT_CONFIG_JSON_SCHEMA['properties']['tool_definitions'][
-    'additionalProperties'
-]
+TOOL_OVERRIDE_SCHEMA: dict[str, Any] = AGENT_CONFIG_JSON_SCHEMA['properties']['tool_definitions']['items']
 
-# Every section populated, with every canonical setting and every override field, so the assertions
-# below cover the whole surface rather than the fields that happen to be interesting.
+# The object branch of an `instructions` entry, the other branch being a bare string.
+INSTRUCTION_BLOCK_SCHEMA: dict[str, Any] = next(
+    option for option in INSTRUCTIONS_SCHEMA['anyOf'][1]['items']['anyOf'] if option['type'] == 'object'
+)
+
+# Every section populated, with every canonical setting, every override field, and every kind of
+# instruction entry, so the assertions below cover the whole surface rather than the fields that
+# happen to be interesting.
 FULL_VALUE: dict[str, Any] = {
-    'instructions': 'Be concise.',
+    'instructions': [
+        'Be concise.',
+        {'id': 'agent', 'instructions': 'You are a refund specialist.'},
+        {'id': 'toolset:weather', 'instructions': None},
+        {'id': 'agent:today', 'instructions': 'It is Monday.', 'dynamic': True},
+    ],
     'model': 'openai:gpt-5',
     'settings': {
         'max_tokens': 2048,
@@ -54,22 +65,24 @@ FULL_VALUE: dict[str, Any] = {
         'service_tier': 'flex',
         'provider_options': {'anthropic': {'thinking': {'type': 'enabled', 'budget_tokens': 16384}}},
     },
-    'tool_definitions': {
-        'get_weather': {
+    'tool_definitions': [
+        {
+            'name': 'get_weather',
             'new_name': 'lookup_weather',
             'description': 'Look up the current weather for a city.',
             'parameter_descriptions': {'city': "City name, e.g. 'London'"},
         }
-    },
+    ],
 }
 
-_JSON_TYPES: dict[str, type | tuple[type, ...]] = {
+_JSON_TYPES: dict[str, type | tuple[type, ...] | None] = {
     'object': dict,
     'array': list,
     'string': str,
     'integer': int,
     'number': (int, float),
     'boolean': bool,
+    'null': None,
 }
 
 
@@ -81,8 +94,11 @@ def schema_errors(schema: dict[str, Any], value: Any, path: str = 'value') -> li
             errors.append(f'{path}: matches none of the allowed types')
         return errors
     expected: str = schema['type']
+    expected_type = _JSON_TYPES[expected]
+    if expected_type is None:
+        return [] if value is None else [f'{path}: expected null, got {type(value).__name__}']
     # `bool` is an `int` subclass, so a numeric schema has to reject `True` explicitly.
-    if not isinstance(value, _JSON_TYPES[expected]) or (expected in ('integer', 'number') and isinstance(value, bool)):
+    if not isinstance(value, expected_type) or (expected in ('integer', 'number') and isinstance(value, bool)):
         return [f'{path}: expected {expected}, got {type(value).__name__}']
     if expected == 'string' and len(value) < schema.get('minLength', 0):
         errors.append(f'{path}: shorter than minLength')
@@ -90,6 +106,8 @@ def schema_errors(schema: dict[str, Any], value: Any, path: str = 'value') -> li
         members: dict[str, Any] = value
         properties: dict[str, Any] = schema.get('properties', {})
         additional: dict[str, Any] | bool = schema.get('additionalProperties', True)
+        required: list[str] = schema.get('required', [])
+        errors.extend(f'{path}.{key}: required' for key in required if key not in members)
         for key, item in members.items():
             item_schema = properties.get(key, additional)
             if item_schema is False:
@@ -124,6 +142,7 @@ def test_every_model_field_is_described() -> None:
     assert set(AgentConfig.model_fields) == set(AGENT_CONFIG_JSON_SCHEMA['properties']), LOCKSTEP
     assert set(AgentConfigSettings.model_fields) == set(SETTINGS_SCHEMA['properties']), LOCKSTEP
     assert set(ToolDefinitionOverride.model_fields) == set(TOOL_OVERRIDE_SCHEMA['properties']), LOCKSTEP
+    assert set(InstructionBlock.model_fields) == set(INSTRUCTION_BLOCK_SCHEMA['properties']), LOCKSTEP
 
 
 def test_schema_is_permissive_at_every_level() -> None:
@@ -131,33 +150,92 @@ def test_schema_is_permissive_at_every_level() -> None:
     # built to tolerate, so the forward-compatibility contract lives in the stored schema too.
     for subschema in subschemas(AGENT_CONFIG_JSON_SCHEMA):
         assert subschema.get('additionalProperties') is not False, LOCKSTEP
-        assert 'required' not in subschema, LOCKSTEP
         assert 'enum' not in subschema, LOCKSTEP
-        # Optional by omission, not by a null union, and flat: no `$defs`/`$ref` indirection and none
-        # of Pydantic's `title`/`default` noise, which render badly in a form editor.
-        assert subschema.get('type') != 'null', LOCKSTEP
+        # Flat: no `$defs`/`$ref` indirection and none of Pydantic's `title`/`default` noise, which
+        # render badly in a form editor.
         assert not {'$defs', '$ref', 'title', 'default'} & set(subschema), LOCKSTEP
+
+
+def test_the_only_required_field_is_the_one_an_entry_is_useless_without() -> None:
+    # `required` is a write-time rejection, so it is only ever justified when the value it would reject
+    # cannot mean anything -- not merely when this release has no use for it. A tool overlay that names
+    # no tool patches nothing, and letting the UI save one would only produce a row that silently does
+    # nothing. Everything else stays optional by omission.
+    required = {
+        tuple(subschema['required']) for subschema in subschemas(AGENT_CONFIG_JSON_SCHEMA) if 'required' in subschema
+    }
+    assert required == {('name',)}, LOCKSTEP
+    assert TOOL_OVERRIDE_SCHEMA['required'] == ['name'], LOCKSTEP
+
+
+def test_null_is_only_offered_where_it_means_something() -> None:
+    # Optional-by-omission everywhere, so a `null` branch never exists just to spell out "unset". The
+    # one exception carries meaning: an instruction entry's `null` text is how a block gets dropped, so
+    # it has to be distinguishable from an entry that simply has no text yet.
+    nullable = [subschema for subschema in subschemas(AGENT_CONFIG_JSON_SCHEMA) if subschema.get('type') == 'null']
+    assert len(nullable) == 1, LOCKSTEP
+    assert {'type': 'null'} in INSTRUCTION_BLOCK_SCHEMA['properties']['instructions']['anyOf'], LOCKSTEP
+
+
+def test_empty_strings_are_rejected_wherever_they_would_be_meaningless() -> None:
+    # `''` is a half-filled field, never a value: `None`/omission already means "leave this to code".
+    # `model: ''` is the one that bites hardest -- Pydantic AI raises `Unknown model:` on every request
+    # -- and the config around it is otherwise valid, so nothing downstream would catch it.
+    assert schema_errors(AGENT_CONFIG_JSON_SCHEMA, {'model': ''}) == ['value.model: shorter than minLength']
+    assert schema_errors(AGENT_CONFIG_JSON_SCHEMA, {'instructions': ''}) == [
+        'value.instructions: matches none of the allowed types'
+    ]
+    assert schema_errors(AGENT_CONFIG_JSON_SCHEMA, {'instructions': [{'id': 'agent', 'instructions': ''}]}) == [
+        'value.instructions: matches none of the allowed types'
+    ]
+    assert schema_errors(AGENT_CONFIG_JSON_SCHEMA, {'tool_definitions': [{'name': ''}]}) == [
+        'value.tool_definitions[0].name: shorter than minLength'
+    ]
+    assert schema_errors(AGENT_CONFIG_JSON_SCHEMA, {'tool_definitions': [{'name': 't', 'new_name': ''}]}) == [
+        'value.tool_definitions[0].new_name: shorter than minLength'
+    ]
 
 
 def test_everything_agent_config_emits_validates() -> None:
     dumped = AgentConfig.model_validate(FULL_VALUE).model_dump(exclude_none=True)
-    assert dumped == FULL_VALUE, LOCKSTEP
     assert schema_errors(AGENT_CONFIG_JSON_SCHEMA, dumped) == [], LOCKSTEP
+    # A round trip normalizes each list entry to its object form and drops the fields it left unset,
+    # so the dumped value is the same config rather than the same bytes.
+    assert dumped['instructions'] == [
+        {'instructions': 'Be concise.'},
+        {'id': 'agent', 'instructions': 'You are a refund specialist.'},
+        {'id': 'toolset:weather'},
+        {'id': 'agent:today', 'instructions': 'It is Monday.', 'dynamic': True},
+    ]
+    assert {key: value for key, value in dumped.items() if key != 'instructions'} == {
+        key: value for key, value in FULL_VALUE.items() if key != 'instructions'
+    }
 
 
 def test_schema_shaped_value_round_trips() -> None:
     assert schema_errors(AGENT_CONFIG_JSON_SCHEMA, FULL_VALUE) == [], LOCKSTEP
     config = AgentConfig.model_validate(FULL_VALUE)
-    assert config.instructions == FULL_VALUE['instructions']
     assert config.model == FULL_VALUE['model']
     assert config.settings == AgentConfigSettings.model_validate(FULL_VALUE['settings'])
-    assert config.tool_definitions == {
-        'get_weather': ToolDefinitionOverride.model_validate(FULL_VALUE['tool_definitions']['get_weather'])
-    }
+    assert config.tool_definitions == [ToolDefinitionOverride.model_validate(FULL_VALUE['tool_definitions'][0])]
+    assert config.instructions == [
+        InstructionBlock(instructions='Be concise.'),
+        InstructionBlock(id='agent', instructions='You are a refund specialist.'),
+        InstructionBlock(id='toolset:weather'),
+        InstructionBlock(id='agent:today', instructions='It is Monday.', dynamic=True),
+    ]
+
+
+def test_a_bare_instructions_string_stays_a_bare_string() -> None:
+    # The shape a value was written in survives the round trip, so a config someone wrote (or the UI
+    # wrote before the list form existed) reads back the way they left it.
+    assert schema_errors(AGENT_CONFIG_JSON_SCHEMA, {'instructions': 'Be concise.'}) == []
+    assert AgentConfig.model_validate({'instructions': 'Be concise.'}).instructions == 'Be concise.'
 
 
 def test_boolean_thinking_and_empty_sections_validate() -> None:
-    assert schema_errors(AGENT_CONFIG_JSON_SCHEMA, {'settings': {'thinking': True}, 'tool_definitions': {}}) == []
+    assert schema_errors(AGENT_CONFIG_JSON_SCHEMA, {'settings': {'thinking': True}, 'tool_definitions': []}) == []
+    assert schema_errors(AGENT_CONFIG_JSON_SCHEMA, {'instructions': []}) == []
 
 
 def test_unknown_keys_are_accepted_everywhere() -> None:
@@ -167,7 +245,8 @@ def test_unknown_keys_are_accepted_everywhere() -> None:
     value = {
         'future_section': {'anything': 1},
         'settings': {'future_setting': 'raw json'},
-        'tool_definitions': {'get_weather': {'future_override': ['x']}},
+        'tool_definitions': [{'name': 'get_weather', 'future_override': ['x']}],
+        'instructions': [{'id': 'agent', 'instructions': 'x', 'future_field': 1}],
     }
     assert schema_errors(AGENT_CONFIG_JSON_SCHEMA, value) == [], LOCKSTEP
     assert AgentConfig.model_validate(value).settings is not None
@@ -175,7 +254,10 @@ def test_unknown_keys_are_accepted_everywhere() -> None:
 
 def test_wrong_types_are_rejected() -> None:
     assert schema_errors(AGENT_CONFIG_JSON_SCHEMA, {'instructions': 5}) == [
-        'value.instructions: expected string, got int'
+        'value.instructions: matches none of the allowed types'
+    ]
+    assert schema_errors(AGENT_CONFIG_JSON_SCHEMA, {'tool_definitions': {'get_weather': {}}}) == [
+        'value.tool_definitions: expected array, got dict'
     ]
     assert schema_errors(AGENT_CONFIG_JSON_SCHEMA, {'settings': {'max_tokens': True}}) == [
         'value.settings.max_tokens: expected integer, got bool'
@@ -186,11 +268,11 @@ def test_wrong_types_are_rejected() -> None:
     assert schema_errors(AGENT_CONFIG_JSON_SCHEMA, {'settings': {'stop_sequences': [1]}}) == [
         'value.settings.stop_sequences[0]: expected string, got int'
     ]
-    # An empty `new_name` is the one value constraint the schema keeps: it is structural rather than
-    # versioned, so it is worth refusing at write time instead of leaving the SDK to drop the override
-    # (see `test_agent_config_skew.py`) on every read.
-    assert schema_errors(AGENT_CONFIG_JSON_SCHEMA, {'tool_definitions': {'t': {'new_name': ''}}}) == [
-        'value.tool_definitions.t.new_name: shorter than minLength'
+
+
+def test_a_tool_overlay_must_name_its_tool() -> None:
+    assert schema_errors(AGENT_CONFIG_JSON_SCHEMA, {'tool_definitions': [{'description': 'x'}]}) == [
+        'value.tool_definitions[0].name: required'
     ]
 
 
