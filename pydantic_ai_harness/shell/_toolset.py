@@ -126,8 +126,6 @@ class ShellToolset(FunctionToolset[AgentDepsT]):
 
         if self._allowed_commands and self._denied_commands:
             raise ValueError('Specify allowed_commands or denied_commands, not both.')
-        if max_output_chars <= 0:
-            raise ValueError('max_output_chars must be a positive integer.')
 
         self.add_function(self.run_command, name='run_command')
         self.add_function(self.start_command, name='start_command')
@@ -228,7 +226,7 @@ class ShellToolset(FunctionToolset[AgentDepsT]):
         """
         return truncate_tail(text, self._max_output_chars)
 
-    def _join_metadata_and_output(self, metadata: list[str], output: str) -> str:
+    def _join_metadata_and_output(self, metadata: Sequence[str], output: str) -> str:
         """Keep background-command metadata when there is room inside the output cap."""
         prefix = '\n'.join(metadata)
         output_budget = self._max_output_chars - len(prefix) - 1
@@ -238,8 +236,7 @@ class ShellToolset(FunctionToolset[AgentDepsT]):
 
     def _unknown_command_error(self, command_id: str) -> str:
         """Report an unknown ID without allowing its value to hide the error."""
-        message = f'[Error: unknown command ID {command_id!r}]'
-        return truncate_head(message, self._max_output_chars)
+        return truncate_head(f'[Error: unknown command ID {command_id!r}]', self._max_output_chars)
 
     def _build_cwd_capture(self, command: str) -> tuple[str, Path | None]:
         """Wrap a command to record its final working directory out-of-band.
@@ -523,8 +520,7 @@ class ShellToolset(FunctionToolset[AgentDepsT]):
         del self._background[command_id]
         await bg.proc.aclose()
 
-        stopped = f'[stopped: {bg.command!r}]'
-        parts = [stopped]
+        parts = [f'[stopped: {bg.command!r}]']
         if bg.exit_code is not None:
             parts.append(f'[exit code: {bg.exit_code}]')
         output_sections: list[str] = []
@@ -533,6 +529,6 @@ class ShellToolset(FunctionToolset[AgentDepsT]):
         if stderr:
             output_sections.append(f'[stderr]\n{stderr}')
         output = '\n'.join(output_sections) if output_sections else '(no output)'
-        if sum(len(part) for part in parts) + len(parts) + len(output) > self._max_output_chars:
+        if len('\n'.join([*parts, output])) > self._max_output_chars:
             parts[0] = '[stopped]'
         return self._join_metadata_and_output(parts, output)
