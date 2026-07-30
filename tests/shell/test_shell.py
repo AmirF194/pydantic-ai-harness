@@ -733,12 +733,22 @@ class TestProcessGroupKill:
 
 class TestBackgroundCommands:
     async def test_start_command_returns_id(self, shell_dir: Path) -> None:
-        ts = _shell_toolset(shell_dir, max_output_chars=1)
+        ts = _shell_toolset(shell_dir)
         result = await _call_shell_tool(ts, 'start_command', command='sleep 100')
         assert 'ID:' in result
         assert 'Started background command' in result
-        assert len(result) > 1
         command_id = _parse_command_id(result)
+        await ts.stop_command(command_id)
+
+    async def test_start_command_long_echo_is_capped_keeping_id(self, shell_dir: Path) -> None:
+        # The command echo is subject to the cap like any other output; the ID
+        # line is the tail, so truncation keeps it usable for check/stop calls.
+        ts = _shell_toolset(shell_dir, max_output_chars=80)
+        result = await _call_shell_tool(ts, 'start_command', command='true ' + 'x' * 200)
+        assert len(result) == 80
+        assert 'output truncated' in result
+        command_id = _parse_command_id(result)
+        assert len(command_id) == 12
         await ts.stop_command(command_id)
 
     async def test_check_unknown_id(self, toolset: ShellToolset[None]) -> None:

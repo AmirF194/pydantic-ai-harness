@@ -161,9 +161,14 @@ class ShellToolset(FunctionToolset[AgentDepsT]):
         ctx: RunContext[AgentDepsT],
         tool: ToolsetTool[AgentDepsT],
     ) -> Any:
-        """Enforce the model-visible output cap at the tool dispatch seam."""
+        """Enforce the model-visible output cap at the tool dispatch seam.
+
+        Tools place control metadata (status, exit code, `start_command`'s ID
+        line) at the end of their responses, so keeping the tail preserves it
+        without any per-tool cases here.
+        """
         result = await super().call_tool(name, tool_args, ctx, tool)
-        if name == 'start_command' or not isinstance(result, str):
+        if not isinstance(result, str):
             return result
         return truncate_tail(result, self._max_output_chars)
 
