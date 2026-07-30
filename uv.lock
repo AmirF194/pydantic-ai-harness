@@ -2418,6 +2418,9 @@ mongodb = [
 skills = [
     { name = "pyyaml" },
 ]
+stackone = [
+    { name = "pydantic-ai-slim", extra = ["mcp"] },
+]
 temporal = [
     { name = "pydantic-ai-slim", extra = ["temporal"] },
 ]
@@ -2453,6 +2456,7 @@ requires-dist = [
     { name = "pydantic-ai-slim", specifier = ">=2.18.0" },
     { name = "pydantic-ai-slim", marker = "extra == 'aws-lambda'", specifier = ">=2.15.0" },
     { name = "pydantic-ai-slim", extras = ["dbos"], marker = "extra == 'dbos'" },
+    { name = "pydantic-ai-slim", extras = ["mcp"], marker = "extra == 'stackone'", specifier = ">=2.18.0" },
     { name = "pydantic-ai-slim", extras = ["spec"], marker = "extra == 'logfire'", specifier = ">=2.18.0" },
     { name = "pydantic-ai-slim", extras = ["temporal"], marker = "extra == 'temporal'" },
     { name = "pydantic-monty", marker = "extra == 'code-mode'", specifier = ">=0.0.19" },
@@ -2461,7 +2465,7 @@ requires-dist = [
     { name = "pymongo", marker = "extra == 'mongodb'", specifier = ">=4.17.0" },
     { name = "pyyaml", marker = "extra == 'skills'", specifier = ">=6.0.2" },
 ]
-provides-extras = ["acp", "aws-lambda", "code-mode", "codemode", "dbos", "dynamic-workflow", "exa", "logfire", "modal", "mongodb", "skills", "temporal"]
+provides-extras = ["acp", "aws-lambda", "code-mode", "codemode", "dbos", "dynamic-workflow", "exa", "logfire", "modal", "mongodb", "skills", "stackone", "temporal"]
 
 [package.metadata.requires-dev]
 dev = [
