@@ -2369,6 +2369,9 @@ restate = [
 skills = [
     { name = "pyyaml" },
 ]
+stackone = [
+    { name = "pydantic-ai-slim", extra = ["mcp"] },
+]
 temporal = [
     { name = "pydantic-ai-slim", extra = ["temporal"] },
 ]
@@ -2403,6 +2406,7 @@ requires-dist = [
     { name = "pydantic-ai-slim", git = "https://github.com/pydantic/pydantic-ai.git?subdirectory=pydantic_ai_slim&branch=claude%2Fdurable-base-declarative" },
     { name = "pydantic-ai-slim", marker = "extra == 'restate'", git = "https://github.com/pydantic/pydantic-ai.git?subdirectory=pydantic_ai_slim&branch=claude%2Fdurable-base-declarative" },
     { name = "pydantic-ai-slim", extras = ["dbos"], marker = "extra == 'dbos'", git = "https://github.com/pydantic/pydantic-ai.git?subdirectory=pydantic_ai_slim&branch=claude%2Fdurable-base-declarative" },
+    { name = "pydantic-ai-slim", extras = ["mcp"], marker = "extra == 'stackone'", git = "https://github.com/pydantic/pydantic-ai.git?subdirectory=pydantic_ai_slim&branch=claude%2Fdurable-base-declarative" },
     { name = "pydantic-ai-slim", extras = ["spec"], marker = "extra == 'logfire'", git = "https://github.com/pydantic/pydantic-ai.git?subdirectory=pydantic_ai_slim&branch=claude%2Fdurable-base-declarative" },
     { name = "pydantic-ai-slim", extras = ["temporal"], marker = "extra == 'temporal'", git = "https://github.com/pydantic/pydantic-ai.git?subdirectory=pydantic_ai_slim&branch=claude%2Fdurable-base-declarative" },
     { name = "pydantic-monty", marker = "extra == 'code-mode'", specifier = ">=0.0.19" },
@@ -2412,7 +2416,7 @@ requires-dist = [
     { name = "pyyaml", marker = "extra == 'skills'", specifier = ">=6.0.2" },
     { name = "restate-sdk", marker = "extra == 'restate'", specifier = ">=1.0.2" },
 ]
-provides-extras = ["acp", "code-mode", "codemode", "dbos", "dynamic-workflow", "exa", "logfire", "modal", "mongodb", "restate", "skills", "temporal"]
+provides-extras = ["acp", "code-mode", "codemode", "dbos", "dynamic-workflow", "exa", "logfire", "modal", "mongodb", "restate", "skills", "stackone", "temporal"]
 
 [package.metadata.requires-dev]
 dev = [
@@ -2436,8 +2440,8 @@ lint = [
 
 [[package]]
 name = "pydantic-ai-slim"
-version = "2.20.1.dev15+1b1cd262"
-source = { git = "https://github.com/pydantic/pydantic-ai.git?subdirectory=pydantic_ai_slim&branch=claude%2Fdurable-base-declarative#1b1cd26205cdba9bf5d569f98f8b5d491729c118" }
+version = "2.21.1.dev10+5fdff448"
+source = { git = "https://github.com/pydantic/pydantic-ai.git?subdirectory=pydantic_ai_slim&branch=claude%2Fdurable-base-declarative#5fdff448714eb164c1dde1c2d437c91e727b93fd" }
 dependencies = [
     { name = "exceptiongroup", marker = "python_full_version < '3.11'" },
     { name = "genai-prices" },
@@ -2582,8 +2586,8 @@ wheels = [
 
 [[package]]
 name = "pydantic-graph"
-version = "2.20.1.dev15+1b1cd262"
-source = { git = "https://github.com/pydantic/pydantic-ai.git?subdirectory=pydantic_graph&branch=claude%2Fdurable-base-declarative#1b1cd26205cdba9bf5d569f98f8b5d491729c118" }
+version = "2.21.1.dev10+5fdff448"
+source = { git = "https://github.com/pydantic/pydantic-ai.git?subdirectory=pydantic_graph&branch=claude%2Fdurable-base-declarative#5fdff448714eb164c1dde1c2d437c91e727b93fd" }
 dependencies = [
     { name = "httpx" },
     { name = "logfire-api" },
