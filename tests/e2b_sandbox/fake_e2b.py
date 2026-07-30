@@ -2,11 +2,18 @@
 
 from __future__ import annotations
 
+import os
 import posixpath
 import re
+import shlex
+import shutil
+import signal
+import subprocess
+import tempfile
 import types
 from collections.abc import Callable
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Literal, overload
 
 import anyio
@@ -142,6 +149,50 @@ class FakeCommandHandle:
         return True
 
 
+class LocalCommandHandle(FakeCommandHandle):
+    """Handle for the focused real-shell capture-wrapper reproduction."""
+
+    def __init__(
+        self,
+        control: FakeE2B,
+        *,
+        process: subprocess.Popen[bytes],
+        local_dir: Path,
+        remote_dir: str,
+        filesystem: FakeFilesystem,
+    ) -> None:
+        super().__init__(
+            control,
+            result=FakeCommandResult('', '', 0),
+            wait_error=TimeoutException('deadline'),
+        )
+        self.pid = process.pid
+        self._process = process
+        self._local_dir = local_dir
+        self._remote_dir = remote_dir
+        self._filesystem = filesystem
+
+    async def wait(self) -> FakeCommandResult:
+        partial = self._local_dir / 'stderr.partial'
+        with anyio.fail_after(5):
+            while not partial.exists() or partial.read_bytes() != b'warning':
+                await anyio.sleep(0.01)
+        return await super().wait()
+
+    async def kill(self) -> bool:
+        try:
+            if self._process.poll() is None:  # pragma: no branch - the test command remains asleep until killed
+                os.killpg(self._process.pid, signal.SIGKILL)
+                self._process.wait()
+            for name in ('stdout.partial', 'stderr.partial'):
+                source = self._local_dir / name
+                if source.exists():  # pragma: no branch - the wrapper creates both prefix files before waiting
+                    self._filesystem.files[posixpath.join(self._remote_dir, name)] = source.read_bytes()
+        finally:
+            shutil.rmtree(self._local_dir, ignore_errors=True)
+        return await super().kill()
+
+
 class FakeFilesystem:
     """Dictionary-backed E2B filesystem."""
 
@@ -151,6 +202,7 @@ class FakeFilesystem:
         self.stat_sizes: dict[str, int] = {}
         self.listings: dict[str, list[FakeEntryInfo]] = {}
         self.removed: list[str] = []
+        self.read_formats: list[str] = []
 
     async def get_info(self, path: str) -> FakeEntryInfo:
         if self._control.info_error is not None:
@@ -160,34 +212,21 @@ class FakeFilesystem:
         size = self.stat_sizes.get(path, len(self.files.get(path, b'')))
         return FakeEntryInfo(posixpath.basename(path), path, FakeFileType('file'), size)
 
-    @overload
-    async def read(self, path: str, format: Literal['bytes']) -> bytearray: ...  # pragma: no cover
-
-    @overload
     async def read(
         self,
         path: str,
         format: Literal['stream'],
         *,
         stream_idle_timeout: float | None = None,
-    ) -> FakeFileStream: ...  # pragma: no cover
-
-    async def read(
-        self,
-        path: str,
-        format: Literal['bytes', 'stream'],
-        *,
-        stream_idle_timeout: float | None = None,
-    ) -> bytearray | FakeFileStream:
+    ) -> FakeFileStream:
         del stream_idle_timeout
+        self.read_formats.append(format)
         if self._control.read_error is not None:
             raise self._control.read_error
         try:
             data = self.files[path]
         except KeyError as e:
             raise FileNotFoundException(path) from e
-        if format == 'bytes':
-            return bytearray(data)
         return FakeFileStream(data, self._control.file_chunk_size)
 
     async def write(self, path: str, data: str | bytes) -> object:
@@ -256,16 +295,37 @@ class FakeCommands:
                 raise self._control.kill_process_error
             return FakeCommandResult('', '', 0)
 
-        wrapper_path = command.rsplit(' ', 1)[-1]
+        command_parts = shlex.split(command)
+        wrapper_path = command_parts[command_parts.index('/bin/bash') + 1]
         temp_dir = posixpath.dirname(wrapper_path)
         command_text = self._sandbox.files.files[f'{temp_dir}/command.sh'].decode()
         wrapper = self._sandbox.files.files[wrapper_path].decode()
+        if self._control.execute_capture_wrapper:
+            local_dir = Path(tempfile.mkdtemp(prefix='pydantic-ai-harness-test-'))
+            local_wrapper = wrapper.replace(temp_dir, str(local_dir))
+            (local_dir / 'command.sh').write_text(command_text)
+            (local_dir / 'capture.sh').write_text(local_wrapper)
+            process = subprocess.Popen(
+                ['/bin/bash', str(local_dir / 'capture.sh')],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,
+            )
+            handle = LocalCommandHandle(
+                self._control,
+                process=process,
+                local_dir=local_dir,
+                remote_dir=temp_dir,
+                filesystem=self._sandbox.files,
+            )
+            self.handles.append(handle)
+            return handle
         tail_match = re.search(r'tail -c (\d+)', wrapper)
-        head_match = re.search(r'head -c (\d+)', wrapper)
-        if tail_match is None or head_match is None:  # pragma: no cover - asserts Harness's private wrapper contract
+        prefix_match = re.search(r'dd bs=1 count=(\d+)', wrapper)
+        if tail_match is None or prefix_match is None:  # pragma: no cover - asserts Harness's private wrapper contract
             raise AssertionError('Harness capture wrapper did not contain the byte limits')
         byte_limit = int(tail_match.group(1))
-        if int(head_match.group(1)) != byte_limit + 1:  # pragma: no cover - asserts Harness's private wrapper contract
+        if int(prefix_match.group(1)) != byte_limit + 1:  # pragma: no cover - asserts private wrapper contract
             raise AssertionError('Harness prefix capture must hold one byte past the tail limit')
         stdout, stderr, exit_code = self._control.responder(command_text, int(timeout or 0))
         if not self._control.omit_capture:
@@ -277,6 +337,8 @@ class FakeCommands:
             else:
                 self._write_capture(temp_dir, 'stdout', stdout, byte_limit)
                 self._write_capture(temp_dir, 'stderr', stderr, byte_limit)
+        for name, data in self._control.capture_overrides.items():
+            self._sandbox.files.files[posixpath.join(temp_dir, name)] = data
         result = FakeCommandResult(
             self._control.sdk_stdout,
             self._control.sdk_stderr,
@@ -378,6 +440,8 @@ class FakeE2B:
         self.omit_capture = False
         self.omit_count = False
         self.invalid_count = False
+        self.capture_overrides: dict[str, bytes] = {}
+        self.execute_capture_wrapper = False
         self.sdk_stdout = ''
         self.sdk_stderr = ''
         self.file_chunk_size = 4

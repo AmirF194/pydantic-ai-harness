@@ -8,6 +8,9 @@ import types
 
 import anyio
 import pytest
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 
 from pydantic_ai_harness.e2b_sandbox import (
     E2BSandboxAuthError,
@@ -197,6 +200,22 @@ class TestConfigurationAndErrors:
             async with E2BSandboxSession():
                 pass  # pragma: no cover
 
+    async def test_create_error_span_does_not_record_provider_message(self, fake_e2b: FakeE2B) -> None:
+        exporter = InMemorySpanExporter()
+        provider = TracerProvider()
+        provider.add_span_processor(SimpleSpanProcessor(exporter))
+        fake_e2b.create_error = SandboxException('secret provider diagnostic')
+
+        with pytest.raises(E2BSandboxError, match='secret provider diagnostic'):
+            async with E2BSandboxSession(tracer=provider.get_tracer('test')):
+                pass  # pragma: no cover
+
+        span = next(span for span in exporter.get_finished_spans() if span.name == 'e2b.sandbox.create')
+        assert span.attributes is not None
+        assert span.attributes['e2b.outcome'] == 'error'
+        assert not span.events
+        assert 'secret' not in repr(span)
+
     async def test_missing_attached_id_is_named(self, fake_e2b: FakeE2B) -> None:
         fake_e2b.connect_error = SandboxNotFoundException('gone')
         with pytest.raises(E2BSandboxUnavailableError, match="'sbx-missing'"):
@@ -205,6 +224,14 @@ class TestConfigurationAndErrors:
 
 
 class TestExec:
+    @pytest.mark.skipif(sys.platform == 'win32', reason='E2B command capture requires POSIX process groups')
+    async def test_timeout_wrapper_flushes_short_output_incrementally(self, fake_e2b: FakeE2B) -> None:
+        fake_e2b.execute_capture_wrapper = True
+        async with E2BSandboxSession() as session:
+            result = await session.exec('printf warning >&2; sleep 30', timeout=1, max_output_bytes=100)
+        assert result.stderr == 'warning'
+        assert result.timed_out is True
+
     async def test_success_and_bounded_tail(self, fake_e2b: FakeE2B) -> None:
         fake_e2b.responder = lambda command, timeout: ('A' * 20 + 'END', 'warning', 0)
         async with E2BSandboxSession(workdir='/project') as session:
@@ -220,16 +247,46 @@ class TestExec:
         assert result.applied_timeout == 7
         assert fake_e2b.sandboxes[0].files.removed
 
-    async def test_nonzero_exit_and_sdk_diagnostics(self, fake_e2b: FakeE2B) -> None:
+    async def test_sdk_streams_are_redirected_and_discarded(self, fake_e2b: FakeE2B) -> None:
         fake_e2b.responder = lambda command, timeout: ('out', 'err', 9)
         fake_e2b.sdk_stdout = 'wrapper out'
         fake_e2b.sdk_stderr = 'wrapper err'
         async with E2BSandboxSession() as session:
             result = await session.exec('exit 9', timeout=3, max_output_bytes=100)
-        assert result.stdout == 'out\nwrapper out'
-        assert result.stderr == 'err\nwrapper err'
+        assert result.stdout == 'out'
+        assert result.stderr == 'err'
         assert result.returncode == 9
         assert result.timed_out is False
+        assert fake_e2b.sandboxes[0].commands.calls[0].command.endswith('>/dev/null 2>&1')
+
+    @pytest.mark.parametrize(
+        ('capture_name', 'capture_size', 'max_output_bytes', 'read_limit'),
+        [
+            ('stdout', 101, 100, 100),
+            ('stdout.count', 65, 100, 64),
+        ],
+    )
+    async def test_completed_capture_files_are_read_with_bounds(
+        self,
+        fake_e2b: FakeE2B,
+        capture_name: str,
+        capture_size: int,
+        max_output_bytes: int,
+        read_limit: int,
+    ) -> None:
+        fake_e2b.capture_overrides[capture_name] = b'1' * capture_size
+        async with E2BSandboxSession() as session:
+            with pytest.raises(E2BSandboxError, match=rf'{read_limit}-byte read limit'):
+                await session.exec('true', timeout=3, max_output_bytes=max_output_bytes)
+            assert set(fake_e2b.sandboxes[0].files.read_formats) == {'stream'}
+
+    async def test_timeout_capture_file_is_read_with_a_bound(self, fake_e2b: FakeE2B) -> None:
+        fake_e2b.wait_error = TimeoutException('deadline')
+        fake_e2b.capture_overrides['stdout.partial'] = b'x' * 102
+        async with E2BSandboxSession() as session:
+            with pytest.raises(E2BSandboxError, match='101-byte read limit'):
+                await session.exec('sleep 99', timeout=3, max_output_bytes=100)
+            assert set(fake_e2b.sandboxes[0].files.read_formats) == {'stream'}
 
     async def test_timeout_kills_process_group_and_handle(self, fake_e2b: FakeE2B) -> None:
         fake_e2b.responder = lambda command, timeout: ('partial', '', 0)

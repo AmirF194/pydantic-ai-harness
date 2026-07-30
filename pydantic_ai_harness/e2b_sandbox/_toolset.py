@@ -181,7 +181,11 @@ class E2BSandboxToolset(FunctionToolset[AgentDepsT]):
         """
         session = self._require_session()
         timeout = self._command_timeout(timeout_seconds)
-        with self._operation_tracer().start_as_current_span('e2b.sandbox.run_command') as span:
+        with self._operation_tracer().start_as_current_span(
+            'e2b.sandbox.run_command',
+            record_exception=False,
+            set_status_on_exception=False,
+        ) as span:
             self._set_span_base(span, session, 'run_command')
             span.set_attribute('e2b.command.timeout_seconds', timeout)
             try:
@@ -237,7 +241,11 @@ class E2BSandboxToolset(FunctionToolset[AgentDepsT]):
             limit: Maximum number of lines to read.
         """
         session = self._require_session()
-        with self._operation_tracer().start_as_current_span('e2b.sandbox.read_file') as span:
+        with self._operation_tracer().start_as_current_span(
+            'e2b.sandbox.read_file',
+            record_exception=False,
+            set_status_on_exception=False,
+        ) as span:
             self._set_span_base(span, session, 'read_file')
             try:
                 guard_read_size(await session.file_size(path), max_bytes=self._max_read_bytes)
@@ -275,7 +283,11 @@ class E2BSandboxToolset(FunctionToolset[AgentDepsT]):
             data = content.encode('utf-8')
         except UnicodeEncodeError:
             raise ModelRetry('content contains characters that cannot be encoded as UTF-8 (unpaired surrogates).')
-        with self._operation_tracer().start_as_current_span('e2b.sandbox.write_file') as span:
+        with self._operation_tracer().start_as_current_span(
+            'e2b.sandbox.write_file',
+            record_exception=False,
+            set_status_on_exception=False,
+        ) as span:
             self._set_span_base(span, session, 'write_file')
             try:
                 await session.write_bytes(path, data)
@@ -296,7 +308,11 @@ class E2BSandboxToolset(FunctionToolset[AgentDepsT]):
             path: Sandbox path, relative to the configured working directory when needed.
         """
         session = self._require_session()
-        with self._operation_tracer().start_as_current_span('e2b.sandbox.list_directory') as span:
+        with self._operation_tracer().start_as_current_span(
+            'e2b.sandbox.list_directory',
+            record_exception=False,
+            set_status_on_exception=False,
+        ) as span:
             self._set_span_base(span, session, 'list_directory')
             try:
                 entries = await session.list_files(path)

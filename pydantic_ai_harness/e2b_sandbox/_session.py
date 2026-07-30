@@ -4,9 +4,12 @@ External assumptions last verified 2026-07-29 against E2B Python SDK 2.35.0:
 
 * `AsyncSandbox.create`, `connect`, and `kill` provide the owned/attached lifecycle:
   https://github.com/e2b-dev/E2B/blob/main/packages/python-sdk/e2b/sandbox_async/main.py
-* foreground command results buffer all output, so bounded command capture must happen
-  inside the sandbox before the SDK receives it:
+* command handles buffer all process output. Harness redirects the capture
+  wrapper's streams away from the SDK and bounds every internal capture-file read:
   https://github.com/e2b-dev/E2B/blob/main/packages/python-sdk/e2b/sandbox_async/commands/command_handle.py
+* E2B starts commands through `/bin/bash -l -c`, so login startup output occurs
+  before command-level redirection and cannot be bounded through the public API:
+  https://github.com/e2b-dev/E2B/blob/main/packages/python-sdk/e2b/sandbox_async/commands/command.py
 * the default `base` template contains Bash, GNU coreutils, and `setsid` (util-linux),
   which the bounded capture wrapper uses:
   https://github.com/e2b-dev/E2B/blob/main/templates/base/e2b.Dockerfile
@@ -38,6 +41,7 @@ DEFAULT_WORKDIR = '/home/user'
 _CREATE_TIMEOUT = 120
 _TEARDOWN_TIMEOUT = 30
 _INTERNAL_COMMAND_TIMEOUT = 10
+_CAPTURE_COUNT_MAX_BYTES = 64
 _TIMEOUT_EXIT_CODE = 124
 
 _MISSING_E2B = (
@@ -48,18 +52,12 @@ _AUTH_MESSAGE = 'E2B rejected the credentials. Set a valid E2B_API_KEY in the en
 
 
 class _CommandResult(Protocol):  # pragma: no cover - structural typing only
-    stdout: str
-    stderr: str
     exit_code: int
-    error: str | None
 
 
 @runtime_checkable
 class _CommandFailure(Protocol):  # pragma: no cover - structural typing only
-    stdout: str
-    stderr: str
     exit_code: int
-    error: str | None
 
 
 class _CommandHandle(Protocol):  # pragma: no cover - structural typing only
@@ -114,10 +112,6 @@ class _AsyncFileStream(Protocol):  # pragma: no cover - structural typing only
 class _Filesystem(Protocol):  # pragma: no cover - structural typing only
     async def get_info(self, path: str) -> _EntryInfo: ...
 
-    @overload
-    async def read(self, path: str, format: Literal['bytes']) -> bytearray: ...
-
-    @overload
     async def read(
         self,
         path: str,
@@ -220,7 +214,7 @@ def _capture_wrapper(temp_dir: str, max_output_bytes: int) -> str:
 
     `tail -c` and `wc -c` only flush at EOF, so a timed-out command (killed before
     its streams close) leaves both files empty. Each stream is therefore also teed
-    into a FIFO drained by `head -c limit+1`, which writes a bounded prefix
+    into a FIFO drained byte-by-byte by `dd`, which writes a bounded prefix
     incrementally and keeps a reader attached afterwards (`cat`), so tee never
     loses a reader and a SIGKILLed pipeline still leaves partial output on disk.
     The extra byte past the limit makes timeout truncation detection exact.
@@ -247,13 +241,13 @@ wc -c < {stdout_count_stream} > {stdout_count} &
 stdout_count_pid=$!
 tee {stdout_count_stream} {stdout_partial_stream} < {stdout_stream} | tail -c {limit} > {stdout_path} &
 stdout_capture_pid=$!
-{{ head -c {prefix_limit} > {stdout_partial}; cat > /dev/null; }} < {stdout_partial_stream} &
+{{ dd bs=1 count={prefix_limit} of={stdout_partial} 2> /dev/null; cat > /dev/null; }} < {stdout_partial_stream} &
 stdout_partial_pid=$!
 wc -c < {stderr_count_stream} > {stderr_count} &
 stderr_count_pid=$!
 tee {stderr_count_stream} {stderr_partial_stream} < {stderr_stream} | tail -c {limit} > {stderr_path} &
 stderr_capture_pid=$!
-{{ head -c {prefix_limit} > {stderr_partial}; cat > /dev/null; }} < {stderr_partial_stream} &
+{{ dd bs=1 count={prefix_limit} of={stderr_partial} 2> /dev/null; cat > /dev/null; }} < {stderr_partial_stream} &
 stderr_partial_pid=$!
 /bin/bash {command_path} > {stdout_stream} 2> {stderr_stream}
 command_status=$?
@@ -349,7 +343,11 @@ class E2BSandboxSession:
                 'Use a separate session per concurrent context.'
             )
         operation = 'connect' if self._sandbox_id is not None else 'create'
-        with self._tracer.start_as_current_span(f'e2b.sandbox.{operation}') as span:
+        with self._tracer.start_as_current_span(
+            f'e2b.sandbox.{operation}',
+            record_exception=False,
+            set_status_on_exception=False,
+        ) as span:
             span.set_attribute('e2b.sandbox.mode', self.mode)
             if self._template is not None:
                 span.set_attribute('e2b.sandbox.template', self._template)
@@ -421,7 +419,11 @@ class E2BSandboxSession:
             self._sandbox = None
             return
         e2b = _load_e2b()
-        with self._tracer.start_as_current_span('e2b.sandbox.kill') as span:
+        with self._tracer.start_as_current_span(
+            'e2b.sandbox.kill',
+            record_exception=False,
+            set_status_on_exception=False,
+        ) as span:
             span.set_attribute('e2b.sandbox.id', sandbox.sandbox_id)
             span.set_attribute('e2b.sandbox.mode', 'owned')
             try:
@@ -486,28 +488,23 @@ class E2BSandboxSession:
         command_path = posixpath.join(temp_dir, 'command.sh')
         wrapper_path = posixpath.join(temp_dir, 'capture.sh')
         handle: _CommandHandle | None = None
-        sdk_stdout = ''
-        sdk_stderr = ''
         returncode = 0
         timed_out = False
 
         try:
             await sandbox.files.write(command_path, command)
             await sandbox.files.write(wrapper_path, _capture_wrapper(temp_dir, max_output_bytes))
-            run = f'exec setsid /bin/bash {shlex.quote(wrapper_path)}'
+            # Keep the wrapper's inherited streams out of the SDK's unbounded buffers.
+            run = f'exec setsid /bin/bash {shlex.quote(wrapper_path)} >/dev/null 2>&1'
             handle = await sandbox.commands.run(run, background=True, cwd=self._workdir, timeout=timeout)
             try:
                 result = await handle.wait()
                 returncode = result.exit_code
-                sdk_stdout = result.stdout
-                sdk_stderr = result.stderr
             except Exception as e:
                 if isinstance(e, e2b.CommandExitException):
                     if not isinstance(e, _CommandFailure):  # pragma: no cover - incompatible SDK exception
                         raise E2BSandboxError('E2B returned an incomplete command failure.') from e
                     returncode = e.exit_code
-                    sdk_stdout = e.stdout
-                    sdk_stderr = e.stderr
                 elif isinstance(e, e2b.TimeoutException):
                     timed_out = True
                     returncode = _TIMEOUT_EXIT_CODE
@@ -537,10 +534,6 @@ class E2BSandboxSession:
         finally:
             await self._remove_temp_dir(temp_dir)
 
-        if sdk_stdout:
-            stdout = f'{stdout}\n{sdk_stdout}' if stdout else sdk_stdout
-        if sdk_stderr:
-            stderr = f'{stderr}\n{sdk_stderr}' if stderr else sdk_stderr
         return E2BSandboxExecResult(
             stdout=stdout,
             stderr=stderr,
@@ -575,16 +568,17 @@ class E2BSandboxSession:
         stream: str,
         max_output_bytes: int,
     ) -> tuple[str, bool]:
-        sandbox = self._require_sandbox()
-        data = bytes(await sandbox.files.read(posixpath.join(temp_dir, stream), 'bytes'))
-        bounded = data[-max_output_bytes:]
-        decoded = bounded.decode('utf-8', errors='replace')
-        count_data = bytes(await sandbox.files.read(posixpath.join(temp_dir, f'{stream}.count'), 'bytes'))
+        data = await self._read_bounded_file(posixpath.join(temp_dir, stream), max_bytes=max_output_bytes)
+        decoded = data.decode('utf-8', errors='replace')
+        count_data = await self._read_bounded_file(
+            posixpath.join(temp_dir, f'{stream}.count'),
+            max_bytes=_CAPTURE_COUNT_MAX_BYTES,
+        )
         try:
             total_bytes = int(count_data.decode().strip())
         except (UnicodeDecodeError, ValueError) as e:
             raise E2BSandboxError(f'E2B command {stream} byte count was invalid.') from e
-        return decoded, total_bytes > len(bounded)
+        return decoded, total_bytes > len(data)
 
     async def _read_partial(
         self,
@@ -598,10 +592,12 @@ class E2BSandboxSession:
         makes truncation exact rather than a length guess. A missing file means the
         pipeline died before producing anything, not an error.
         """
-        sandbox = self._require_sandbox()
         e2b = _load_e2b()
         try:
-            data = bytes(await sandbox.files.read(posixpath.join(temp_dir, f'{stream}.partial'), 'bytes'))
+            data = await self._read_bounded_file(
+                posixpath.join(temp_dir, f'{stream}.partial'),
+                max_bytes=max_output_bytes + 1,
+            )
         except e2b.FileNotFoundException:
             return '', False
         bounded = data[:max_output_bytes]
@@ -628,24 +624,27 @@ class E2BSandboxSession:
             raise ValueError(f'max_bytes must be a positive integer, got {max_bytes!r}.')
         target = self._resolve(path)
         try:
-            stream = await self._require_sandbox().files.read(
-                target,
-                'stream',
-                stream_idle_timeout=_INTERNAL_COMMAND_TIMEOUT,
-            )
-            data = bytearray()
-            async with stream:
-                async for chunk in stream:
-                    remaining = max_bytes + 1 - len(data)
-                    if remaining > 0:  # pragma: no branch - we raise as soon as max_bytes + 1 is retained
-                        data.extend(chunk[:remaining])
-                    if len(data) > max_bytes:
-                        raise _E2BSandboxReadTooLargeError(size_bytes=len(data), max_bytes=max_bytes)
-            return bytes(data)
+            return await self._read_bounded_file(target, max_bytes=max_bytes)
         except _E2BSandboxReadTooLargeError:
             raise
         except Exception as e:
             raise self._operation_error(e, f'Could not read sandbox file {path!r}') from e
+
+    async def _read_bounded_file(self, path: str, *, max_bytes: int) -> bytes:
+        stream = await self._require_sandbox().files.read(
+            path,
+            'stream',
+            stream_idle_timeout=_INTERNAL_COMMAND_TIMEOUT,
+        )
+        data = bytearray()
+        async with stream:
+            async for chunk in stream:
+                remaining = max_bytes + 1 - len(data)
+                if remaining > 0:  # pragma: no branch - we raise as soon as max_bytes + 1 is retained
+                    data.extend(chunk[:remaining])
+                if len(data) > max_bytes:
+                    raise _E2BSandboxReadTooLargeError(size_bytes=len(data), max_bytes=max_bytes)
+        return bytes(data)
 
     async def write_bytes(self, path: str, data: bytes) -> None:
         """Write bytes to a sandbox file, creating parent directories."""

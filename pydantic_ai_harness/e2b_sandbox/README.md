@@ -57,9 +57,10 @@ tracer. With Pydantic AI instrumentation enabled, Logfire shows:
   file size, and directory entry count
 
 Harness does not add commands, paths, file contents, stdout, or stderr to its
-`e2b.*` span attributes. Pydantic AI's own tool spans can include tool arguments
-and results, so set `include_content=False` when those values must stay out of
-telemetry:
+`e2b.*` span attributes, and disables automatic exception events on those spans
+so provider error messages do not reintroduce that content. Pydantic AI's own
+tool spans can include tool arguments and results, so set `include_content=False`
+when those values must stay out of telemetry:
 
 ```python
 import logfire
@@ -115,13 +116,21 @@ The injected session must already be open. The capability uses it but never
 opens or kills it. Reused sandboxes share one filesystem and process space, so
 do not use the same session for overlapping runs that require isolation.
 
-## Output and memory bounds
+## Command output and file-read bounds
 
-The E2B Python SDK buffers a command's output in the command handle. Harness
-therefore captures stdout and stderr inside the sandbox with a bounded tail
-before the SDK receives them. Each stream retains at most `max_output_bytes`,
-then the model-facing result applies `max_output_bytes` and `max_output_lines`
-again. Truncation is marked and stream labels are preserved.
+The E2B Python SDK buffers process output in the command handle. Harness
+redirects its capture wrapper's own streams away from the SDK, captures command
+stdout and stderr inside the sandbox, and reads every capture artifact through a
+bounded stream. Each command stream retains at most `max_output_bytes`, then the
+model-facing result applies `max_output_bytes` and `max_output_lines` again.
+Truncation is marked and stream labels are preserved.
+
+E2B starts commands through `/bin/bash -l -c` before Harness's command-level
+redirection runs. Output emitted by Bash login startup files can therefore reach
+the SDK outside this bound. A command can modify its user login files for later
+calls, so `max_output_bytes` is not a hard SDK-memory ceiling in a reused
+sandbox. Keep login profiles silent in E2B templates. A hard bound for startup
+output requires a public E2B raw-exec or no-buffer command API.
 
 A completed command returns the bounded tail. The tail pipeline flushes only
 when the streams close, so a timed-out command instead returns a bounded prefix
@@ -129,8 +138,8 @@ when the streams close, so a timed-out command instead returns a bounded prefix
 the first bytes. The truncation flag is exact: the prefix capture retains one
 byte past the limit to tell "exactly full" from "cut off".
 
-This capture wrapper requires Bash, `setsid`, `mkfifo`, `cat`, `wc`, `tee`, and
-GNU `head` and `tail`. E2B's standard `base` template supplies them. Custom
+This capture wrapper requires Bash, `setsid`, `mkfifo`, `cat`, `dd`, `wc`,
+`tee`, and GNU `tail`. E2B's standard `base` template supplies them. Custom
 templates must retain those programs.
 
 `read_file` checks metadata and then streams at most `max_read_bytes + 1` bytes,
@@ -185,6 +194,12 @@ E2BSandbox(
     instructions=None,                # None: defaults; '': disabled; str: custom
 )
 ```
+
+`template`, `sandbox_timeout`, `env`, `metadata`, and
+`allow_internet_access` cannot be combined with `sandbox_id`. An injected
+`session` additionally rejects `sandbox_id` and a non-default `workdir`, because
+the caller-owned session already controls those settings. These conflicts fail
+during capability construction.
 
 ## Composition
 

@@ -5,7 +5,7 @@ from __future__ import annotations
 import inspect
 from collections.abc import AsyncGenerator, Mapping
 from contextlib import asynccontextmanager
-from typing import Protocol, TypeGuard, runtime_checkable
+from typing import Any, Protocol, TypeGuard, runtime_checkable
 
 import pytest
 from opentelemetry.sdk.trace import TracerProvider
@@ -13,7 +13,7 @@ from opentelemetry.sdk.trace.export import SimpleSpanProcessor
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 from opentelemetry.trace import NoOpTracer, Tracer
 from pydantic_ai import Agent, RunContext
-from pydantic_ai.capabilities import Capability
+from pydantic_ai.capabilities import AbstractCapability, Capability
 from pydantic_ai.exceptions import ModelRetry, UserError
 from pydantic_ai.messages import ModelMessage, ModelResponse, TextPart, ToolCallPart, ToolReturnPart
 from pydantic_ai.models.function import AgentInfo, FunctionModel
@@ -39,6 +39,16 @@ from .fake_e2b import (
     SandboxNotFoundException,
     TimeoutException,
 )
+
+
+class BaseDurabilityCapability(AbstractCapability[Any]):
+    """Match the stable base-class identity without importing Prefect."""
+
+    __module__ = 'pydantic_ai.durable_exec._base'
+
+
+class PrefectDurability(BaseDurabilityCapability):
+    """Dependency-free representative of Prefect's concrete wrapper."""
 
 
 @runtime_checkable
@@ -317,7 +327,7 @@ class TestLifecycleAndTracing:
     @pytest.mark.parametrize(
         ('error', 'outcome'),
         [
-            (SandboxException('transient'), 'retry'),
+            (SandboxException('transient secret path /workspace/private.txt'), 'retry'),
             (AuthenticationException('bad key'), 'terminal_error'),
         ],
     )
@@ -332,6 +342,8 @@ class TestLifecycleAndTracing:
         span = next(span for span in exporter.get_finished_spans() if span.name == 'e2b.sandbox.run_command')
         assert span.attributes is not None
         assert span.attributes['e2b.outcome'] == outcome
+        assert not span.events
+        assert 'secret' not in repr(span)
 
 
 class TestCapability:
@@ -443,7 +455,7 @@ class TestCapability:
         class_name: str,
         engine_name: str,
     ) -> None:
-        module = pytest.importorskip(module_name)
+        module = pytest.importorskip(module_name, exc_type=ImportError)
         durability_type = getattr(module, class_name)
 
         with pytest.raises(UserError, match=rf'E2BSandbox.*{engine_name}'):
@@ -451,6 +463,14 @@ class TestCapability:
                 TestModel(),
                 name=f'e2b_{engine_name.lower()}',
                 capabilities=[E2BSandbox(), durability_type()],
+            )
+
+    def test_prefect_durability_is_rejected_before_run_without_prefect_dependency(self) -> None:
+        with pytest.raises(UserError, match=r'E2BSandbox.*Prefect'):
+            Agent(
+                TestModel(),
+                name='e2b_prefect',
+                capabilities=[E2BSandbox(), PrefectDurability()],
             )
 
     @pytest.mark.parametrize(
@@ -468,12 +488,20 @@ class TestCapability:
         class_name: str,
         engine_name: str,
     ) -> None:
-        module = pytest.importorskip(module_name)
+        module = pytest.importorskip(module_name, exc_type=ImportError)
         durability_type = getattr(module, class_name)
         agent: Agent[None, str] = Agent(TestModel(), capabilities=[E2BSandbox()])
 
         with pytest.raises(UserError, match=rf'E2BSandbox.*{engine_name}'):
             await agent.run('hi', capabilities=[durability_type()])
+        assert fake_e2b.sandboxes == []
+
+    @pytest.mark.anyio(backends=['asyncio'])
+    async def test_run_level_prefect_durability_is_rejected_without_prefect_dependency(self, fake_e2b: FakeE2B) -> None:
+        agent: Agent[None, str] = Agent(TestModel(), capabilities=[E2BSandbox()])
+
+        with pytest.raises(UserError, match=r'E2BSandbox.*Prefect'):
+            await agent.run('hi', capabilities=[PrefectDurability()])
         assert fake_e2b.sandboxes == []
 
     @pytest.mark.anyio(backends=['asyncio'])
