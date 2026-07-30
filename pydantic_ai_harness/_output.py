@@ -3,7 +3,7 @@
 
 def truncate_tail(text: str, max_chars: int) -> str:
     """Limit text to `max_chars`, including an accurate truncation marker."""
-    if max_chars <= 0:
+    if max_chars <= 0:  # pragma: no cover - callers validate the cap at construction
         return ''
     if len(text) <= max_chars:
         return text

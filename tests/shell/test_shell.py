@@ -539,10 +539,6 @@ class TestRunCommand:
         result = await ts.run_command('sleep 10')
         assert 'timed out after 0.5s' in result
 
-    async def test_zero_output_cap_returns_no_model_visible_output(self, shell_dir: Path) -> None:
-        ts = _shell_toolset(shell_dir, max_output_chars=0)
-        assert await _call_shell_tool(ts, 'run_command', command='echo hidden') == ''
-
     async def test_custom_timeout_overrides_default(self, shell_dir: Path) -> None:
         ts = ShellToolset(
             cwd=shell_dir,
@@ -622,6 +618,12 @@ class TestRunCommand:
                 persist_cwd=False,
                 allow_interactive=False,
             )
+
+    def test_non_positive_max_output_chars_rejected(self, shell_dir: Path) -> None:
+        # Matches LocalStackToolset: a cap of 0 would blank every response,
+        # including start_command's ID line, leaving its process unstoppable.
+        with pytest.raises(ValueError, match='max_output_chars must be a positive integer.'):
+            _shell_toolset(shell_dir, max_output_chars=0)
 
     async def test_stdout_chunks_joined_cleanly(self, shell_dir: Path) -> None:
         ts = ShellToolset(

@@ -140,7 +140,11 @@ class LocalStackToolset(FunctionToolset[AgentDepsT]):
         ctx: RunContext[AgentDepsT],
         tool: ToolsetTool[AgentDepsT],
     ) -> Any:
-        """Enforce the model-visible output cap at the tool dispatch seam."""
+        """Enforce the model-visible output cap at the tool dispatch seam.
+
+        Only `str` results are capped; a future tool returning rich content
+        (e.g. `ToolReturn`) needs this seam extended.
+        """
         result = await super().call_tool(name, tool_args, ctx, tool)
         if not isinstance(result, str):
             return result

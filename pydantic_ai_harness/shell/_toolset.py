@@ -67,17 +67,15 @@ def _is_interactive_command(command: str) -> bool:
 class _BackgroundProcess:
     """State for a background command using temp files for output."""
 
-    __slots__ = ('proc', 'command', 'stdout_path', 'stderr_path', 'finished', 'exit_code')
+    __slots__ = ('proc', 'stdout_path', 'stderr_path', 'finished', 'exit_code')
 
     def __init__(
         self,
         proc: anyio.abc.Process,
-        command: str,
         stdout_path: str,
         stderr_path: str,
     ) -> None:
         self.proc = proc
-        self.command = command
         self.stdout_path = stdout_path
         self.stderr_path = stderr_path
         self.finished = False
@@ -126,6 +124,8 @@ class ShellToolset(FunctionToolset[AgentDepsT]):
 
         if self._allowed_commands and self._denied_commands:
             raise ValueError('Specify allowed_commands or denied_commands, not both.')
+        if max_output_chars <= 0:
+            raise ValueError('max_output_chars must be a positive integer.')
 
         self.add_function(self.run_command, name='run_command')
         self.add_function(self.start_command, name='start_command')
@@ -165,7 +165,9 @@ class ShellToolset(FunctionToolset[AgentDepsT]):
 
         Tools place control metadata (status, exit code, `start_command`'s ID
         line) at the end of their responses, so keeping the tail preserves it
-        without any per-tool cases here.
+        without any per-tool cases here. Only `str` results are capped; a
+        future tool returning rich content (e.g. `ToolReturn`) needs this seam
+        extended.
         """
         result = await super().call_tool(name, tool_args, ctx, tool)
         if not isinstance(result, str):
@@ -429,7 +431,6 @@ class ShellToolset(FunctionToolset[AgentDepsT]):
 
         bg = _BackgroundProcess(
             proc=proc,
-            command=command,
             stdout_path=stdout_file.name,
             stderr_path=stderr_file.name,
         )
