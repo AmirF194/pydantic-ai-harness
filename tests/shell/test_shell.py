@@ -209,6 +209,19 @@ class TestCommandValidation:
                 allow_interactive=False,
             )
 
+    def test_non_positive_max_output_chars_rejected(self, shell_dir: Path) -> None:
+        with pytest.raises(ValueError, match='max_output_chars must be a positive integer.'):
+            ShellToolset(
+                cwd=shell_dir,
+                allowed_commands=[],
+                denied_commands=[],
+                denied_operators=[],
+                default_timeout=10.0,
+                max_output_chars=0,
+                persist_cwd=False,
+                allow_interactive=False,
+            )
+
     async def test_interactive_blocked_by_default(self, toolset: ShellToolset[None]) -> None:
         with pytest.raises(PermissionError, match='Interactive commands'):
             toolset._check_command('vim file.txt')
@@ -359,8 +372,7 @@ class TestTruncation:
             allow_interactive=False,
         )
         result = ts._truncate('x' * 20)
-        assert result.endswith('x' * 10)
-        assert 'truncated, showing last 10 chars' in result
+        assert result == 'x' * 10
 
     def test_exactly_at_limit_not_truncated(self, shell_dir: Path) -> None:
         ts = ShellToolset(
@@ -389,8 +401,7 @@ class TestTruncation:
             allow_interactive=False,
         )
         result = ts._truncate('x' * 11)
-        assert result.endswith('x' * 10)
-        assert 'truncated, showing last 10 chars' in result
+        assert result == 'x' * 10
 
     def test_keeps_tail_not_head(self, shell_dir: Path) -> None:
         """The tail (where errors and the [stderr] section land) is preserved."""
@@ -408,7 +419,7 @@ class TestTruncation:
         result = ts._truncate(text)
         assert result.endswith('TAIL_ERROR')
         assert 'HEAD' not in result
-        assert 'truncated' in result
+        assert len(result) == 20
 
     def test_truncation_marker_wording(self, shell_dir: Path) -> None:
         ts = ShellToolset(
@@ -417,12 +428,12 @@ class TestTruncation:
             denied_commands=[],
             denied_operators=[],
             default_timeout=10.0,
-            max_output_chars=10,
+            max_output_chars=50,
             persist_cwd=False,
             allow_interactive=False,
         )
-        result = ts._truncate('x' * 20)
-        assert 'output truncated, showing last 10 chars' in result
+        result = ts._truncate('x' * 100)
+        assert result == '[... output truncated, showing last 5 chars]\nxxxxx'
 
 
 class TestCwdCapture:
@@ -548,7 +559,41 @@ class TestRunCommand:
             allow_interactive=False,
         )
         result = await ts.run_command(f'{sys.executable} -c "print(\'x\' * 200)"')
-        assert 'truncated, showing last 50 chars' in result
+        assert len(result) == 50
+        assert 'truncated, showing last 5 chars' in result
+
+    async def test_output_truncation_caps_complete_success_response(self, shell_dir: Path) -> None:
+        ts = ShellToolset(
+            cwd=shell_dir,
+            allowed_commands=[],
+            denied_commands=[],
+            denied_operators=[],
+            default_timeout=10.0,
+            max_output_chars=200,
+            persist_cwd=False,
+            allow_interactive=False,
+        )
+        result = await ts.run_command(f'{sys.executable} -c "import sys; sys.stdout.write(\'x\' * 400)"')
+        assert len(result) == 200
+        assert result.startswith('[... output truncated, showing last 153 chars]\n')
+        assert result.endswith('x' * 153)
+
+    async def test_output_truncation_caps_complete_failure_response(self, shell_dir: Path) -> None:
+        ts = ShellToolset(
+            cwd=shell_dir,
+            allowed_commands=[],
+            denied_commands=[],
+            denied_operators=[],
+            default_timeout=10.0,
+            max_output_chars=200,
+            persist_cwd=False,
+            allow_interactive=False,
+        )
+        command = f'{sys.executable} -c "import sys; sys.stdout.write(\'x\' * 400); sys.exit(7)"'
+        result = await ts.run_command(command)
+        assert len(result) == 200
+        assert result.startswith('[... output truncated, showing last 153 chars]\n')
+        assert result.endswith('[exit code: 7]')
 
     async def test_persist_cwd(self, shell_dir: Path) -> None:
         ts = ShellToolset(
@@ -607,6 +652,20 @@ class TestRunCommand:
         )
         result = await ts.run_command('sleep 10')
         assert 'timed out after 0.5s' in result
+
+    async def test_timeout_respects_output_cap(self, shell_dir: Path) -> None:
+        ts = ShellToolset(
+            cwd=shell_dir,
+            allowed_commands=[],
+            denied_commands=[],
+            denied_operators=[],
+            default_timeout=0.1,
+            max_output_chars=10,
+            persist_cwd=False,
+            allow_interactive=False,
+        )
+        result = await ts.run_command('sleep 10')
+        assert len(result) == 10
 
     async def test_custom_timeout_overrides_default(self, shell_dir: Path) -> None:
         ts = ShellToolset(
@@ -818,6 +877,20 @@ class TestBackgroundCommands:
         result = await toolset.check_command('nonexistent_id')
         assert 'unknown command ID' in result
 
+    async def test_unknown_id_responses_respect_output_cap(self, shell_dir: Path) -> None:
+        ts = ShellToolset(
+            cwd=shell_dir,
+            allowed_commands=[],
+            denied_commands=[],
+            denied_operators=[],
+            default_timeout=10.0,
+            max_output_chars=10,
+            persist_cwd=False,
+            allow_interactive=False,
+        )
+        assert len(await ts.check_command('a' * 100)) == 10
+        assert len(await ts.stop_command('a' * 100)) == 10
+
     async def test_stop_unknown_id(self, toolset: ShellToolset[None]) -> None:
         result = await toolset.stop_command('nonexistent_id')
         assert 'unknown command ID' in result
@@ -860,6 +933,30 @@ class TestBackgroundCommands:
         assert 'running' in check_result
 
         await ts.stop_command(command_id)
+
+    async def test_check_and_stop_respect_output_cap(self, shell_dir: Path) -> None:
+        ts = ShellToolset(
+            cwd=shell_dir,
+            allowed_commands=[],
+            denied_commands=[],
+            denied_operators=[],
+            default_timeout=10.0,
+            max_output_chars=200,
+            persist_cwd=False,
+            allow_interactive=False,
+        )
+        start_result = await ts.start_command("printf '%0400d' 0; sleep 30")
+        command_id = _parse_command_id(start_result)
+        await anyio.sleep(0.2)
+
+        try:
+            check_result = await ts.check_command(command_id)
+            assert len(check_result) == 200
+            assert check_result.startswith('[... output truncated, showing last 153 chars]\n')
+        finally:
+            stop_result = await ts.stop_command(command_id)
+        assert len(stop_result) == 200
+        assert stop_result.startswith('[... output truncated, showing last 153 chars]\n')
 
     async def test_start_and_check_finished(self, shell_dir: Path) -> None:
         ts = ShellToolset(

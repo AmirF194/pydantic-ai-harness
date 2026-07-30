@@ -254,10 +254,17 @@ class TestAwsCli:
     async def test_truncation_keeps_tail_and_marker_for_normal_cap(self, tmp_path: Path) -> None:
         stub = _make_stub(tmp_path, 'printf "HEAD"; printf "%0500dTAIL" 0')
         result = await _toolset(max_output_chars=200, aws_cli_path=stub).aws_cli('s3 ls')
-        assert len(result) <= 200
-        assert 'output truncated' in result
+        assert len(result) == 200
+        assert result.startswith('[... output truncated, showing last 153 chars]\n')
         assert result.endswith('TAIL')
         assert 'HEAD' not in result
+
+    async def test_truncation_caps_complete_failure_response(self, tmp_path: Path) -> None:
+        stub = _make_stub(tmp_path, 'printf "%0500d" 0; exit 7')
+        result = await _toolset(max_output_chars=200, aws_cli_path=stub).aws_cli('s3 ls')
+        assert len(result) == 200
+        assert result.startswith('[... output truncated, showing last 153 chars]\n')
+        assert result.endswith('[exit code: 7]')
 
 
 class TestLocalStackHealth:

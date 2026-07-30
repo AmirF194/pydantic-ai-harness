@@ -22,6 +22,8 @@ from pydantic_ai.exceptions import ModelRetry
 from pydantic_ai.tools import AgentDepsT
 from pydantic_ai.toolsets import AbstractToolset, FunctionToolset
 
+from pydantic_ai_harness._output import truncate_tail
+
 _IO_DRAIN_TIMEOUT: float = 2.0
 _KILL_GRACE_PERIOD: float = 2.0
 
@@ -124,6 +126,8 @@ class ShellToolset(FunctionToolset[AgentDepsT]):
 
         if self._allowed_commands and self._denied_commands:
             raise ValueError('Specify allowed_commands or denied_commands, not both.')
+        if max_output_chars <= 0:
+            raise ValueError('max_output_chars must be a positive integer.')
 
         self.add_function(self.run_command, name='run_command')
         self.add_function(self.start_command, name='start_command')
@@ -222,10 +226,7 @@ class ShellToolset(FunctionToolset[AgentDepsT]):
         `[stderr]` section (which callers append last) -- lands at the end, so
         the head is dropped and the final `max_output_chars` are kept.
         """
-        if len(text) <= self._max_output_chars:
-            return text
-        marker = f'[... output truncated, showing last {self._max_output_chars} chars]\n'
-        return marker + text[-self._max_output_chars :]
+        return truncate_tail(text, self._max_output_chars)
 
     def _build_cwd_capture(self, command: str) -> tuple[str, Path | None]:
         """Wrap a command to record its final working directory out-of-band.
@@ -355,7 +356,7 @@ class ShellToolset(FunctionToolset[AgentDepsT]):
                 with anyio.CancelScope(shield=True):
                     await proc.wait()
                     await self._drain_with_timeout(stdout_chunks, stderr_chunks, proc)
-                return f'[Command timed out after {timeout}s]'
+                return self._truncate(f'[Command timed out after {timeout}s]')
             finally:
                 await proc.aclose()
 
@@ -369,15 +370,14 @@ class ShellToolset(FunctionToolset[AgentDepsT]):
                 parts.append(f'[stderr]\n{stderr}')
             output = '\n'.join(parts) if parts else '(no output)'
 
-            output = self._truncate(output)
             exit_code = proc.returncode if proc.returncode is not None else 0
 
             if cwd_file is not None and exit_code == 0:
                 self._apply_captured_cwd(cwd_file)
 
             if exit_code != 0:
-                return f'{output}\n[exit code: {exit_code}]'
-            return output
+                output = f'{output}\n[exit code: {exit_code}]'
+            return self._truncate(output)
         finally:
             if cwd_file is not None:
                 cwd_file.unlink(missing_ok=True)
@@ -464,7 +464,7 @@ class ShellToolset(FunctionToolset[AgentDepsT]):
         """
         bg = self._background.get(command_id)
         if bg is None:
-            return f'[Error: unknown command ID {command_id!r}]'
+            return self._truncate(f'[Error: unknown command ID {command_id!r}]')
 
         if not bg.finished and bg.proc.returncode is not None:
             bg.exit_code = bg.proc.returncode
@@ -482,11 +482,11 @@ class ShellToolset(FunctionToolset[AgentDepsT]):
         if stderr:
             output_sections.append(f'[stderr]\n{stderr}')
         if output_sections:
-            parts.append(self._truncate('\n'.join(output_sections)))
+            parts.append('\n'.join(output_sections))
         else:
             parts.append('(no output yet)')
 
-        return '\n'.join(parts)
+        return self._truncate('\n'.join(parts))
 
     async def stop_command(self, command_id: str) -> str:
         """Stop a background command and return its final output.
@@ -499,7 +499,7 @@ class ShellToolset(FunctionToolset[AgentDepsT]):
         """
         bg = self._background.get(command_id)
         if bg is None:
-            return f'[Error: unknown command ID {command_id!r}]'
+            return self._truncate(f'[Error: unknown command ID {command_id!r}]')
 
         if not bg.finished:
             await self._kill_process_group(bg.proc)
@@ -523,8 +523,8 @@ class ShellToolset(FunctionToolset[AgentDepsT]):
         if stderr:
             output_sections.append(f'[stderr]\n{stderr}')
         if output_sections:
-            parts.append(self._truncate('\n'.join(output_sections)))
+            parts.append('\n'.join(output_sections))
         else:
             parts.append('(no output)')
 
-        return '\n'.join(parts)
+        return self._truncate('\n'.join(parts))

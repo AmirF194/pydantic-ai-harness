@@ -17,6 +17,7 @@ from pydantic_ai.tools import AgentDepsT
 from pydantic_ai.toolsets import AbstractToolset, FunctionToolset
 from typing_extensions import Self
 
+from pydantic_ai_harness._output import truncate_tail
 from pydantic_ai_harness.localstack._container import LocalStackContainer
 
 _HEALTH_PATH = '/_localstack/health'
@@ -246,13 +247,7 @@ class LocalStackToolset(FunctionToolset[AgentDepsT]):
         Errors and the `[stderr]` section land at the end, so the head is
         dropped and the final `max_output_chars` are kept.
         """
-        if len(text) <= self._max_output_chars:
-            return text
-        marker = f'[... output truncated, showing last {self._max_output_chars} chars]\n'
-        tail_budget = self._max_output_chars - len(marker)
-        if tail_budget <= 0:
-            return text[-self._max_output_chars :]
-        return marker + text[-tail_budget:]
+        return truncate_tail(text, self._max_output_chars)
 
     async def aws_cli(self, command: str, *, timeout_seconds: float | None = None) -> str:
         """Run an AWS CLI command against the emulated AWS environment.
@@ -300,7 +295,7 @@ class LocalStackToolset(FunctionToolset[AgentDepsT]):
                     stderr=stderr_file,
                 )
             except FileNotFoundError:
-                return (
+                return self._truncate(
                     f'[error: AWS CLI {self._aws_cli_path!r} not found. Install the AWS CLI to use LocalStack tools.]'
                 )
 
@@ -312,7 +307,7 @@ class LocalStackToolset(FunctionToolset[AgentDepsT]):
                     proc.kill()
                     with anyio.CancelScope(shield=True):
                         await proc.wait()
-                    return f'[command timed out after {timeout}s]'
+                    return self._truncate(f'[command timed out after {timeout}s]')
             finally:
                 await proc.aclose()
 
@@ -324,12 +319,12 @@ class LocalStackToolset(FunctionToolset[AgentDepsT]):
                 parts.append(f'[stdout]\n{stdout}')
             if stderr:
                 parts.append(f'[stderr]\n{stderr}')
-            output = self._truncate('\n'.join(parts) if parts else '(no output)')
+            output = '\n'.join(parts) if parts else '(no output)'
 
             exit_code = proc.returncode
             if exit_code:
-                return f'{output}\n[exit code: {exit_code}]'
-            return output
+                output = f'{output}\n[exit code: {exit_code}]'
+            return self._truncate(output)
         finally:
             stdout_file.close()
             stderr_file.close()
@@ -350,7 +345,7 @@ class LocalStackToolset(FunctionToolset[AgentDepsT]):
             async with httpx.AsyncClient(timeout=self._default_timeout) as client:
                 response = await client.get(url)
         except httpx.HTTPError as e:
-            return f'[error: could not reach LocalStack at {url}: {e}]'
+            return self._truncate(f'[error: could not reach LocalStack at {url}: {e}]')
         if response.status_code != 200:
-            return f'[error: LocalStack health check returned HTTP {response.status_code}]'
+            return self._truncate(f'[error: LocalStack health check returned HTTP {response.status_code}]')
         return self._truncate(response.text)
