@@ -78,6 +78,8 @@ full = await restore_media(lean, media_store=store)
 
 The current reader restores binary markers written before text externalization. That compatibility is upgrade-only: a release that predates text externalization treats every marker as binary, so it cannot validate a snapshot containing an externalized text marker. Keep a current reader for persisted snapshots that contain those markers.
 
+`restore_media` recognizes a marker by its shape, not by its bookkeeping keys alone, so a tool that returns a mapping carrying one of those keys stays data on the way back in. Recognition is still in-band: a payload that also mimics a serialized part and omits the field the walker moves out (`data` for binary, `content` for text) is read as a marker.
+
 ## Public URLs
 
 When a store is fronted by a CDN, a local HTTP server, or a signed-URL service, pass a `public_url=` resolver (or use `make_static_public_url`) to turn a stored `media+sha256://` URI into a URL the model can fetch directly. Without a resolver, `public_url(...)` returns `None`.

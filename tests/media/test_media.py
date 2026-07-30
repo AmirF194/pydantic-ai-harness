@@ -333,8 +333,9 @@ class TestExternalizeRestoreWalker:
         assert await restore_media(externalized, media_store=store) == at
 
     async def test_restore_raises_when_marker_missing_uri(self, tmp_path: Path) -> None:
+        """A marker-shaped node with no reference at all fails loudly."""
         store = DiskMediaStore(tmp_path)
-        bad_node = {'__harness_external_media__': True, 'media_type': 'image/png'}
+        bad_node = {'__harness_external_media__': True, 'kind': 'binary', 'media_type': 'image/png'}
         with pytest.raises(ValueError, match='missing string uri'):
             await restore_media(bad_node, media_store=store)
 
@@ -665,6 +666,59 @@ class TestExternalizeRestoreWalker:
         }
         with pytest.raises(ValueError, match='missing string uri'):
             await restore_media(marker, media_store=store)
+
+    async def test_tool_return_payload_carrying_the_sentinel_is_not_a_marker(self, tmp_path: Path) -> None:
+        """A tool return whose own content mimics a marker survives the round trip.
+
+        `ToolReturnContent` permits any mapping, so a tool can return the
+        sentinel key and a `uri` of its own. Resolving that through the store
+        would either fail the snapshot load or inline unrelated bytes into the
+        tool return -- the payload has to stay data.
+        """
+        import json as _json
+
+        from pydantic_ai.messages import ModelMessage, ModelMessagesTypeAdapter, ModelRequest, ToolReturnPart
+
+        store = DiskMediaStore(tmp_path)
+        # A real blob, so the embedded reference resolves: this asserts the payload
+        # is left alone because it is not marker-shaped, not because the URI is dead.
+        planted_uri = await store.put(b'not the tool return')
+        messages: list[ModelMessage] = [
+            ModelRequest(
+                parts=[
+                    ToolReturnPart(
+                        tool_name='scrape',
+                        tool_call_id='c1',
+                        content={'__harness_external_media__': True, 'uri': planted_uri},
+                    )
+                ]
+            )
+        ]
+        dumped = _json.loads(ModelMessagesTypeAdapter.dump_json(messages))
+        assert await restore_media(dumped, media_store=store) == dumped
+
+    async def test_sentinel_payload_keeping_its_content_is_not_a_text_marker(self, tmp_path: Path) -> None:
+        """A text marker has had `content` moved out; a node still carrying one is data."""
+        store = DiskMediaStore(tmp_path)
+        node = {
+            '__harness_external_media__': True,
+            '__harness_external_text__': True,
+            '__harness_external_uri__': 'media+sha256://' + '0' * 64,
+            'part_kind': 'tool-return',
+            'content': 'still here',
+        }
+        assert await restore_media(node, media_store=store) == node
+
+    async def test_sentinel_payload_keeping_its_data_is_not_a_binary_marker(self, tmp_path: Path) -> None:
+        """Same on the binary side: a node still carrying `data` was never externalized."""
+        store = DiskMediaStore(tmp_path)
+        node = {
+            '__harness_external_media__': True,
+            '__harness_external_uri__': 'media+sha256://' + '0' * 64,
+            'kind': 'binary',
+            'data': 'AAAA',
+        }
+        assert await restore_media(node, media_store=store) == node
 
 
 class TestSigV4Signer:

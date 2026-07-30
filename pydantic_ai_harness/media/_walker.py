@@ -97,7 +97,33 @@ def _is_text_part(node: dict[str, object]) -> bool:
 
 
 def _is_external_marker(node: dict[str, object]) -> bool:
-    return node.get(_EXTERNAL_MARKER) is True
+    """A node shaped like something `externalize_media` actually produced.
+
+    The sentinel alone is not enough. `ToolReturnContent` permits any
+    `Mapping[str, ...]`, so a tool can legitimately return a payload carrying
+    `_EXTERNAL_MARKER` -- and on the sentinel-only test that payload's own
+    `uri` would be resolved through the store, either failing the whole
+    snapshot load or inlining unrelated bytes into the tool return.
+
+    So restore matches the same discriminators the externalize side gates on,
+    plus the absence of the field that was moved out: a binary marker keeps
+    `kind == 'binary'` and has no `data`, a text marker keeps its `part_kind`
+    (or `kind == 'text-content'`) and has no `content`. Markers written before
+    text externalization existed are all binary and all carry `kind`, so they
+    still match.
+
+    This narrows the collision rather than closing it -- an in-band JSON
+    sentinel is collidable by construction. A payload that sets the sentinel
+    *and* mimics a part shape *and* omits the moved field is still read as a
+    marker; nothing short of out-of-band framing prevents that.
+    """
+    if node.get(_EXTERNAL_MARKER) is not True:
+        return False
+    if node.get(_TEXT_MARKER) is True:
+        if 'content' in node:
+            return False
+        return isinstance(node.get('part_kind'), str) or node.get('kind') == _TEXT_CONTENT_KIND
+    return node.get('kind') == 'binary' and 'data' not in node
 
 
 async def externalize_media(node: object, *, media_store: MediaStore, threshold_bytes: int) -> object:
@@ -218,6 +244,10 @@ async def restore_media(node: object, *, media_store: MediaStore) -> object:
     Each marker dict's `uri` is resolved via `media_store.get`; a text marker
     re-inlines `content`, a binary marker re-inlines base64 `data`, so the
     result round-trips through `ModelMessagesTypeAdapter.validate_python`.
+
+    Only nodes shaped like a marker this module wrote are resolved -- see
+    `_is_external_marker`. Anything else, including a tool payload that
+    happens to carry the sentinel key, is walked through as ordinary data.
     """
     if _is_json_list(node):
         out_list: list[object] = []
