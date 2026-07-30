@@ -49,6 +49,7 @@ class Shell(AbstractCapability[AgentDepsT]):
     Exactly one of `allowed_commands` and `denied_commands` is a set at any
     time; the `None` side records which mode is selected. To switch modes on
     an existing instance, assign one side a set and the other `None`.
+    Assigning `None` to both restores the default denylist.
     """
 
     denied_commands: frozenset[str] | None = None

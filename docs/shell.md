@@ -96,7 +96,10 @@ denied_commands=['rm']` to `denied_commands=['rm']`. Use
 The same rule applies to direct `ShellToolset` construction, which previously
 required both kwargs. Two more changes from earlier releases: `allowed_commands=[]`
 previously meant no allowlist filtering and now allows nothing, and all `Shell`
-arguments after `cwd` are now keyword-only.
+arguments after `cwd` are now keyword-only. Stored configuration is normalized:
+command fields hold `frozenset[str] | None`, `denied_operators` and
+`denied_env_patterns` hold tuples, and `env` is copied to a dict, so
+reconfigure by assigning new values rather than mutating the old ones in place.
 
 `denied_operators` and `allow_interactive` apply in either command mode. The
 executable name is extracted with `shlex`, so arguments don't bypass the check.

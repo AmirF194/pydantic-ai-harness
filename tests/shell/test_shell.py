@@ -14,6 +14,8 @@ import anyio
 import pytest
 from pydantic_ai import Agent, AgentSpec, RunContext
 from pydantic_ai.exceptions import ModelRetry
+from pydantic_ai.messages import ModelMessage, ModelResponse, RetryPromptPart, TextPart, ToolCallPart, ToolReturnPart
+from pydantic_ai.models.function import AgentInfo, FunctionModel
 from pydantic_ai.models.test import TestModel
 from pydantic_ai.usage import RunUsage
 
@@ -554,6 +556,24 @@ class TestForRunIsolation:
         assert run_toolset._allow_interactive is True
         assert run_toolset._env == {'MARKER': 'x'}
         assert run_toolset._denied_env_patterns == ['OPENAI_*']
+
+    async def test_for_run_preserves_custom_denylist(self, shell_dir: Path) -> None:
+        toolset = ShellToolset[None](
+            cwd=shell_dir,
+            denied_commands=['curl'],
+            denied_operators=[],
+            default_timeout=10.0,
+            max_output_chars=50_000,
+            persist_cwd=False,
+            allow_interactive=False,
+        )
+
+        run_toolset = await toolset.for_run(_run_context())
+
+        assert isinstance(run_toolset, ShellToolset)
+        with pytest.raises(PermissionError, match="'curl' is denied"):
+            run_toolset._check_command('curl example.com')
+        run_toolset._check_command('rm -rf /')
 
     async def test_persist_cwd_isolated_across_runs(self, persist_toolset: ShellToolset[None], shell_dir: Path) -> None:
         run1 = await persist_toolset.for_run(_run_context())
@@ -1253,6 +1273,23 @@ class TestShellCapability:
         assert allow.allowed_commands == frozenset({'echo'})
         assert allow.denied_commands is None
 
+    def test_dataclasses_replace_switches_mode_with_both_fields(self) -> None:
+        allow = dataclasses.replace(Shell(), allowed_commands=frozenset({'echo'}), denied_commands=None)
+        assert allow.allowed_commands == frozenset({'echo'})
+        assert allow.denied_commands is None
+
+        with pytest.raises(ValueError, match='Specify allowed_commands or denied_commands'):
+            dataclasses.replace(Shell(), allowed_commands=frozenset({'echo'}))
+
+    def test_clearing_both_fields_restores_default_denylist(self) -> None:
+        shell = Shell(allowed_commands=['echo'])
+        shell.allowed_commands = None
+        shell.denied_commands = None
+
+        with pytest.raises(PermissionError, match="'rm' is denied"):
+            shell.get_toolset()._check_command('rm -rf /')
+        shell.get_toolset()._check_command('echo hello')
+
     def test_mode_flip_to_denylist_by_assignment(self) -> None:
         shell = Shell(allowed_commands=['echo'])
         shell.allowed_commands = None
@@ -1379,6 +1416,50 @@ class TestShellCapability:
         agent: Agent[None, str] = Agent(model, capabilities=[Shell(cwd=tmp_path)])
         result = await agent.run('run echo hello')
         assert result.output == 'done'
+
+    @pytest.mark.anyio(backends=['asyncio'])
+    async def test_agent_runs_allowlisted_command(self, tmp_path: Path) -> None:
+        import sniffio
+
+        if sniffio.current_async_library() != 'asyncio':  # pragma: no cover
+            pytest.skip('Agent.run() requires asyncio')
+
+        def call_shell(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+            if len(messages) == 1:
+                return ModelResponse(parts=[ToolCallPart('run_command', {'command': 'echo hi'})])
+            return ModelResponse(parts=[TextPart('done')])
+
+        agent: Agent[None, str] = Agent(
+            FunctionModel(call_shell),
+            capabilities=[Shell(cwd=tmp_path, allowed_commands=['echo'])],
+        )
+        result = await agent.run('say hi')
+
+        assert result.output == 'done'
+        tool_returns = [p for m in result.all_messages() for p in m.parts if isinstance(p, ToolReturnPart)]
+        assert any('hi' in str(p.content) for p in tool_returns)
+
+    @pytest.mark.anyio(backends=['asyncio'])
+    async def test_agent_allowlist_rejection_surfaces_as_retry(self, tmp_path: Path) -> None:
+        import sniffio
+
+        if sniffio.current_async_library() != 'asyncio':  # pragma: no cover
+            pytest.skip('Agent.run() requires asyncio')
+
+        def call_shell(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+            if len(messages) == 1:
+                return ModelResponse(parts=[ToolCallPart('run_command', {'command': 'cat file.txt'})])
+            return ModelResponse(parts=[TextPart('done')])
+
+        agent: Agent[None, str] = Agent(
+            FunctionModel(call_shell),
+            capabilities=[Shell(cwd=tmp_path, allowed_commands=['echo'])],
+        )
+        result = await agent.run('read the file')
+
+        assert result.output == 'done'
+        retries = [p for m in result.all_messages() for p in m.parts if isinstance(p, RetryPromptPart)]
+        assert any('not in the allowed list' in str(p.content) for p in retries)
 
 
 class TestKillProcessGroupEdgeCases:
