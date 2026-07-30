@@ -287,7 +287,7 @@ class TestAwsCli:
             _toolset(max_output_chars=100, aws_cli_path=stub), 'aws_cli', command='s3 ls'
         )
         assert 'output truncated' in result
-        assert len(result) <= 100
+        assert len(result) == 100
 
     async def test_truncation_respects_small_cap_without_marker(self, tmp_path: Path) -> None:
         stub = _make_stub(tmp_path, 'printf "%01000d" 0')
