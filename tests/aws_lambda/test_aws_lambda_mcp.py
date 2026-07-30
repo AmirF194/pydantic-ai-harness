@@ -249,3 +249,36 @@ class TestFakeServerFidelity:
 
         assert result.output == 'summed'
         assert 'calc__mcp_server__calc.get_instructions' in ctx.step_names
+
+
+class TestEnqueueGuard:
+    """Discovery is checkpointed too, so a message enqueued while resolving tools or instructions
+    is dropped on replay just as silently as one enqueued from a tool call."""
+
+    def test_enqueue_while_listing_tools_raises(self) -> None:
+        from pydantic_ai.exceptions import UserError
+
+        class EnqueueingServer(FakeMCPToolset):
+            async def get_tools(self, ctx: RunContext[object]) -> dict[str, ToolsetTool[object]]:
+                ctx.enqueue('later')
+                return await super().get_tools(ctx)  # pragma: no cover - the enqueue always raises
+
+        agent = build(EnqueueingServer(id='calc', instructions='Use the calculator.'))
+        ctx = FakeDurableContext()
+
+        with pytest.raises(UserError, match='enqueue'):
+            run_durable(lambda: agent.run('add 2 and 3'), context=ctx)
+
+    def test_enqueue_while_fetching_instructions_raises(self) -> None:
+        from pydantic_ai.exceptions import UserError
+
+        class EnqueueingServer(FakeMCPToolset):
+            async def get_instructions(self, ctx: RunContext[object]) -> InstructionPart | None:
+                ctx.enqueue('later')
+                return await super().get_instructions(ctx)  # pragma: no cover - the enqueue always raises
+
+        agent = build(EnqueueingServer(id='calc', instructions='Use the calculator.'))
+        ctx = FakeDurableContext()
+
+        with pytest.raises(UserError, match='enqueue'):
+            run_durable(lambda: agent.run('add 2 and 3'), context=ctx)

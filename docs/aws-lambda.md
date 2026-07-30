@@ -142,6 +142,9 @@ it was recorded for. The default model keeps the plain, suffix-less name.
   attempts that do execute the body. For a tool that must not repeat, set both:
 
     ```python {test="skip" lint="skip"}
+    from aws_durable_execution_sdk_python.config import StepSemantics
+    from aws_durable_execution_sdk_python.retries import RetryPresets
+
     metadata={'aws_lambda': {'step_semantics': StepSemantics.AT_MOST_ONCE_PER_RETRY,
                              'retry_strategy': RetryPresets.none()}}
     ```

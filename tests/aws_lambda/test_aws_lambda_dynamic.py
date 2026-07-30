@@ -131,3 +131,26 @@ class TestMultipleDynamicToolsets:
         assert result.output == 'doubled'
         assert 'd__dynamic_toolset__ta.get_tools' in ctx.step_names
         assert 'd__dynamic_toolset__tb.get_tools' in ctx.step_names
+
+
+class TestEnqueueGuard:
+    def test_enqueue_from_the_toolset_factory_raises(self) -> None:
+        """Resolution is checkpointed, so on replay the recorded tool set is served and the factory
+        never runs again -- anything it enqueued the first time round would be lost. The factory is
+        user code, which makes this the discovery path most likely to try."""
+        from pydantic_ai.exceptions import UserError
+
+        def resolver(ctx: RunContext[object]) -> FunctionToolset[object]:
+            ctx.enqueue('later')
+            return FunctionToolset[object]()  # pragma: no cover - the enqueue above always raises
+
+        agent = Agent(
+            double_then_done(),
+            name='d',
+            toolsets=[DynamicToolset[object](resolver, id='tools')],
+            capabilities=[AWSLambdaDurability()],
+        )
+        ctx = FakeDurableContext()
+
+        with pytest.raises(UserError, match='enqueue'):
+            run_durable(lambda: agent.run('double 21'), context=ctx)

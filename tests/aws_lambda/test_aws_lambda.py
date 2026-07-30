@@ -589,6 +589,25 @@ class TestBridgeFailureModes:
         shutdown(replacement)
         shutdown(abandoned)
 
+    def test_a_stopped_loop_is_not_handed_to_the_next_invocation(self) -> None:
+        """`is_closed()` answers `False` for a stopped-but-open loop, so deciding reuse on that
+        alone would hand the next invocation a loop that never runs a callback: `schedule_run`
+        would sit in its queue, `bridge.finish()` would never be called, and the handler would
+        block in `consume()` until Lambda timed the function out."""
+        loops = _bridge._AgentLoop()  # pyright: ignore[reportPrivateUsage]
+        stopped = loops.get()
+        stopped.call_soon_threadsafe(stopped.stop)
+        deadline = time.monotonic() + 5
+        while stopped.is_running() and time.monotonic() < deadline:  # pragma: no branch - stops promptly
+            time.sleep(0.01)
+
+        replacement = loops.get()
+
+        assert replacement is not stopped
+        assert replacement.is_running()
+        shutdown(replacement)
+        shutdown(stopped)
+
     def test_retiring_a_loop_that_was_already_replaced_leaves_the_current_one_alone(self) -> None:
         loops = _bridge._AgentLoop()  # pyright: ignore[reportPrivateUsage]
         live = loops.get()

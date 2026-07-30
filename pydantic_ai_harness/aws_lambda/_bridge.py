@@ -101,12 +101,30 @@ class _AgentLoop:
         self._loop: asyncio.AbstractEventLoop | None = None
 
     def get(self) -> asyncio.AbstractEventLoop:
+        """A loop that is confirmed to be running.
+
+        `is_closed()` alone is not enough to decide a loop is reusable: a stopped-but-open loop
+        answers `False` to it while still never running a callback, so `run_durable` would queue
+        `schedule_run` on a loop that can never execute it and then block in `consume()` until
+        Lambda timed the function out. Hence the `is_running()` check -- and hence, in turn,
+        waiting for a freshly-built loop to actually start before returning it, so that check
+        cannot race a loop whose thread has not reached `run_forever` yet.
+        """
         with self._lock:
             loop = self._loop
-            if loop is None or loop.is_closed():
-                loop = asyncio.new_event_loop()
-                threading.Thread(target=loop.run_forever, daemon=True, name='pydantic-ai-lambda-agent').start()
-                self._loop = loop
+            if loop is not None and not loop.is_closed() and loop.is_running():
+                return loop
+            loop = asyncio.new_event_loop()
+            running = threading.Event()
+
+            def run(loop: asyncio.AbstractEventLoop = loop) -> None:
+                asyncio.set_event_loop(loop)
+                loop.call_soon(running.set)
+                loop.run_forever()
+
+            threading.Thread(target=run, daemon=True, name='pydantic-ai-lambda-agent').start()
+            running.wait()
+            self._loop = loop
             return loop
 
     def retire(self, loop: asyncio.AbstractEventLoop) -> None:
