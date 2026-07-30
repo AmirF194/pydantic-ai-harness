@@ -231,10 +231,9 @@ class ShellToolset(FunctionToolset[AgentDepsT]):
     def _join_metadata_and_output(self, metadata: list[str], output: str) -> str:
         """Keep background-command metadata when there is room inside the output cap."""
         prefix = '\n'.join(metadata)
-        combined = f'{prefix}\n{output}'
         output_budget = self._max_output_chars - len(prefix) - 1
         if output_budget <= 0:
-            return truncate_head(combined, self._max_output_chars)
+            return truncate_head(f'{prefix}\n{output}', self._max_output_chars)
         return f'{prefix}\n{truncate_tail(output, output_budget)}'
 
     def _unknown_command_error(self, command_id: str) -> str:
@@ -534,6 +533,6 @@ class ShellToolset(FunctionToolset[AgentDepsT]):
         if stderr:
             output_sections.append(f'[stderr]\n{stderr}')
         output = '\n'.join(output_sections) if output_sections else '(no output)'
-        if len('\n'.join([*parts, output])) > self._max_output_chars:
+        if sum(len(part) for part in parts) + len(parts) + len(output) > self._max_output_chars:
             parts[0] = '[stopped]'
         return self._join_metadata_and_output(parts, output)
