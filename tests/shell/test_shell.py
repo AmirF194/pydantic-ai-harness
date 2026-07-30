@@ -852,13 +852,17 @@ class TestBackgroundCommands:
         ts = _shell_toolset(shell_dir, max_output_chars=200)
         start_result = await ts.start_command("printf '%0400d' 0; exit 7")
         command_id = _parse_command_id(start_result)
-        await anyio.sleep(0.5)
-
-        check_result = await ts.check_command(command_id)
-        assert len(check_result) == 200
-        assert check_result.startswith('[status: finished]\n[exit code: 7]\n[... output truncated')
-
-        stop_result = await ts.stop_command(command_id)
+        try:
+            with anyio.fail_after(5):
+                while True:
+                    check_result = await ts.check_command(command_id)
+                    if check_result.startswith('[status: finished]'):
+                        break
+                    await anyio.sleep(0.05)
+            assert len(check_result) == 200
+            assert check_result.startswith('[status: finished]\n[exit code: 7]\n[... output truncated')
+        finally:
+            stop_result = await ts.stop_command(command_id)
         assert len(stop_result) <= 200
         assert stop_result.startswith('[stopped]')
         assert '[exit code: 7]' in stop_result
