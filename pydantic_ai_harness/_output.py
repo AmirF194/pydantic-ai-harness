@@ -3,6 +3,8 @@
 
 def truncate_tail(text: str, max_chars: int) -> str:
     """Limit text to `max_chars`, including an accurate truncation marker."""
+    if max_chars <= 0:  # pragma: no cover
+        raise ValueError('max_chars must be a positive integer.')
     if len(text) <= max_chars:
         return text
 
@@ -15,3 +17,10 @@ def truncate_tail(text: str, max_chars: int) -> str:
     if tail_chars == 0:
         return text[-max_chars:]
     return marker(tail_chars) + text[-tail_chars:]
+
+
+def truncate_head(text: str, max_chars: int) -> str:
+    """Limit control text to `max_chars`, keeping its identifying prefix."""
+    if max_chars <= 0:  # pragma: no cover
+        raise ValueError('max_chars must be a positive integer.')
+    return text[:max_chars]

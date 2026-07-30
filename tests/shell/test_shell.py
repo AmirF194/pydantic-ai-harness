@@ -666,6 +666,7 @@ class TestRunCommand:
         )
         result = await ts.run_command('sleep 10')
         assert len(result) == 10
+        assert result == '[Command t'
 
     async def test_custom_timeout_overrides_default(self, shell_dir: Path) -> None:
         ts = ShellToolset(
@@ -888,8 +889,10 @@ class TestBackgroundCommands:
             persist_cwd=False,
             allow_interactive=False,
         )
-        assert len(await ts.check_command('a' * 100)) == 10
-        assert len(await ts.stop_command('a' * 100)) == 10
+        check_result = await ts.check_command('a' * 100)
+        stop_result = await ts.stop_command('a' * 100)
+        assert check_result == '[Error: un'
+        assert stop_result == '[Error: un'
 
     async def test_stop_unknown_id(self, toolset: ShellToolset[None]) -> None:
         result = await toolset.stop_command('nonexistent_id')
@@ -947,16 +950,83 @@ class TestBackgroundCommands:
         )
         start_result = await ts.start_command("printf '%0400d' 0; sleep 30")
         command_id = _parse_command_id(start_result)
-        await anyio.sleep(0.2)
+        await anyio.sleep(0.5)
 
         try:
             check_result = await ts.check_command(command_id)
             assert len(check_result) == 200
-            assert check_result.startswith('[... output truncated, showing last 153 chars]\n')
+            assert check_result.startswith('[status: running]\n[... output truncated')
         finally:
             stop_result = await ts.stop_command(command_id)
-        assert len(stop_result) == 200
-        assert stop_result.startswith('[... output truncated, showing last 153 chars]\n')
+        assert len(stop_result) <= 200
+        assert stop_result.startswith('[stopped:')
+        assert '[exit code:' in stop_result
+        assert 'output truncated' in stop_result
+
+    async def test_finished_background_metadata_survives_output_cap(self, shell_dir: Path) -> None:
+        ts = ShellToolset(
+            cwd=shell_dir,
+            allowed_commands=[],
+            denied_commands=[],
+            denied_operators=[],
+            default_timeout=10.0,
+            max_output_chars=200,
+            persist_cwd=False,
+            allow_interactive=False,
+        )
+        start_result = await ts.start_command("printf '%0400d' 0; exit 7")
+        command_id = _parse_command_id(start_result)
+        await anyio.sleep(0.5)
+
+        check_result = await ts.check_command(command_id)
+        assert len(check_result) == 200
+        assert check_result.startswith('[status: finished]\n[exit code: 7]\n[... output truncated')
+
+        stop_result = await ts.stop_command(command_id)
+        assert len(stop_result) <= 200
+        assert stop_result.startswith('[stopped:')
+        assert '[exit code: 7]' in stop_result
+        assert 'output truncated' in stop_result
+
+    async def test_background_metadata_larger_than_output_cap(self, shell_dir: Path) -> None:
+        ts = ShellToolset(
+            cwd=shell_dir,
+            allowed_commands=[],
+            denied_commands=[],
+            denied_operators=[],
+            default_timeout=10.0,
+            max_output_chars=10,
+            persist_cwd=False,
+            allow_interactive=False,
+        )
+        start_result = await ts.start_command('sleep 30')
+        command_id = _parse_command_id(start_result)
+        try:
+            check_result = await ts.check_command(command_id)
+            assert check_result == '[status: r'
+        finally:
+            stop_result = await ts.stop_command(command_id)
+            assert stop_result == '[stopped: '
+
+    async def test_long_stopped_command_keeps_exit_code_within_cap(self, shell_dir: Path) -> None:
+        ts = ShellToolset(
+            cwd=shell_dir,
+            allowed_commands=[],
+            denied_commands=[],
+            denied_operators=[],
+            default_timeout=10.0,
+            max_output_chars=200,
+            persist_cwd=False,
+            allow_interactive=False,
+        )
+        start_result = await ts.start_command(f'exit 7 # {"x" * 400}')
+        command_id = _parse_command_id(start_result)
+        await anyio.sleep(0.5)
+
+        stop_result = await ts.stop_command(command_id)
+        assert len(stop_result) <= 200
+        assert stop_result.startswith('[stopped:')
+        assert stop_result.endswith('[exit code: 7]')
 
     async def test_start_and_check_finished(self, shell_dir: Path) -> None:
         ts = ShellToolset(

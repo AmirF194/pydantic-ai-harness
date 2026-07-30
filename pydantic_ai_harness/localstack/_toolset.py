@@ -17,7 +17,7 @@ from pydantic_ai.tools import AgentDepsT
 from pydantic_ai.toolsets import AbstractToolset, FunctionToolset
 from typing_extensions import Self
 
-from pydantic_ai_harness._output import truncate_tail
+from pydantic_ai_harness._output import truncate_head, truncate_tail
 from pydantic_ai_harness.localstack._container import LocalStackContainer
 
 _HEALTH_PATH = '/_localstack/health'
@@ -295,8 +295,9 @@ class LocalStackToolset(FunctionToolset[AgentDepsT]):
                     stderr=stderr_file,
                 )
             except FileNotFoundError:
-                return self._truncate(
-                    f'[error: AWS CLI {self._aws_cli_path!r} not found. Install the AWS CLI to use LocalStack tools.]'
+                return truncate_head(
+                    f'[error: AWS CLI {self._aws_cli_path!r} not found. Install the AWS CLI to use LocalStack tools.]',
+                    self._max_output_chars,
                 )
 
             try:
@@ -307,7 +308,7 @@ class LocalStackToolset(FunctionToolset[AgentDepsT]):
                     proc.kill()
                     with anyio.CancelScope(shield=True):
                         await proc.wait()
-                    return self._truncate(f'[command timed out after {timeout}s]')
+                    return truncate_head(f'[command timed out after {timeout}s]', self._max_output_chars)
             finally:
                 await proc.aclose()
 
@@ -345,7 +346,9 @@ class LocalStackToolset(FunctionToolset[AgentDepsT]):
             async with httpx.AsyncClient(timeout=self._default_timeout) as client:
                 response = await client.get(url)
         except httpx.HTTPError as e:
-            return self._truncate(f'[error: could not reach LocalStack at {url}: {e}]')
+            return truncate_head(f'[error: could not reach LocalStack at {url}: {e}]', self._max_output_chars)
         if response.status_code != 200:
-            return self._truncate(f'[error: LocalStack health check returned HTTP {response.status_code}]')
+            return truncate_head(
+                f'[error: LocalStack health check returned HTTP {response.status_code}]', self._max_output_chars
+            )
         return self._truncate(response.text)

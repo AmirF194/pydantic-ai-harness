@@ -229,10 +229,19 @@ class TestAwsCli:
         result = await _toolset(aws_cli_path='/no/such/aws-binary').aws_cli('s3 ls')
         assert 'not found' in result
 
+    async def test_missing_cli_binary_respects_output_cap(self) -> None:
+        result = await _toolset(max_output_chars=10, aws_cli_path='/no/such/aws-binary').aws_cli('s3 ls')
+        assert result == '[error: AW'
+
     async def test_timeout(self, tmp_path: Path) -> None:
         stub = _make_stub(tmp_path, 'sleep 5')
         result = await _toolset(aws_cli_path=stub).aws_cli('s3 ls', timeout_seconds=0.3)
         assert 'timed out after 0.3s' in result
+
+    async def test_timeout_respects_output_cap(self, tmp_path: Path) -> None:
+        stub = _make_stub(tmp_path, 'sleep 5')
+        result = await _toolset(max_output_chars=10, aws_cli_path=stub).aws_cli('s3 ls', timeout_seconds=0.1)
+        assert result == '[command t'
 
     async def test_per_call_timeout_overrides_default(self, tmp_path: Path) -> None:
         stub = _make_stub(tmp_path, 'echo "$@"')
@@ -284,6 +293,11 @@ class TestLocalStackHealth:
             result = await _toolset(endpoint_url=server.endpoint_url).localstack_health()
         assert 'HTTP 503' in result
 
+    async def test_non_200_respects_output_cap(self) -> None:
+        with http_server([HttpResponse(503)]) as server:
+            result = await _toolset(endpoint_url=server.endpoint_url, max_output_chars=10).localstack_health()
+        assert result == '[error: Lo'
+
     async def test_at_size_limit_is_not_truncated(self) -> None:
         with http_server([HttpResponse(200, 'x' * 100)]) as server:
             result = await _toolset(endpoint_url=server.endpoint_url, max_output_chars=100).localstack_health()
@@ -300,6 +314,12 @@ class TestLocalStackHealth:
     async def test_connection_error(self) -> None:
         result = await _toolset(endpoint_url=f'http://localhost:{unused_tcp_port()}').localstack_health()
         assert 'could not reach LocalStack' in result
+
+    async def test_connection_error_respects_output_cap(self) -> None:
+        result = await _toolset(
+            endpoint_url=f'http://localhost:{unused_tcp_port()}', max_output_chars=10
+        ).localstack_health()
+        assert result == '[error: co'
 
 
 class TestLocalStackCapability:
