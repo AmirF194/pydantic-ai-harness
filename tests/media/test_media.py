@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import base64
+import json
 import os
 import sqlite3
 from datetime import datetime, timezone
@@ -10,6 +12,16 @@ from typing import TypeGuard
 
 import pytest
 from httpx import AsyncClient, MockTransport, Request, Response
+from pydantic_ai.messages import (
+    ModelMessage,
+    ModelMessagesTypeAdapter,
+    ModelRequest,
+    ModelResponse,
+    TextContent,
+    TextPart,
+    ToolReturnPart,
+    UserPromptPart,
+)
 
 from pydantic_ai_harness.media import (
     DiskMediaStore,
@@ -234,8 +246,6 @@ async def _restore_as_pre_pr_reader(node: dict[str, object], store: MediaStore) 
 
 class TestExternalizeRestoreWalker:
     async def test_round_trip_with_inline_binary(self, tmp_path: Path) -> None:
-        import base64
-        import json as _json
 
         store = DiskMediaStore(tmp_path)
         big_payload = b'\x00' * 70_000
@@ -252,19 +262,18 @@ class TestExternalizeRestoreWalker:
             ]
         }
         externalized = await externalize_media(node, media_store=store, threshold_bytes=64 * 1024)
-        externalized_text = _json.dumps(externalized)
+        externalized_text = json.dumps(externalized)
         assert '__harness_external_media__' in externalized_text
         assert 'media+sha256://' in externalized_text
         assert b64_payload not in externalized_text  # bytes really went external
 
         restored = await restore_media(externalized, media_store=store)
-        restored_text = _json.dumps(restored)
+        restored_text = json.dumps(restored)
         assert '"kind": "binary"' in restored_text
         assert b64_payload in restored_text  # bytes restored exactly
 
     async def test_binary_restore_reuses_write_context(self, tmp_path: Path) -> None:
         """A context-dependent storage key is found with the binary media type."""
-        import base64
 
         seen_contexts: list[MediaContext] = []
 
@@ -284,7 +293,6 @@ class TestExternalizeRestoreWalker:
         assert seen_contexts == [MediaContext(media_type='image/png'), MediaContext(media_type='image/png')]
 
     async def test_threshold_boundary_keeps_small_inline(self, tmp_path: Path) -> None:
-        import base64
 
         store = DiskMediaStore(tmp_path)
         small_payload = b'\x42' * 32
@@ -301,7 +309,6 @@ class TestExternalizeRestoreWalker:
 
     async def test_binary_threshold_boundary_is_inclusive(self, tmp_path: Path) -> None:
         """Exactly `threshold_bytes` externalizes; one byte under stays inline."""
-        import base64
 
         store = DiskMediaStore(tmp_path)
         threshold = 256
@@ -341,8 +348,6 @@ class TestExternalizeRestoreWalker:
 
     async def test_round_trip_preserves_unknown_binary_fields(self, tmp_path: Path) -> None:
         """A field the walker doesn't know about survives externalize -> restore."""
-        import base64
-        import json as _json
 
         store = DiskMediaStore(tmp_path)
         big = base64.b64encode(b'\x01' * 70_000).decode('ascii')
@@ -355,7 +360,7 @@ class TestExternalizeRestoreWalker:
             'future_field': 'keep-me',
         }
         externalized = await externalize_media(node, media_store=store, threshold_bytes=64 * 1024)
-        assert '"data"' not in _json.dumps(externalized)  # bytes field went external
+        assert '"data"' not in json.dumps(externalized)  # bytes field went external
         restored = await restore_media(externalized, media_store=store)
         assert restored == node
 
@@ -383,7 +388,6 @@ class TestExternalizeRestoreWalker:
         Closes #440: large tool-return strings would otherwise stay inline and
         push a snapshot past MongoDB's 16MB document cap.
         """
-        import json as _json
 
         store = DiskMediaStore(tmp_path)
         big_text = 'x' * 70_000
@@ -391,7 +395,7 @@ class TestExternalizeRestoreWalker:
             'parts': [{'content': big_text, 'tool_name': 'scrape', 'tool_call_id': 'c1', 'part_kind': 'tool-return'}]
         }
         externalized = await externalize_media(node, media_store=store, threshold_bytes=64 * 1024)
-        externalized_text = _json.dumps(externalized)
+        externalized_text = json.dumps(externalized)
         assert '__harness_external_text__' in externalized_text
         assert 'media+sha256://' in externalized_text
         assert big_text not in externalized_text  # text really went external
@@ -432,13 +436,12 @@ class TestExternalizeRestoreWalker:
 
     async def test_text_measured_in_utf8_bytes_not_characters(self, tmp_path: Path) -> None:
         """A multi-byte string below the char count but above the byte threshold externalizes."""
-        import json as _json
 
         store = DiskMediaStore(tmp_path)
         # 'é' is 2 UTF-8 bytes: 40 chars, 80 bytes.
         node = {'content': 'é' * 40, 'part_kind': 'text'}
         externalized = await externalize_media(node, media_store=store, threshold_bytes=64)
-        assert '__harness_external_text__' in _json.dumps(externalized)
+        assert '__harness_external_text__' in json.dumps(externalized)
         restored = await restore_media(externalized, media_store=store)
         assert restored == node
 
@@ -456,8 +459,6 @@ class TestExternalizeRestoreWalker:
 
     async def test_text_part_externalizes_nested_binary(self, tmp_path: Path) -> None:
         """A large text part with a nested large binary externalizes both and round-trips."""
-        import base64
-        import json as _json
 
         store = DiskMediaStore(tmp_path)
         big_text = 'x' * 70_000
@@ -468,7 +469,7 @@ class TestExternalizeRestoreWalker:
             'metadata': {'kind': 'binary', 'data': big_bin_b64, 'media_type': 'image/png'},
         }
         externalized = await externalize_media(node, media_store=store, threshold_bytes=64 * 1024)
-        dumped = _json.dumps(externalized)
+        dumped = json.dumps(externalized)
         assert big_text not in dumped
         assert big_bin_b64 not in dumped  # nested binary went external too
         assert len(list(tmp_path.glob('*.bin'))) == 2  # one text blob, one binary blob
@@ -485,7 +486,6 @@ class TestExternalizeRestoreWalker:
         large `content`, but the reference URI is stored under a namespaced key,
         so the payload's own `uri` must survive externalize -> restore intact.
         """
-        import json as _json
 
         store = DiskMediaStore(tmp_path)
         node = {
@@ -495,7 +495,7 @@ class TestExternalizeRestoreWalker:
             'tool_name': 'scrape',
         }
         externalized = await externalize_media(node, media_store=store, threshold_bytes=64 * 1024)
-        dumped = _json.dumps(externalized)
+        dumped = json.dumps(externalized)
         assert '__harness_external_text__' in dumped  # large content went external
         assert 'source://original' in dumped  # original uri untouched, not overwritten
         restored = await restore_media(externalized, media_store=store)
@@ -559,16 +559,6 @@ class TestExternalizeRestoreWalker:
         a multi-megabyte tool return delivered as `[TextContent(...)]` would
         then be written whole into the snapshot record.
         """
-        import json as _json
-
-        from pydantic_ai.messages import (
-            ModelMessage,
-            ModelMessagesTypeAdapter,
-            ModelRequest,
-            TextContent,
-            ToolReturnPart,
-            UserPromptPart,
-        )
 
         store = DiskMediaStore(tmp_path)
         big_text = 'q' * 70_000
@@ -580,9 +570,9 @@ class TestExternalizeRestoreWalker:
                 ]
             )
         ]
-        dumped = _json.loads(ModelMessagesTypeAdapter.dump_json(messages))
+        dumped = json.loads(ModelMessagesTypeAdapter.dump_json(messages))
         externalized = await externalize_media(dumped, media_store=store, threshold_bytes=64 * 1024)
-        assert big_text not in _json.dumps(externalized)
+        assert big_text not in json.dumps(externalized)
 
         restored = await restore_media(externalized, media_store=store)
         assert restored == dumped
@@ -601,7 +591,6 @@ class TestExternalizeRestoreWalker:
 
     async def test_marker_mirrors_reference_to_uri_for_pre_uri_key_readers(self, tmp_path: Path) -> None:
         """A marker written now still restores on a reader that only knows plain `uri`."""
-        import base64
 
         store = DiskMediaStore(tmp_path)
         b64_payload = base64.b64encode(b'\x02' * 70_000).decode('ascii')
@@ -620,12 +609,9 @@ class TestExternalizeRestoreWalker:
 
     async def test_text_marker_requires_current_reader_after_downgrade(self, tmp_path: Path) -> None:
         """The pre-PR binary reader cannot reconstruct externally stored text."""
-        import json as _json
-
-        from pydantic_ai.messages import ModelMessagesTypeAdapter, ModelResponse, TextPart
 
         store = DiskMediaStore(tmp_path)
-        original: object = _json.loads(
+        original: object = json.loads(
             ModelMessagesTypeAdapter.dump_json([ModelResponse(parts=[TextPart(content='x' * 128)])])
         )
         marker: object = await externalize_media(original, media_store=store, threshold_bytes=64)
@@ -675,10 +661,6 @@ class TestExternalizeRestoreWalker:
         would either fail the snapshot load or inline unrelated bytes into the
         tool return -- the payload has to stay data.
         """
-        import json as _json
-
-        from pydantic_ai.messages import ModelMessage, ModelMessagesTypeAdapter, ModelRequest, ToolReturnPart
-
         store = DiskMediaStore(tmp_path)
         # A real blob, so the embedded reference resolves: this asserts the payload
         # is left alone because it is not marker-shaped, not because the URI is dead.
@@ -694,7 +676,7 @@ class TestExternalizeRestoreWalker:
                 ]
             )
         ]
-        dumped = _json.loads(ModelMessagesTypeAdapter.dump_json(messages))
+        dumped = json.loads(ModelMessagesTypeAdapter.dump_json(messages))
         assert await restore_media(dumped, media_store=store) == dumped
 
     async def test_sentinel_payload_keeping_its_content_is_not_a_text_marker(self, tmp_path: Path) -> None:
