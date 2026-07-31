@@ -44,7 +44,7 @@ break agents that rely on inherited credentials, so opt in explicitly.
 """
 
 
-@dataclass
+@dataclass(init=False)
 class Shell(AbstractCapability[AgentDepsT]):
     """Shell command execution for agents.
 
@@ -100,15 +100,47 @@ class Shell(AbstractCapability[AgentDepsT]):
     `LLM_API_KEY_ENV_PATTERNS` for a ready-made provider-credential denylist.
     """
 
+    def __init__(
+        self,
+        cwd: str | Path = '.',
+        allowed_commands: Sequence[str] | None = None,
+        denied_commands: Sequence[str] | None = None,
+        denied_operators: Sequence[str] | None = None,
+        default_timeout: float = 30.0,
+        max_output_chars: int = 50_000,
+        persist_cwd: bool = False,
+        allow_interactive: bool = False,
+        env: Mapping[str, str] | None = None,
+        denied_env_patterns: Sequence[str] | None = None,
+        *,
+        id: str | None = None,
+        description: str | None = None,
+        defer_loading: bool = False,
+    ) -> None:
+        """Configure shell command execution."""
+        self.cwd = cwd
+        self.allowed_commands = [] if allowed_commands is None else allowed_commands
+        if denied_commands is None:
+            self.denied_commands = [] if self.allowed_commands else list(_DEFAULT_DENIED_COMMANDS)
+        else:
+            self.denied_commands = denied_commands
+        self.denied_operators = [] if denied_operators is None else denied_operators
+        self.default_timeout = default_timeout
+        self.max_output_chars = max_output_chars
+        self.persist_cwd = persist_cwd
+        self.allow_interactive = allow_interactive
+        self.env = env
+        self.denied_env_patterns = [] if denied_env_patterns is None else denied_env_patterns
+        self.id = id
+        self.description = description
+        self.defer_loading = defer_loading
+
     def get_toolset(self) -> ShellToolset[AgentDepsT]:
         """Build and return the shell toolset."""
-        denied_commands = self.denied_commands
-        if self.allowed_commands and denied_commands == _DEFAULT_DENIED_COMMANDS:
-            denied_commands = ()
         return ShellToolset[AgentDepsT](
             cwd=Path(self.cwd),
             allowed_commands=self.allowed_commands,
-            denied_commands=denied_commands,
+            denied_commands=self.denied_commands,
             denied_operators=self.denied_operators,
             default_timeout=self.default_timeout,
             max_output_chars=self.max_output_chars,

@@ -1147,9 +1147,30 @@ class TestShellCapability:
             cwd='/tmp',
             allowed_commands=['echo', 'cat'],
             denied_commands=[],
+            denied_operators=['>'],
             default_timeout=60.0,
+            max_output_chars=1_000,
+            persist_cwd=True,
+            allow_interactive=True,
+            env={'PATH': '/bin'},
+            denied_env_patterns=['OPENAI_*'],
+            id='shell',
+            description='Run shell commands.',
+            defer_loading=True,
         )
+        assert shell.cwd == '/tmp'
+        assert shell.allowed_commands == ['echo', 'cat']
+        assert shell.denied_commands == []
+        assert shell.denied_operators == ['>']
         assert shell.default_timeout == 60.0
+        assert shell.max_output_chars == 1_000
+        assert shell.persist_cwd is True
+        assert shell.allow_interactive is True
+        assert shell.env == {'PATH': '/bin'}
+        assert shell.denied_env_patterns == ['OPENAI_*']
+        assert shell.id == 'shell'
+        assert shell.description == 'Run shell commands.'
+        assert shell.defer_loading is True
         shell.get_toolset()._check_command('echo hello')
 
     def test_allowlist_ignores_implicit_default_denylist(self) -> None:
@@ -1174,6 +1195,13 @@ class TestShellCapability:
         with pytest.raises(ValueError, match='Specify allowed_commands or denied_commands'):
             shell.get_toolset()
 
+    def test_explicit_default_valued_denylist_remains_invalid(self) -> None:
+        denied_commands = Shell().denied_commands
+        shell = Shell(allowed_commands=['rm'], denied_commands=denied_commands)
+
+        with pytest.raises(ValueError, match='Specify allowed_commands or denied_commands'):
+            shell.get_toolset()
+
     def test_agent_accepts_allowlist_without_explicit_denylist(self, tmp_path: Path) -> None:
         Agent(TestModel(), capabilities=[Shell(cwd=tmp_path, allowed_commands=['echo'])])
 
@@ -1187,7 +1215,7 @@ class TestShellCapability:
         assert len(shells) == 1
         shell = shells[0]
         assert shell.allowed_commands == ['ls', 'cat', 'rg']
-        assert 'rm' in shell.denied_commands
+        assert shell.denied_commands == []
         shell.get_toolset()._check_command('ls')
 
     def test_dataclasses_replace_preserves_allowlist(self) -> None:
@@ -1195,7 +1223,7 @@ class TestShellCapability:
 
         assert replaced.cwd == '/tmp'
         assert replaced.allowed_commands == ['echo']
-        assert 'rm' in replaced.denied_commands
+        assert replaced.denied_commands == []
         replaced.get_toolset()._check_command('echo')
 
     def test_get_toolset_returns_toolset(self, tmp_path: Path) -> None:
