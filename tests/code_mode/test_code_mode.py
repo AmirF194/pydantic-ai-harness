@@ -2232,7 +2232,7 @@ class TestCodeMode:
                     tools['run_code'],
                 )
             )
-            await first_started.wait()
+            await asyncio.wait_for(first_started.wait(), timeout=1)
             await asyncio.sleep(0)
             assert events == ['a']
             release_first.set()
@@ -3194,12 +3194,13 @@ async def test_dispatch_gate_cancels_waiters_and_keeps_writers_fair() -> None:
     await writer
 
 
-async def test_dispatch_tracker_keeps_interrupted_task_reapable() -> None:
-    """An interrupted awaiter cancels its dispatch task and leaves it for `cancel`.
+async def test_dispatch_tracker_reaps_dropped_wrapper_via_cancel() -> None:
+    """Dropping a mid-feed wrapper leaves its dispatch task for `cancel` to reap.
 
-    Cancelling the coroutine that awaits a task does not cancel the task itself,
-    so without this the dispatched host work would keep running untracked after
-    Monty tears down an external wrapper mid-feed.
+    Monty's driver may drop the external wrapper coroutine during feed teardown
+    (`coroutine.close()`, i.e. `GeneratorExit`), which does not stop the dispatch
+    task it is awaiting. The tracker must keep that task until `cancel` runs, so
+    host work cannot outlive the feed.
     """
     tracker = _DispatchTracker()
     dispatch_started = asyncio.Event()
@@ -3213,11 +3214,15 @@ async def test_dispatch_tracker_keeps_interrupted_task_reapable() -> None:
             dispatch_cancelled.set()
             raise
 
-    awaiter = asyncio.create_task(tracker.run(dispatch()))
-    await dispatch_started.wait()
-    awaiter.cancel()
-    with pytest.raises(asyncio.CancelledError):
-        await awaiter
+    # Drive the wrapper to its `await task` suspension the way Monty invokes an
+    # external, then drop it, without ever cancelling the dispatch task ourselves.
+    wrapper = tracker.run(dispatch())
+    wrapper.send(None)
+    await asyncio.wait_for(dispatch_started.wait(), timeout=1)
+    wrapper.close()
+
+    assert not dispatch_cancelled.is_set()
+    assert tracker._tasks  # pyright: ignore[reportPrivateUsage]
 
     await tracker.cancel()
     assert dispatch_cancelled.is_set()

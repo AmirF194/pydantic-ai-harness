@@ -105,10 +105,12 @@ class _SyncMontyRunState:
 
     async def close(self) -> None:
         """Return the checked-out worker and close the owning pool."""
-        await self.reset()
-        self._pool_stack.close()
-        self._pool_stack = ExitStack()
-        self.pool = None
+        try:
+            await self.reset()
+        finally:
+            self._pool_stack.close()
+            self._pool_stack = ExitStack()
+            self.pool = None
 
 
 @dataclass
@@ -142,10 +144,12 @@ class _AsyncMontyRunState:
 
     async def close(self) -> None:
         """Return the async worker before closing its local or remote pool."""
-        await self.reset()
-        await self._pool_stack.aclose()
-        self._pool_stack = AsyncExitStack()
-        self.pool = None
+        try:
+            await self.reset()
+        finally:
+            await self._pool_stack.aclose()
+            self._pool_stack = AsyncExitStack()
+            self.pool = None
 
 
 _MontyRunState = _SyncMontyRunState | _AsyncMontyRunState
