@@ -96,8 +96,8 @@ def _is_text_part(node: dict[str, object]) -> bool:
     return isinstance(node.get('part_kind'), str) or node.get('kind') == _TEXT_CONTENT_KIND
 
 
-def _is_external_marker(node: dict[str, object]) -> bool:
-    """A node shaped like something `externalize_media` actually produced.
+def _marker_kind(node: dict[str, object]) -> str | None:
+    """Which of the two markers `node` is shaped like, or `None` for ordinary data.
 
     The sentinel alone is not enough. `ToolReturnContent` permits any
     `Mapping[str, ...]`, so a tool can legitimately return a payload carrying
@@ -106,11 +106,18 @@ def _is_external_marker(node: dict[str, object]) -> bool:
     snapshot load or inlining unrelated bytes into the tool return.
 
     So restore matches the same discriminators the externalize side gates on,
-    plus the absence of the field that was moved out: a binary marker keeps
-    `kind == 'binary'` and has no `data`, a text marker keeps its `part_kind`
-    (or `kind == 'text-content'`) and has no `content`. Markers written before
+    plus the absence of the field that was moved out: a text marker keeps its
+    `part_kind` (or `kind == 'text-content'`) and has no `content`, a binary
+    marker keeps `kind == 'binary'` and has no `data`. Markers written before
     text externalization existed are all binary and all carry `kind`, so they
     still match.
+
+    Shape decides, `_TEXT_MARKER` alone does not. `_preserve_fields` copies
+    every field of the source node onto the marker, so a binary payload that
+    already carried a `_TEXT_MARKER` key hands its marker that key too; keying
+    the text branch on the flag would then strand the binary marker as
+    unrestorable. The text branch therefore requires a text *shape*, and a
+    binary marker falls through to the binary branch regardless of the flag.
 
     This narrows the collision rather than closing it -- an in-band JSON
     sentinel is collidable by construction. A payload that sets the sentinel
@@ -118,12 +125,13 @@ def _is_external_marker(node: dict[str, object]) -> bool:
     marker; nothing short of out-of-band framing prevents that.
     """
     if node.get(_EXTERNAL_MARKER) is not True:
-        return False
-    if node.get(_TEXT_MARKER) is True:
-        if 'content' in node:
-            return False
-        return isinstance(node.get('part_kind'), str) or node.get('kind') == _TEXT_CONTENT_KIND
-    return node.get('kind') == 'binary' and 'data' not in node
+        return None
+    if node.get(_TEXT_MARKER) is True and 'content' not in node:
+        if isinstance(node.get('part_kind'), str) or node.get('kind') == _TEXT_CONTENT_KIND:
+            return 'text'
+    if node.get('kind') == 'binary' and 'data' not in node:
+        return 'binary'
+    return None
 
 
 async def externalize_media(node: object, *, media_store: MediaStore, threshold_bytes: int) -> object:
@@ -246,8 +254,8 @@ async def restore_media(node: object, *, media_store: MediaStore) -> object:
     result round-trips through `ModelMessagesTypeAdapter.validate_python`.
 
     Only nodes shaped like a marker this module wrote are resolved -- see
-    `_is_external_marker`. Anything else, including a tool payload that
-    happens to carry the sentinel key, is walked through as ordinary data.
+    `_marker_kind`. Anything else, including a tool payload that happens to
+    carry the sentinel key, is walked through as ordinary data.
     """
     if _is_json_list(node):
         out_list: list[object] = []
@@ -255,8 +263,9 @@ async def restore_media(node: object, *, media_store: MediaStore) -> object:
             out_list.append(await restore_media(item, media_store=media_store))
         return out_list
     if _is_json_dict(node):
-        if _is_external_marker(node):
-            return await _restore_external(node, media_store)
+        kind = _marker_kind(node)
+        if kind is not None:
+            return await _restore_external(node, media_store, kind)
         out_dict: dict[str, object] = {}
         for key, value in node.items():
             out_dict[key] = await restore_media(value, media_store=media_store)
@@ -264,8 +273,11 @@ async def restore_media(node: object, *, media_store: MediaStore) -> object:
     return node
 
 
-async def _restore_external(node: dict[str, object], media_store: MediaStore) -> dict[str, object]:
-    dropped = {_EXTERNAL_MARKER, _TEXT_MARKER}
+async def _restore_external(node: dict[str, object], media_store: MediaStore, kind: str) -> dict[str, object]:
+    is_text = kind == 'text'
+    # `_TEXT_MARKER` is only ours on a text marker. On a binary one it came from the
+    # source payload via `_preserve_fields`, so dropping it would delete user data.
+    dropped = {_EXTERNAL_MARKER, _TEXT_MARKER} if is_text else {_EXTERNAL_MARKER}
     if _URI_KEY in node:
         uri_value = node[_URI_KEY]
         dropped.add(_URI_KEY)
@@ -283,7 +295,6 @@ async def _restore_external(node: dict[str, object], media_store: MediaStore) ->
         dropped.add('uri')
     if not isinstance(uri_value, str):
         raise ValueError(f'externalized media marker missing string uri: {node!r}')
-    is_text = node.get(_TEXT_MARKER) is True
     if is_text:
         context = MediaContext(media_type='text/plain')
     else:

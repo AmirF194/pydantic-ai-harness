@@ -694,6 +694,25 @@ class TestExternalizeRestoreWalker:
         }
         assert await restore_media(node, media_store=store) == node
 
+    async def test_binary_part_carrying_the_text_marker_still_round_trips(self, tmp_path: Path) -> None:
+        """A binary payload whose own fields include the text marker key still restores.
+
+        `_preserve_fields` copies every source field onto the marker, so the stray
+        `__harness_external_text__` lands on a binary marker. Keying the text branch
+        on that flag rather than on a text shape would leave the marker unresolved
+        and the bytes stranded behind a URI.
+        """
+        store = DiskMediaStore(tmp_path)
+        node: dict[str, object] = {
+            'kind': 'binary',
+            'data': base64.b64encode(b'\x07' * 70_000).decode('ascii'),
+            'media_type': 'image/png',
+            '__harness_external_text__': True,
+        }
+        externalized = await externalize_media(node, media_store=store, threshold_bytes=64 * 1024)
+        assert externalized != node
+        assert await restore_media(externalized, media_store=store) == node
+
     async def test_sentinel_payload_keeping_its_data_is_not_a_binary_marker(self, tmp_path: Path) -> None:
         """Same on the binary side: a node still carrying `data` was never externalized."""
         store = DiskMediaStore(tmp_path)
