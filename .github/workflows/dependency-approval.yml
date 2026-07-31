@@ -7,7 +7,7 @@ on:
 
 permissions:
   issues: write
-  pull-requests: read
+  pull-requests: write
   statuses: write
 
 concurrency:
@@ -30,15 +30,38 @@ jobs:
           LABEL_NAME: ${{ github.event.label.name }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
         run: |
-          pr="$(gh api "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER")"
-          files="$(
-            gh api \
-              --paginate \
-              --slurp \
-              "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER/files?per_page=100"
-          )"
-          expected="$(jq -r '.changed_files' <<<"$pr")"
-          found="$(jq -r 'flatten | length' <<<"$files")"
+          # Revoking is `approved=false`; dropping the label is only cleanup, so a
+          # failure there must not abort the step before the status is posted.
+          revoke_approval() {
+            if ! gh api \
+              --method DELETE \
+              "repos/$GITHUB_REPOSITORY/issues/$PR_NUMBER/labels/dependencies%3Aapproved"
+            then
+              echo "::warning::Could not remove the dependencies:approved label. Approval is still revoked for this head."
+            fi
+            approved=false
+          }
+
+          # `changed_files` on the PR object and the paginated files listing are
+          # populated independently, so they disagree for a few seconds after a
+          # PR opens or a push lands. A disagreement is a stale read, not an
+          # incomplete diff, so refetch both until they agree before judging.
+          for attempt in 1 2 3 4 5; do
+            pr="$(gh api "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER")"
+            files="$(
+              gh api \
+                --paginate \
+                --slurp \
+                "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER/files?per_page=100"
+            )"
+            expected="$(jq -r '.changed_files' <<<"$pr")"
+            found="$(jq -r 'flatten | length' <<<"$files")"
+            if [ "$found" -eq "$expected" ]; then
+              break
+            fi
+            echo "::notice::Listed $found of $expected changed files (attempt $attempt); refetching."
+            sleep "$((attempt * 3))"
+          done
           changed="$(jq -r '
             flatten |
             any(
@@ -53,10 +76,7 @@ jobs:
           ' <<<"$pr")"
 
           if [ "$ACTION" = synchronize ] && [ "$approved" = true ]; then
-            gh api \
-              --method DELETE \
-              "repos/$GITHUB_REPOSITORY/issues/$PR_NUMBER/labels/dependencies%3Aapproved"
-            approved=false
+            revoke_approval
           elif [ "$ACTION" = labeled ] && [ "$LABEL_NAME" = dependencies:approved ]; then
             permission="$(
               gh api \
@@ -64,10 +84,7 @@ jobs:
                 --jq '.permission'
             )"
             if [[ ! "$permission" =~ ^(admin|maintain|write)$ ]]; then
-              gh api \
-                --method DELETE \
-                "repos/$GITHUB_REPOSITORY/issues/$PR_NUMBER/labels/dependencies%3Aapproved"
-              approved=false
+              revoke_approval
             fi
           fi
 
