@@ -196,7 +196,10 @@ class FileSystemToolset(FunctionToolset[AgentDepsT]):
         if limit is None:
             limit = self._max_read_lines
         absolute = await self._safe_resolve(path)
-        entry = await self.sandbox.fs.stat(absolute)
+        try:
+            entry = await self.sandbox.fs.stat(absolute)
+        except FileNotFoundError as e:
+            raise FileNotFoundError(f'File not found: {path}') from e
         if entry.is_dir:
             raise FileNotFoundError(f"'{path}' is a directory, not a file.")
 
@@ -257,7 +260,10 @@ class FileSystemToolset(FunctionToolset[AgentDepsT]):
             expected_hash: If provided, rejects the edit when the file's current hash doesn't match.
         """
         absolute = await self._safe_resolve(path, write=True)
-        raw = await self.sandbox.fs.read_bytes(absolute)
+        try:
+            raw = await self.sandbox.fs.read_bytes(absolute)
+        except FileNotFoundError as e:
+            raise FileNotFoundError(f'File not found: {path}') from e
 
         text = raw.decode('utf-8', errors='replace')
         current_hash = _content_hash(text)
@@ -289,7 +295,10 @@ class FileSystemToolset(FunctionToolset[AgentDepsT]):
             path: Directory path relative to the root directory.
         """
         absolute = await self._safe_resolve(path, check_allowed=False)
-        entry = await self.sandbox.fs.stat(absolute)
+        try:
+            entry = await self.sandbox.fs.stat(absolute)
+        except FileNotFoundError as e:
+            raise NotADirectoryError(f'Not a directory: {path}') from e
         if not entry.is_dir:
             raise NotADirectoryError(f'Not a directory: {path}')
 
@@ -316,6 +325,9 @@ class FileSystemToolset(FunctionToolset[AgentDepsT]):
             pattern: Regex pattern to search for.
             path: Directory to search in, relative to the root directory.
             include_glob: If provided, only search files matching this glob (e.g. `*.py`).
+
+        Returns:
+            str: Matching lines formatted as file:line_number:text.
         """
         absolute = await self._safe_resolve(path, check_allowed=False)
         try:
@@ -359,7 +371,10 @@ class FileSystemToolset(FunctionToolset[AgentDepsT]):
             path: Directory to search in, relative to the root directory.
         """
         absolute = await self._safe_resolve(path, check_allowed=False)
-        entry = await self.sandbox.fs.stat(absolute)
+        try:
+            entry = await self.sandbox.fs.stat(absolute)
+        except FileNotFoundError as e:
+            raise NotADirectoryError(f'Not a directory: {path}') from e
         if not entry.is_dir:
             raise NotADirectoryError(f'Not a directory: {path}')
 
@@ -401,7 +416,10 @@ class FileSystemToolset(FunctionToolset[AgentDepsT]):
             path: File or directory path relative to the root directory.
         """
         absolute = await self._safe_resolve(path)
-        entry = await self.sandbox.fs.stat(absolute)
+        try:
+            entry = await self.sandbox.fs.stat(absolute)
+        except FileNotFoundError as e:
+            raise FileNotFoundError(f'Path not found: {path}') from e
 
         parts = [f'path: {path}', f'type: {"directory" if entry.is_dir else "file"}', f'size: {entry.size or 0} bytes']
 
