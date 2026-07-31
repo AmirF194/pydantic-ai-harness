@@ -7,15 +7,25 @@ from typing import Any
 from unittest.mock import AsyncMock, patch
 
 import pytest
-from opentelemetry.trace import NoOpTracer, Tracer
+from opentelemetry.trace import NoOpTracer, Tracer, get_tracer
+from pydantic_ai import Agent, Tool
+from pydantic_ai.capabilities import ToolSearch
 from pydantic_ai.messages import (
+    BinaryContent,
+    FilePart,
+    ImageUrl,
     LoadCapabilityCallPart,
     ModelMessage,
     ModelMessagesTypeAdapter,
     ModelRequest,
     ModelResponse,
+    NativeToolCallPart,
+    NativeToolReturnPart,
+    RetryPromptPart,
     SystemPromptPart,
+    TextContent,
     TextPart,
+    ThinkingPart,
     ToolCallPart,
     ToolReturnPart,
     ToolSearchCallPart,
@@ -24,10 +34,14 @@ from pydantic_ai.messages import (
     UserPromptPart,
 )
 from pydantic_ai.models import Model, ModelRequestContext, ModelRequestParameters
+from pydantic_ai.models.function import AgentInfo, FunctionModel
+from pydantic_ai.models.instrumented import InstrumentationSettings
 from pydantic_ai.models.test import TestModel
 from pydantic_ai.toolsets._tool_search import parse_discovered_tools
 from pydantic_ai.usage import RunUsage
 
+import pydantic_ai_harness
+import pydantic_ai_harness.compaction as compaction
 from pydantic_ai_harness.compaction import (
     ClampOversizedMessages,
     ClearToolResults,
@@ -53,6 +67,7 @@ from pydantic_ai_harness.compaction._shared import (
     prepend_first_user_message,
 )
 from pydantic_ai_harness.compaction._summarizing_compaction import (
+    _DEFAULT_SUMMARY_PROMPT,
     _SUMMARY_PREFIX,
     _extract_previous_summary,
     _extract_system_prompts,
@@ -717,8 +732,6 @@ class TestExtractSystemPrompts:
 
 class TestExports:
     def test_exposed_under_submodule_only(self):
-        import pydantic_ai_harness
-        import pydantic_ai_harness.compaction as compaction
 
         names = [
             'SlidingWindowCompaction',
@@ -744,7 +757,6 @@ class TestUserPromptMultiModal:
     """Cover _user_prompt_text_for_counting and _user_prompt_text for non-string UserContent."""
 
     def test_estimate_with_text_content_parts(self):
-        from pydantic_ai.messages import TextContent
 
         part = UserPromptPart(content=[TextContent(content='hello')])
         msgs: list[ModelMessage] = [ModelRequest(parts=[part])]
@@ -759,7 +771,6 @@ class TestUserPromptMultiModal:
         assert estimate_token_count(msgs) == 2
 
     def test_format_with_text_content(self):
-        from pydantic_ai.messages import TextContent
 
         part = UserPromptPart(content=[TextContent(content='multi-part')])
         msgs: list[ModelMessage] = [ModelRequest(parts=[part])]
@@ -1859,7 +1870,6 @@ class TestSummarizingCompactionModel:
         assert mock_agent_instance.run.call_args.kwargs['usage'] is ctx.usage
 
     def test_default_prompt_has_structured_sections(self):
-        from pydantic_ai_harness.compaction._summarizing_compaction import _DEFAULT_SUMMARY_PROMPT
 
         for heading in (
             '## Intent',
@@ -2018,7 +2028,6 @@ class TestClampOversizedMessages:
 
     @pytest.mark.anyio
     async def test_request_messages_and_other_parts_untouched(self):
-        from pydantic_ai.messages import ThinkingPart
 
         big_user = _user('u' * 5_000)
         mixed = ModelResponse(parts=[ThinkingPart(content='t' * 5_000), TextPart(content='z' * 5_000)])
@@ -2064,8 +2073,6 @@ class TestPublicPath:
 
     @pytest.mark.anyio
     async def test_capabilities_wired_into_agent(self):
-        from pydantic_ai import Agent
-        from pydantic_ai.models.test import TestModel
 
         agent = Agent(
             TestModel(),
@@ -2076,8 +2083,6 @@ class TestPublicPath:
 
     @pytest.mark.anyio
     async def test_clamp_oversized_wired_into_agent(self):
-        from pydantic_ai import Agent
-        from pydantic_ai.models.test import TestModel
 
         agent = Agent(
             TestModel(),
@@ -2093,9 +2098,6 @@ class TestPublicPath:
         # `parse_discovered_tools`; blanking it to a string used to crash the *next*
         # request. Drive a multi-request run (search -> clear fires -> another request)
         # and assert it completes with discovery intact.
-        from pydantic_ai import Agent, Tool
-        from pydantic_ai.capabilities import ToolSearch
-        from pydantic_ai.models.function import AgentInfo, FunctionModel
 
         def hidden_gem(x: int) -> int:
             return x + 1
@@ -2149,7 +2151,6 @@ class TestHelperBranchCoverage:
 
     def test_a_retry_and_a_thinking_block_are_counted(self):
         """Both are sent to the provider, and a run under load is where they appear."""
-        from pydantic_ai.messages import RetryPromptPart, ThinkingPart
 
         msgs: list[ModelMessage] = [
             ModelRequest(parts=[RetryPromptPart(content='r' * 400)]),
@@ -2162,7 +2163,6 @@ class TestHelperBranchCoverage:
 
     def test_a_provider_side_tool_call_and_its_result_are_counted(self):
         """A web search runs on the provider's side and its result still lands in the context."""
-        from pydantic_ai.messages import NativeToolCallPart, NativeToolReturnPart
 
         msgs: list[ModelMessage] = [
             ModelResponse(
@@ -2193,7 +2193,6 @@ class TestHelperBranchCoverage:
 
     def test_a_binary_part_is_not_counted_as_characters(self):
         """`FilePart` carries bytes; its length in characters would mean nothing."""
-        from pydantic_ai.messages import BinaryContent, FilePart
 
         msgs: list[ModelMessage] = [
             ModelResponse(parts=[FilePart(content=BinaryContent(data=b'\x00' * 4_000, media_type='image/png'))])
@@ -2202,7 +2201,6 @@ class TestHelperBranchCoverage:
         assert _format_messages(msgs) == ''
 
     def test_user_prompt_text_skips_non_text_content(self):
-        from pydantic_ai.messages import ImageUrl
 
         part = UserPromptPart(content=[ImageUrl(url='https://example.com/y.png'), 'hello'])
         msgs: list[ModelMessage] = [ModelRequest(parts=[part])]
@@ -2277,7 +2275,6 @@ def _make_ctx_with_tracer() -> Any:
     The `capfire` fixture configures the global OTel provider, so a tracer fetched from it
     captures the `compact_messages` span without needing a full instrumented `Agent` run.
     """
-    from opentelemetry.trace import get_tracer
 
     ctx = _make_ctx()
     ctx.tracer = get_tracer('test')
@@ -2294,9 +2291,6 @@ class TestCompactionSpan:
 
     @pytest.mark.anyio
     async def test_span_emitted_when_threshold_exceeded(self, capfire: CaptureLogfire) -> None:
-        from pydantic_ai import Agent
-        from pydantic_ai.models.instrumented import InstrumentationSettings
-        from pydantic_ai.models.test import TestModel
 
         agent: Agent[None, str] = Agent(
             TestModel(),
@@ -2319,9 +2313,6 @@ class TestCompactionSpan:
 
     @pytest.mark.anyio
     async def test_no_span_when_threshold_not_exceeded(self, capfire: CaptureLogfire) -> None:
-        from pydantic_ai import Agent
-        from pydantic_ai.models.instrumented import InstrumentationSettings
-        from pydantic_ai.models.test import TestModel
 
         agent: Agent[None, str] = Agent(
             TestModel(),
@@ -2379,7 +2370,6 @@ class TestCompactionSpan:
 
     @pytest.mark.anyio
     async def test_clamp_no_span_for_non_oversized_or_skipped_parts(self, capfire: CaptureLogfire) -> None:
-        from pydantic_ai.messages import ThinkingPart
 
         comp = ClampOversizedMessages(max_part_chars=1_000, clamp_tool_call_args=True)
         messages: list[ModelMessage] = [
