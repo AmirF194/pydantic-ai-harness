@@ -13,7 +13,6 @@ from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanE
 from opentelemetry.trace import Tracer
 from pydantic_ai import Agent, AgentSpec, DeferredToolRequests, ModelRetry, RunContext
 from pydantic_ai.capabilities import ToolSearch
-from pydantic_ai.durable_exec.temporal import TemporalDurability
 from pydantic_ai.messages import (
     ModelMessage,
     ModelMessagesTypeAdapter,
@@ -1382,6 +1381,8 @@ class TestTelemetryAndComposition:
 
     def test_temporal_durability_accepts_static_memory_toolset(self) -> None:
         pytest.importorskip('temporalio')
+
+        from pydantic_ai.durable_exec.temporal import TemporalDurability  # noqa: PLC0415  # needs the temporal extra
 
         Agent(
             TestModel(),
