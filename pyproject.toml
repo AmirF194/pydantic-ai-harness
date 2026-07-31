@@ -103,6 +103,12 @@ lint = [
     'pyright>=1.1.408',
 ]
 
+[tool.uv.sources]
+# Pinned to the unreleased sandbox concept branch (pydantic/pydantic-ai#6492) so this
+# harness can consume `RunContext.sandbox`, `get_sandbox`, and the `Sandbox` facade.
+# Flip back to a released pydantic-ai-slim once #6492 lands.
+pydantic-ai-slim = { git = 'https://github.com/pydantic/pydantic-ai.git', branch = 'sandbox-concept', subdirectory = 'pydantic_ai_slim' }
+
 [tool.hatch.version]
 source = 'uv-dynamic-versioning'
 
