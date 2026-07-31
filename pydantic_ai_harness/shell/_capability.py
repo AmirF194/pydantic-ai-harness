@@ -11,7 +11,7 @@ from pydantic_ai.tools import AgentDepsT
 
 from pydantic_ai_harness.shell._toolset import ShellToolset
 
-_DEFAULT_DENIED_COMMANDS: list[str] = [
+_DEFAULT_DENIED_COMMANDS: tuple[str, ...] = (
     'rm',
     'rmdir',
     'mkfs',
@@ -22,7 +22,7 @@ _DEFAULT_DENIED_COMMANDS: list[str] = [
     'halt',
     'poweroff',
     'init',
-]
+)
 
 
 LLM_API_KEY_ENV_PATTERNS: tuple[str, ...] = (
@@ -44,7 +44,7 @@ break agents that rely on inherited credentials, so opt in explicitly.
 """
 
 
-@dataclass(init=False)
+@dataclass
 class Shell(AbstractCapability[AgentDepsT]):
     """Shell command execution for agents.
 
@@ -58,7 +58,7 @@ class Shell(AbstractCapability[AgentDepsT]):
     allowed_commands: Sequence[str] = field(default_factory=list[str])
     """If non-empty, only these command names may be executed (allowlist)."""
 
-    denied_commands: Sequence[str] = field(default_factory=lambda: list(_DEFAULT_DENIED_COMMANDS))
+    denied_commands: Sequence[str] = _DEFAULT_DENIED_COMMANDS
     """These command names are always rejected (denylist).
 
     Defaults to blocking destructive commands (rm, dd, shutdown, etc.).
@@ -100,40 +100,10 @@ class Shell(AbstractCapability[AgentDepsT]):
     `LLM_API_KEY_ENV_PATTERNS` for a ready-made provider-credential denylist.
     """
 
-    def __init__(
-        self,
-        cwd: str | Path = '.',
-        allowed_commands: Sequence[str] | None = None,
-        denied_commands: Sequence[str] | None = None,
-        denied_operators: Sequence[str] | None = None,
-        default_timeout: float = 30.0,
-        max_output_chars: int = 50_000,
-        persist_cwd: bool = False,
-        allow_interactive: bool = False,
-        env: Mapping[str, str] | None = None,
-        denied_env_patterns: Sequence[str] | None = None,
-        *,
-        id: str | None = None,
-        description: str | None = None,
-        defer_loading: bool = False,
-    ) -> None:
-        """Configure shell command execution."""
-        self.cwd = cwd
-        self.allowed_commands = [] if allowed_commands is None else allowed_commands
-        if denied_commands is None:
+    def __post_init__(self) -> None:
+        """Resolve the built-in denylist according to the selected policy."""
+        if self.denied_commands is _DEFAULT_DENIED_COMMANDS:
             self.denied_commands = [] if self.allowed_commands else list(_DEFAULT_DENIED_COMMANDS)
-        else:
-            self.denied_commands = denied_commands
-        self.denied_operators = [] if denied_operators is None else denied_operators
-        self.default_timeout = default_timeout
-        self.max_output_chars = max_output_chars
-        self.persist_cwd = persist_cwd
-        self.allow_interactive = allow_interactive
-        self.env = env
-        self.denied_env_patterns = [] if denied_env_patterns is None else denied_env_patterns
-        self.id = id
-        self.description = description
-        self.defer_loading = defer_loading
 
     def get_toolset(self) -> ShellToolset[AgentDepsT]:
         """Build and return the shell toolset."""
