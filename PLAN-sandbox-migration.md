@@ -9,6 +9,39 @@ head; the pin flips back to a released version once #6492 lands. See `pyproject.
 
 Delete this file before merge.
 
+## Progress
+
+Migrated so far (each with tests green + docstring covering the sandbox contract):
+
+- `filesystem` (commits `3c719b9`, `3e56451`)
+- `shell` (commits `9c3e3ca`, `6573f2c`) -- persist_cwd marker parsing fix, `env -i`
+  strict-env wrap for backends that overlay host env (e.g. `LocalSandbox`), and
+  `start()`-only tests skipped on `LocalSandbox`.
+- `experimental/acp` client toolsets (commit `d8fdf92`) -- read-only-client local
+  writer rebound to `ctx.sandbox` via `for_run`.
+- `pydantic_ai_docs` (commit `e3ad259`) -- local checkout probe uses
+  `sandbox.fs.exists` + `read_text`.
+- `repo_context` (commit `366d231`) -- walk-up discovery and nested-traversal notes
+  route through `sandbox.fs`; instructions load once in `before_run`. Symlink-realpath
+  dedup dropped (content-hash dedup preserved).
+
+Remaining (in migration-table order):
+
+- Storage variants: `SandboxOverflowStore`, `SandboxMediaStore`, `SandboxStepStore`,
+  `SandboxMemoryStore` -- each ships alongside the existing `Disk*` store, and the
+  matching capability's default flips to the sandbox-backed variant via
+  `default_state_dir(sandbox, '<capability>')` resolved in `before_run` /
+  `for_run`.
+- `subagents/_disk.py` -- markdown definitions currently loaded synchronously at
+  capability construction; needs deferral to `before_run` so file reads can consult
+  `ctx.sandbox`. Non-trivial because `_by_name` and `get_instructions` depend on the
+  loaded roster.
+- `capability_creation` (formerly `runtime_authoring`) -- writes through
+  `ctx.sandbox.fs`; validation stays local.
+- README and `docs/<capability>.md` updates for each migrated capability.
+- Adversarial review rounds across correctness / api-consistency / security /
+  test-coverage.
+
 ## Motivation
 
 Once `ctx.sandbox` is the framework's single execution surface, every capability that
