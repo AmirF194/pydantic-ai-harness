@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import dataclasses
 import os
 import shlex
 import sys
@@ -12,10 +11,8 @@ from unittest.mock import MagicMock, patch
 
 import anyio
 import pytest
-from pydantic_ai import Agent, AgentSpec, RunContext
+from pydantic_ai import Agent, RunContext
 from pydantic_ai.exceptions import ModelRetry
-from pydantic_ai.messages import ModelMessage, ModelResponse, RetryPromptPart, TextPart, ToolCallPart, ToolReturnPart
-from pydantic_ai.models.function import AgentInfo, FunctionModel
 from pydantic_ai.models.test import TestModel
 from pydantic_ai.usage import RunUsage
 
@@ -35,6 +32,7 @@ def _env_toolset(
     """Build a ShellToolset wired for env-control tests, with safe defaults."""
     return ShellToolset(
         cwd=shell_dir,
+        allowed_commands=[],
         denied_commands=[],
         denied_operators=[],
         default_timeout=10.0,
@@ -141,6 +139,7 @@ def shell_dir(tmp_path: Path) -> Path:
 def toolset(shell_dir: Path) -> ShellToolset[None]:
     return ShellToolset(
         cwd=shell_dir,
+        allowed_commands=[],
         denied_commands=['rm', 'rmdir'],
         denied_operators=[],
         default_timeout=10.0,
@@ -154,6 +153,7 @@ def toolset(shell_dir: Path) -> ShellToolset[None]:
 def persist_toolset(shell_dir: Path) -> ShellToolset[None]:
     return ShellToolset(
         cwd=shell_dir,
+        allowed_commands=[],
         denied_commands=[],
         denied_operators=[],
         default_timeout=10.0,
@@ -172,6 +172,7 @@ class TestCommandValidation:
         ts = ShellToolset(
             cwd=shell_dir,
             allowed_commands=['echo', 'cat'],
+            denied_commands=[],
             denied_operators=[],
             default_timeout=10.0,
             max_output_chars=50_000,
@@ -185,6 +186,7 @@ class TestCommandValidation:
         ts = ShellToolset(
             cwd=shell_dir,
             allowed_commands=['echo'],
+            denied_commands=[],
             denied_operators=[],
             default_timeout=10.0,
             max_output_chars=50_000,
@@ -194,63 +196,12 @@ class TestCommandValidation:
         with pytest.raises(PermissionError, match='not in the allowed list'):
             ts._check_command('cat file.txt')
 
-    async def test_run_command_enforces_allowlist(self, shell_dir: Path) -> None:
-        ts = ShellToolset(
-            cwd=shell_dir,
-            allowed_commands=['echo'],
-            denied_operators=[],
-            default_timeout=10.0,
-            max_output_chars=50_000,
-            persist_cwd=False,
-            allow_interactive=False,
-        )
-        assert 'hello' in await ts.run_command('echo hello')
-        with pytest.raises(ModelRetry, match='not in the allowed list'):
-            await ts.run_command('cat file.txt')
-
-    async def test_empty_allowlist_blocks_every_executable(self, shell_dir: Path) -> None:
-        ts = ShellToolset(
-            cwd=shell_dir,
-            allowed_commands=[],
-            denied_operators=[],
-            default_timeout=10.0,
-            max_output_chars=50_000,
-            persist_cwd=False,
-            allow_interactive=False,
-        )
-        with pytest.raises(PermissionError, match='not in the allowed list'):
-            ts._check_command('echo hello')
-
-    async def test_empty_denylist_allows_every_executable(self, shell_dir: Path) -> None:
-        ts = ShellToolset(
-            cwd=shell_dir,
-            denied_commands=[],
-            denied_operators=[],
-            default_timeout=10.0,
-            max_output_chars=50_000,
-            persist_cwd=False,
-            allow_interactive=False,
-        )
-        ts._check_command('rm -rf /')
-
-    async def test_default_policy_denies_destructive_commands(self, shell_dir: Path) -> None:
-        ts = ShellToolset(
-            cwd=shell_dir,
-            denied_operators=[],
-            default_timeout=10.0,
-            max_output_chars=50_000,
-            persist_cwd=False,
-            allow_interactive=False,
-        )
-        with pytest.raises(PermissionError, match="'rm' is denied"):
-            ts._check_command('rm -rf /')
-
     async def test_both_allow_and_deny_raises(self, shell_dir: Path) -> None:
         with pytest.raises(ValueError, match='Specify allowed_commands or denied_commands'):
-            ShellToolset(  # pyright: ignore[reportCallIssue]
+            ShellToolset(
                 cwd=shell_dir,
                 allowed_commands=['echo'],
-                denied_commands=['rm'],  # pyright: ignore[reportArgumentType]
+                denied_commands=['rm'],
                 denied_operators=[],
                 default_timeout=10.0,
                 max_output_chars=50_000,
@@ -265,6 +216,7 @@ class TestCommandValidation:
     async def test_interactive_allowed_when_enabled(self, shell_dir: Path) -> None:
         ts = ShellToolset(
             cwd=shell_dir,
+            allowed_commands=[],
             denied_commands=[],
             denied_operators=[],
             default_timeout=10.0,
@@ -277,6 +229,7 @@ class TestCommandValidation:
     async def test_denied_operator_blocked(self, shell_dir: Path) -> None:
         ts = ShellToolset(
             cwd=shell_dir,
+            allowed_commands=[],
             denied_commands=[],
             denied_operators=['>', '>>'],
             default_timeout=10.0,
@@ -290,6 +243,7 @@ class TestCommandValidation:
     async def test_denied_operator_passes_when_not_present(self, shell_dir: Path) -> None:
         ts = ShellToolset(
             cwd=shell_dir,
+            allowed_commands=[],
             denied_commands=[],
             denied_operators=['>', '>>'],
             default_timeout=10.0,
@@ -308,6 +262,7 @@ class TestCommandValidation:
     async def test_denied_operator_substring_match(self, shell_dir: Path) -> None:
         ts = ShellToolset(
             cwd=shell_dir,
+            allowed_commands=[],
             denied_commands=[],
             denied_operators=['>>'],
             default_timeout=10.0,
@@ -321,6 +276,7 @@ class TestCommandValidation:
     async def test_shlex_error_returns_early(self, shell_dir: Path) -> None:
         ts = ShellToolset(
             cwd=shell_dir,
+            allowed_commands=[],
             denied_commands=['rm'],
             denied_operators=[],
             default_timeout=10.0,
@@ -334,6 +290,7 @@ class TestCommandValidation:
         ts = ShellToolset(
             cwd=shell_dir,
             allowed_commands=['echo'],
+            denied_commands=[],
             denied_operators=[],
             default_timeout=10.0,
             max_output_chars=50_000,
@@ -345,6 +302,7 @@ class TestCommandValidation:
     def test_first_denied_operator_match(self, toolset: ShellToolset[None]) -> None:
         ts = ShellToolset(
             cwd=Path('/tmp'),
+            allowed_commands=[],
             denied_commands=[],
             denied_operators=['|', '>'],
             default_timeout=10.0,
@@ -357,6 +315,7 @@ class TestCommandValidation:
     def test_first_denied_operator_no_match(self, toolset: ShellToolset[None]) -> None:
         ts = ShellToolset(
             cwd=Path('/tmp'),
+            allowed_commands=[],
             denied_commands=[],
             denied_operators=['|', '>'],
             default_timeout=10.0,
@@ -377,6 +336,7 @@ class TestTruncation:
     def test_at_limit(self, shell_dir: Path) -> None:
         ts = ShellToolset(
             cwd=shell_dir,
+            allowed_commands=[],
             denied_commands=[],
             denied_operators=[],
             default_timeout=10.0,
@@ -390,6 +350,7 @@ class TestTruncation:
     def test_over_limit(self, shell_dir: Path) -> None:
         ts = ShellToolset(
             cwd=shell_dir,
+            allowed_commands=[],
             denied_commands=[],
             denied_operators=[],
             default_timeout=10.0,
@@ -404,6 +365,7 @@ class TestTruncation:
     def test_exactly_at_limit_not_truncated(self, shell_dir: Path) -> None:
         ts = ShellToolset(
             cwd=shell_dir,
+            allowed_commands=[],
             denied_commands=[],
             denied_operators=[],
             default_timeout=10.0,
@@ -418,6 +380,7 @@ class TestTruncation:
     def test_one_over_limit_truncated(self, shell_dir: Path) -> None:
         ts = ShellToolset(
             cwd=shell_dir,
+            allowed_commands=[],
             denied_commands=[],
             denied_operators=[],
             default_timeout=10.0,
@@ -433,6 +396,7 @@ class TestTruncation:
         """The tail (where errors and the [stderr] section land) is preserved."""
         ts = ShellToolset(
             cwd=shell_dir,
+            allowed_commands=[],
             denied_commands=[],
             denied_operators=[],
             default_timeout=10.0,
@@ -449,6 +413,7 @@ class TestTruncation:
     def test_truncation_marker_wording(self, shell_dir: Path) -> None:
         ts = ShellToolset(
             cwd=shell_dir,
+            allowed_commands=[],
             denied_commands=[],
             denied_operators=[],
             default_timeout=10.0,
@@ -513,68 +478,6 @@ class TestForRunIsolation:
         assert run1 is not persist_toolset
         assert run2 is not run1
 
-    async def test_for_run_preserves_empty_allowlist_mode(self, shell_dir: Path) -> None:
-        toolset = ShellToolset[None](
-            cwd=shell_dir,
-            allowed_commands=[],
-            denied_operators=[],
-            default_timeout=10.0,
-            max_output_chars=50_000,
-            persist_cwd=False,
-            allow_interactive=False,
-        )
-
-        run_toolset = await toolset.for_run(_run_context())
-
-        assert isinstance(run_toolset, ShellToolset)
-        with pytest.raises(PermissionError, match='not in the allowed list'):
-            run_toolset._check_command('echo hello')
-
-    async def test_for_run_preserves_allow_mode_configuration(self, shell_dir: Path) -> None:
-        toolset = ShellToolset[None](
-            cwd=shell_dir,
-            allowed_commands=['echo'],
-            denied_operators=['>'],
-            default_timeout=45.0,
-            max_output_chars=123,
-            persist_cwd=True,
-            allow_interactive=True,
-            env={'MARKER': 'x'},
-            denied_env_patterns=['OPENAI_*'],
-        )
-
-        run_toolset = await toolset.for_run(_run_context())
-
-        assert isinstance(run_toolset, ShellToolset)
-        with pytest.raises(PermissionError, match='not in the allowed list'):
-            run_toolset._check_command('cat file.txt')
-        with pytest.raises(PermissionError, match='Shell operator'):
-            run_toolset._check_command('echo hi > out.txt')
-        assert run_toolset._default_timeout == 45.0
-        assert run_toolset._max_output_chars == 123
-        assert run_toolset._persist_cwd is True
-        assert run_toolset._allow_interactive is True
-        assert run_toolset._env == {'MARKER': 'x'}
-        assert run_toolset._denied_env_patterns == ['OPENAI_*']
-
-    async def test_for_run_preserves_custom_denylist(self, shell_dir: Path) -> None:
-        toolset = ShellToolset[None](
-            cwd=shell_dir,
-            denied_commands=['curl'],
-            denied_operators=[],
-            default_timeout=10.0,
-            max_output_chars=50_000,
-            persist_cwd=False,
-            allow_interactive=False,
-        )
-
-        run_toolset = await toolset.for_run(_run_context())
-
-        assert isinstance(run_toolset, ShellToolset)
-        with pytest.raises(PermissionError, match="'curl' is denied"):
-            run_toolset._check_command('curl example.com')
-        run_toolset._check_command('rm -rf /')
-
     async def test_persist_cwd_isolated_across_runs(self, persist_toolset: ShellToolset[None], shell_dir: Path) -> None:
         run1 = await persist_toolset.for_run(_run_context())
         assert isinstance(run1, ShellToolset)
@@ -636,6 +539,7 @@ class TestRunCommand:
     async def test_output_truncation(self, shell_dir: Path) -> None:
         ts = ShellToolset(
             cwd=shell_dir,
+            allowed_commands=[],
             denied_commands=[],
             denied_operators=[],
             default_timeout=10.0,
@@ -649,6 +553,7 @@ class TestRunCommand:
     async def test_persist_cwd(self, shell_dir: Path) -> None:
         ts = ShellToolset(
             cwd=shell_dir,
+            allowed_commands=[],
             denied_commands=[],
             denied_operators=[],
             default_timeout=10.0,
@@ -663,6 +568,7 @@ class TestRunCommand:
     async def test_persist_cwd_only_on_success(self, shell_dir: Path) -> None:
         ts = ShellToolset(
             cwd=shell_dir,
+            allowed_commands=[],
             denied_commands=[],
             denied_operators=[],
             default_timeout=10.0,
@@ -691,6 +597,7 @@ class TestRunCommand:
     async def test_timeout_reports_value(self, shell_dir: Path) -> None:
         ts = ShellToolset(
             cwd=shell_dir,
+            allowed_commands=[],
             denied_commands=[],
             denied_operators=[],
             default_timeout=0.5,
@@ -704,6 +611,7 @@ class TestRunCommand:
     async def test_custom_timeout_overrides_default(self, shell_dir: Path) -> None:
         ts = ShellToolset(
             cwd=shell_dir,
+            allowed_commands=[],
             denied_commands=[],
             denied_operators=[],
             default_timeout=30.0,
@@ -717,6 +625,7 @@ class TestRunCommand:
     async def test_persist_cwd_disabled_no_update(self, shell_dir: Path) -> None:
         ts = ShellToolset(
             cwd=shell_dir,
+            allowed_commands=[],
             denied_commands=[],
             denied_operators=[],
             default_timeout=10.0,
@@ -755,6 +664,7 @@ class TestRunCommand:
     async def test_exit_code_fallback_to_zero(self, shell_dir: Path) -> None:
         ts = ShellToolset(
             cwd=shell_dir,
+            allowed_commands=[],
             denied_commands=[],
             denied_operators=[],
             default_timeout=10.0,
@@ -767,10 +677,10 @@ class TestRunCommand:
 
     async def test_error_message_content(self, shell_dir: Path) -> None:
         with pytest.raises(ValueError, match='^Specify allowed_commands or denied_commands, not both\\.$'):
-            ShellToolset(  # pyright: ignore[reportCallIssue]
+            ShellToolset(
                 cwd=shell_dir,
                 allowed_commands=['echo'],
-                denied_commands=['rm'],  # pyright: ignore[reportArgumentType]
+                denied_commands=['rm'],
                 denied_operators=[],
                 default_timeout=10.0,
                 max_output_chars=50_000,
@@ -781,6 +691,7 @@ class TestRunCommand:
     async def test_stdout_chunks_joined_cleanly(self, shell_dir: Path) -> None:
         ts = ShellToolset(
             cwd=shell_dir,
+            allowed_commands=[],
             denied_commands=[],
             denied_operators=[],
             default_timeout=30.0,
@@ -794,6 +705,7 @@ class TestRunCommand:
     async def test_stderr_chunks_joined_cleanly(self, shell_dir: Path) -> None:
         ts = ShellToolset(
             cwd=shell_dir,
+            allowed_commands=[],
             denied_commands=[],
             denied_operators=[],
             default_timeout=30.0,
@@ -808,6 +720,7 @@ class TestRunCommand:
         """CWD should update to the actual directory after a successful cd."""
         ts = ShellToolset(
             cwd=shell_dir,
+            allowed_commands=[],
             denied_commands=[],
             denied_operators=[],
             default_timeout=10.0,
@@ -822,6 +735,7 @@ class TestRunCommand:
         """CWD should not update if command fails (exit code non-zero)."""
         ts = ShellToolset(
             cwd=shell_dir,
+            allowed_commands=[],
             denied_commands=[],
             denied_operators=[],
             default_timeout=10.0,
@@ -839,6 +753,7 @@ class TestProcessGroupKill:
         """On timeout, the entire process group should be killed."""
         ts = ShellToolset(
             cwd=shell_dir,
+            allowed_commands=[],
             denied_commands=[],
             denied_operators=[],
             default_timeout=0.5,
@@ -853,6 +768,7 @@ class TestProcessGroupKill:
         """Output produced before timeout should still result in timeout message."""
         ts = ShellToolset(
             cwd=shell_dir,
+            allowed_commands=[],
             denied_commands=[],
             denied_operators=[],
             default_timeout=0.5,
@@ -867,6 +783,7 @@ class TestProcessGroupKill:
         """Verify the child is in a different process group from the parent."""
         ts = ShellToolset(
             cwd=shell_dir,
+            allowed_commands=[],
             denied_commands=[],
             denied_operators=[],
             default_timeout=10.0,
@@ -883,6 +800,7 @@ class TestBackgroundCommands:
     async def test_start_command_returns_id(self, shell_dir: Path) -> None:
         ts = ShellToolset(
             cwd=shell_dir,
+            allowed_commands=[],
             denied_commands=[],
             denied_operators=[],
             default_timeout=10.0,
@@ -907,6 +825,7 @@ class TestBackgroundCommands:
     async def test_start_and_stop(self, shell_dir: Path) -> None:
         ts = ShellToolset(
             cwd=shell_dir,
+            allowed_commands=[],
             denied_commands=[],
             denied_operators=[],
             default_timeout=10.0,
@@ -926,6 +845,7 @@ class TestBackgroundCommands:
     async def test_start_and_check_running(self, shell_dir: Path) -> None:
         ts = ShellToolset(
             cwd=shell_dir,
+            allowed_commands=[],
             denied_commands=[],
             denied_operators=[],
             default_timeout=10.0,
@@ -944,6 +864,7 @@ class TestBackgroundCommands:
     async def test_start_and_check_finished(self, shell_dir: Path) -> None:
         ts = ShellToolset(
             cwd=shell_dir,
+            allowed_commands=[],
             denied_commands=[],
             denied_operators=[],
             default_timeout=10.0,
@@ -965,6 +886,7 @@ class TestBackgroundCommands:
     async def test_start_denied_command_raises(self, shell_dir: Path) -> None:
         ts = ShellToolset(
             cwd=shell_dir,
+            allowed_commands=[],
             denied_commands=['rm'],
             denied_operators=[],
             default_timeout=10.0,
@@ -978,6 +900,7 @@ class TestBackgroundCommands:
     async def test_stop_captures_stderr(self, shell_dir: Path) -> None:
         ts = ShellToolset(
             cwd=shell_dir,
+            allowed_commands=[],
             denied_commands=[],
             denied_operators=[],
             default_timeout=10.0,
@@ -996,6 +919,7 @@ class TestBackgroundCommands:
     async def test_stop_no_output(self, shell_dir: Path) -> None:
         ts = ShellToolset(
             cwd=shell_dir,
+            allowed_commands=[],
             denied_commands=[],
             denied_operators=[],
             default_timeout=10.0,
@@ -1014,6 +938,7 @@ class TestBackgroundCommands:
     async def test_check_no_output_yet(self, shell_dir: Path) -> None:
         ts = ShellToolset(
             cwd=shell_dir,
+            allowed_commands=[],
             denied_commands=[],
             denied_operators=[],
             default_timeout=10.0,
@@ -1032,6 +957,7 @@ class TestBackgroundCommands:
     async def test_check_command_captures_stderr(self, shell_dir: Path) -> None:
         ts = ShellToolset(
             cwd=shell_dir,
+            allowed_commands=[],
             denied_commands=[],
             denied_operators=[],
             default_timeout=10.0,
@@ -1053,6 +979,7 @@ class TestBackgroundCommands:
     async def test_start_command_uses_cwd(self, shell_dir: Path) -> None:
         ts = ShellToolset(
             cwd=shell_dir,
+            allowed_commands=[],
             denied_commands=[],
             denied_operators=[],
             default_timeout=10.0,
@@ -1072,6 +999,7 @@ class TestBackgroundCommands:
         """After stop, the command_id should no longer be known."""
         ts = ShellToolset(
             cwd=shell_dir,
+            allowed_commands=[],
             denied_commands=[],
             denied_operators=[],
             default_timeout=10.0,
@@ -1093,6 +1021,7 @@ class TestBackgroundCommands:
     async def test_start_command_cleans_temp_files_on_failure(self, shell_dir: Path) -> None:
         ts = ShellToolset(
             cwd=shell_dir,
+            allowed_commands=[],
             denied_commands=[],
             denied_operators=[],
             default_timeout=10.0,
@@ -1108,6 +1037,7 @@ class TestBackgroundCommands:
     async def test_aexit_terminates_background_processes(self, shell_dir: Path) -> None:
         ts = ShellToolset(
             cwd=shell_dir,
+            allowed_commands=[],
             denied_commands=[],
             denied_operators=[],
             default_timeout=10.0,
@@ -1132,6 +1062,7 @@ class TestBackgroundCommands:
     async def test_aexit_noop_when_no_background(self, shell_dir: Path) -> None:
         ts = ShellToolset(
             cwd=shell_dir,
+            allowed_commands=[],
             denied_commands=[],
             denied_operators=[],
             default_timeout=10.0,
@@ -1145,6 +1076,7 @@ class TestBackgroundCommands:
     async def test_aexit_cleans_already_finished_process(self, shell_dir: Path) -> None:
         ts = ShellToolset(
             cwd=shell_dir,
+            allowed_commands=[],
             denied_commands=[],
             denied_operators=[],
             default_timeout=10.0,
@@ -1175,6 +1107,7 @@ class TestEdgeCases:
     async def test_run_command_uses_actual_cwd(self, shell_dir: Path) -> None:
         ts = ShellToolset(
             cwd=shell_dir,
+            allowed_commands=[],
             denied_commands=[],
             denied_operators=[],
             default_timeout=10.0,
@@ -1188,6 +1121,7 @@ class TestEdgeCases:
     async def test_persist_cwd_requires_all_three_conditions(self, shell_dir: Path) -> None:
         ts = ShellToolset(
             cwd=shell_dir,
+            allowed_commands=[],
             denied_commands=[],
             denied_operators=[],
             default_timeout=10.0,
@@ -1205,167 +1139,42 @@ class TestShellCapability:
         shell = Shell()
         assert shell.cwd == '.'
         assert shell.default_timeout == 30.0
-        assert shell.allowed_commands is None
-        assert shell.denied_commands is not None
         assert 'rm' in shell.denied_commands
 
     def test_custom_construction(self) -> None:
         shell = Shell(
             cwd='/tmp',
             allowed_commands=['echo', 'cat'],
+            denied_commands=[],
             default_timeout=60.0,
         )
         assert shell.default_timeout == 60.0
-        assert shell.allowed_commands == frozenset({'echo', 'cat'})
-        assert shell.denied_commands is None
-
-    def test_capability_fields_are_preserved(self) -> None:
-        shell = Shell(id='shell', description='Run repository commands.', defer_loading=True)
-
-        assert shell.id == 'shell'
-        assert shell.description == 'Run repository commands.'
-        assert shell.defer_loading is True
-
-    def test_explicit_denylist_construction(self) -> None:
-        shell = Shell(denied_commands=['curl', 'ssh'])
-
-        assert shell.allowed_commands is None
-        assert shell.denied_commands == frozenset({'curl', 'ssh'})
-
-    @pytest.mark.parametrize('allowed_commands', [{'echo'}, frozenset({'echo'})])
-    def test_set_allowlist_construction(self, allowed_commands: set[str] | frozenset[str]) -> None:
-        shell = Shell(allowed_commands=allowed_commands)
-
-        assert shell.allowed_commands == frozenset({'echo'})
-        assert shell.denied_commands is None
-
-    def test_empty_allowlist_selects_allow_mode(self) -> None:
-        shell = Shell(allowed_commands=[])
-
-        assert shell.allowed_commands == frozenset()
-        assert shell.denied_commands is None
-        with pytest.raises(PermissionError, match='not in the allowed list'):
-            shell.get_toolset()._check_command('echo hello')
-
-    def test_empty_denylist_selects_deny_mode(self) -> None:
-        shell = Shell(denied_commands=[])
-
-        assert shell.allowed_commands is None
-        assert shell.denied_commands == frozenset()
-        shell.get_toolset()._check_command('rm -rf /')
-
-    def test_empty_modes_are_distinct(self) -> None:
-        allow_nothing = Shell(allowed_commands=[])
-        allow_everything = Shell(denied_commands=[])
-
-        assert allow_nothing != allow_everything
-        assert repr(allow_nothing) != repr(allow_everything)
-
-    def test_dataclasses_replace_round_trip(self) -> None:
-        replaced = dataclasses.replace(Shell(), cwd='/tmp')
-        assert replaced.cwd == '/tmp'
-        assert replaced.allowed_commands is None
-        assert replaced.denied_commands is not None
-        assert 'rm' in replaced.denied_commands
-
-        allow = dataclasses.replace(Shell(allowed_commands=['echo']), default_timeout=5.0)
-        assert allow.default_timeout == 5.0
-        assert allow.allowed_commands == frozenset({'echo'})
-        assert allow.denied_commands is None
-
-    def test_dataclasses_replace_switches_mode_with_both_fields(self) -> None:
-        allow = dataclasses.replace(Shell(), allowed_commands=frozenset({'echo'}), denied_commands=None)
-        assert allow.allowed_commands == frozenset({'echo'})
-        assert allow.denied_commands is None
-
-        with pytest.raises(ValueError, match='Specify allowed_commands or denied_commands'):
-            dataclasses.replace(Shell(), allowed_commands=frozenset({'echo'}))
-
-    def test_clearing_both_fields_restores_default_denylist(self) -> None:
-        shell = Shell(allowed_commands=['echo'])
-        shell.allowed_commands = None
-        shell.denied_commands = None
-
-        with pytest.raises(PermissionError, match="'rm' is denied"):
-            shell.get_toolset()._check_command('rm -rf /')
         shell.get_toolset()._check_command('echo hello')
 
-    def test_mode_flip_to_denylist_by_assignment(self) -> None:
+    def test_allowlist_ignores_implicit_default_denylist(self) -> None:
         shell = Shell(allowed_commands=['echo'])
-        shell.allowed_commands = None
-        shell.denied_commands = frozenset({'rm'})
 
-        shell.get_toolset()._check_command('cat file.txt')
-        with pytest.raises(PermissionError, match="'rm' is denied"):
-            shell.get_toolset()._check_command('rm -rf /')
-
-    def test_mode_flip_to_allowlist_by_assignment(self) -> None:
-        shell = Shell()
-        shell.denied_commands = None
-        shell.allowed_commands = frozenset({'cat'})
-
-        shell.get_toolset()._check_command('cat file.txt')
+        toolset = shell.get_toolset()
+        toolset._check_command('echo hello')
         with pytest.raises(PermissionError, match='not in the allowed list'):
-            shell.get_toolset()._check_command('echo hello')
+            toolset._check_command('cat file.txt')
 
-    def test_allow_mode_preserves_independent_controls(self, tmp_path: Path) -> None:
-        shell = Shell(
-            cwd=tmp_path,
-            allowed_commands=['echo', 'vi'],
-            denied_operators=['>'],
-            default_timeout=45.0,
-            max_output_chars=123,
-            persist_cwd=True,
-            env={'MARKER': 'x'},
-            denied_env_patterns=['OPENAI_*'],
-        )
-        ts = shell.get_toolset()
+    def test_empty_allowlist_keeps_default_denylist(self) -> None:
+        shell = Shell(allowed_commands=[])
 
-        with pytest.raises(PermissionError, match='Shell operator'):
-            ts._check_command('echo hi > out.txt')
-        with pytest.raises(PermissionError, match='Interactive commands'):
-            ts._check_command('vi notes.txt')
-        assert ts._default_timeout == 45.0
-        assert ts._max_output_chars == 123
-        assert ts._persist_cwd is True
-        assert ts._env == {'MARKER': 'x'}
-        assert ts._denied_env_patterns == ['OPENAI_*']
+        toolset = shell.get_toolset()
+        with pytest.raises(PermissionError, match="'rm' is denied"):
+            toolset._check_command('rm -rf /')
+        toolset._check_command('echo hello')
 
-    @pytest.mark.parametrize(
-        ('allowed_commands', 'denied_commands'),
-        [
-            (['echo'], ['rm']),
-            (['echo'], []),
-            ([], ['rm']),
-            ([], []),
-        ],
-    )
-    def test_explicit_allow_and_deny_are_rejected(
-        self,
-        allowed_commands: list[str],
-        denied_commands: list[str],
-    ) -> None:
-        with pytest.raises(ValueError, match='Specify allowed_commands or denied_commands'):
-            Shell(  # pyright: ignore[reportCallIssue]
-                allowed_commands=allowed_commands,
-                denied_commands=denied_commands,  # pyright: ignore[reportArgumentType]
-            )
-
-    @pytest.mark.parametrize('field', ['allowed_commands', 'denied_commands'])
-    def test_bare_string_command_collection_is_rejected(self, field: str) -> None:
-        with pytest.raises(TypeError, match='must be a collection of command names'):
-            Shell(**{field: 'echo'})  # pyright: ignore[reportCallIssue, reportArgumentType]
-
-    def test_non_string_command_name_is_rejected(self) -> None:
-        with pytest.raises(TypeError, match='must contain only command names as strings'):
-            Shell(allowed_commands=['echo', 1])  # pyright: ignore[reportCallIssue, reportArgumentType]
-
-    def test_get_toolset_rejects_conflicting_mutated_state(self) -> None:
-        shell = Shell()
-        shell.allowed_commands = frozenset({'echo'})
+    def test_explicit_allowlist_and_denylist_remain_invalid(self) -> None:
+        shell = Shell(allowed_commands=['echo'], denied_commands=['rm'])
 
         with pytest.raises(ValueError, match='Specify allowed_commands or denied_commands'):
             shell.get_toolset()
+
+    def test_agent_accepts_allowlist_without_explicit_denylist(self, tmp_path: Path) -> None:
+        Agent(TestModel(), capabilities=[Shell(cwd=tmp_path, allowed_commands=['echo'])])
 
     def test_get_toolset_returns_toolset(self, tmp_path: Path) -> None:
         shell = Shell(cwd=tmp_path)
@@ -1374,37 +1183,9 @@ class TestShellCapability:
 
     def test_default_denied_commands(self) -> None:
         shell = Shell()
-        assert shell.denied_commands is not None
         assert 'rm' in shell.denied_commands
         assert 'dd' in shell.denied_commands
         assert 'shutdown' in shell.denied_commands
-
-    def test_agent_loads_allowlist_from_spec_file(self, tmp_path: Path) -> None:
-        spec = tmp_path / 'agent.yaml'
-        spec.write_text('model: test\ncapabilities:\n  - Shell:\n      cwd: .\n      allowed_commands: [ls, cat, rg]\n')
-
-        agent = Agent.from_file(spec, custom_capability_types=[Shell])
-
-        shells = [c for c in agent.root_capability.capabilities if isinstance(c, Shell)]
-        assert len(shells) == 1
-        assert shells[0].allowed_commands == frozenset({'ls', 'cat', 'rg'})
-        assert shells[0].denied_commands is None
-
-    def test_agent_rejects_conflicting_spec_file(self, tmp_path: Path) -> None:
-        spec = tmp_path / 'agent.yaml'
-        spec.write_text(
-            'model: test\ncapabilities:\n  - Shell:\n      allowed_commands: [ls]\n      denied_commands: [rm]\n'
-        )
-
-        with pytest.raises(ValueError, match='Specify allowed_commands or denied_commands'):
-            Agent.from_file(spec, custom_capability_types=[Shell])
-
-    def test_agent_spec_schema_includes_shell_configuration(self) -> None:
-        schema = AgentSpec.model_json_schema_with_capabilities([Shell])
-
-        assert 'spec_Shell' in schema['$defs']
-        assert 'allowed_commands' in schema['$defs']['spec_params_Shell']['properties']
-        assert 'denied_commands' in schema['$defs']['spec_params_Shell']['properties']
 
     @pytest.mark.anyio(backends=['asyncio'])
     async def test_agent_integration(self, tmp_path: Path) -> None:
@@ -1417,56 +1198,13 @@ class TestShellCapability:
         result = await agent.run('run echo hello')
         assert result.output == 'done'
 
-    @pytest.mark.anyio(backends=['asyncio'])
-    async def test_agent_runs_allowlisted_command(self, tmp_path: Path) -> None:
-        import sniffio
-
-        if sniffio.current_async_library() != 'asyncio':  # pragma: no cover
-            pytest.skip('Agent.run() requires asyncio')
-
-        def call_shell(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
-            if len(messages) == 1:
-                return ModelResponse(parts=[ToolCallPart('run_command', {'command': 'echo hi'})])
-            return ModelResponse(parts=[TextPart('done')])
-
-        agent: Agent[None, str] = Agent(
-            FunctionModel(call_shell),
-            capabilities=[Shell(cwd=tmp_path, allowed_commands=['echo'])],
-        )
-        result = await agent.run('say hi')
-
-        assert result.output == 'done'
-        tool_returns = [p for m in result.all_messages() for p in m.parts if isinstance(p, ToolReturnPart)]
-        assert any('hi' in str(p.content) for p in tool_returns)
-
-    @pytest.mark.anyio(backends=['asyncio'])
-    async def test_agent_allowlist_rejection_surfaces_as_retry(self, tmp_path: Path) -> None:
-        import sniffio
-
-        if sniffio.current_async_library() != 'asyncio':  # pragma: no cover
-            pytest.skip('Agent.run() requires asyncio')
-
-        def call_shell(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
-            if len(messages) == 1:
-                return ModelResponse(parts=[ToolCallPart('run_command', {'command': 'cat file.txt'})])
-            return ModelResponse(parts=[TextPart('done')])
-
-        agent: Agent[None, str] = Agent(
-            FunctionModel(call_shell),
-            capabilities=[Shell(cwd=tmp_path, allowed_commands=['echo'])],
-        )
-        result = await agent.run('read the file')
-
-        assert result.output == 'done'
-        retries = [p for m in result.all_messages() for p in m.parts if isinstance(p, RetryPromptPart)]
-        assert any('not in the allowed list' in str(p.content) for p in retries)
-
 
 class TestKillProcessGroupEdgeCases:
     async def test_sigterm_raises_process_lookup_error(self, tmp_path: Path) -> None:
         """When SIGTERM raises ProcessLookupError, method returns without SIGKILL."""
         ts = ShellToolset(
             cwd=tmp_path,
+            allowed_commands=[],
             denied_commands=[],
             denied_operators=[],
             default_timeout=5.0,
@@ -1484,6 +1222,7 @@ class TestKillProcessGroupEdgeCases:
         """When process doesn't exit within grace period, SIGKILL is sent."""
         ts = ShellToolset(
             cwd=tmp_path,
+            allowed_commands=[],
             denied_commands=[],
             denied_operators=[],
             default_timeout=5.0,
@@ -1522,6 +1261,7 @@ class TestKillProcessGroupEdgeCases:
         """When SIGKILL raises ProcessLookupError (process exited between SIGTERM and SIGKILL)."""
         ts = ShellToolset(
             cwd=tmp_path,
+            allowed_commands=[],
             denied_commands=[],
             denied_operators=[],
             default_timeout=5.0,
@@ -1562,6 +1302,7 @@ class TestDrainWithTimeoutEdgeCases:
         """ClosedResourceError on stdout is caught silently after yielding data."""
         ts = ShellToolset(
             cwd=tmp_path,
+            allowed_commands=[],
             denied_commands=[],
             denied_operators=[],
             default_timeout=5.0,
@@ -1597,6 +1338,7 @@ class TestDrainWithTimeoutEdgeCases:
         """BrokenResourceError on stderr is caught silently after yielding data."""
         ts = ShellToolset(
             cwd=tmp_path,
+            allowed_commands=[],
             denied_commands=[],
             denied_operators=[],
             default_timeout=5.0,
@@ -1633,6 +1375,7 @@ class TestReadBgOutputEdgeCases:
         """OSError reading stdout file returns empty string."""
         ts = ShellToolset(
             cwd=tmp_path,
+            allowed_commands=[],
             denied_commands=[],
             denied_operators=[],
             default_timeout=5.0,
@@ -1652,6 +1395,7 @@ class TestReadBgOutputEdgeCases:
         """OSError reading stderr file only, stdout succeeds."""
         ts = ShellToolset(
             cwd=tmp_path,
+            allowed_commands=[],
             denied_commands=[],
             denied_operators=[],
             default_timeout=5.0,
@@ -1677,6 +1421,7 @@ class TestCleanupBgFilesEdgeCases:
         """OSError on unlink is caught silently."""
         ts = ShellToolset(
             cwd=tmp_path,
+            allowed_commands=[],
             denied_commands=[],
             denied_operators=[],
             default_timeout=5.0,
@@ -1697,6 +1442,7 @@ class TestStopCommandAlreadyFinished:
         """stop_command on an already-finished process skips kill."""
         ts = ShellToolset(
             cwd=shell_dir,
+            allowed_commands=[],
             denied_commands=[],
             denied_operators=[],
             default_timeout=10.0,

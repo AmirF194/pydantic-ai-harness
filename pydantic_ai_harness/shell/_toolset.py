@@ -11,9 +11,9 @@ import signal
 import subprocess
 import tempfile
 import uuid
-from collections.abc import Awaitable, Callable, Collection, Mapping, Sequence
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from pathlib import Path
-from typing import Any, Concatenate, ParamSpec, overload
+from typing import Any, Concatenate, ParamSpec
 
 import anyio
 import anyio.abc
@@ -21,8 +21,6 @@ from pydantic_ai import RunContext
 from pydantic_ai.exceptions import ModelRetry
 from pydantic_ai.tools import AgentDepsT
 from pydantic_ai.toolsets import AbstractToolset, FunctionToolset
-
-from pydantic_ai_harness.shell._command_policy import CommandPolicy, normalize_command_policy
 
 _IO_DRAIN_TIMEOUT: float = 2.0
 _KILL_GRACE_PERIOD: float = 2.0
@@ -91,52 +89,15 @@ class ShellToolset(FunctionToolset[AgentDepsT]):
     (start_command / check_command / stop_command). Output is streamed,
     truncated to fit model context, and labelled with stdout/stderr/exit code.
 
-    Pass `allowed_commands` to select allowlist mode or `denied_commands` to
-    select denylist mode. Omitting both uses the built-in denylist. An empty
-    collection keeps the selected mode with no entries, and supplying both
-    controls raises `ValueError`.
-
-    Optionally tracks the working directory across calls so `cd` persists.
+    Optionally tracks the working directory across calls so ``cd`` persists.
     """
-
-    @overload
-    def __init__(  # pragma: no cover - overload is enforced by static type checking
-        self,
-        *,
-        cwd: Path,
-        allowed_commands: Collection[str],
-        denied_commands: None = None,
-        denied_operators: Sequence[str],
-        default_timeout: float,
-        max_output_chars: int,
-        persist_cwd: bool,
-        allow_interactive: bool,
-        env: Mapping[str, str] | None = None,
-        denied_env_patterns: Sequence[str] = (),
-    ) -> None: ...
-
-    @overload
-    def __init__(  # pragma: no cover - overload is enforced by static type checking
-        self,
-        *,
-        cwd: Path,
-        allowed_commands: None = None,
-        denied_commands: Collection[str] | None = None,
-        denied_operators: Sequence[str],
-        default_timeout: float,
-        max_output_chars: int,
-        persist_cwd: bool,
-        allow_interactive: bool,
-        env: Mapping[str, str] | None = None,
-        denied_env_patterns: Sequence[str] = (),
-    ) -> None: ...
 
     def __init__(
         self,
         *,
         cwd: Path,
-        allowed_commands: Collection[str] | None = None,
-        denied_commands: Collection[str] | None = None,
+        allowed_commands: Sequence[str],
+        denied_commands: Sequence[str],
         denied_operators: Sequence[str],
         default_timeout: float,
         max_output_chars: int,
@@ -146,11 +107,12 @@ class ShellToolset(FunctionToolset[AgentDepsT]):
         denied_env_patterns: Sequence[str] = (),
     ) -> None:
         super().__init__()
-        self._command_policy: CommandPolicy = normalize_command_policy(allowed_commands, denied_commands)
         self._cwd = cwd.resolve()
         # The configured starting directory, never mutated by persist_cwd, so
         # `for_run` can hand each run a fresh instance rooted back here.
         self._initial_cwd = self._cwd
+        self._allowed_commands = list(allowed_commands)
+        self._denied_commands = list(denied_commands)
         self._denied_operators = list(denied_operators)
         self._default_timeout = default_timeout
         self._max_output_chars = max_output_chars
@@ -160,54 +122,13 @@ class ShellToolset(FunctionToolset[AgentDepsT]):
         self._denied_env_patterns = list(denied_env_patterns)
         self._background: dict[str, _BackgroundProcess] = {}
 
+        if self._allowed_commands and self._denied_commands:
+            raise ValueError('Specify allowed_commands or denied_commands, not both.')
+
         self.add_function(self.run_command, name='run_command')
         self.add_function(self.start_command, name='start_command')
         self.add_function(self.check_command, name='check_command')
         self.add_function(self.stop_command, name='stop_command')
-
-    @classmethod
-    def _from_policy(
-        cls,
-        policy: CommandPolicy,
-        *,
-        cwd: Path,
-        denied_operators: Sequence[str],
-        default_timeout: float,
-        max_output_chars: int,
-        persist_cwd: bool,
-        allow_interactive: bool,
-        env: Mapping[str, str] | None,
-        denied_env_patterns: Sequence[str],
-    ) -> ShellToolset[AgentDepsT]:
-        """Build a toolset from an already-normalized policy.
-
-        The public constructor keeps the `allowed_commands`/`denied_commands`
-        kwargs, so this is the one place that splits a policy back into the
-        mode-specific kwarg.
-        """
-        if policy.mode == 'allow':
-            return cls(
-                cwd=cwd,
-                allowed_commands=policy.commands,
-                denied_operators=denied_operators,
-                default_timeout=default_timeout,
-                max_output_chars=max_output_chars,
-                persist_cwd=persist_cwd,
-                allow_interactive=allow_interactive,
-                env=env,
-                denied_env_patterns=denied_env_patterns,
-            )
-        return cls(
-            cwd=cwd,
-            denied_commands=policy.commands,
-            denied_operators=denied_operators,
-            default_timeout=default_timeout,
-            max_output_chars=max_output_chars,
-            persist_cwd=persist_cwd,
-            allow_interactive=allow_interactive,
-            env=env,
-            denied_env_patterns=denied_env_patterns,
-        )
 
     async def for_run(self, ctx: RunContext[AgentDepsT]) -> AbstractToolset[AgentDepsT]:
         """Return a fresh instance per run so cwd and background processes are isolated.
@@ -218,9 +139,10 @@ class ShellToolset(FunctionToolset[AgentDepsT]):
         an override two concurrent runs would corrupt each other's cwd and kill
         each other's background processes.
         """
-        return type(self)._from_policy(
-            self._command_policy,
+        return ShellToolset(
             cwd=self._initial_cwd,
+            allowed_commands=self._allowed_commands,
+            denied_commands=self._denied_commands,
             denied_operators=self._denied_operators,
             default_timeout=self._default_timeout,
             max_output_chars=self._max_output_chars,
@@ -288,8 +210,10 @@ class ShellToolset(FunctionToolset[AgentDepsT]):
             return
         executable = tokens[0]
 
-        if denial_message := self._command_policy.denial_message(executable):
-            raise PermissionError(denial_message)
+        if self._denied_commands and executable in self._denied_commands:
+            raise PermissionError(f'Command {executable!r} is denied.')
+        if self._allowed_commands and executable not in self._allowed_commands:
+            raise PermissionError(f'Command {executable!r} is not in the allowed list.')
 
     def _truncate(self, text: str) -> str:
         """Truncate output to the configured cap, keeping the tail.
