@@ -8,7 +8,7 @@ from typing import Any
 from unittest.mock import AsyncMock, patch
 
 import pytest
-from opentelemetry.trace import NoOpTracer, Tracer
+from opentelemetry.trace import NoOpTracer, Tracer, get_tracer
 from pydantic_ai import Agent
 from pydantic_ai.messages import (
     ModelMessage,
@@ -24,6 +24,8 @@ from pydantic_ai.models.fallback import FallbackModel
 from pydantic_ai.models.test import TestModel
 from pydantic_ai.usage import RunUsage
 
+import pydantic_ai_harness
+import pydantic_ai_harness.compaction as compaction
 from pydantic_ai_harness.compaction import (
     DEFAULT_CONTEXT_WINDOW,
     ClearToolResults,
@@ -959,7 +961,6 @@ class TestCompactNowSpan:
         return [s for s in capfire.exporter.exported_spans_as_dict() if s['name'] == 'compact_messages']
 
     async def test_emits_the_compaction_span(self, capfire: CaptureLogfire):
-        from opentelemetry.trace import get_tracer
 
         strategy: SlidingWindowCompaction[None] = SlidingWindowCompaction(max_tokens=1, keep_messages=2)
 
@@ -974,7 +975,6 @@ class TestCompactNowSpan:
 
     async def test_the_span_is_measured_with_the_tokenizer_it_was_given(self, capfire: CaptureLogfire):
         """Without it the manual path reports the heuristic where the in-run path reported a real count."""
-        from opentelemetry.trace import get_tracer
 
         strategy: SlidingWindowCompaction[None] = SlidingWindowCompaction(max_tokens=1, keep_messages=2)
         messages = _history(4)
@@ -986,7 +986,6 @@ class TestCompactNowSpan:
         assert attributes['compaction.tokens_before'] == characters, 'the 4-characters heuristic was used instead'
 
     async def test_no_span_when_the_history_is_unchanged(self, capfire: CaptureLogfire):
-        from opentelemetry.trace import get_tracer
 
         tiered: TieredCompaction[None] = TieredCompaction(
             tiers=[SlidingWindowCompaction(max_tokens=1, keep_messages=2)],
@@ -998,7 +997,6 @@ class TestCompactNowSpan:
         assert self._spans(capfire) == []
 
     async def test_the_span_names_the_focused_strategy(self, capfire: CaptureLogfire):
-        from opentelemetry.trace import get_tracer
 
         tiered: TieredCompaction[None] = TieredCompaction(
             tiers=[SlidingWindowCompaction(max_tokens=1, keep_messages=2)],
@@ -1037,8 +1035,6 @@ class TestWithFocus:
 
 class TestNewExports:
     def test_exposed_under_the_submodule_only(self):
-        import pydantic_ai_harness
-        import pydantic_ai_harness.compaction as compaction
 
         for name in ('ContextUsage', 'ReportContextUsage', 'compact_now', 'resolve_context_window'):
             assert hasattr(compaction, name)
@@ -1073,7 +1069,6 @@ class TestPositionalCompatibility:
         assert WarnNearLimits(10, 1_000, 2_000).max_total_tokens == 2_000
 
     def test_the_new_fields_stay_keyword_only(self):
-        import dataclasses
 
         cases = [
             (SlidingWindowCompaction, 'max_fraction'),

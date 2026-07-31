@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import shlex
+import signal
 import sys
 from collections.abc import Mapping, Sequence
 from pathlib import Path
@@ -11,6 +12,7 @@ from unittest.mock import MagicMock, patch
 
 import anyio
 import pytest
+import sniffio
 from pydantic_ai import Agent, RunContext
 from pydantic_ai.exceptions import ModelRetry
 from pydantic_ai.models.test import TestModel
@@ -1163,7 +1165,6 @@ class TestShellCapability:
 
     @pytest.mark.anyio(backends=['asyncio'])
     async def test_agent_integration(self, tmp_path: Path) -> None:
-        import sniffio
 
         if sniffio.current_async_library() != 'asyncio':  # pragma: no cover
             pytest.skip('Agent.run() requires asyncio')
@@ -1213,8 +1214,6 @@ class TestKillProcessGroupEdgeCases:
 
         proc.wait = never_return
 
-        import signal
-
         kill_calls: list[tuple[int, int]] = []
 
         def fake_killpg(pgid: int, sig: int) -> None:
@@ -1250,8 +1249,6 @@ class TestKillProcessGroupEdgeCases:
             await anyio.sleep(999)
 
         proc.wait = never_return
-
-        import signal
 
         call_count = 0
 

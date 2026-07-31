@@ -11,12 +11,15 @@ import stat
 from pathlib import Path
 
 import pytest
+import sniffio
 from pydantic_ai import Agent, RunContext
 from pydantic_ai.exceptions import ModelRetry
 from pydantic_ai.models.test import TestModel
 from pydantic_ai.usage import RunUsage
 
+import pydantic_ai_harness
 from pydantic_ai_harness.localstack import LocalStack, LocalStackError, LocalStackToolset
+from pydantic_ai_harness.localstack import LocalStack as Exported
 
 from ._http_server import HttpResponse, http_server, unused_tcp_port
 
@@ -324,7 +327,6 @@ class TestLocalStackCapability:
 
     @pytest.mark.anyio(backends=['asyncio'])
     async def test_agent_integration(self) -> None:
-        import sniffio
 
         if sniffio.current_async_library() != 'asyncio':  # pragma: no cover
             pytest.skip('Agent.run() requires asyncio')
@@ -334,8 +336,6 @@ class TestLocalStackCapability:
         assert result.output == 'done'
 
     def test_exported_from_submodule(self) -> None:
-        import pydantic_ai_harness
-        from pydantic_ai_harness.localstack import LocalStack as Exported
 
         assert Exported is LocalStack
         # Capabilities are reached via their submodule, not the package root, so each keeps its own optional deps.
@@ -404,7 +404,6 @@ class TestContainerManagement:
 
     @pytest.mark.anyio(backends=['asyncio'])
     async def test_agent_integration_manages_container(self, tmp_path: Path) -> None:
-        import sniffio
 
         if sniffio.current_async_library() != 'asyncio':  # pragma: no cover
             pytest.skip('Agent.run() requires asyncio')

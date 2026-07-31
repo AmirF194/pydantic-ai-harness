@@ -10,6 +10,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import TypeGuard
 
+import httpx
 import pytest
 from httpx import AsyncClient, MockTransport, Request, Response
 from pydantic_ai.messages import (
@@ -35,7 +36,10 @@ from pydantic_ai_harness.media import (
     parse_media_uri,
     restore_media,
 )
-from pydantic_ai_harness.media._s3 import sign_request
+from pydantic_ai_harness.media._s3 import (
+    _canonical_uri,  # pyright: ignore[reportPrivateUsage]
+    sign_request,
+)
 
 pytestmark = pytest.mark.anyio
 
@@ -234,7 +238,6 @@ async def _restore_as_pre_pr_reader(node: dict[str, object], store: MediaStore) 
     The previous reader treats every marker as binary. Its missing-`uri` guard
     is left out because the markers under test always carry one.
     """
-    import base64
 
     uri_value = node.get('uri')
     assert isinstance(uri_value, str)
@@ -794,7 +797,6 @@ class TestS3MediaStoreWithMockTransport:
         Otherwise the signed canonical path and the path S3 receives diverge ->
         SignatureDoesNotMatch. The wire `raw_path` must equal `_canonical_uri(path)`.
         """
-        from pydantic_ai_harness.media._s3 import _canonical_uri  # pyright: ignore[reportPrivateUsage]
 
         captured: list[Request] = []
 
@@ -1041,7 +1043,6 @@ class TestS3MediaStoreWithMockTransport:
 
     async def test_no_client_branch_opens_one_per_call(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """Without `client=`, the store opens a fresh `httpx.AsyncClient` per call."""
-        import httpx
 
         captured: list[Request] = []
 
