@@ -11,7 +11,7 @@ from pydantic_ai.tools import AgentDepsT
 
 from pydantic_ai_harness.shell._toolset import ShellToolset
 
-_DEFAULT_DENIED_COMMANDS: tuple[str, ...] = (
+_DEFAULT_DENIED_COMMANDS: list[str] = [
     'rm',
     'rmdir',
     'mkfs',
@@ -22,15 +22,7 @@ _DEFAULT_DENIED_COMMANDS: tuple[str, ...] = (
     'halt',
     'poweroff',
     'init',
-)
-
-
-class _DefaultDeniedCommands(list[str]):
-    pass
-
-
-def _default_denied_commands() -> list[str]:
-    return _DefaultDeniedCommands(_DEFAULT_DENIED_COMMANDS)
+]
 
 
 LLM_API_KEY_ENV_PATTERNS: tuple[str, ...] = (
@@ -66,7 +58,7 @@ class Shell(AbstractCapability[AgentDepsT]):
     allowed_commands: Sequence[str] = field(default_factory=list[str])
     """If non-empty, only these command names may be executed (allowlist)."""
 
-    denied_commands: Sequence[str] = field(default_factory=_default_denied_commands)
+    denied_commands: Sequence[str] = field(default_factory=lambda: list(_DEFAULT_DENIED_COMMANDS))
     """These command names are always rejected (denylist).
 
     Defaults to blocking destructive commands (rm, dd, shutdown, etc.).
@@ -110,8 +102,8 @@ class Shell(AbstractCapability[AgentDepsT]):
 
     def get_toolset(self) -> ShellToolset[AgentDepsT]:
         """Build and return the shell toolset."""
-        denied_commands: Sequence[str] = self.denied_commands
-        if self.allowed_commands and isinstance(denied_commands, _DefaultDeniedCommands):
+        denied_commands = self.denied_commands
+        if self.allowed_commands and denied_commands == _DEFAULT_DENIED_COMMANDS:
             denied_commands = ()
         return ShellToolset[AgentDepsT](
             cwd=Path(self.cwd),

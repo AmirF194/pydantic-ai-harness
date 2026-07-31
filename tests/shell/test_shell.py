@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import os
 import shlex
 import sys
@@ -1175,6 +1176,27 @@ class TestShellCapability:
 
     def test_agent_accepts_allowlist_without_explicit_denylist(self, tmp_path: Path) -> None:
         Agent(TestModel(), capabilities=[Shell(cwd=tmp_path, allowed_commands=['echo'])])
+
+    def test_agent_loads_allowlist_from_spec_file(self, tmp_path: Path) -> None:
+        spec = tmp_path / 'agent.yaml'
+        spec.write_text('model: test\ncapabilities:\n  - Shell:\n      allowed_commands: [ls, cat, rg]\n')
+
+        agent = Agent.from_file(spec, custom_capability_types=[Shell])
+
+        shells = [capability for capability in agent.root_capability.capabilities if isinstance(capability, Shell)]
+        assert len(shells) == 1
+        shell = shells[0]
+        assert shell.allowed_commands == ['ls', 'cat', 'rg']
+        assert 'rm' in shell.denied_commands
+        shell.get_toolset()._check_command('ls')
+
+    def test_dataclasses_replace_preserves_allowlist(self) -> None:
+        replaced = dataclasses.replace(Shell(allowed_commands=['echo']), cwd='/tmp')
+
+        assert replaced.cwd == '/tmp'
+        assert replaced.allowed_commands == ['echo']
+        assert 'rm' in replaced.denied_commands
+        replaced.get_toolset()._check_command('echo')
 
     def test_get_toolset_returns_toolset(self, tmp_path: Path) -> None:
         shell = Shell(cwd=tmp_path)
