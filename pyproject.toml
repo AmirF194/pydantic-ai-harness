@@ -97,6 +97,7 @@ dev = [
     "pytest-examples>=0.0.18",
     "pytest-recording>=0.13.4",
     "mongomock-motor>=0.0.36",
+    "websockets>=14",
 ]
 lint = [
     'ruff>=0.14',

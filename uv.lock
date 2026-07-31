@@ -2387,6 +2387,7 @@ dev = [
     { name = "pytest-anyio" },
     { name = "pytest-examples" },
     { name = "pytest-recording" },
+    { name = "websockets" },
 ]
 lint = [
     { name = "pyright" },
@@ -2428,6 +2429,7 @@ dev = [
     { name = "pytest-anyio" },
     { name = "pytest-examples", specifier = ">=0.0.18" },
     { name = "pytest-recording", specifier = ">=0.13.4" },
+    { name = "websockets", specifier = ">=14" },
 ]
 lint = [
     { name = "pyright", specifier = ">=1.1.408" },
