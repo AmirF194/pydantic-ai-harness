@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import AsyncIterator
 from pathlib import Path
 
 import httpx
@@ -10,6 +11,7 @@ from pydantic import TypeAdapter
 from pydantic_ai import Agent
 from pydantic_ai.messages import ModelMessage, ModelResponse, TextPart, ToolCallPart, ToolReturnPart
 from pydantic_ai.models.function import AgentInfo, FunctionModel
+from pydantic_ai.sandboxes import LocalSandbox, Sandbox
 
 from pydantic_ai_harness.pydantic_ai_docs import PydanticAIDocs, PydanticAIDocsToolset, PydanticAIDocsTopic
 
@@ -20,6 +22,12 @@ pytestmark = pytest.mark.anyio
 def anyio_backend() -> str:
     """Run async tests on the asyncio backend (matching upstream pydantic-ai)."""
     return 'asyncio'
+
+
+@pytest.fixture
+async def sandbox(tmp_path: Path) -> AsyncIterator[Sandbox]:
+    async with LocalSandbox(root=tmp_path) as backend:
+        yield Sandbox.wrap(backend)
 
 
 class _FakeClient:
@@ -58,10 +66,10 @@ def _install_fake_httpx(
 
 
 class TestPydanticAIDocsToolset:
-    async def test_local_hit_is_cached(self, tmp_path: Path) -> None:
+    async def test_local_hit_is_cached(self, tmp_path: Path, sandbox: Sandbox) -> None:
         (tmp_path / 'hooks.md').write_text('# Hooks local', encoding='utf-8')
         cache: dict[PydanticAIDocsTopic, str] = {}
-        toolset = PydanticAIDocsToolset[object](local_docs_path=tmp_path, cache=cache)
+        toolset = PydanticAIDocsToolset[object](local_docs_path=tmp_path, cache=cache, sandbox=sandbox)
 
         assert await toolset.read_pyai_docs(PydanticAIDocsTopic.hooks) == '# Hooks local'
         assert cache[PydanticAIDocsTopic.hooks] == '# Hooks local'
@@ -77,11 +85,11 @@ class TestPydanticAIDocsToolset:
         assert await toolset.read_pyai_docs(PydanticAIDocsTopic.capabilities) == '# Capabilities remote'
 
     async def test_remote_fallback_when_local_file_missing(
-        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, sandbox: Sandbox
     ) -> None:
         _install_fake_httpx(monkeypatch, text='# Agent remote')
         cache: dict[PydanticAIDocsTopic, str] = {}
-        toolset = PydanticAIDocsToolset[object](local_docs_path=tmp_path, cache=cache)
+        toolset = PydanticAIDocsToolset[object](local_docs_path=tmp_path, cache=cache, sandbox=sandbox)
 
         assert await toolset.read_pyai_docs(PydanticAIDocsTopic.agent) == '# Agent remote'
         assert cache[PydanticAIDocsTopic.agent] == '# Agent remote'
@@ -93,9 +101,11 @@ class TestPydanticAIDocsToolset:
         with pytest.raises(RuntimeError, match='no local checkout configured'):
             await toolset.read_pyai_docs(PydanticAIDocsTopic.tools)
 
-    async def test_remote_error_reports_local_path(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    async def test_remote_error_reports_local_path(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, sandbox: Sandbox
+    ) -> None:
         _install_fake_httpx(monkeypatch, status=404)
-        toolset = PydanticAIDocsToolset[object](local_docs_path=tmp_path, cache=None)
+        toolset = PydanticAIDocsToolset[object](local_docs_path=tmp_path, cache=None, sandbox=sandbox)
 
         with pytest.raises(RuntimeError, match=str(tmp_path)):
             await toolset.read_pyai_docs(PydanticAIDocsTopic.toolsets)
@@ -106,16 +116,18 @@ class TestPydanticAIDocsToolset:
         assert PydanticAIDocsTopic.tools_advanced.value == 'tools-advanced'
         assert TypeAdapter(PydanticAIDocsTopic).validate_python('tools-advanced') is PydanticAIDocsTopic.tools_advanced
 
-    async def test_tools_advanced_reads_hyphenated_file(self, tmp_path: Path) -> None:
+    async def test_tools_advanced_reads_hyphenated_file(self, tmp_path: Path, sandbox: Sandbox) -> None:
         (tmp_path / 'tools-advanced.md').write_text('# Tools advanced local', encoding='utf-8')
-        toolset = PydanticAIDocsToolset[object](local_docs_path=tmp_path, cache=None)
+        toolset = PydanticAIDocsToolset[object](local_docs_path=tmp_path, cache=None, sandbox=sandbox)
 
         assert await toolset.read_pyai_docs(PydanticAIDocsTopic.tools_advanced) == '# Tools advanced local'
 
-    async def test_local_path_expands_user(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    async def test_local_path_expands_user(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, sandbox: Sandbox
+    ) -> None:
         monkeypatch.setenv('HOME', str(tmp_path))
         (tmp_path / 'hooks.md').write_text('# Hooks home', encoding='utf-8')
-        toolset = PydanticAIDocsToolset[object](local_docs_path=Path('~'), cache=None)
+        toolset = PydanticAIDocsToolset[object](local_docs_path=Path('~'), cache=None, sandbox=sandbox)
 
         assert await toolset.read_pyai_docs(PydanticAIDocsTopic.hooks) == '# Hooks home'
 
