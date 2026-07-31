@@ -24,14 +24,15 @@ _DEFAULT_PROTECTED: list[str] = [
 
 @dataclass
 class FileSystem(AbstractCapability[AgentDepsT]):
-    """File system access scoped to a root directory.
+    """File system access scoped to a sub-root inside `ctx.sandbox`.
 
-    All paths are resolved relative to `root_dir`. Traversal above the root
-    is rejected. Symlinks are resolved before authorization.
+    Paths resolve relative to `root_dir`, itself a path inside the run's sandbox
+    working directory. Traversal above the root is rejected textually. Symlink
+    containment is the sandbox's responsibility.
     """
 
     root_dir: str | Path = '.'
-    """Root directory for all file operations. Defaults to the current directory."""
+    """Path inside the sandbox working directory. Defaults to the working directory itself."""
 
     allowed_patterns: Sequence[str] = field(default_factory=list[str])
     """If non-empty, only paths matching at least one glob pattern are accessible."""
@@ -56,8 +57,6 @@ class FileSystem(AbstractCapability[AgentDepsT]):
     """Maximum number of matches returned by `find_files`."""
 
     def __post_init__(self) -> None:
-        # Runtime validation: dataclass field annotations are advisory, not enforced.
-        # A config-driven caller could pass a string that would otherwise propagate.
         values: dict[str, Any] = {
             'max_read_lines': self.max_read_lines,
             'max_search_results': self.max_search_results,
@@ -68,9 +67,8 @@ class FileSystem(AbstractCapability[AgentDepsT]):
                 raise ValueError(f'{name} must be a positive integer, got {value!r}')
 
     def get_toolset(self) -> FileSystemToolset[AgentDepsT]:
-        """Build and return the filesystem toolset."""
         return FileSystemToolset[AgentDepsT](
-            root_dir=Path(self.root_dir),
+            root_dir=str(self.root_dir),
             allowed_patterns=self.allowed_patterns,
             denied_patterns=self.denied_patterns,
             protected_patterns=self.protected_patterns,
