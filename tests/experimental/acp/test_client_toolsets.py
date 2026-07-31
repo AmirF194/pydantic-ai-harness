@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import AsyncIterator
 from pathlib import Path
 
 import anyio
@@ -10,6 +11,7 @@ import pytest
 from acp import Client, schema
 from pydantic_ai import RunContext
 from pydantic_ai.models.test import TestModel
+from pydantic_ai.sandboxes import LocalSandbox, Sandbox
 from pydantic_ai.usage import RunUsage
 
 from pydantic_ai_harness.experimental.acp import (
@@ -24,8 +26,24 @@ from tests.experimental.acp._acp_clients import RecordingClient  # pyright: igno
 pytestmark = pytest.mark.anyio
 
 
-def _ctx() -> RunContext[None]:
-    return RunContext[None](deps=None, model=TestModel(), usage=RunUsage(), prompt=None, messages=[], run_step=1)
+# LocalSandbox in the sandbox-concept branch is asyncio-only.
+@pytest.fixture
+def anyio_backend() -> str:
+    return 'asyncio'
+
+
+@pytest.fixture
+async def sandbox(tmp_path: Path) -> AsyncIterator[Sandbox]:
+    async with LocalSandbox(root=tmp_path) as backend:
+        yield Sandbox.wrap(backend)
+
+
+def _ctx(sandbox: Sandbox | None = None) -> RunContext[None]:
+    if sandbox is None:
+        return RunContext[None](deps=None, model=TestModel(), usage=RunUsage(), prompt=None, messages=[], run_step=1)
+    return RunContext[None](
+        deps=None, model=TestModel(), usage=RunUsage(), prompt=None, messages=[], run_step=1, sandbox=sandbox
+    )
 
 
 def _session(client: Client, capabilities: schema.ClientCapabilities | None) -> AcpSession:
@@ -94,7 +112,9 @@ async def test_acp_filesystem_builds_a_working_toolset_when_fs_is_advertised() -
     assert await toolset.read_file('/ws/a.py') == 'hi'  # the built toolset routes through the same client
 
 
-async def test_acp_filesystem_read_only_client_reads_via_acp_and_writes_locally(tmp_path: Path) -> None:
+async def test_acp_filesystem_read_only_client_reads_via_acp_and_writes_locally(
+    tmp_path: Path, sandbox: Sandbox
+) -> None:
     # A read-only client keeps editor-native reads, but writes go to the local workspace disk
     # rather than the client (coherent only when the agent shares that disk -- see the helper docs).
     client = RecordingClient({str(tmp_path / 'notes.txt'): 'hello'})
@@ -106,7 +126,9 @@ async def test_acp_filesystem_read_only_client_reads_via_acp_and_writes_locally(
         client=client,
         session_id=session.session_id,
     )
-    toolset = acp_filesystem(session)
+    built = acp_filesystem(session)
+    assert isinstance(built, AcpFileSystemToolset)
+    toolset = await built.for_run(_ctx(sandbox=sandbox))
     assert isinstance(toolset, AcpFileSystemToolset)
 
     assert await toolset.read_file('notes.txt') == 'hello'

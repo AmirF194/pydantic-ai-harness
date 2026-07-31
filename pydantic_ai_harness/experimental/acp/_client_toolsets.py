@@ -31,17 +31,31 @@ from typing import Protocol
 
 import anyio
 from acp import Client, schema
+from pydantic_ai import RunContext
 from pydantic_ai.tools import AgentDepsT
-from pydantic_ai.toolsets import FunctionToolset
+from pydantic_ai.toolsets import AbstractToolset, FunctionToolset
 
 from pydantic_ai_harness.experimental.acp._session import AcpSession
 from pydantic_ai_harness.filesystem import FileSystem
+from pydantic_ai_harness.filesystem._toolset import FileSystemToolset
 
 
 class _LocalFileWriter(Protocol):
     """Something that can write a file on the local disk -- structurally satisfied by `FileSystemToolset`."""
 
     def write_file(self, path: str, content: str) -> Awaitable[str]: ...  # pragma: no cover - structural protocol
+
+
+async def _bind_local_writer(writer: _LocalFileWriter | None, ctx: RunContext[AgentDepsT]) -> _LocalFileWriter | None:
+    """Bind a `FileSystemToolset`-shaped writer to the run's sandbox, or return it unchanged."""
+    if not isinstance(writer, FileSystemToolset):
+        return writer
+    # `isinstance` on a generic erases the parameter; the runtime class matches
+    # the parametrization used in `acp_filesystem()` so casting back is safe.
+    typed: FileSystemToolset[AgentDepsT] = writer  # pyright: ignore[reportUnknownVariableType,reportAssignmentType]
+    bound = await typed.for_run(ctx)
+    assert isinstance(bound, FileSystemToolset)
+    return bound  # pyright: ignore[reportReturnType]
 
 
 class AcpFileSystemToolset(FunctionToolset[AgentDepsT]):
@@ -70,6 +84,14 @@ class AcpFileSystemToolset(FunctionToolset[AgentDepsT]):
         self._local_writer = local_writer
         self.add_function(self.read_file, name='read_file')
         self.add_function(self.write_file, name='write_file')
+
+    async def for_run(self, ctx: RunContext[AgentDepsT]) -> AbstractToolset[AgentDepsT]:
+        # Bind the local writer to the run's sandbox so filesystem writes route
+        # through `ctx.sandbox` like the standalone `FileSystem` capability does.
+        local_writer = await _bind_local_writer(self._local_writer, ctx)
+        return AcpFileSystemToolset[AgentDepsT](
+            client=self._client, session_id=self._session_id, cwd=self._cwd, local_writer=local_writer
+        )
 
     def _absolute(self, path: str) -> str:
         if self._cwd is None or os.path.isabs(path):
