@@ -191,7 +191,7 @@ State persists between `run_code` calls within the same agent run -- variables, 
 
 ## Remote workers over WebSockets
 
-Set `sandbox_url` to run the Monty worker remotely instead of spawning local worker subprocesses:
+Set `monty_sandbox_url` to run the Monty worker remotely instead of spawning local worker subprocesses:
 
 ```python
 from pydantic_ai import Agent
@@ -199,7 +199,7 @@ from pydantic_ai_harness import CodeMode
 
 agent = Agent(
     'anthropic:claude-sonnet-4-6',
-    capabilities=[CodeMode(sandbox_url='wss://sandbox.example.com/monty')],
+    capabilities=[CodeMode(monty_sandbox_url='wss://sandbox.example.com/monty')],
 )
 ```
 
@@ -216,7 +216,7 @@ does with local workers.
 The WebSocket transport has a 10-second deadline for each remote protocol turn. The deadline
 covers worker-side execution only: while the sandbox is suspended waiting for a host tool call, the
 clock is not running, so slow tools are safe. Sandbox code that computes for longer than the
-deadline between suspensions surfaces as a sandbox-crash retry and resets the session. `sandbox_url` cannot be used
+deadline between suspensions surfaces as a sandbox-crash retry and resets the session. `monty_sandbox_url` cannot be used
 inside a Temporal workflow because that workflow-side path requires Monty's synchronous snapshot
 API.
 
@@ -251,7 +251,7 @@ either `__pydantic_ai_agents__` or `AgentPlugin`.
 runnable there, but `run_code` still executes in workflow code and is re-executed during replay.
 CodeMode deliberately uses Monty's synchronous snapshot API in this path because Temporal's
 deterministic workflow event loop cannot be woken by Monty's async worker I/O thread. For this
-reason, `sandbox_url` is not available inside a Temporal workflow.
+reason, `monty_sandbox_url` is not available inside a Temporal workflow.
 Model requests and, by default, nested tool calls cross Temporal activity boundaries;
 `asyncio.gather` can schedule nested tool activities concurrently. The REPL is process-local state
 for one agent run, not durable storage. Replay reconstructs it by running the recorded snippets
@@ -382,14 +382,14 @@ Code runs inside [Monty](https://github.com/pydantic/monty), a sandboxed Python 
 from pydantic_ai_harness import CodeMode
 
 CodeMode(
-    tools='all',          # 'all', list[str], callable, or metadata dict
-    max_retries=3,        # retries on sandbox execution errors
-    id=None,              # required when defer_loading=True
-    description=None,     # one-line catalog entry shown while deferred
+    tools='all',             # 'all', list[str], callable, or metadata dict
+    max_retries=3,           # retries on sandbox execution errors
+    id=None,                 # required when defer_loading=True
+    description=None,        # one-line catalog entry shown while deferred
     defer_loading=False,
-    os_access=None,       # OS behavior; custom handlers may expose host resources
-    mount=None,           # host directories to share with the sandbox
-    sandbox_url=None,     # ws:// or wss:// remote Monty worker relay
+    os_access=None,          # OS behavior; custom handlers may expose host resources
+    mount=None,              # host directories to share with the sandbox
+    monty_sandbox_url=None,  # ws:// or wss:// remote Monty worker relay
     dynamic_catalog=False,
 )
 ```

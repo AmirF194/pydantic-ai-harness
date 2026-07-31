@@ -109,7 +109,7 @@ async def test_code_mode_runs_over_websocket(
         FunctionModel(model),
         capabilities=[
             CodeMode(
-                sandbox_url=websocket_relay_url,
+                monty_sandbox_url=websocket_relay_url,
                 mount=MountDir(virtual_path='/workspace', host_path=tmp_path),
             )
         ],

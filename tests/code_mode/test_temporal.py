@@ -168,7 +168,7 @@ sandbox_url_guard_agent = Agent(
     FunctionModel(_sandbox_url_guard_model),
     name='code_mode_temporal_sandbox_url_guard_agent',
     capabilities=[
-        CodeMode(sandbox_url='ws://127.0.0.1:1'),
+        CodeMode(monty_sandbox_url='ws://127.0.0.1:1'),
         TemporalDurability(activity_config=BASE_ACTIVITY_CONFIG),
     ],
 )
@@ -337,6 +337,6 @@ async def test_sandbox_url_rejected_in_temporal_workflow(client: Client) -> None
         )
 
     assert result == (
-        '`CodeMode.sandbox_url` cannot be used inside a Temporal workflow because '
+        '`CodeMode.monty_sandbox_url` cannot be used inside a Temporal workflow because '
         'Monty WebSocket transport requires async worker I/O.'
     )

@@ -117,7 +117,7 @@ class _SyncMontyRunState:
 class _AsyncMontyRunState:
     """Async local or WebSocket Monty resources shared for one agent run."""
 
-    sandbox_url: str | None
+    monty_sandbox_url: str | None
     pool: AsyncMonty | AsyncMontyWebsocket | None = None
     session: AsyncMontySession | None = None
     has_executed_feed: bool = False
@@ -127,7 +127,9 @@ class _AsyncMontyRunState:
     async def get_session(self, *, type_check: bool, type_check_stubs: str | None) -> AsyncMontySession:
         """Return the run's live async REPL, dialing or spawning on first use."""
         if self.pool is None:
-            configured_pool = AsyncMonty() if self.sandbox_url is None else AsyncMontyWebsocket(self.sandbox_url)
+            configured_pool = (
+                AsyncMonty() if self.monty_sandbox_url is None else AsyncMontyWebsocket(self.monty_sandbox_url)
+            )
             self.pool = await self._pool_stack.enter_async_context(configured_pool)
         if self.session is None:
             self.session = await self._session_stack.enter_async_context(
@@ -506,7 +508,7 @@ class CodeModeToolset(WrapperToolset[AgentDepsT]):
     mount: CodeModeMount | None = None
     """Host directories to expose to sandboxed `pathlib` code; each mount's `mode` controls whether writes reach the host."""
 
-    sandbox_url: str | None = None
+    monty_sandbox_url: str | None = None
     """Run sandboxed code on remote Monty workers reached over this `ws://` or `wss://` URL.
 
     The URL may point to a relay or any server that bridges the WebSocket to a
@@ -559,16 +561,16 @@ class CodeModeToolset(WrapperToolset[AgentDepsT]):
     async def __aenter__(self) -> Self:
         """Enter the wrapped toolset and prepare lazy Monty resources for this run."""
         in_temporal_workflow = _in_temporal_workflow()
-        if in_temporal_workflow and self.sandbox_url is not None:
+        if in_temporal_workflow and self.monty_sandbox_url is not None:
             raise UserError(
-                '`CodeMode.sandbox_url` cannot be used inside a Temporal workflow because '
+                '`CodeMode.monty_sandbox_url` cannot be used inside a Temporal workflow because '
                 'Monty WebSocket transport requires async worker I/O.'
             )
         run_state: _MontyRunState
         if in_temporal_workflow:
             run_state = _SyncMontyRunState()
         else:
-            run_state = _AsyncMontyRunState(sandbox_url=self.sandbox_url)
+            run_state = _AsyncMontyRunState(monty_sandbox_url=self.monty_sandbox_url)
         await self.wrapped.__aenter__()
         self._run_state = run_state
         return self

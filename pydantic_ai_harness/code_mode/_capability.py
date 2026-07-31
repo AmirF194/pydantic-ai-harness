@@ -93,7 +93,7 @@ class CodeMode(AbstractCapability[AgentDepsT]):
     mount: CodeModeMount | None = None
     """Host directories to expose to sandboxed `pathlib` code; each mount's `mode` controls whether writes reach the host."""
 
-    sandbox_url: str | None = None
+    monty_sandbox_url: str | None = None
     """Run sandboxed code on remote Monty workers reached over this `ws://` or `wss://` URL.
 
     The URL may point to a relay or any server that bridges the WebSocket to a
@@ -155,7 +155,7 @@ class CodeMode(AbstractCapability[AgentDepsT]):
             dynamic_catalog=self.dynamic_catalog,
             os_access=self.os_access,
             mount=self.mount,
-            sandbox_url=self.sandbox_url,
+            monty_sandbox_url=self.monty_sandbox_url,
         )
 
     async def after_tool_execute(
