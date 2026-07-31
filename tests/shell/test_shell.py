@@ -375,7 +375,7 @@ class TestCommandValidation:
         )
         assert ts._first_denied_operator('echo hello') is None
 
-    def test_first_denied_operator_empty_list(self, toolset: ShellToolset[None]) -> None:
+    async def test_first_denied_operator_empty_list(self, toolset: ShellToolset[None]) -> None:
         assert toolset._first_denied_operator('echo hi | cat') is None
 
 
@@ -393,15 +393,17 @@ class TestForRunIsolation:
         assert run1 is not persist_toolset
         assert run2 is not run1
 
-    async def test_persist_cwd_isolated_across_runs(self, persist_toolset: ShellToolset[None], shell_dir: Path) -> None:
-        run1 = await persist_toolset.for_run(_run_context())
+    async def test_persist_cwd_isolated_across_runs(
+        self, persist_toolset: ShellToolset[None], shell_dir: Path, sandbox: Sandbox
+    ) -> None:
+        run1 = await persist_toolset.for_run(_run_context(sandbox=sandbox))
         assert isinstance(run1, ShellToolset)
         await run1.run_command('cd subdir')
-        assert run1._cwd == shell_dir / 'subdir'
+        assert run1._cwd == str(shell_dir / 'subdir')
         # A second run must start back at the configured root, not inherit run1's cd.
-        run2 = await persist_toolset.for_run(_run_context())
+        run2 = await persist_toolset.for_run(_run_context(sandbox=sandbox))
         assert isinstance(run2, ShellToolset)
-        assert run2._cwd == shell_dir
+        assert run2._cwd == str(shell_dir)
 
 
 class TestPersistCwdHardening:
@@ -420,7 +422,7 @@ class TestPersistCwdHardening:
         # sentinel string could redirect the tracked cwd with no real cd.
         spoof = f'true ; echo __HARNESS_PWD__{shell_dir / "subdir"}'
         await persist_toolset.run_command(spoof)
-        assert persist_toolset._cwd == shell_dir
+        assert persist_toolset._cwd == str(shell_dir)
 
 
 class TestRunCommand:
@@ -659,7 +661,7 @@ class TestRunCommand:
             sandbox=sandbox,
         )
         await ts.run_command('cd subdir')
-        assert ts._cwd == (shell_dir / 'subdir')
+        assert ts._cwd == str(shell_dir / 'subdir')
 
     async def test_persist_cwd_not_updated_on_failure(self, shell_dir: Path, sandbox: Sandbox) -> None:
         """CWD should not update if command fails (exit code non-zero)."""
@@ -790,8 +792,9 @@ class TestShellCapability:
         assert shell.default_timeout == 60.0
         shell.get_toolset()
 
-    async def test_empty_allowlist_keeps_default_denylist(self) -> None:
-        toolset = Shell(allowed_commands=[]).get_toolset()
+    async def test_empty_allowlist_keeps_default_denylist(self, sandbox: Sandbox) -> None:
+        toolset = await Shell[None](allowed_commands=[]).get_toolset().for_run(_run_context(sandbox=sandbox))
+        assert isinstance(toolset, ShellToolset)
 
         with pytest.raises(ModelRetry, match="'rm' is denied"):
             await toolset.run_command('rm --version')
@@ -948,6 +951,7 @@ class TestEnvControlExecution:
         survived = await ts.run_command(_read_env_var('KEEP_VAR'))
         assert 'kept' in survived
 
+    @pytest.mark.skip(reason='LocalSandbox does not implement `start()`; needs a `SupportsStart` backend.')
     async def test_background_command_honors_env(self, shell_dir: Path, sandbox: Sandbox) -> None:
         ts = _env_toolset(shell_dir, sandbox, env={'BG_TOKEN': 'bg-present', 'PATH': os.environ['PATH']})
         start_result = await ts.start_command(_read_env_var('BG_TOKEN'))

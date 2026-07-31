@@ -189,11 +189,30 @@ class ShellToolset(FunctionToolset[AgentDepsT]):
     def _wrap_for_cwd_capture(self, command: str) -> str:
         return f'{command}\n__harness_ec=$?\necho {_CWD_MARKER}\npwd\nexit $__harness_ec'
 
+    def _wrap_for_strict_env(self, command: str) -> str:
+        """Enforce env-strip via `env -i` so host-env-merging backends can't leak.
+
+        `LocalSandbox` overlays the host environment on top of any explicit `env`
+        passed to `run()`, which would leak vars we intentionally stripped. Wrap
+        the command with `env -i` when the toolset was configured with `env=` or
+        `denied_env_patterns=`; otherwise fall back to backend-default env
+        inheritance.
+        """
+        resolved = self._resolve_env()
+        if resolved is None:
+            return command
+        env_args = ' '.join(f'{name}={shlex.quote(value)}' for name, value in resolved.items())
+        return f'env -i {env_args} sh -c {shlex.quote(command)}'
+
     def _extract_captured_cwd(self, stdout: str) -> tuple[str, str | None]:
-        marker = f'\n{_CWD_MARKER}\n'
+        # The marker is echoed on its own line; user output may or may not end
+        # with a trailing newline, so match the trailing separator only.
+        marker = f'{_CWD_MARKER}\n'
         if marker not in stdout:
             return stdout, None
         prefix, tail = stdout.rsplit(marker, 1)
+        if prefix.endswith('\n'):
+            prefix = prefix[:-1]
         recorded = tail.strip().splitlines()
         if not recorded:
             return prefix, None
@@ -214,12 +233,12 @@ class ShellToolset(FunctionToolset[AgentDepsT]):
         timeout = timeout_seconds if timeout_seconds is not None else self._default_timeout
 
         actual_command = self._wrap_for_cwd_capture(command) if self._persist_cwd else command
+        actual_command = self._wrap_for_strict_env(actual_command)
         try:
             result = await self.sandbox.run(
                 actual_command,
                 shell=True,
                 cwd=await self._resolved_cwd(),
-                env=self._resolve_env(),
                 timeout=timeout,
             )
         except TimeoutError:
@@ -259,10 +278,9 @@ class ShellToolset(FunctionToolset[AgentDepsT]):
         self._check_command(command)
         command_id = uuid.uuid4().hex[:12]
         proc = await self.sandbox.start(
-            command,
+            self._wrap_for_strict_env(command),
             shell=True,
             cwd=await self._resolved_cwd(),
-            env=self._resolve_env(),
         )
         self._background[command_id] = proc
         return f'Started background command: {command!r}\nID: {command_id}'
