@@ -8,6 +8,7 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 from opentelemetry.trace import NoOpTracer, Tracer
+from pydantic_ai.capabilities import AbstractCapability
 from pydantic_ai.messages import (
     LoadCapabilityCallPart,
     ModelMessage,
@@ -91,19 +92,30 @@ def _make_ctx(
         model: Model = dataclasses.field(default_factory=TestModel)
         deps: None = None
         tracer: Tracer = dataclasses.field(default_factory=NoOpTracer)
+        # A declared field, like the real `RunContext`: a strategy reached from
+        # `before_model_request` sees a context rebuilt for the request's model, and an
+        # attribute merely assigned onto the fake would not survive that rebuild.
+        capabilities: dict[str, AbstractCapability[None]] = dataclasses.field(
+            default_factory=dict[str, AbstractCapability[None]]
+        )
 
     return _FakeCtx(usage=usage)
 
 
-def _make_request_context(messages: list[ModelMessage]) -> ModelRequestContext:
-    """Build a ModelRequestContext wrapping the given messages."""
+def _make_request_context(messages: list[ModelMessage], model: Model | None = None) -> ModelRequestContext:
+    """Build a ModelRequestContext wrapping the given messages.
+
+    *model* is the model the request would be sent to. Pass the context's own model to
+    reproduce a run where no capability replaced it, which is the common case.
+    """
 
     @dataclasses.dataclass
     class _FakeModel:
         model_id: str = 'test-model'
+        model_name: str = 'test-model'
 
     return ModelRequestContext(
-        model=_FakeModel(),  # type: ignore[arg-type]
+        model=model if model is not None else _FakeModel(),  # type: ignore[arg-type]
         messages=messages,
         model_settings=None,
         model_request_parameters=ModelRequestParameters(),
@@ -275,7 +287,7 @@ class TestFindTokenCutoff:
 
 class TestSlidingWindowCompaction:
     def test_validation_no_trigger(self):
-        with pytest.raises(ValueError, match='At least one of max_messages or max_tokens must be set'):
+        with pytest.raises(ValueError, match='At least one of max_messages, max_tokens, or max_fraction must be set'):
             SlidingWindowCompaction()
 
     def test_validation_negative_max_messages(self):
@@ -492,7 +504,7 @@ class TestWarnNearLimits:
 
 class TestCompaction:
     def test_validation_no_trigger(self):
-        with pytest.raises(ValueError, match='At least one of max_messages or max_tokens must be set'):
+        with pytest.raises(ValueError, match='At least one of max_messages, max_tokens, or max_fraction must be set'):
             SummarizingCompaction(model='test', max_messages=None, max_tokens=None)
 
     def test_validation_negative_max_messages(self):
@@ -1500,7 +1512,7 @@ class TestIterToolPairs:
 
 class TestClearToolResults:
     def test_validation_no_trigger(self):
-        with pytest.raises(ValueError, match='At least one of max_messages or max_tokens must be set'):
+        with pytest.raises(ValueError, match='At least one of max_messages, max_tokens, or max_fraction must be set'):
             ClearToolResults()
 
     def test_validation_negative_max_messages(self):
@@ -1850,7 +1862,7 @@ class TestTieredCompaction:
 
 class TestSummarizingCompactionModel:
     @pytest.mark.anyio
-    async def test_model_inherits_from_ctx_when_none(self):
+    async def test_model_inherits_from_the_request_when_none(self):
         comp = SummarizingCompaction(
             max_messages=3, keep_messages=1, preserve_first_user_message=False, incremental=False
         )
@@ -1866,9 +1878,11 @@ class TestSummarizingCompactionModel:
             MockAgent.return_value = mock_agent_instance
             await comp.before_model_request(ctx, rc)
 
-        # The summarizer agent was constructed with the running agent's model.
-        assert MockAgent.call_args.args[0] is ctx.model
-        # And its usage is threaded into the parent run for honest accounting.
+        # The summarizer agent was constructed with the model the request is going to. Core
+        # starts that as the run's model, so the two differ only where a capability replaced
+        # it -- and then the request's is the one the compaction is being done for.
+        assert MockAgent.call_args.args[0] is rc.model
+        # Its usage is threaded into the parent run for honest accounting.
         assert mock_agent_instance.run.call_args.kwargs['usage'] is ctx.usage
 
     def test_default_prompt_has_structured_sections(self):
@@ -2160,14 +2174,57 @@ class TestHelperBranchCoverage:
         ]
         assert [p.content for p in _extract_system_prompts(msgs)] == ['a', 'b']
 
-    def test_collect_and_format_skip_unknown_part_types(self):
+    def test_a_retry_and_a_thinking_block_are_counted(self):
+        """Both are sent to the provider, and a run under load is where they appear."""
         from pydantic_ai.messages import RetryPromptPart, ThinkingPart
 
         msgs: list[ModelMessage] = [
-            ModelRequest(parts=[RetryPromptPart(content='retry')]),
-            ModelResponse(parts=[ThinkingPart(content='think')]),
+            ModelRequest(parts=[RetryPromptPart(content='r' * 400)]),
+            ModelResponse(parts=[ThinkingPart(content='t' * 400)]),
         ]
-        # Unknown part types contribute no countable text but exercise the skip branches.
+        assert estimate_token_count(msgs) == 200
+        # `_format_messages` renders history for a summarizer prompt, which is a different
+        # question from what the request costs; a retry and a thinking block stay out of it.
+        assert _format_messages(msgs) == ''
+
+    def test_a_provider_side_tool_call_and_its_result_are_counted(self):
+        """A web search runs on the provider's side and its result still lands in the context."""
+        from pydantic_ai.messages import NativeToolCallPart, NativeToolReturnPart
+
+        msgs: list[ModelMessage] = [
+            ModelResponse(
+                parts=[
+                    NativeToolCallPart(tool_name='web_search', args={'q': 'x' * 200}, tool_call_id='c1'),
+                    NativeToolReturnPart(tool_name='web_search', content='r' * 200, tool_call_id='c1'),
+                ]
+            )
+        ]
+
+        assert estimate_token_count(msgs) > 100
+
+    def test_instructions_are_counted_once_however_many_turns_carry_them(self):
+        """A request sends one set; summing them would multiply a system prompt by the turn count."""
+        instructions = 'i' * 400
+        one_turn: list[ModelMessage] = [ModelRequest(parts=[UserPromptPart(content='')], instructions=instructions)]
+        four_turns: list[ModelMessage] = [
+            ModelRequest(parts=[UserPromptPart(content='')], instructions=instructions) for _ in range(4)
+        ]
+
+        assert estimate_token_count(one_turn) == 100
+        assert estimate_token_count(four_turns) == 100
+
+    def test_a_history_with_no_instructions_counts_none(self):
+        msgs: list[ModelMessage] = [ModelRequest(parts=[UserPromptPart(content='')])]
+
+        assert estimate_token_count(msgs) == 0
+
+    def test_a_binary_part_is_not_counted_as_characters(self):
+        """`FilePart` carries bytes; its length in characters would mean nothing."""
+        from pydantic_ai.messages import BinaryContent, FilePart
+
+        msgs: list[ModelMessage] = [
+            ModelResponse(parts=[FilePart(content=BinaryContent(data=b'\x00' * 4_000, media_type='image/png'))])
+        ]
         assert estimate_token_count(msgs) == 0
         assert _format_messages(msgs) == ''
 
@@ -3251,9 +3308,12 @@ class TestBridgePrefix:
             ]
         )
         messages: list[ModelMessage] = [_user('a'), tail[0], _user('c'), tail[1]]
-        rc = _make_request_context(messages)
+        run_ctx = ctx if ctx is not None else _make_ctx()
+        # No capability replaces the model here, so the request goes to the run's own model --
+        # which is what the bridge gate reads when the history names no model.
+        rc = _make_request_context(messages, run_ctx.model)
         with patch('pydantic_ai.Agent', return_value=_patched_summary_agent('BASE')):
-            result = await comp.before_model_request(ctx if ctx is not None else _make_ctx(), rc)
+            result = await comp.before_model_request(run_ctx, rc)
         first = result.messages[0]
         assert isinstance(first, ModelRequest)
         return next(
