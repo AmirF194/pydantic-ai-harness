@@ -108,7 +108,7 @@ class Shell(AbstractCapability[AgentDepsT]):
     def get_toolset(self) -> ShellToolset[AgentDepsT]:
         """Build and return the shell toolset."""
         return ShellToolset[AgentDepsT](
-            cwd=Path(self.cwd),
+            cwd=str(self.cwd),
             allowed_commands=self.allowed_commands,
             denied_commands=self.denied_commands,
             denied_operators=self.denied_operators,
