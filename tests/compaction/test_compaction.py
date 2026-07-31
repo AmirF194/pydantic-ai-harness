@@ -8,6 +8,7 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 from opentelemetry.trace import NoOpTracer, Tracer
+from pydantic_ai import Agent
 from pydantic_ai.capabilities import AbstractCapability
 from pydantic_ai.messages import (
     LoadCapabilityCallPart,
@@ -26,6 +27,7 @@ from pydantic_ai.messages import (
     UserPromptPart,
 )
 from pydantic_ai.models import Model, ModelRequestContext, ModelRequestParameters
+from pydantic_ai.models.function import AgentInfo, FunctionModel
 from pydantic_ai.models.test import TestModel
 from pydantic_ai.toolsets._tool_search import parse_discovered_tools
 from pydantic_ai.usage import RunUsage
@@ -2122,7 +2124,7 @@ class TestPublicPath:
         # and assert it completes with discovery intact.
         from pydantic_ai import Agent, Tool
         from pydantic_ai.capabilities import ToolSearch
-        from pydantic_ai.models.function import AgentInfo, FunctionModel
+        from pydantic_ai.models.function import FunctionModel
 
         def hidden_gem(x: int) -> int:
             return x + 1
@@ -3243,7 +3245,7 @@ class TestAnchoredIncremental:
     async def test_previous_summary_fed_as_anchor_with_update_instruction(self):
         from pydantic_ai.messages import ModelResponse as _MR
         from pydantic_ai.messages import TextPart as _TP
-        from pydantic_ai.models.function import AgentInfo, FunctionModel
+        from pydantic_ai.models.function import FunctionModel
 
         captured: list[str] = []
 
@@ -3437,3 +3439,173 @@ class TestStepPersistenceHandle:
 
         sp: StepPersistence[None] = StepPersistence(store=InMemoryStepStore())
         assert sp.compaction_transcript_handle() is None
+
+
+# ---------------------------------------------------------------------------
+# Structural features through a real Agent run
+# ---------------------------------------------------------------------------
+
+
+def _recording_model(seen: list[list[ModelMessage]]) -> FunctionModel:
+    """A run model that records the history each request actually carried."""
+
+    def model_fn(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        seen.append(list(messages))
+        return ModelResponse(parts=[TextPart(content='done')])
+
+    return FunctionModel(model_fn)
+
+
+def _recording_summarizer(prompts: list[str], output: str = 'THE SUMMARY') -> FunctionModel:
+    """A summarizer model that records the prompt each summarization call carried."""
+
+    def model_fn(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        prompts.append(
+            '\n'.join(
+                _part_text(part)
+                for message in messages
+                if isinstance(message, ModelRequest)
+                for part in message.parts
+                if isinstance(part, UserPromptPart)
+            )
+        )
+        return ModelResponse(parts=[TextPart(content=output)])
+
+    return FunctionModel(model_fn)
+
+
+class TestStructuralFeaturesThroughAgent:
+    """The four structural features driven through `Agent(..., capabilities=[...])`.
+
+    The rest of this file calls `compact` directly, so it cannot catch a break in the
+    `before_model_request` wiring or in how core threads a compacted history into the next
+    request. These assert on the history the model was actually sent.
+    """
+
+    @pytest.fixture
+    def anyio_backend(self) -> str:
+        # A full `agent.run` only needs one backend; trio hits a core event-loop quirk here
+        # that has nothing to do with compaction.
+        return 'asyncio'
+
+    @pytest.mark.anyio
+    async def test_receipt_reaches_the_model_and_does_not_accumulate(self):
+        seen: list[list[ModelMessage]] = []
+        agent = Agent(
+            _recording_model(seen),
+            capabilities=[SlidingWindowCompaction(max_messages=3, keep_messages=1, receipts=True)],
+        )
+        history: list[ModelMessage] = [_user('a'), _assistant('b'), _user('c'), _assistant('d')]
+        first = await agent.run('one', message_history=history)
+
+        receipts = _receipt_parts(seen[0])
+        assert len(receipts) == 1
+        assert 'was dropped by the harness' in receipts[0]
+
+        # A second compaction replaces the receipt rather than stacking a new one beside it.
+        await agent.run('two', message_history=first.all_messages())
+        assert len(_receipt_parts(seen[1])) == 1
+
+    @pytest.mark.anyio
+    async def test_receipt_is_not_mistaken_for_the_first_user_turn(self):
+        seen: list[list[ModelMessage]] = []
+        agent = Agent(
+            _recording_model(seen),
+            capabilities=[SlidingWindowCompaction(max_messages=3, keep_messages=1, receipts=True)],
+        )
+        history: list[ModelMessage] = [_user('FIRST'), _assistant('b'), _user('c'), _assistant('d')]
+        first = await agent.run('one', message_history=history)
+        await agent.run('two', message_history=first.all_messages())
+
+        # `preserve_first_user_message` defaults on, so the real opening turn -- not the
+        # receipt that now sits ahead of it -- is what gets carried forward.
+        assert 'FIRST' in _user_texts(seen[1])
+
+    @pytest.mark.anyio
+    async def test_pin_survives_compaction_in_a_run(self):
+        seen: list[list[ModelMessage]] = []
+        agent = Agent(
+            _recording_model(seen),
+            capabilities=[SlidingWindowCompaction(max_messages=3, keep_messages=1, preserve_first_user_message=False)],
+        )
+        history: list[ModelMessage] = [_pinned_msg('DURABLE STATE'), _user('a'), _assistant('b'), _user('c')]
+        await agent.run('go', message_history=history)
+
+        sent = seen[0]
+        assert len(sent) < len(history) + 1
+        assert [
+            _part_text(part)
+            for message in sent
+            if isinstance(message, ModelRequest)
+            for part in message.parts
+            if isinstance(part, UserPromptPart) and is_pinned(part)
+        ] == ['DURABLE STATE']
+
+    @pytest.mark.anyio
+    async def test_keep_user_messages_reaches_the_model_truncated(self):
+        seen: list[list[ModelMessage]] = []
+        prompts: list[str] = []
+        agent = Agent(
+            _recording_model(seen),
+            capabilities=[
+                SummarizingCompaction(
+                    model=_recording_summarizer(prompts),
+                    max_messages=3,
+                    keep_messages=2,
+                    keep_user_messages=True,
+                    keep_user_messages_max_chars=10,
+                )
+            ],
+        )
+        await agent.run('go', message_history=[_user('u' * 40), _assistant('b'), _user('v' * 40), _assistant('d')])
+
+        assert len(prompts) == 1
+        texts = _user_texts(seen[0])
+        assert any(text.startswith('vvvvv') and text.endswith('[...]') for text in texts)
+
+    @pytest.mark.anyio
+    async def test_retained_user_turns_arrive_as_a_single_request(self):
+        # `keep_user_messages` leaves the summary, the receipt, and the retained turns as
+        # adjacent `ModelRequest`s. Core normalizes that into one turn after the hooks run, so
+        # providers requiring a single request per turn (Bedrock Converse, Gemini) never see the
+        # consecutive shape. The docs promise this; assert core still does it.
+        seen: list[list[ModelMessage]] = []
+        prompts: list[str] = []
+        agent = Agent(
+            _recording_model(seen),
+            capabilities=[
+                SummarizingCompaction(
+                    model=_recording_summarizer(prompts),
+                    max_messages=3,
+                    keep_messages=2,
+                    keep_user_messages=True,
+                    receipts=True,
+                )
+            ],
+        )
+        await agent.run('go', message_history=[_user('a'), _assistant('b'), _user('c'), _assistant('d')])
+
+        sent = seen[0]
+        # The compacted history did contain several request-shaped pieces to begin with.
+        assert len(_user_texts(sent)) > 1
+        assert not any(
+            isinstance(earlier, ModelRequest) and isinstance(later, ModelRequest)
+            for earlier, later in zip(sent, sent[1:])
+        )
+
+    @pytest.mark.anyio
+    async def test_incremental_anchors_the_next_summary_on_the_previous_one(self):
+        seen: list[list[ModelMessage]] = []
+        prompts: list[str] = []
+        agent = Agent(
+            _recording_model(seen),
+            capabilities=[SummarizingCompaction(model=_recording_summarizer(prompts), max_messages=2, keep_messages=1)],
+        )
+        first = await agent.run('one', message_history=[_user('a'), _assistant('b'), _user('c'), _assistant('d')])
+        assert len(prompts) == 1
+        assert '<previous-summary>' not in prompts[0]
+
+        await agent.run('two', message_history=first.all_messages())
+        assert len(prompts) == 2
+        assert '<previous-summary>\nTHE SUMMARY\n</previous-summary>' in prompts[1]
+        assert _UPDATE_ANCHOR in prompts[1]
