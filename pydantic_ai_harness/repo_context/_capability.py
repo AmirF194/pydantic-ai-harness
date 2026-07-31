@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING, Any, Literal
 
 from pydantic_ai.capabilities import AbstractCapability
 from pydantic_ai.messages import ToolCallPart
+from pydantic_ai.sandboxes import Sandbox
 from pydantic_ai.tools import AgentDepsT, RunContext, ToolDefinition
 from pydantic_ai.toolsets import AgentToolset
 
@@ -109,7 +110,7 @@ class RepoContext(AbstractCapability[AgentDepsT]):
     """Root directories the inventory tool scans, relative to `workspace_dir`."""
 
     _context_files: list[ContextFile] | None = field(default=None, init=False, repr=False, compare=False)
-    """Cached walk-up result for this run, computed lazily on first access."""
+    """Walk-up result for this run, loaded once in `before_run` via `ctx.sandbox`."""
 
     _seen_dirs: set[str] = field(default_factory=set[str], init=False, repr=False, compare=False)
     """Run-scoped set of directories already surfaced by Strategy 3."""
@@ -118,18 +119,19 @@ class RepoContext(AbstractCapability[AgentDepsT]):
         """Return a fresh per-run instance with isolated traversal/cache state."""
         return replace(self)
 
-    def _files(self) -> list[ContextFile]:
-        if self._context_files is None:
-            self._context_files = discover_instruction_files(self.workspace_dir, self.home_dir, self.filenames)
-        return self._context_files
+    async def before_run(self, ctx: RunContext[AgentDepsT]) -> None:
+        """Load walk-up instruction files through `ctx.sandbox` so `get_instructions` is sync."""
+        if not self.autoload_instructions:
+            return
+        self._context_files = await discover_instruction_files(
+            ctx.sandbox, self.workspace_dir, self.home_dir, self.filenames
+        )
 
     def get_instructions(self) -> AgentInstructions[AgentDepsT] | None:
         """Static, cache-stable instructions: loaded files plus the inventory hint."""
         parts: list[str] = []
-        if self.autoload_instructions:
-            files = self._files()
-            if files:
-                parts.append(render_context_files(files, relative_to=self.workspace_dir))
+        if self.autoload_instructions and self._context_files:
+            parts.append(render_context_files(self._context_files, relative_to=self.workspace_dir))
         if self.expose_inventory_tool:
             parts.append(_INVENTORY_HINT.format(tool_name=self.inventory_tool_name))
         return '\n\n'.join(parts) or None
@@ -155,11 +157,11 @@ class RepoContext(AbstractCapability[AgentDepsT]):
         raw_path = args.get(self.traversal_path_arg)
         if not isinstance(raw_path, str):
             return result
-        directory = self._resolve_directory(raw_path)
-        context_file = find_dir_context_file(directory, self.filenames)
+        directory = await self._resolve_directory(ctx.sandbox, raw_path)
+        context_file = await find_dir_context_file(ctx.sandbox, directory, self.filenames)
         if context_file is None:
             return result
-        key = str(directory.resolve())
+        key = str(directory)
         if key in self._seen_dirs:
             return result
         if not isinstance(result, str):
@@ -168,11 +170,18 @@ class RepoContext(AbstractCapability[AgentDepsT]):
         note = self._render_note(context_file)
         return f'{result}\n\n{note}'
 
-    def _resolve_directory(self, raw_path: str) -> Path:
+    async def _resolve_directory(self, sandbox: Sandbox, raw_path: str) -> Path:
         candidate = Path(raw_path)
         if not candidate.is_absolute():
             candidate = self.workspace_dir / candidate
-        return candidate.parent if candidate.is_file() else candidate
+        text = str(candidate)
+        if not await sandbox.fs.exists(text):
+            return candidate
+        try:
+            entry = await sandbox.fs.stat(text)
+        except FileNotFoundError:
+            return candidate
+        return candidate.parent if not entry.is_dir else candidate
 
     def _render_note(self, context_file: ContextFile) -> str:
         label = self._label(context_file.path)
@@ -185,7 +194,7 @@ class RepoContext(AbstractCapability[AgentDepsT]):
 
     def _label(self, path: Path) -> str:
         try:
-            return path.resolve().relative_to(self.workspace_dir.resolve()).as_posix()
+            return path.relative_to(self.workspace_dir).as_posix()
         except ValueError:
             return path.as_posix()
 
