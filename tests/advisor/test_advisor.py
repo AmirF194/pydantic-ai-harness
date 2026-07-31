@@ -399,7 +399,7 @@ class TestAdvisor:
         with pytest.raises(UserError, match='tool whose name conflicts'):
             await agent.run('Review this.')
 
-    def test_rejects_invalid_limits(self) -> None:
+    def test_rejects_invalid_options(self) -> None:
         model = FunctionModel(lambda _messages, _info: ModelResponse(parts=[TextPart('done')]))
         with pytest.raises(ValueError, match='Advisor.mode'):
             Advisor(model, mode='invalid')  # pyright: ignore[reportArgumentType]

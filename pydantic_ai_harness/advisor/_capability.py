@@ -224,9 +224,6 @@ class Advisor(NativeOrLocalTool[AgentDepsT]):
         if not isinstance(model, str):
             return None, None
         provider, model_name = parse_model_id(model)
-        if model_name:
-            if provider == 'anthropic':
-                return provider, model_name
-            if provider == 'openrouter':
-                return provider, model_name
+        if model_name and (provider == 'anthropic' or provider == 'openrouter'):
+            return provider, model_name
         return None, None
