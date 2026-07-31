@@ -246,24 +246,6 @@ def _is_code_execution_tool(tool_def: ToolDefinition) -> bool:
     return bool(tool_def.metadata and 'code_arg_name' in tool_def.metadata)
 
 
-def _revealed_tool_names(ctx: RunContext[AgentDepsT], tools: dict[str, ToolsetTool[AgentDepsT]]) -> set[str]:
-    """Names of the deferred tools the model can see right now.
-
-    `ToolDefinition.defer_loading` records what the tool's author asked for and keeps that value
-    after a reveal, so it doesn't answer this question: a flag that flipped mid-run would rewrite
-    the tool-definitions block on the wire and invalidate the provider's cached prefix
-    (pydantic/pydantic-ai#6770). Current visibility travels on
-    `ModelRequestParameters.revealed_tool_names`, which is assembled after toolsets have run and
-    so isn't reachable from `get_tools`; this is the same set from the run context: the tools tool
-    search has discovered, plus the tools owned by a deferred capability the model has loaded.
-    """
-    return ctx.discovered_tool_names | {
-        name
-        for name, tool in tools.items()
-        if (capability_id := tool.tool_def.capability_id) is not None and capability_id in ctx.loaded_capability_ids
-    }
-
-
 def _sanitize_tool_name(name: str) -> str:
     """Turn a tool name into a valid Python identifier.
 
@@ -432,8 +414,6 @@ class CodeModeToolset(WrapperToolset[AgentDepsT]):
         """Return the `run_code` tool plus any native (non-sandboxed) tools."""
         wrapped_tools = await self.wrapped.get_tools(ctx)
 
-        revealed_tool_names = _revealed_tool_names(ctx, wrapped_tools)
-
         # Split tools into sandboxed vs native based on the selector.
         sandboxed_tools: dict[str, ToolsetTool[AgentDepsT]] = {}
         native_tools: dict[str, ToolsetTool[AgentDepsT]] = {}
@@ -443,10 +423,10 @@ class CodeModeToolset(WrapperToolset[AgentDepsT]):
             # for them; pydantic-ai has set it on `search_tools` since 1.95.0.
             if tool.tool_def.tool_kind is not None:
                 native_tools[name] = tool
-            elif tool.tool_def.defer_loading and name not in revealed_tool_names:
-                # Stay native while still hidden, so Tool Search's `defer_loading`/`with_native`
-                # flags reach `Model.prepare_request` unaltered. Once the tool is revealed it
-                # falls through to the checks below and is sandboxed from then on.
+            elif not ctx.is_tool_available(tool.tool_def):
+                # Use the run's public availability predicate so Tool Search and deferred
+                # capability reveals share the same wire-side semantics. Hidden tools stay native
+                # until revealed, then fall through to the checks below and become sandboxed.
                 native_tools[name] = tool
             elif tool.tool_def.unless_native:
                 # Keep the local fallback native so `Model.prepare_request` can drop it
