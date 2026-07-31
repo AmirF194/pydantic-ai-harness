@@ -13,17 +13,19 @@ Delete this file before merge.
 
 Migrated so far (each with tests green + docstring covering the sandbox contract):
 
-- `filesystem` (commits `3c719b9`, `3e56451`)
-- `shell` (commits `9c3e3ca`, `6573f2c`) -- persist_cwd marker parsing fix, `env -i`
-  strict-env wrap for backends that overlay host env (e.g. `LocalSandbox`), and
-  `start()`-only tests skipped on `LocalSandbox`.
-- `experimental/acp` client toolsets (commit `d8fdf92`) -- read-only-client local
-  writer rebound to `ctx.sandbox` via `for_run`.
-- `pydantic_ai_docs` (commit `e3ad259`) -- local checkout probe uses
-  `sandbox.fs.exists` + `read_text`.
-- `repo_context` (commit `366d231`) -- walk-up discovery and nested-traversal notes
-  route through `sandbox.fs`; instructions load once in `before_run`. Symlink-realpath
-  dedup dropped (content-hash dedup preserved).
+- `filesystem` -- tool methods take `ctx: RunContext[AgentDepsT]` as first arg; every
+  read/write/stat routes through `ctx.sandbox.fs`. No `sandbox=` constructor kwarg
+  and no toolset-owned sandbox state; sandbox lifetime is tied to the run.
+- `shell` -- same shape (`ctx` first arg, `sandbox = ctx.sandbox`). `for_run` retained
+  only for `_cwd`/`_background` per-run isolation. `persist_cwd` marker parsing fix,
+  `env -i` strict-env wrap for backends that overlay host env (e.g. `LocalSandbox`).
+- `pydantic_ai_docs` -- `read_pyai_docs` takes `ctx` and reads from `ctx.sandbox.fs`;
+  remote fallback unchanged.
+- `experimental/acp` client toolsets -- `AcpFileSystemToolset.write_file` takes `ctx`
+  and threads it through to any configured local writer; the `for_run` / bind-sandbox
+  dance is gone.
+- `repo_context` -- walk-up discovery reads `ctx.sandbox.fs` from `before_run` and
+  `wrap_tool_execute`. No toolset-owned sandbox state.
 
 Remaining (in migration-table order):
 

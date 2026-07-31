@@ -4,15 +4,32 @@ from __future__ import annotations
 
 from collections.abc import AsyncIterator
 from pathlib import Path
+from typing import Any
 
 import pytest
-from pydantic_ai import Agent
+from pydantic_ai import Agent, RunContext
 from pydantic_ai.exceptions import ModelRetry
 from pydantic_ai.models.test import TestModel
 from pydantic_ai.sandboxes import LocalSandbox, Sandbox
+from pydantic_ai.usage import RunUsage
 
 from pydantic_ai_harness.filesystem import FileSystem
 from pydantic_ai_harness.filesystem._toolset import FileSystemToolset, _content_hash, _format_lines, _is_binary
+
+
+def _run_context(sandbox: Sandbox) -> RunContext[None]:
+    """Minimal `RunContext` carrying `sandbox` for direct toolset invocations."""
+    return RunContext[None](
+        deps=None, model=TestModel(), usage=RunUsage(), prompt=None, messages=[], run_step=0, sandbox=sandbox
+    )
+
+
+async def _call_fs_tool(toolset: FileSystemToolset[None], sandbox: Sandbox, name: str, **tool_args: Any) -> str:
+    ctx = _run_context(sandbox=sandbox)
+    tools = await toolset.get_tools(ctx)
+    result = await toolset.call_tool(name, tool_args, ctx, tools[name])
+    assert isinstance(result, str)
+    return result
 
 
 # LocalSandbox in the sandbox-concept branch is asyncio-only (uses asyncio.ensure_future).
@@ -117,7 +134,6 @@ def toolset(fs_root: Path, sandbox: Sandbox) -> FileSystemToolset[None]:
         max_read_lines=2000,
         max_search_results=1000,
         max_find_results=1000,
-        sandbox=sandbox,
     )
 
 
@@ -157,7 +173,6 @@ class TestAccessPatterns:
     async def test_denied_pattern_blocks(self, fs_root: Path, sandbox: Sandbox) -> None:
         ts = FileSystemToolset(
             root_dir=fs_root,
-            sandbox=sandbox,
             allowed_patterns=[],
             denied_patterns=['*.secret'],
             protected_patterns=[],
@@ -171,7 +186,6 @@ class TestAccessPatterns:
     async def test_denied_pattern_passes_non_matching(self, fs_root: Path, sandbox: Sandbox) -> None:
         ts = FileSystemToolset(
             root_dir=fs_root,
-            sandbox=sandbox,
             allowed_patterns=[],
             denied_patterns=['*.secret'],
             protected_patterns=[],
@@ -185,7 +199,6 @@ class TestAccessPatterns:
     async def test_allowed_pattern_permits(self, fs_root: Path, sandbox: Sandbox) -> None:
         ts = FileSystemToolset(
             root_dir=fs_root,
-            sandbox=sandbox,
             allowed_patterns=['*.py'],
             denied_patterns=[],
             protected_patterns=[],
@@ -199,7 +212,6 @@ class TestAccessPatterns:
     async def test_allowed_pattern_blocks_non_matching(self, fs_root: Path, sandbox: Sandbox) -> None:
         ts = FileSystemToolset(
             root_dir=fs_root,
-            sandbox=sandbox,
             allowed_patterns=['*.py'],
             denied_patterns=[],
             protected_patterns=[],
@@ -229,7 +241,6 @@ class TestAccessPatterns:
     async def test_access_with_no_denied_patterns(self, fs_root: Path, sandbox: Sandbox) -> None:
         ts = FileSystemToolset(
             root_dir=fs_root,
-            sandbox=sandbox,
             allowed_patterns=[],
             denied_patterns=[],
             protected_patterns=[],
@@ -243,7 +254,6 @@ class TestAccessPatterns:
     async def test_is_accessible_no_patterns(self, fs_root: Path, sandbox: Sandbox) -> None:
         ts = FileSystemToolset(
             root_dir=fs_root,
-            sandbox=sandbox,
             allowed_patterns=[],
             denied_patterns=[],
             protected_patterns=[],
@@ -257,7 +267,6 @@ class TestAccessPatterns:
     async def test_is_accessible_protected_only_on_write(self, fs_root: Path, sandbox: Sandbox) -> None:
         ts = FileSystemToolset(
             root_dir=fs_root,
-            sandbox=sandbox,
             allowed_patterns=[],
             denied_patterns=[],
             protected_patterns=['.env', '.env.*'],
@@ -275,7 +284,6 @@ class TestAccessPatterns:
     async def test_is_accessible_denied(self, fs_root: Path, sandbox: Sandbox) -> None:
         ts = FileSystemToolset(
             root_dir=fs_root,
-            sandbox=sandbox,
             allowed_patterns=[],
             denied_patterns=['*.secret'],
             protected_patterns=[],
@@ -289,7 +297,6 @@ class TestAccessPatterns:
     async def test_is_accessible_allowed_list_excludes(self, fs_root: Path, sandbox: Sandbox) -> None:
         ts = FileSystemToolset(
             root_dir=fs_root,
-            sandbox=sandbox,
             allowed_patterns=['*.py'],
             denied_patterns=[],
             protected_patterns=[],
@@ -302,147 +309,177 @@ class TestAccessPatterns:
 
 
 class TestReadFile:
-    async def test_read_basic(self, toolset: FileSystemToolset[None]) -> None:
-        result = await toolset.read_file('hello.txt')
+    async def test_read_basic(self, toolset: FileSystemToolset[None], sandbox: Sandbox) -> None:
+        result = await _call_fs_tool(toolset, sandbox, 'read_file', path='hello.txt')
         assert 'Hello, world!' in result
         assert 'hash:' in result
         assert '1 lines' in result
 
-    async def test_read_with_offset(self, toolset: FileSystemToolset[None]) -> None:
-        result = await toolset.read_file('multi.txt', offset=2)
+    async def test_read_with_offset(self, toolset: FileSystemToolset[None], sandbox: Sandbox) -> None:
+        result = await _call_fs_tool(toolset, sandbox, 'read_file', path='multi.txt', offset=2)
         assert 'line3' in result
         assert 'line1' not in result
 
-    async def test_read_with_limit(self, toolset: FileSystemToolset[None]) -> None:
-        result = await toolset.read_file('multi.txt', limit=2)
+    async def test_read_with_limit(self, toolset: FileSystemToolset[None], sandbox: Sandbox) -> None:
+        result = await _call_fs_tool(toolset, sandbox, 'read_file', path='multi.txt', limit=2)
         assert 'line1' in result
         assert 'line2' in result
         assert '... (3 more lines' in result
 
-    async def test_read_directory_raises(self, toolset: FileSystemToolset[None]) -> None:
+    async def test_read_directory_raises(self, toolset: FileSystemToolset[None], sandbox: Sandbox) -> None:
         with pytest.raises(ModelRetry, match='is a directory'):
-            await toolset.read_file('subdir')
+            await _call_fs_tool(toolset, sandbox, 'read_file', path='subdir')
 
-    async def test_read_missing_raises(self, toolset: FileSystemToolset[None]) -> None:
+    async def test_read_missing_raises(self, toolset: FileSystemToolset[None], sandbox: Sandbox) -> None:
         with pytest.raises(ModelRetry, match='File not found'):
-            await toolset.read_file('nonexistent.txt')
+            await _call_fs_tool(toolset, sandbox, 'read_file', path='nonexistent.txt')
 
-    async def test_read_binary_file(self, toolset: FileSystemToolset[None]) -> None:
-        result = await toolset.read_file('binary.bin')
+    async def test_read_binary_file(self, toolset: FileSystemToolset[None], sandbox: Sandbox) -> None:
+        result = await _call_fs_tool(toolset, sandbox, 'read_file', path='binary.bin')
         assert 'Binary file' in result
         assert '4 bytes' in result
 
-    async def test_read_traversal_blocked(self, toolset: FileSystemToolset[None]) -> None:
+    async def test_read_traversal_blocked(self, toolset: FileSystemToolset[None], sandbox: Sandbox) -> None:
         with pytest.raises(ModelRetry):
-            await toolset.read_file('../../../etc/passwd')
+            await _call_fs_tool(toolset, sandbox, 'read_file', path='../../../etc/passwd')
 
 
 class TestWriteFile:
-    async def test_write_new_file(self, toolset: FileSystemToolset[None], fs_root: Path) -> None:
-        result = await toolset.write_file('new.txt', 'new content\n')
+    async def test_write_new_file(self, toolset: FileSystemToolset[None], fs_root: Path, sandbox: Sandbox) -> None:
+        result = await _call_fs_tool(toolset, sandbox, 'write_file', path='new.txt', content='new content\n')
         assert 'Wrote' in result
         assert (fs_root / 'new.txt').read_text() == 'new content\n'
 
-    async def test_write_nonexistent_parent_raises(self, toolset: FileSystemToolset[None]) -> None:
+    async def test_write_nonexistent_parent_raises(self, toolset: FileSystemToolset[None], sandbox: Sandbox) -> None:
         with pytest.raises(ModelRetry, match="Parent directory 'deep/nested' does not exist"):
-            await toolset.write_file('deep/nested/file.txt', 'deep\n')
+            await _call_fs_tool(toolset, sandbox, 'write_file', path='deep/nested/file.txt', content='deep\n')
 
-    async def test_write_overwrite(self, toolset: FileSystemToolset[None], fs_root: Path) -> None:
-        await toolset.write_file('hello.txt', 'overwritten\n')
+    async def test_write_overwrite(self, toolset: FileSystemToolset[None], fs_root: Path, sandbox: Sandbox) -> None:
+        await _call_fs_tool(toolset, sandbox, 'write_file', path='hello.txt', content='overwritten\n')
         assert (fs_root / 'hello.txt').read_text() == 'overwritten\n'
 
-    async def test_write_conflict_detection(self, toolset: FileSystemToolset[None], fs_root: Path) -> None:
+    async def test_write_conflict_detection(
+        self, toolset: FileSystemToolset[None], fs_root: Path, sandbox: Sandbox
+    ) -> None:
         # Get current hash
         content = (fs_root / 'hello.txt').read_text()
         current_hash = _content_hash(content)
 
         # Write with correct hash succeeds
-        await toolset.write_file('hello.txt', 'updated\n', expected_hash=current_hash)
+        await _call_fs_tool(
+            toolset, sandbox, 'write_file', path='hello.txt', content='updated\n', expected_hash=current_hash
+        )
         assert (fs_root / 'hello.txt').read_text() == 'updated\n'
 
-    async def test_write_conflict_rejection(self, toolset: FileSystemToolset[None], fs_root: Path) -> None:
+    async def test_write_conflict_rejection(
+        self, toolset: FileSystemToolset[None], fs_root: Path, sandbox: Sandbox
+    ) -> None:
         with pytest.raises(ModelRetry, match='Conflict'):
-            await toolset.write_file('hello.txt', 'bad\n', expected_hash='wrong_hash_x')
+            await _call_fs_tool(
+                toolset, sandbox, 'write_file', path='hello.txt', content='bad\n', expected_hash='wrong_hash_x'
+            )
 
-    async def test_write_protected_blocked(self, toolset: FileSystemToolset[None]) -> None:
+    async def test_write_protected_blocked(self, toolset: FileSystemToolset[None], sandbox: Sandbox) -> None:
         with pytest.raises(ModelRetry, match='protected'):
-            await toolset.write_file('.env', 'HACKED=true\n')
+            await _call_fs_tool(toolset, sandbox, 'write_file', path='.env', content='HACKED=true\n')
 
-    async def test_write_returns_hash(self, toolset: FileSystemToolset[None]) -> None:
-        result = await toolset.write_file('hashed.txt', 'content\n')
+    async def test_write_returns_hash(self, toolset: FileSystemToolset[None], sandbox: Sandbox) -> None:
+        result = await _call_fs_tool(toolset, sandbox, 'write_file', path='hashed.txt', content='content\n')
         assert 'hash:' in result
 
 
 class TestEditFile:
-    async def test_edit_basic(self, toolset: FileSystemToolset[None], fs_root: Path) -> None:
-        result = await toolset.edit_file('hello.txt', 'Hello, world!', 'Hello, universe!')
+    async def test_edit_basic(self, toolset: FileSystemToolset[None], fs_root: Path, sandbox: Sandbox) -> None:
+        result = await _call_fs_tool(
+            toolset, sandbox, 'edit_file', path='hello.txt', old_text='Hello, world!', new_text='Hello, universe!'
+        )
         assert 'Edited' in result
         assert (fs_root / 'hello.txt').read_text() == 'Hello, universe!\n'
 
-    async def test_edit_not_found_text(self, toolset: FileSystemToolset[None]) -> None:
+    async def test_edit_not_found_text(self, toolset: FileSystemToolset[None], sandbox: Sandbox) -> None:
         with pytest.raises(ModelRetry, match='old_text not found'):
-            await toolset.edit_file('hello.txt', 'NONEXISTENT', 'replacement')
+            await _call_fs_tool(
+                toolset, sandbox, 'edit_file', path='hello.txt', old_text='NONEXISTENT', new_text='replacement'
+            )
 
-    async def test_edit_ambiguous_match(self, toolset: FileSystemToolset[None], fs_root: Path) -> None:
+    async def test_edit_ambiguous_match(
+        self, toolset: FileSystemToolset[None], fs_root: Path, sandbox: Sandbox
+    ) -> None:
         (fs_root / 'repeat.txt').write_text('foo bar foo\n')
         with pytest.raises(ModelRetry, match='found 2 times'):
-            await toolset.edit_file('repeat.txt', 'foo', 'baz')
+            await _call_fs_tool(toolset, sandbox, 'edit_file', path='repeat.txt', old_text='foo', new_text='baz')
 
-    async def test_edit_missing_file(self, toolset: FileSystemToolset[None]) -> None:
+    async def test_edit_missing_file(self, toolset: FileSystemToolset[None], sandbox: Sandbox) -> None:
         with pytest.raises(ModelRetry, match='File not found'):
-            await toolset.edit_file('ghost.txt', 'x', 'y')
+            await _call_fs_tool(toolset, sandbox, 'edit_file', path='ghost.txt', old_text='x', new_text='y')
 
-    async def test_edit_conflict_detection(self, toolset: FileSystemToolset[None], fs_root: Path) -> None:
+    async def test_edit_conflict_detection(
+        self, toolset: FileSystemToolset[None], fs_root: Path, sandbox: Sandbox
+    ) -> None:
         content = (fs_root / 'hello.txt').read_text()
         current_hash = _content_hash(content)
-        result = await toolset.edit_file('hello.txt', 'Hello', 'Hi', expected_hash=current_hash)
+        result = await _call_fs_tool(
+            toolset, sandbox, 'edit_file', path='hello.txt', old_text='Hello', new_text='Hi', expected_hash=current_hash
+        )
         assert 'hash:' in result
 
-    async def test_edit_conflict_rejection(self, toolset: FileSystemToolset[None]) -> None:
+    async def test_edit_conflict_rejection(self, toolset: FileSystemToolset[None], sandbox: Sandbox) -> None:
         with pytest.raises(ModelRetry, match='Conflict'):
-            await toolset.edit_file('hello.txt', 'Hello', 'Hi', expected_hash='stale_hash_')
+            await _call_fs_tool(
+                toolset,
+                sandbox,
+                'edit_file',
+                path='hello.txt',
+                old_text='Hello',
+                new_text='Hi',
+                expected_hash='stale_hash_',
+            )
 
-    async def test_edit_protected_blocked(self, toolset: FileSystemToolset[None]) -> None:
+    async def test_edit_protected_blocked(self, toolset: FileSystemToolset[None], sandbox: Sandbox) -> None:
         with pytest.raises(ModelRetry, match='protected'):
-            await toolset.edit_file('.env', 'SECRET', 'HACKED')
+            await _call_fs_tool(toolset, sandbox, 'edit_file', path='.env', old_text='SECRET', new_text='HACKED')
 
-    async def test_edit_returns_new_hash(self, toolset: FileSystemToolset[None]) -> None:
-        result = await toolset.edit_file('hello.txt', 'Hello, world!', 'Goodbye!')
+    async def test_edit_returns_new_hash(self, toolset: FileSystemToolset[None], sandbox: Sandbox) -> None:
+        result = await _call_fs_tool(
+            toolset, sandbox, 'edit_file', path='hello.txt', old_text='Hello, world!', new_text='Goodbye!'
+        )
         assert 'hash:' in result
 
 
 class TestListDirectory:
-    async def test_list_root(self, toolset: FileSystemToolset[None]) -> None:
-        result = await toolset.list_directory('.')
+    async def test_list_root(self, toolset: FileSystemToolset[None], sandbox: Sandbox) -> None:
+        result = await _call_fs_tool(toolset, sandbox, 'list_directory', path='.')
         assert 'hello.txt' in result
         assert 'subdir/' in result
 
-    async def test_list_subdir(self, toolset: FileSystemToolset[None]) -> None:
-        result = await toolset.list_directory('subdir')
+    async def test_list_subdir(self, toolset: FileSystemToolset[None], sandbox: Sandbox) -> None:
+        result = await _call_fs_tool(toolset, sandbox, 'list_directory', path='subdir')
         assert 'nested.py' in result
 
-    async def test_list_not_a_dir(self, toolset: FileSystemToolset[None]) -> None:
+    async def test_list_not_a_dir(self, toolset: FileSystemToolset[None], sandbox: Sandbox) -> None:
         with pytest.raises(ModelRetry):
-            await toolset.list_directory('hello.txt')
+            await _call_fs_tool(toolset, sandbox, 'list_directory', path='hello.txt')
 
-    async def test_list_skips_hidden(self, toolset: FileSystemToolset[None]) -> None:
+    async def test_list_skips_hidden(self, toolset: FileSystemToolset[None], sandbox: Sandbox) -> None:
         # Dotfiles/dot-directories are hidden, matching find_files/search_files.
-        result = await toolset.list_directory('.')
+        result = await _call_fs_tool(toolset, sandbox, 'list_directory', path='.')
         assert 'hello.txt' in result
         assert '.hidden' not in result
         assert '.git' not in result
 
-    async def test_list_shows_sizes(self, toolset: FileSystemToolset[None]) -> None:
-        result = await toolset.list_directory('.')
+    async def test_list_shows_sizes(self, toolset: FileSystemToolset[None], sandbox: Sandbox) -> None:
+        result = await _call_fs_tool(toolset, sandbox, 'list_directory', path='.')
         assert 'bytes' in result
 
-    async def test_list_shows_dir_indicator(self, toolset: FileSystemToolset[None]) -> None:
-        result = await toolset.list_directory('.')
+    async def test_list_shows_dir_indicator(self, toolset: FileSystemToolset[None], sandbox: Sandbox) -> None:
+        result = await _call_fs_tool(toolset, sandbox, 'list_directory', path='.')
         assert 'subdir/' in result
 
-    async def test_list_empty_directory(self, toolset: FileSystemToolset[None], fs_root: Path) -> None:
+    async def test_list_empty_directory(
+        self, toolset: FileSystemToolset[None], fs_root: Path, sandbox: Sandbox
+    ) -> None:
         (fs_root / 'empty').mkdir()
-        result = await toolset.list_directory('empty')
+        result = await _call_fs_tool(toolset, sandbox, 'list_directory', path='empty')
         assert result == '(empty directory)'
 
     async def test_list_hides_protected_entries(self, fs_root: Path, sandbox: Sandbox) -> None:
@@ -452,7 +489,6 @@ class TestListDirectory:
         (fs_root / 'visible.txt').write_text('ok\n')
         ts = FileSystemToolset(
             root_dir=fs_root,
-            sandbox=sandbox,
             allowed_patterns=[],
             denied_patterns=[],
             protected_patterns=['.env', '.env.*'],
@@ -460,7 +496,7 @@ class TestListDirectory:
             max_search_results=1000,
             max_find_results=1000,
         )
-        result = await ts.list_directory('.')
+        result = await _call_fs_tool(ts, sandbox, 'list_directory', path='.')
         assert 'visible.txt' in result
         assert '.env' not in result
 
@@ -471,7 +507,6 @@ class TestListDirectory:
         (fs_root / 'skip.md').write_text('ok\n')
         ts = FileSystemToolset(
             root_dir=fs_root,
-            sandbox=sandbox,
             allowed_patterns=['*.py'],
             denied_patterns=[],
             protected_patterns=[],
@@ -479,7 +514,7 @@ class TestListDirectory:
             max_search_results=1000,
             max_find_results=1000,
         )
-        result = await ts.list_directory('.')
+        result = await _call_fs_tool(ts, sandbox, 'list_directory', path='.')
         assert 'keep.py' in result
         assert 'skip.md' not in result
 
@@ -488,7 +523,6 @@ class TestListDirectory:
         (fs_root / 'creds.secret').write_text('hunter2\n')
         ts = FileSystemToolset(
             root_dir=fs_root,
-            sandbox=sandbox,
             allowed_patterns=[],
             denied_patterns=['*.secret'],
             protected_patterns=[],
@@ -496,46 +530,46 @@ class TestListDirectory:
             max_search_results=1000,
             max_find_results=1000,
         )
-        result = await ts.list_directory('.')
+        result = await _call_fs_tool(ts, sandbox, 'list_directory', path='.')
         assert 'visible.txt' in result
         assert 'creds.secret' not in result
 
 
 class TestSearchFiles:
-    async def test_search_basic(self, toolset: FileSystemToolset[None]) -> None:
-        result = await toolset.search_files('Hello')
+    async def test_search_basic(self, toolset: FileSystemToolset[None], sandbox: Sandbox) -> None:
+        result = await _call_fs_tool(toolset, sandbox, 'search_files', pattern='Hello')
         assert 'hello.txt:1:Hello, world!' in result
 
-    async def test_search_regex(self, toolset: FileSystemToolset[None]) -> None:
-        result = await toolset.search_files(r'line\d')
+    async def test_search_regex(self, toolset: FileSystemToolset[None], sandbox: Sandbox) -> None:
+        result = await _call_fs_tool(toolset, sandbox, 'search_files', pattern=r'line\d')
         assert 'multi.txt' in result
 
-    async def test_search_no_matches(self, toolset: FileSystemToolset[None]) -> None:
-        result = await toolset.search_files('ZZZZNOTHERE')
+    async def test_search_no_matches(self, toolset: FileSystemToolset[None], sandbox: Sandbox) -> None:
+        result = await _call_fs_tool(toolset, sandbox, 'search_files', pattern='ZZZZNOTHERE')
         assert result == 'No matches found.'
 
-    async def test_search_skips_hidden(self, toolset: FileSystemToolset[None]) -> None:
-        result = await toolset.search_files('secret')
+    async def test_search_skips_hidden(self, toolset: FileSystemToolset[None], sandbox: Sandbox) -> None:
+        result = await _call_fs_tool(toolset, sandbox, 'search_files', pattern='secret')
         assert '.hidden' not in result
 
-    async def test_search_skips_binary(self, toolset: FileSystemToolset[None]) -> None:
-        result = await toolset.search_files('.')
+    async def test_search_skips_binary(self, toolset: FileSystemToolset[None], sandbox: Sandbox) -> None:
+        result = await _call_fs_tool(toolset, sandbox, 'search_files', pattern='.')
         assert 'binary.bin' not in result
 
-    async def test_search_invalid_regex(self, toolset: FileSystemToolset[None]) -> None:
+    async def test_search_invalid_regex(self, toolset: FileSystemToolset[None], sandbox: Sandbox) -> None:
         with pytest.raises(ModelRetry, match='Invalid regex'):
-            await toolset.search_files('[invalid')
+            await _call_fs_tool(toolset, sandbox, 'search_files', pattern='[invalid')
 
-    async def test_search_include_glob(self, toolset: FileSystemToolset[None]) -> None:
-        result = await toolset.search_files('print', include_glob='*.py')
+    async def test_search_include_glob(self, toolset: FileSystemToolset[None], sandbox: Sandbox) -> None:
+        result = await _call_fs_tool(toolset, sandbox, 'search_files', pattern='print', include_glob='*.py')
         assert 'nested.py' in result
 
-    async def test_search_include_glob_excludes(self, toolset: FileSystemToolset[None]) -> None:
-        result = await toolset.search_files('Hello', include_glob='*.py')
+    async def test_search_include_glob_excludes(self, toolset: FileSystemToolset[None], sandbox: Sandbox) -> None:
+        result = await _call_fs_tool(toolset, sandbox, 'search_files', pattern='Hello', include_glob='*.py')
         assert result == 'No matches found.'
 
-    async def test_search_in_specific_file(self, toolset: FileSystemToolset[None]) -> None:
-        result = await toolset.search_files('line', path='multi.txt')
+    async def test_search_in_specific_file(self, toolset: FileSystemToolset[None], sandbox: Sandbox) -> None:
+        result = await _call_fs_tool(toolset, sandbox, 'search_files', pattern='line', path='multi.txt')
         assert 'multi.txt' in result
 
     async def test_search_truncation(self, fs_root: Path, sandbox: Sandbox) -> None:
@@ -544,7 +578,6 @@ class TestSearchFiles:
             (fs_root / f'match{i}.txt').write_text('findme\n' * 100)
         ts = FileSystemToolset(
             root_dir=fs_root,
-            sandbox=sandbox,
             allowed_patterns=[],
             denied_patterns=[],
             protected_patterns=[],
@@ -552,7 +585,7 @@ class TestSearchFiles:
             max_search_results=50,
             max_find_results=1000,
         )
-        result = await ts.search_files('findme')
+        result = await _call_fs_tool(ts, sandbox, 'search_files', pattern='findme')
         assert 'truncated at 50 matches' in result
 
     async def test_search_skips_protected_contents(self, fs_root: Path, sandbox: Sandbox) -> None:
@@ -562,7 +595,6 @@ class TestSearchFiles:
         (fs_root / '.env').write_text('SECRET=matchme\n')
         ts = FileSystemToolset(
             root_dir=fs_root,
-            sandbox=sandbox,
             allowed_patterns=[],
             denied_patterns=[],
             protected_patterns=['.env', '.env.*'],
@@ -570,7 +602,7 @@ class TestSearchFiles:
             max_search_results=1000,
             max_find_results=1000,
         )
-        result = await ts.search_files('matchme')
+        result = await _call_fs_tool(ts, sandbox, 'search_files', pattern='matchme')
         assert 'visible.txt' in result
         assert '.env' not in result
 
@@ -579,7 +611,6 @@ class TestSearchFiles:
         (fs_root / 'creds.secret').write_text('lookhere\n')
         ts = FileSystemToolset(
             root_dir=fs_root,
-            sandbox=sandbox,
             allowed_patterns=[],
             denied_patterns=['*.secret'],
             protected_patterns=[],
@@ -587,7 +618,7 @@ class TestSearchFiles:
             max_search_results=1000,
             max_find_results=1000,
         )
-        result = await ts.search_files('lookhere')
+        result = await _call_fs_tool(ts, sandbox, 'search_files', pattern='lookhere')
         assert 'visible.txt' in result
         assert 'creds.secret' not in result
 
@@ -598,7 +629,6 @@ class TestSearchFiles:
         (fs_root / 'skip.md').write_text('findme\n')
         ts = FileSystemToolset(
             root_dir=fs_root,
-            sandbox=sandbox,
             allowed_patterns=['*.py'],
             denied_patterns=[],
             protected_patterns=[],
@@ -606,40 +636,40 @@ class TestSearchFiles:
             max_search_results=1000,
             max_find_results=1000,
         )
-        result = await ts.search_files('findme')
+        result = await _call_fs_tool(ts, sandbox, 'search_files', pattern='findme')
         assert 'keep.py' in result
         assert 'skip.md' not in result
 
 
 class TestFindFiles:
-    async def test_find_glob(self, toolset: FileSystemToolset[None]) -> None:
-        result = await toolset.find_files('*.txt')
+    async def test_find_glob(self, toolset: FileSystemToolset[None], sandbox: Sandbox) -> None:
+        result = await _call_fs_tool(toolset, sandbox, 'find_files', pattern='*.txt')
         assert 'hello.txt' in result
         assert 'multi.txt' in result
 
-    async def test_find_recursive(self, toolset: FileSystemToolset[None]) -> None:
-        result = await toolset.find_files('**/*.py')
+    async def test_find_recursive(self, toolset: FileSystemToolset[None], sandbox: Sandbox) -> None:
+        result = await _call_fs_tool(toolset, sandbox, 'find_files', pattern='**/*.py')
         assert 'nested.py' in result
 
-    async def test_find_no_matches(self, toolset: FileSystemToolset[None]) -> None:
-        result = await toolset.find_files('*.xyz')
+    async def test_find_no_matches(self, toolset: FileSystemToolset[None], sandbox: Sandbox) -> None:
+        result = await _call_fs_tool(toolset, sandbox, 'find_files', pattern='*.xyz')
         assert result == 'No matches found.'
 
-    async def test_find_skips_hidden(self, toolset: FileSystemToolset[None]) -> None:
-        result = await toolset.find_files('*')
+    async def test_find_skips_hidden(self, toolset: FileSystemToolset[None], sandbox: Sandbox) -> None:
+        result = await _call_fs_tool(toolset, sandbox, 'find_files', pattern='*')
         assert '.hidden' not in result
         assert '.git' not in result
 
-    async def test_find_not_a_dir(self, toolset: FileSystemToolset[None]) -> None:
+    async def test_find_not_a_dir(self, toolset: FileSystemToolset[None], sandbox: Sandbox) -> None:
         with pytest.raises(ModelRetry):
-            await toolset.find_files('*.txt', path='hello.txt')
+            await _call_fs_tool(toolset, sandbox, 'find_files', pattern='*.txt', path='hello.txt')
 
-    async def test_find_in_subdir(self, toolset: FileSystemToolset[None]) -> None:
-        result = await toolset.find_files('*.py', path='subdir')
+    async def test_find_in_subdir(self, toolset: FileSystemToolset[None], sandbox: Sandbox) -> None:
+        result = await _call_fs_tool(toolset, sandbox, 'find_files', pattern='*.py', path='subdir')
         assert 'nested.py' in result
 
-    async def test_find_directories(self, toolset: FileSystemToolset[None]) -> None:
-        result = await toolset.find_files('sub*')
+    async def test_find_directories(self, toolset: FileSystemToolset[None], sandbox: Sandbox) -> None:
+        result = await _call_fs_tool(toolset, sandbox, 'find_files', pattern='sub*')
         assert 'subdir/' in result
 
     async def test_find_truncation(self, fs_root: Path, sandbox: Sandbox) -> None:
@@ -647,7 +677,6 @@ class TestFindFiles:
             (fs_root / f'file{i}.dat').write_text(f'{i}\n')
         ts = FileSystemToolset(
             root_dir=fs_root,
-            sandbox=sandbox,
             allowed_patterns=[],
             denied_patterns=[],
             protected_patterns=[],
@@ -655,7 +684,7 @@ class TestFindFiles:
             max_search_results=1000,
             max_find_results=5,
         )
-        result = await ts.find_files('*.dat')
+        result = await _call_fs_tool(ts, sandbox, 'find_files', pattern='*.dat')
         assert 'truncated at 5 matches' in result
 
     async def test_find_hides_protected_entries(self, fs_root: Path, sandbox: Sandbox) -> None:
@@ -663,7 +692,6 @@ class TestFindFiles:
         (fs_root / '.env').write_text('SECRET=abc\n')
         ts = FileSystemToolset(
             root_dir=fs_root,
-            sandbox=sandbox,
             allowed_patterns=[],
             denied_patterns=[],
             protected_patterns=['.env', '.env.*'],
@@ -671,7 +699,7 @@ class TestFindFiles:
             max_search_results=1000,
             max_find_results=1000,
         )
-        result = await ts.find_files('*')
+        result = await _call_fs_tool(ts, sandbox, 'find_files', pattern='*')
         assert 'visible.txt' in result
         assert '.env' not in result
 
@@ -680,7 +708,6 @@ class TestFindFiles:
         (fs_root / 'creds.secret').write_text('hunter2\n')
         ts = FileSystemToolset(
             root_dir=fs_root,
-            sandbox=sandbox,
             allowed_patterns=[],
             denied_patterns=['*.secret'],
             protected_patterns=[],
@@ -688,7 +715,7 @@ class TestFindFiles:
             max_search_results=1000,
             max_find_results=1000,
         )
-        result = await ts.find_files('*')
+        result = await _call_fs_tool(ts, sandbox, 'find_files', pattern='*')
         assert 'visible.txt' in result
         assert 'creds.secret' not in result
 
@@ -699,7 +726,6 @@ class TestFindFiles:
         (fs_root / 'skip.md').write_text('ok\n')
         ts = FileSystemToolset(
             root_dir=fs_root,
-            sandbox=sandbox,
             allowed_patterns=['*.py'],
             denied_patterns=[],
             protected_patterns=[],
@@ -707,56 +733,56 @@ class TestFindFiles:
             max_search_results=1000,
             max_find_results=1000,
         )
-        result = await ts.find_files('*')
+        result = await _call_fs_tool(ts, sandbox, 'find_files', pattern='*')
         assert 'keep.py' in result
         assert 'skip.md' not in result
 
 
 class TestCreateDirectory:
-    async def test_create_basic(self, toolset: FileSystemToolset[None], fs_root: Path) -> None:
-        result = await toolset.create_directory('newdir')
+    async def test_create_basic(self, toolset: FileSystemToolset[None], fs_root: Path, sandbox: Sandbox) -> None:
+        result = await _call_fs_tool(toolset, sandbox, 'create_directory', path='newdir')
         assert 'Created directory' in result
         assert (fs_root / 'newdir').is_dir()
 
-    async def test_create_nested(self, toolset: FileSystemToolset[None], fs_root: Path) -> None:
-        await toolset.create_directory('a/b/c')
+    async def test_create_nested(self, toolset: FileSystemToolset[None], fs_root: Path, sandbox: Sandbox) -> None:
+        await _call_fs_tool(toolset, sandbox, 'create_directory', path='a/b/c')
         assert (fs_root / 'a' / 'b' / 'c').is_dir()
 
-    async def test_create_existing_ok(self, toolset: FileSystemToolset[None]) -> None:
-        result = await toolset.create_directory('subdir')
+    async def test_create_existing_ok(self, toolset: FileSystemToolset[None], sandbox: Sandbox) -> None:
+        result = await _call_fs_tool(toolset, sandbox, 'create_directory', path='subdir')
         assert 'Created directory' in result
 
-    async def test_create_protected_blocked(self, toolset: FileSystemToolset[None]) -> None:
+    async def test_create_protected_blocked(self, toolset: FileSystemToolset[None], sandbox: Sandbox) -> None:
         with pytest.raises(ModelRetry, match='protected'):
-            await toolset.create_directory('.git/hooks')
+            await _call_fs_tool(toolset, sandbox, 'create_directory', path='.git/hooks')
 
 
 class TestFileInfo:
-    async def test_info_file(self, toolset: FileSystemToolset[None]) -> None:
-        result = await toolset.file_info('hello.txt')
+    async def test_info_file(self, toolset: FileSystemToolset[None], sandbox: Sandbox) -> None:
+        result = await _call_fs_tool(toolset, sandbox, 'file_info', path='hello.txt')
         assert 'type: file' in result
         assert 'size:' in result
         assert 'lines:' in result
         assert 'hash:' in result
         assert 'binary: False' in result
 
-    async def test_info_directory(self, toolset: FileSystemToolset[None]) -> None:
-        result = await toolset.file_info('subdir')
+    async def test_info_directory(self, toolset: FileSystemToolset[None], sandbox: Sandbox) -> None:
+        result = await _call_fs_tool(toolset, sandbox, 'file_info', path='subdir')
         assert 'type: directory' in result
 
-    async def test_info_binary(self, toolset: FileSystemToolset[None]) -> None:
-        result = await toolset.file_info('binary.bin')
+    async def test_info_binary(self, toolset: FileSystemToolset[None], sandbox: Sandbox) -> None:
+        result = await _call_fs_tool(toolset, sandbox, 'file_info', path='binary.bin')
         assert 'binary: True' in result
         assert 'lines:' not in result
 
-    async def test_info_not_found(self, toolset: FileSystemToolset[None]) -> None:
+    async def test_info_not_found(self, toolset: FileSystemToolset[None], sandbox: Sandbox) -> None:
         with pytest.raises(ModelRetry, match='Path not found'):
-            await toolset.file_info('nonexistent')
+            await _call_fs_tool(toolset, sandbox, 'file_info', path='nonexistent')
 
-    async def test_info_symlink(self, toolset: FileSystemToolset[None], fs_root: Path) -> None:
+    async def test_info_symlink(self, toolset: FileSystemToolset[None], fs_root: Path, sandbox: Sandbox) -> None:
         link = fs_root / 'link.txt'
         link.symlink_to(fs_root / 'hello.txt')
-        result = await toolset.file_info('link.txt')
+        result = await _call_fs_tool(toolset, sandbox, 'file_info', path='link.txt')
         assert 'type: file' in result
         assert 'symlink_target:' in result
 
@@ -810,21 +836,31 @@ class TestMutationKillers:
         # Verify it's hex characters
         assert all(c in '0123456789abcdef' for c in h)
 
-    async def test_write_file_with_hash_on_new_file(self, toolset: FileSystemToolset[None], fs_root: Path) -> None:
+    async def test_write_file_with_hash_on_new_file(
+        self, toolset: FileSystemToolset[None], fs_root: Path, sandbox: Sandbox
+    ) -> None:
         """When a file doesn't exist, expected_hash should be ignored and the write should succeed."""
-        result = await toolset.write_file('brand_new.txt', 'new content\n', expected_hash='any_hash_val')
+        result = await _call_fs_tool(
+            toolset, sandbox, 'write_file', path='brand_new.txt', content='new content\n', expected_hash='any_hash_val'
+        )
         assert 'Wrote' in result
         assert (fs_root / 'brand_new.txt').read_text() == 'new content\n'
 
-    async def test_edit_file_single_match_succeeds(self, toolset: FileSystemToolset[None], fs_root: Path) -> None:
+    async def test_edit_file_single_match_succeeds(
+        self, toolset: FileSystemToolset[None], fs_root: Path, sandbox: Sandbox
+    ) -> None:
         (fs_root / 'unique.txt').write_text('unique text here\n')
-        result = await toolset.edit_file('unique.txt', 'unique text', 'replaced text')
+        result = await _call_fs_tool(
+            toolset, sandbox, 'edit_file', path='unique.txt', old_text='unique text', new_text='replaced text'
+        )
         assert 'Edited' in result
         assert (fs_root / 'unique.txt').read_text() == 'replaced text here\n'
 
-    async def test_edit_file_zero_matches_raises(self, toolset: FileSystemToolset[None]) -> None:
+    async def test_edit_file_zero_matches_raises(self, toolset: FileSystemToolset[None], sandbox: Sandbox) -> None:
         with pytest.raises(ModelRetry, match='old_text not found'):
-            await toolset.edit_file('hello.txt', 'DEFINITELY NOT IN FILE', 'x')
+            await _call_fs_tool(
+                toolset, sandbox, 'edit_file', path='hello.txt', old_text='DEFINITELY NOT IN FILE', new_text='x'
+            )
 
     async def test_search_truncation_stops_after_limit(self, fs_root: Path, sandbox: Sandbox) -> None:
         # Create many files with 1 match each so truncation is per-file
@@ -832,7 +868,6 @@ class TestMutationKillers:
             (fs_root / f'searchable{i}.txt').write_text(f'match_this_{i}\n')
         ts = FileSystemToolset(
             root_dir=fs_root,
-            sandbox=sandbox,
             allowed_patterns=[],
             denied_patterns=[],
             protected_patterns=[],
@@ -840,7 +875,7 @@ class TestMutationKillers:
             max_search_results=5,
             max_find_results=1000,
         )
-        result = await ts.search_files('match_this')
+        result = await _call_fs_tool(ts, sandbox, 'search_files', pattern='match_this')
         lines = result.strip().split('\n')
         # Truncation check is after each file, so 5 matches + truncation msg
         # Ensure we don't get all 10 matches
@@ -853,7 +888,6 @@ class TestMutationKillers:
             (fs_root / f'findme{i:02d}.dat').write_text(f'{i}\n')
         ts = FileSystemToolset(
             root_dir=fs_root,
-            sandbox=sandbox,
             allowed_patterns=[],
             denied_patterns=[],
             protected_patterns=[],
@@ -861,52 +895,62 @@ class TestMutationKillers:
             max_search_results=1000,
             max_find_results=3,
         )
-        result = await ts.find_files('*.dat')
+        result = await _call_fs_tool(ts, sandbox, 'find_files', pattern='*.dat')
         lines = result.strip().split('\n')
         # Should have exactly 4 lines: 3 matches + 1 truncation message
         assert len(lines) == 4
         assert 'truncated at 3 matches' in lines[-1]
 
-    async def test_read_file_default_limit_used(self, toolset: FileSystemToolset[None], fs_root: Path) -> None:
+    async def test_read_file_default_limit_used(
+        self, toolset: FileSystemToolset[None], fs_root: Path, sandbox: Sandbox
+    ) -> None:
         # Create file with more lines than we'd see with limit=0
         (fs_root / 'big.txt').write_text('\n'.join(f'line{i}' for i in range(100)) + '\n')
-        result = await toolset.read_file('big.txt')
+        result = await _call_fs_tool(toolset, sandbox, 'read_file', path='big.txt')
         # All 100 lines should be present since max_read_lines is 2000
         assert 'line99' in result
 
-    async def test_list_directory_with_files_not_empty(self, toolset: FileSystemToolset[None]) -> None:
-        result = await toolset.list_directory('subdir')
+    async def test_list_directory_with_files_not_empty(
+        self, toolset: FileSystemToolset[None], sandbox: Sandbox
+    ) -> None:
+        result = await _call_fs_tool(toolset, sandbox, 'list_directory', path='subdir')
         assert result != '(empty directory)'
         assert 'nested.py' in result
 
-    async def test_search_in_file_returns_only_that_file(self, toolset: FileSystemToolset[None], fs_root: Path) -> None:
+    async def test_search_in_file_returns_only_that_file(
+        self, toolset: FileSystemToolset[None], fs_root: Path, sandbox: Sandbox
+    ) -> None:
         # Both files contain 'Hello' / 'hello' but searching a specific file should only return from that file
         (fs_root / 'other.txt').write_text('Hello from other\n')
-        result = await toolset.search_files('Hello', path='hello.txt')
+        result = await _call_fs_tool(toolset, sandbox, 'search_files', pattern='Hello', path='hello.txt')
         assert 'hello.txt' in result
         assert 'other.txt' not in result
 
-    async def test_file_info_non_binary_shows_lines_and_hash(self, toolset: FileSystemToolset[None]) -> None:
-        result = await toolset.file_info('hello.txt')
+    async def test_file_info_non_binary_shows_lines_and_hash(
+        self, toolset: FileSystemToolset[None], sandbox: Sandbox
+    ) -> None:
+        result = await _call_fs_tool(toolset, sandbox, 'file_info', path='hello.txt')
         assert 'lines: 1' in result
         assert 'hash:' in result
         assert 'binary: False' in result
 
-    async def test_file_info_binary_no_lines_no_hash(self, toolset: FileSystemToolset[None]) -> None:
-        result = await toolset.file_info('binary.bin')
+    async def test_file_info_binary_no_lines_no_hash(self, toolset: FileSystemToolset[None], sandbox: Sandbox) -> None:
+        result = await _call_fs_tool(toolset, sandbox, 'file_info', path='binary.bin')
         assert 'binary: True' in result
         assert 'lines:' not in result
         assert 'hash:' not in result
 
-    async def test_safe_resolve_passes_write_flag(self, toolset: FileSystemToolset[None], fs_root: Path) -> None:
+    async def test_safe_resolve_passes_write_flag(
+        self, toolset: FileSystemToolset[None], fs_root: Path, sandbox: Sandbox
+    ) -> None:
         # Protected patterns block writes but allow reads
         (fs_root / '.env.local').write_text('SECRET=x\n')
         # Read should work (write=False internally)
-        result = await toolset.read_file('.env.local')
+        result = await _call_fs_tool(toolset, sandbox, 'read_file', path='.env.local')
         assert 'SECRET=x' in result
         # Write should be blocked (write=True internally)
         with pytest.raises(ModelRetry, match='protected'):
-            await toolset.write_file('.env.local', 'HACKED\n')
+            await _call_fs_tool(toolset, sandbox, 'write_file', path='.env.local', content='HACKED\n')
 
     async def test_format_lines_join_separator(self) -> None:
         """Verify the result doesn't contain garbage between lines."""
@@ -922,26 +966,30 @@ class TestMutationKillers:
         assert 'no newline' in result
         assert result.endswith('\n')
 
-    async def test_read_file_hash_is_real_hash(self, toolset: FileSystemToolset[None]) -> None:
-        result = await toolset.read_file('hello.txt')
+    async def test_read_file_hash_is_real_hash(self, toolset: FileSystemToolset[None], sandbox: Sandbox) -> None:
+        result = await _call_fs_tool(toolset, sandbox, 'read_file', path='hello.txt')
         # The actual hash should be a hex string, not 'None'
         assert 'hash:None' not in result
         # Verify the hash matches what we'd compute
         expected_hash = _content_hash('Hello, world!\n')
         assert f'hash:{expected_hash}' in result
 
-    async def test_read_file_non_ascii_content(self, toolset: FileSystemToolset[None], fs_root: Path) -> None:
+    async def test_read_file_non_ascii_content(
+        self, toolset: FileSystemToolset[None], fs_root: Path, sandbox: Sandbox
+    ) -> None:
         """With invalid UTF-8 bytes, the tool should not crash -- it should use replacement chars."""
         # Write raw bytes that are invalid UTF-8
         (fs_root / 'broken_utf8.txt').write_bytes(b'hello \xff\xfe world\n')
-        result = await toolset.read_file('broken_utf8.txt')
+        result = await _call_fs_tool(toolset, sandbox, 'read_file', path='broken_utf8.txt')
         # Should not crash, content should contain replacement characters
         assert 'hello' in result
         assert 'world' in result
 
-    async def test_read_file_default_offset_starts_at_first_line(self, toolset: FileSystemToolset[None]) -> None:
+    async def test_read_file_default_offset_starts_at_first_line(
+        self, toolset: FileSystemToolset[None], sandbox: Sandbox
+    ) -> None:
         """The first line must be included when no offset is specified."""
-        result = await toolset.read_file('multi.txt')
+        result = await _call_fs_tool(toolset, sandbox, 'read_file', path='multi.txt')
         # First line must be present (line1)
         assert '     1\tline1' in result
         # Verify line numbering starts at 1
@@ -959,16 +1007,22 @@ class TestMutationKillers:
         assert 'create_directory' in tool_names
         assert 'file_info' in tool_names
 
-    async def test_write_file_output_format(self, toolset: FileSystemToolset[None], fs_root: Path) -> None:
-        result = await toolset.write_file('fmt.txt', 'ab\ncd\n')
+    async def test_write_file_output_format(
+        self, toolset: FileSystemToolset[None], fs_root: Path, sandbox: Sandbox
+    ) -> None:
+        result = await _call_fs_tool(toolset, sandbox, 'write_file', path='fmt.txt', content='ab\ncd\n')
         # Verify specific format: chars, lines, path, hash
         assert 'Wrote 6 chars (2 lines) to fmt.txt.' in result
         assert 'hash:' in result
         # Verify hash is a real hex hash not None
         assert 'hash:None' not in result
 
-    async def test_edit_file_output_format(self, toolset: FileSystemToolset[None], fs_root: Path) -> None:
-        result = await toolset.edit_file('hello.txt', 'Hello, world!', 'Hi')
+    async def test_edit_file_output_format(
+        self, toolset: FileSystemToolset[None], fs_root: Path, sandbox: Sandbox
+    ) -> None:
+        result = await _call_fs_tool(
+            toolset, sandbox, 'edit_file', path='hello.txt', old_text='Hello, world!', new_text='Hi'
+        )
         assert result.startswith('Edited hello.txt.')
         assert 'hash:' in result
         assert 'hash:None' not in result
@@ -983,64 +1037,72 @@ class TestMutationKillers:
     async def test_safe_resolve_write_default_is_false(self, toolset: FileSystemToolset[None], fs_root: Path) -> None:
         pytest.skip('rewrite pending: sandbox-aware fixture for _safe_resolve')
 
-    async def test_list_directory_exact_size(self, toolset: FileSystemToolset[None]) -> None:
-        result = await toolset.list_directory('.')
+    async def test_list_directory_exact_size(self, toolset: FileSystemToolset[None], sandbox: Sandbox) -> None:
+        result = await _call_fs_tool(toolset, sandbox, 'list_directory', path='.')
         # hello.txt has 'Hello, world!\n' = 14 bytes
         assert '14 bytes' in result
 
-    async def test_list_directory_no_garbage_separator(self, toolset: FileSystemToolset[None]) -> None:
-        result = await toolset.list_directory('.')
+    async def test_list_directory_no_garbage_separator(
+        self, toolset: FileSystemToolset[None], sandbox: Sandbox
+    ) -> None:
+        result = await _call_fs_tool(toolset, sandbox, 'list_directory', path='.')
         assert 'XX' not in result
 
-    async def test_list_directory_error_message(self, toolset: FileSystemToolset[None]) -> None:
+    async def test_list_directory_error_message(self, toolset: FileSystemToolset[None], sandbox: Sandbox) -> None:
         with pytest.raises(ModelRetry, match='Not a directory'):
-            await toolset.list_directory('hello.txt')
+            await _call_fs_tool(toolset, sandbox, 'list_directory', path='hello.txt')
 
-    async def test_find_files_error_message(self, toolset: FileSystemToolset[None]) -> None:
+    async def test_find_files_error_message(self, toolset: FileSystemToolset[None], sandbox: Sandbox) -> None:
         with pytest.raises(ModelRetry, match='Not a directory'):
-            await toolset.find_files('*.txt', path='hello.txt')
+            await _call_fs_tool(toolset, sandbox, 'find_files', pattern='*.txt', path='hello.txt')
 
-    async def test_find_files_no_suffix_on_files(self, toolset: FileSystemToolset[None]) -> None:
-        result = await toolset.find_files('*')
+    async def test_find_files_no_suffix_on_files(self, toolset: FileSystemToolset[None], sandbox: Sandbox) -> None:
+        result = await _call_fs_tool(toolset, sandbox, 'find_files', pattern='*')
         for line in result.splitlines():
             if not line.endswith('/'):
                 assert 'XXXX' not in line
 
-    async def test_find_files_no_garbage_separator(self, toolset: FileSystemToolset[None]) -> None:
-        result = await toolset.find_files('*.txt')
+    async def test_find_files_no_garbage_separator(self, toolset: FileSystemToolset[None], sandbox: Sandbox) -> None:
+        result = await _call_fs_tool(toolset, sandbox, 'find_files', pattern='*.txt')
         assert 'XX' not in result
 
-    async def test_search_files_no_garbage_separator(self, toolset: FileSystemToolset[None]) -> None:
-        result = await toolset.search_files(r'line\d')
+    async def test_search_files_no_garbage_separator(self, toolset: FileSystemToolset[None], sandbox: Sandbox) -> None:
+        result = await _call_fs_tool(toolset, sandbox, 'search_files', pattern=r'line\d')
         assert 'XX' not in result
 
-    async def test_file_info_exact_size(self, toolset: FileSystemToolset[None]) -> None:
-        result = await toolset.file_info('hello.txt')
+    async def test_file_info_exact_size(self, toolset: FileSystemToolset[None], sandbox: Sandbox) -> None:
+        result = await _call_fs_tool(toolset, sandbox, 'file_info', path='hello.txt')
         assert '14 bytes' in result
 
-    async def test_file_info_no_garbage_separator(self, toolset: FileSystemToolset[None]) -> None:
-        result = await toolset.file_info('hello.txt')
+    async def test_file_info_no_garbage_separator(self, toolset: FileSystemToolset[None], sandbox: Sandbox) -> None:
+        result = await _call_fs_tool(toolset, sandbox, 'file_info', path='hello.txt')
         assert 'XX' not in result
 
-    async def test_search_with_invalid_utf8_file(self, toolset: FileSystemToolset[None], fs_root: Path) -> None:
+    async def test_search_with_invalid_utf8_file(
+        self, toolset: FileSystemToolset[None], fs_root: Path, sandbox: Sandbox
+    ) -> None:
         """A file with invalid UTF-8 (but no null bytes = not binary) should be searchable."""
         # Write a file with invalid UTF-8 but no null bytes (not detected as binary)
         (fs_root / 'bad_encoding.txt').write_bytes(b'marker_text \xff\xfe end\n')
-        result = await toolset.search_files('marker_text')
+        result = await _call_fs_tool(toolset, sandbox, 'search_files', pattern='marker_text')
         # Should find the file even with broken encoding
         assert 'bad_encoding.txt' in result
 
-    async def test_search_binary_skip_does_not_stop_iteration(self, toolset: FileSystemToolset[None]) -> None:
+    async def test_search_binary_skip_does_not_stop_iteration(
+        self, toolset: FileSystemToolset[None], sandbox: Sandbox
+    ) -> None:
         """A binary file must be skipped, but subsequent text files must still be searched."""
         # binary.bin exists in the fixture and comes before 'hello.txt' alphabetically
-        result = await toolset.search_files('Hello')
+        result = await _call_fs_tool(toolset, sandbox, 'search_files', pattern='Hello')
         # hello.txt must still be found (binary.bin didn't break the loop)
         assert 'hello.txt' in result
 
-    async def test_find_hidden_skip_does_not_stop_iteration(self, toolset: FileSystemToolset[None]) -> None:
+    async def test_find_hidden_skip_does_not_stop_iteration(
+        self, toolset: FileSystemToolset[None], sandbox: Sandbox
+    ) -> None:
         """Hidden files must be skipped, but subsequent visible files must still appear."""
         # .hidden comes before hello.txt alphabetically -- skipping must not break the loop
-        result = await toolset.find_files('*')
+        result = await _call_fs_tool(toolset, sandbox, 'find_files', pattern='*')
         assert 'hello.txt' in result
         assert 'multi.txt' in result
 
@@ -1121,7 +1183,6 @@ class TestPatternCanonicalization:
         (fs_root / 'config' / 'secret.txt').write_text('token\n')
         ts = FileSystemToolset(
             root_dir=fs_root,
-            sandbox=sandbox,
             allowed_patterns=[],
             denied_patterns=['config/secret.txt'],
             protected_patterns=[],
@@ -1131,13 +1192,12 @@ class TestPatternCanonicalization:
         )
         # A './' segment must not slip the file past its deny rule.
         with pytest.raises(ModelRetry, match='denied'):
-            await ts.read_file('config/./secret.txt')
+            await _call_fs_tool(ts, sandbox, 'read_file', path='config/./secret.txt')
 
     async def test_root_level_secrets_hidden_from_search(self, fs_root: Path, sandbox: Sandbox) -> None:
         (fs_root / 'secrets.yaml').write_text('api: PRIVATE KEY material\n')
         ts = FileSystemToolset(
             root_dir=fs_root,
-            sandbox=sandbox,
             allowed_patterns=[],
             denied_patterns=[],
             protected_patterns=['**/secrets*'],
@@ -1146,5 +1206,5 @@ class TestPatternCanonicalization:
             max_find_results=1000,
         )
         # `**/secrets*` must protect a root-level secrets file, not just nested ones.
-        result = await ts.search_files('PRIVATE KEY')
+        result = await _call_fs_tool(ts, sandbox, 'search_files', pattern='PRIVATE KEY')
         assert 'secrets.yaml' not in result

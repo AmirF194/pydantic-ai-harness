@@ -73,7 +73,7 @@ async def test_read_file_reads_through_the_client() -> None:
 async def test_write_file_writes_through_the_client() -> None:
     client = RecordingClient()
     ts = AcpFileSystemToolset[None](client=client, session_id='sid')
-    result = await ts.write_file('/ws/b.py', 'data')
+    result = await ts.write_file(_ctx(), '/ws/b.py', 'data')
     assert client.writes == [('/ws/b.py', 'data', 'sid')]
     assert client.files['/ws/b.py'] == 'data'
     assert '/ws/b.py' in result  # confirmation names the path so the model knows the write landed
@@ -85,7 +85,7 @@ async def test_relative_paths_resolve_against_the_session_cwd() -> None:
     client = RecordingClient({'/ws/src/a.py': 'code'})
     ts = AcpFileSystemToolset[None](client=client, session_id='sid', cwd='/ws')
     assert await ts.read_file('src/a.py') == 'code'
-    await ts.write_file('src/b.py', 'new')
+    await ts.write_file(_ctx(), 'src/b.py', 'new')
     assert client.reads == [('/ws/src/a.py', 'sid')]
     assert client.writes == [('/ws/src/b.py', 'new', 'sid')]
 
@@ -126,14 +126,12 @@ async def test_acp_filesystem_read_only_client_reads_via_acp_and_writes_locally(
         client=client,
         session_id=session.session_id,
     )
-    built = acp_filesystem(session)
-    assert isinstance(built, AcpFileSystemToolset)
-    toolset = await built.for_run(_ctx(sandbox=sandbox))
+    toolset = acp_filesystem(session)
     assert isinstance(toolset, AcpFileSystemToolset)
 
     assert await toolset.read_file('notes.txt') == 'hello'
     assert client.reads == [(str(tmp_path / 'notes.txt'), 'sid')]  # the read routed through the editor
-    await toolset.write_file('out.txt', 'data')
+    await toolset.write_file(_ctx(sandbox=sandbox), 'out.txt', 'data')
     assert client.writes == []  # the client was never asked to write
     assert (tmp_path / 'out.txt').read_text() == 'data'  # the write landed on local disk
 

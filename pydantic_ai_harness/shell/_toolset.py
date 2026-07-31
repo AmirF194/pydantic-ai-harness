@@ -77,7 +77,6 @@ class ShellToolset(FunctionToolset[AgentDepsT]):
         allow_interactive: bool,
         env: Mapping[str, str] | None = None,
         denied_env_patterns: Sequence[str] = (),
-        sandbox: Sandbox | None = None,
     ) -> None:
         super().__init__()
         self._initial_cwd = str(cwd)
@@ -91,7 +90,6 @@ class ShellToolset(FunctionToolset[AgentDepsT]):
         self._allow_interactive = allow_interactive
         self._env = dict(env) if env is not None else None
         self._denied_env_patterns = list(denied_env_patterns)
-        self._sandbox = sandbox
         self._background: dict[str, SandboxProcess] = {}
 
         if self._allowed_commands and self._denied_commands:
@@ -116,16 +114,7 @@ class ShellToolset(FunctionToolset[AgentDepsT]):
             allow_interactive=self._allow_interactive,
             env=self._env,
             denied_env_patterns=self._denied_env_patterns,
-            sandbox=ctx.sandbox,
         )
-
-    @property
-    def sandbox(self) -> Sandbox:
-        if self._sandbox is None:
-            raise RuntimeError(
-                'ShellToolset has no sandbox; construct it with sandbox=... or use it inside an agent run.'
-            )
-        return self._sandbox
 
     async def call_tool(
         self,
@@ -183,8 +172,8 @@ class ShellToolset(FunctionToolset[AgentDepsT]):
         if self._allowed_commands and executable not in self._allowed_commands:
             raise PermissionError(f'Command {executable!r} is not in the allowed list.')
 
-    async def _resolved_cwd(self) -> str:
-        return await self.sandbox.resolve(self._cwd)
+    async def _resolved_cwd(self, sandbox: Sandbox) -> str:
+        return await sandbox.resolve(self._cwd)
 
     def _wrap_for_cwd_capture(self, command: str) -> str:
         return f'{command}\n__harness_ec=$?\necho {_CWD_MARKER}\npwd\nexit $__harness_ec'
@@ -219,7 +208,9 @@ class ShellToolset(FunctionToolset[AgentDepsT]):
         return prefix, recorded[-1]
 
     @_recoverable
-    async def run_command(self, command: str, *, timeout_seconds: float | None = None) -> str:
+    async def run_command(  # noqa: D417
+        self, ctx: RunContext[AgentDepsT], command: str, *, timeout_seconds: float | None = None
+    ) -> str:
         """Execute a shell command and return its output.
 
         Args:
@@ -229,16 +220,17 @@ class ShellToolset(FunctionToolset[AgentDepsT]):
         Returns:
             Labeled stdout/stderr output with exit code on non-zero exit.
         """
+        sandbox = ctx.sandbox
         self._check_command(command)
         timeout = timeout_seconds if timeout_seconds is not None else self._default_timeout
 
         actual_command = self._wrap_for_cwd_capture(command) if self._persist_cwd else command
         actual_command = self._wrap_for_strict_env(actual_command)
         try:
-            result = await self.sandbox.run(
+            result = await sandbox.run(
                 actual_command,
                 shell=True,
-                cwd=await self._resolved_cwd(),
+                cwd=await self._resolved_cwd(sandbox),
                 timeout=timeout,
             )
         except TimeoutError:
@@ -264,7 +256,7 @@ class ShellToolset(FunctionToolset[AgentDepsT]):
         return output
 
     @_recoverable
-    async def start_command(self, command: str) -> str:
+    async def start_command(self, ctx: RunContext[AgentDepsT], command: str) -> str:  # noqa: D417
         """Start a long-running command in the background (e.g. a server or watcher).
 
         Callers MUST call `stop_command(command_id)` when done to terminate the process.
@@ -275,17 +267,18 @@ class ShellToolset(FunctionToolset[AgentDepsT]):
         Returns:
             A message containing the unique command ID for later check/stop calls.
         """
+        sandbox = ctx.sandbox
         self._check_command(command)
         command_id = uuid.uuid4().hex[:12]
-        proc = await self.sandbox.start(
+        proc = await sandbox.start(
             self._wrap_for_strict_env(command),
             shell=True,
-            cwd=await self._resolved_cwd(),
+            cwd=await self._resolved_cwd(sandbox),
         )
         self._background[command_id] = proc
         return f'Started background command: {command!r}\nID: {command_id}'
 
-    async def check_command(self, command_id: str) -> str:
+    async def check_command(self, ctx: RunContext[AgentDepsT], command_id: str) -> str:  # noqa: D417
         """Check the status and recent output of a background command.
 
         Args:
@@ -299,7 +292,7 @@ class ShellToolset(FunctionToolset[AgentDepsT]):
             return f'[Error: unknown command ID {command_id!r}]'
 
         pid = proc.pid
-        alive = pid is not None and await self._pid_alive(pid)
+        alive = pid is not None and await self._pid_alive(ctx.sandbox, pid)
         if alive:
             return '(no output yet)\n[status: running]'
 
@@ -341,6 +334,6 @@ class ShellToolset(FunctionToolset[AgentDepsT]):
         parts.append(f'[exit code: {result.exit_code}]')
         return '\n'.join(parts)
 
-    async def _pid_alive(self, pid: int) -> bool:
-        result = await self.sandbox.run(f'kill -0 {pid}', shell=True)
+    async def _pid_alive(self, sandbox: Sandbox, pid: int) -> bool:
+        result = await sandbox.run(f'kill -0 {pid}', shell=True)
         return result.exit_code == 0

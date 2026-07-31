@@ -37,7 +37,6 @@ async def sandbox(tmp_path: Path) -> AsyncIterator[Sandbox]:
 
 def _env_toolset(
     shell_dir: Path,
-    sandbox: Sandbox,
     *,
     env: Mapping[str, str] | None = None,
     denied_env_patterns: Sequence[str] = (),
@@ -54,13 +53,11 @@ def _env_toolset(
         allow_interactive=False,
         env=env,
         denied_env_patterns=denied_env_patterns,
-        sandbox=sandbox,
     )
 
 
 def _shell_toolset(
     shell_dir: Path,
-    sandbox: Sandbox,
     *,
     max_output_chars: int = 50_000,
     default_timeout: float = 10.0,
@@ -74,7 +71,6 @@ def _shell_toolset(
         max_output_chars=max_output_chars,
         persist_cwd=False,
         allow_interactive=False,
-        sandbox=sandbox,
     )
 
 
@@ -84,7 +80,7 @@ def _read_env_var(name: str) -> str:
 
 
 def _run_context(sandbox: Sandbox | None = None) -> RunContext[None]:
-    """Minimal `RunContext` for invoking `for_run` directly in tests."""
+    """Minimal `RunContext` carrying `sandbox` for direct toolset invocations."""
     if sandbox is None:
         return RunContext[None](deps=None, model=TestModel(), usage=RunUsage(), prompt=None, messages=[], run_step=0)
     return RunContext[None](
@@ -92,8 +88,8 @@ def _run_context(sandbox: Sandbox | None = None) -> RunContext[None]:
     )
 
 
-async def _call_shell_tool(toolset: ShellToolset[None], name: str, **tool_args: Any) -> str:
-    ctx = _run_context(sandbox=toolset._sandbox)
+async def _call_shell_tool(toolset: ShellToolset[None], sandbox: Sandbox, name: str, **tool_args: Any) -> str:
+    ctx = _run_context(sandbox=sandbox)
     tools = await toolset.get_tools(ctx)
     result = await toolset.call_tool(name, tool_args, ctx, tools[name])
     assert isinstance(result, str)
@@ -185,7 +181,6 @@ def toolset(shell_dir: Path, sandbox: Sandbox) -> ShellToolset[None]:
         max_output_chars=50_000,
         persist_cwd=False,
         allow_interactive=False,
-        sandbox=sandbox,
     )
 
 
@@ -200,7 +195,6 @@ def persist_toolset(shell_dir: Path, sandbox: Sandbox) -> ShellToolset[None]:
         max_output_chars=50_000,
         persist_cwd=True,
         allow_interactive=False,
-        sandbox=sandbox,
     )
 
 
@@ -219,7 +213,6 @@ class TestCommandValidation:
             max_output_chars=50_000,
             persist_cwd=False,
             allow_interactive=False,
-            sandbox=sandbox,
         )
         ts._check_command('echo hello')
         ts._check_command('cat file.txt')
@@ -234,7 +227,6 @@ class TestCommandValidation:
             max_output_chars=50_000,
             persist_cwd=False,
             allow_interactive=False,
-            sandbox=sandbox,
         )
         with pytest.raises(PermissionError, match='not in the allowed list'):
             ts._check_command('cat file.txt')
@@ -279,7 +271,6 @@ class TestCommandValidation:
             max_output_chars=50_000,
             persist_cwd=False,
             allow_interactive=False,
-            sandbox=sandbox,
         )
         with pytest.raises(PermissionError, match="'>' is not allowed"):
             ts._check_command('echo hello > file.txt')
@@ -294,7 +285,6 @@ class TestCommandValidation:
             max_output_chars=50_000,
             persist_cwd=False,
             allow_interactive=False,
-            sandbox=sandbox,
         )
         ts._check_command('echo hello')
 
@@ -314,7 +304,6 @@ class TestCommandValidation:
             max_output_chars=50_000,
             persist_cwd=False,
             allow_interactive=False,
-            sandbox=sandbox,
         )
         with pytest.raises(PermissionError, match="'>>' is not allowed"):
             ts._check_command('echo hello >> file.txt')
@@ -329,7 +318,6 @@ class TestCommandValidation:
             max_output_chars=50_000,
             persist_cwd=False,
             allow_interactive=False,
-            sandbox=sandbox,
         )
         ts._check_command("echo 'unterminated")
 
@@ -343,7 +331,6 @@ class TestCommandValidation:
             max_output_chars=50_000,
             persist_cwd=False,
             allow_interactive=False,
-            sandbox=sandbox,
         )
         ts._check_command('')
 
@@ -357,7 +344,6 @@ class TestCommandValidation:
             max_output_chars=50_000,
             persist_cwd=False,
             allow_interactive=False,
-            sandbox=sandbox,
         )
         assert ts._first_denied_operator('echo hi | cat') == '|'
 
@@ -371,7 +357,6 @@ class TestCommandValidation:
             max_output_chars=50_000,
             persist_cwd=False,
             allow_interactive=False,
-            sandbox=sandbox,
         )
         assert ts._first_denied_operator('echo hello') is None
 
@@ -398,7 +383,7 @@ class TestForRunIsolation:
     ) -> None:
         run1 = await persist_toolset.for_run(_run_context(sandbox=sandbox))
         assert isinstance(run1, ShellToolset)
-        await run1.run_command('cd subdir')
+        await _call_shell_tool(run1, sandbox, 'run_command', command='cd subdir')
         assert run1._cwd == str(shell_dir / 'subdir')
         # A second run must start back at the configured root, not inherit run1's cd.
         run2 = await persist_toolset.for_run(_run_context(sandbox=sandbox))
@@ -410,59 +395,61 @@ class TestPersistCwdHardening:
     """B4: regression tests for the old stdout-sentinel footguns -- a command's
     output spoofing the cwd, and `;` silently disabling tracking."""
 
-    async def test_cd_persists_even_with_semicolon(self, persist_toolset: ShellToolset[None]) -> None:
+    async def test_cd_persists_even_with_semicolon(self, persist_toolset: ShellToolset[None], sandbox: Sandbox) -> None:
         # The old mechanism skipped tracking whenever ';' appeared, silently
         # dropping a real `cd`. The out-of-band capture records it regardless.
-        await persist_toolset.run_command('cd subdir ; true')
-        result = await persist_toolset.run_command('pwd')
+        await _call_shell_tool(persist_toolset, sandbox, 'run_command', command='cd subdir ; true')
+        result = await _call_shell_tool(persist_toolset, sandbox, 'run_command', command='pwd')
         assert 'subdir' in result
 
-    async def test_output_cannot_spoof_cwd(self, persist_toolset: ShellToolset[None], shell_dir: Path) -> None:
+    async def test_output_cannot_spoof_cwd(
+        self, persist_toolset: ShellToolset[None], shell_dir: Path, sandbox: Sandbox
+    ) -> None:
         # The old mechanism parsed cwd from stdout, so a command printing the
         # sentinel string could redirect the tracked cwd with no real cd.
         spoof = f'true ; echo __HARNESS_PWD__{shell_dir / "subdir"}'
-        await persist_toolset.run_command(spoof)
+        await _call_shell_tool(persist_toolset, sandbox, 'run_command', command=spoof)
         assert persist_toolset._cwd == str(shell_dir)
 
 
 class TestRunCommand:
-    async def test_basic_echo(self, toolset: ShellToolset[None]) -> None:
-        result = await toolset.run_command('echo hello')
+    async def test_basic_echo(self, toolset: ShellToolset[None], sandbox: Sandbox) -> None:
+        result = await _call_shell_tool(toolset, sandbox, 'run_command', command='echo hello')
         assert '[stdout]' in result
         assert 'hello' in result
 
-    async def test_stderr_output(self, toolset: ShellToolset[None]) -> None:
-        result = await toolset.run_command('echo error >&2')
+    async def test_stderr_output(self, toolset: ShellToolset[None], sandbox: Sandbox) -> None:
+        result = await _call_shell_tool(toolset, sandbox, 'run_command', command='echo error >&2')
         assert '[stderr]' in result
         assert 'error' in result
 
-    async def test_mixed_output(self, toolset: ShellToolset[None]) -> None:
-        result = await toolset.run_command('echo out && echo err >&2')
+    async def test_mixed_output(self, toolset: ShellToolset[None], sandbox: Sandbox) -> None:
+        result = await _call_shell_tool(toolset, sandbox, 'run_command', command='echo out && echo err >&2')
         assert '[stdout]' in result
         assert '[stderr]' in result
 
-    async def test_exit_code_reported(self, toolset: ShellToolset[None]) -> None:
-        result = await toolset.run_command('exit 42')
+    async def test_exit_code_reported(self, toolset: ShellToolset[None], sandbox: Sandbox) -> None:
+        result = await _call_shell_tool(toolset, sandbox, 'run_command', command='exit 42')
         assert '[exit code: 42]' in result
 
-    async def test_exit_code_zero_not_shown(self, toolset: ShellToolset[None]) -> None:
-        result = await toolset.run_command('echo ok')
+    async def test_exit_code_zero_not_shown(self, toolset: ShellToolset[None], sandbox: Sandbox) -> None:
+        result = await _call_shell_tool(toolset, sandbox, 'run_command', command='echo ok')
         assert 'exit code' not in result
 
-    async def test_no_output(self, toolset: ShellToolset[None]) -> None:
-        result = await toolset.run_command('true')
+    async def test_no_output(self, toolset: ShellToolset[None], sandbox: Sandbox) -> None:
+        result = await _call_shell_tool(toolset, sandbox, 'run_command', command='true')
         assert result == '(no output)'
 
     async def test_output_truncation(self, shell_dir: Path, sandbox: Sandbox) -> None:
-        ts = _shell_toolset(shell_dir, sandbox, max_output_chars=50)
-        result = await _call_shell_tool(ts, 'run_command', command=f'{sys.executable} -c "print(\'x\' * 200)"')
+        ts = _shell_toolset(shell_dir, max_output_chars=50)
+        result = await _call_shell_tool(ts, sandbox, 'run_command', command=f'{sys.executable} -c "print(\'x\' * 200)"')
         assert len(result) == 50
         assert 'truncated, showing last 5 chars' in result
 
     async def test_output_truncation_caps_complete_failure_response(self, shell_dir: Path, sandbox: Sandbox) -> None:
-        ts = _shell_toolset(shell_dir, sandbox, max_output_chars=200)
+        ts = _shell_toolset(shell_dir, max_output_chars=200)
         command = f'{sys.executable} -c "import sys; sys.stdout.write(\'x\' * 400); sys.exit(7)"'
-        result = await _call_shell_tool(ts, 'run_command', command=command)
+        result = await _call_shell_tool(ts, sandbox, 'run_command', command=command)
         assert len(result) == 200
         assert result.startswith('[... output truncated, showing last 153 chars]\n')
         assert result.endswith('[exit code: 7]')
@@ -477,10 +464,9 @@ class TestRunCommand:
             max_output_chars=50_000,
             persist_cwd=True,
             allow_interactive=False,
-            sandbox=sandbox,
         )
-        await ts.run_command('cd subdir')
-        result = await ts.run_command('pwd')
+        await _call_shell_tool(ts, sandbox, 'run_command', command='cd subdir')
+        result = await _call_shell_tool(ts, sandbox, 'run_command', command='pwd')
         assert 'subdir' in result
 
     async def test_persist_cwd_only_on_success(self, shell_dir: Path, sandbox: Sandbox) -> None:
@@ -493,24 +479,25 @@ class TestRunCommand:
             max_output_chars=50_000,
             persist_cwd=True,
             allow_interactive=False,
-            sandbox=sandbox,
         )
         original = ts._cwd
-        await ts.run_command('cd nonexistent_dir_xyz && false')
+        await _call_shell_tool(ts, sandbox, 'run_command', command='cd nonexistent_dir_xyz && false')
         assert ts._cwd == original
 
-    async def test_denied_command_in_run(self, toolset: ShellToolset[None]) -> None:
+    async def test_denied_command_in_run(self, toolset: ShellToolset[None], sandbox: Sandbox) -> None:
         # B2: a denied command is model-correctable, so it surfaces as ModelRetry
         # (which pyai feeds back to the model) rather than aborting the run.
         with pytest.raises(ModelRetry, match="'rm' is denied"):
-            await toolset.run_command('rm -rf /')
+            await _call_shell_tool(toolset, sandbox, 'run_command', command='rm -rf /')
 
-    async def test_cwd_used(self, toolset: ShellToolset[None], shell_dir: Path) -> None:
-        result = await toolset.run_command('cat test.txt')
+    async def test_cwd_used(self, toolset: ShellToolset[None], shell_dir: Path, sandbox: Sandbox) -> None:
+        result = await _call_shell_tool(toolset, sandbox, 'run_command', command='cat test.txt')
         assert 'hello' in result
 
-    async def test_multiline_output(self, toolset: ShellToolset[None]) -> None:
-        result = await toolset.run_command(f'{sys.executable} -c "print(\'a\\nb\\nc\\n\')"')
+    async def test_multiline_output(self, toolset: ShellToolset[None], sandbox: Sandbox) -> None:
+        result = await _call_shell_tool(
+            toolset, sandbox, 'run_command', command=f'{sys.executable} -c "print(\'a\\nb\\nc\\n\')"'
+        )
         assert '[stdout]' in result
 
     async def test_timeout_reports_value(self, shell_dir: Path, sandbox: Sandbox) -> None:
@@ -523,9 +510,8 @@ class TestRunCommand:
             max_output_chars=50_000,
             persist_cwd=False,
             allow_interactive=False,
-            sandbox=sandbox,
         )
-        result = await ts.run_command('sleep 10')
+        result = await _call_shell_tool(ts, sandbox, 'run_command', command='sleep 10')
         assert 'timed out after 0.5s' in result
 
     async def test_custom_timeout_overrides_default(self, shell_dir: Path, sandbox: Sandbox) -> None:
@@ -538,9 +524,8 @@ class TestRunCommand:
             max_output_chars=50_000,
             persist_cwd=False,
             allow_interactive=False,
-            sandbox=sandbox,
         )
-        result = await ts.run_command('sleep 10', timeout_seconds=0.5)
+        result = await _call_shell_tool(ts, sandbox, 'run_command', command='sleep 10', timeout_seconds=0.5)
         assert 'timed out after 0.5s' in result
 
     async def test_persist_cwd_disabled_no_update(self, shell_dir: Path, sandbox: Sandbox) -> None:
@@ -553,34 +538,41 @@ class TestRunCommand:
             max_output_chars=50_000,
             persist_cwd=False,
             allow_interactive=False,
-            sandbox=sandbox,
         )
         original = ts._cwd
-        await ts.run_command('cd subdir')
+        await _call_shell_tool(ts, sandbox, 'run_command', command='cd subdir')
         assert ts._cwd == original
 
-    async def test_nonzero_exit_shows_code(self, toolset: ShellToolset[None]) -> None:
-        result = await toolset.run_command('exit 1')
+    async def test_nonzero_exit_shows_code(self, toolset: ShellToolset[None], sandbox: Sandbox) -> None:
+        result = await _call_shell_tool(toolset, sandbox, 'run_command', command='exit 1')
         assert '[exit code: 1]' in result
 
-    async def test_stdout_stderr_separated_by_newline(self, toolset: ShellToolset[None]) -> None:
-        result = await toolset.run_command('echo out && echo err >&2')
+    async def test_stdout_stderr_separated_by_newline(self, toolset: ShellToolset[None], sandbox: Sandbox) -> None:
+        result = await _call_shell_tool(toolset, sandbox, 'run_command', command='echo out && echo err >&2')
         assert '[stdout]\nout\n\n[stderr]\nerr' in result
 
-    async def test_non_ascii_stdout(self, toolset: ShellToolset[None]) -> None:
-        result = await toolset.run_command(
-            f'{sys.executable} -c "import sys; sys.stdout.buffer.write(b\'hello \\xff\\xfe world\\n\')"'
+    async def test_non_ascii_stdout(self, toolset: ShellToolset[None], sandbox: Sandbox) -> None:
+        result = await _call_shell_tool(
+            toolset,
+            sandbox,
+            'run_command',
+            command=f'{sys.executable} -c "import sys; sys.stdout.buffer.write(b\'hello \\xff\\xfe world\\n\')"',
         )
         assert 'hello' in result
 
-    async def test_non_ascii_stderr(self, toolset: ShellToolset[None]) -> None:
-        result = await toolset.run_command(
-            f'{sys.executable} -c "import sys; sys.stderr.buffer.write(b\'err \\xff\\xfe msg\\n\')"'
+    async def test_non_ascii_stderr(self, toolset: ShellToolset[None], sandbox: Sandbox) -> None:
+        result = await _call_shell_tool(
+            toolset,
+            sandbox,
+            'run_command',
+            command=f'{sys.executable} -c "import sys; sys.stderr.buffer.write(b\'err \\xff\\xfe msg\\n\')"',
         )
         assert 'err' in result
 
-    async def test_stdout_chunk_join(self, toolset: ShellToolset[None]) -> None:
-        result = await toolset.run_command(f"{sys.executable} -c \"print('A' * 100 + 'B' * 100)\"")
+    async def test_stdout_chunk_join(self, toolset: ShellToolset[None], sandbox: Sandbox) -> None:
+        result = await _call_shell_tool(
+            toolset, sandbox, 'run_command', command=f"{sys.executable} -c \"print('A' * 100 + 'B' * 100)\""
+        )
         assert 'A' * 100 + 'B' * 100 in result
 
     async def test_exit_code_fallback_to_zero(self, shell_dir: Path, sandbox: Sandbox) -> None:
@@ -593,9 +585,8 @@ class TestRunCommand:
             max_output_chars=50_000,
             persist_cwd=True,
             allow_interactive=False,
-            sandbox=sandbox,
         )
-        result = await ts.run_command('echo ok')
+        result = await _call_shell_tool(ts, sandbox, 'run_command', command='echo ok')
         assert 'exit code' not in result
 
     async def test_error_message_content(self, shell_dir: Path, sandbox: Sandbox) -> None:
@@ -615,7 +606,7 @@ class TestRunCommand:
         # Matches LocalStackToolset: a cap of 0 would blank every response,
         # including start_command's ID line, leaving its process unstoppable.
         with pytest.raises(ValueError, match='max_output_chars must be a positive integer.'):
-            _shell_toolset(shell_dir, sandbox, max_output_chars=0)
+            _shell_toolset(shell_dir, max_output_chars=0)
 
     async def test_stdout_chunks_joined_cleanly(self, shell_dir: Path, sandbox: Sandbox) -> None:
         ts = ShellToolset(
@@ -627,9 +618,8 @@ class TestRunCommand:
             max_output_chars=500_000,
             persist_cwd=False,
             allow_interactive=False,
-            sandbox=sandbox,
         )
-        result = await ts.run_command("printf '%05000d\\n' $(seq 1 100)")
+        result = await _call_shell_tool(ts, sandbox, 'run_command', command="printf '%05000d\\n' $(seq 1 100)")
         assert 'XXXX' not in result
 
     async def test_stderr_chunks_joined_cleanly(self, shell_dir: Path, sandbox: Sandbox) -> None:
@@ -642,9 +632,8 @@ class TestRunCommand:
             max_output_chars=500_000,
             persist_cwd=False,
             allow_interactive=False,
-            sandbox=sandbox,
         )
-        result = await ts.run_command("printf '%0500d\\n' $(seq 1 100) >&2")
+        result = await _call_shell_tool(ts, sandbox, 'run_command', command="printf '%0500d\\n' $(seq 1 100) >&2")
         assert 'XXXX' not in result
 
     async def test_persist_cwd_updates_after_cd(self, shell_dir: Path, sandbox: Sandbox) -> None:
@@ -658,9 +647,8 @@ class TestRunCommand:
             max_output_chars=50_000,
             persist_cwd=True,
             allow_interactive=False,
-            sandbox=sandbox,
         )
-        await ts.run_command('cd subdir')
+        await _call_shell_tool(ts, sandbox, 'run_command', command='cd subdir')
         assert ts._cwd == str(shell_dir / 'subdir')
 
     async def test_persist_cwd_not_updated_on_failure(self, shell_dir: Path, sandbox: Sandbox) -> None:
@@ -674,10 +662,9 @@ class TestRunCommand:
             max_output_chars=50_000,
             persist_cwd=True,
             allow_interactive=False,
-            sandbox=sandbox,
         )
         original = ts._cwd
-        await ts.run_command('false')
+        await _call_shell_tool(ts, sandbox, 'run_command', command='false')
         assert ts._cwd == original
 
 
@@ -693,9 +680,8 @@ class TestProcessGroupKill:
             max_output_chars=50_000,
             persist_cwd=False,
             allow_interactive=False,
-            sandbox=sandbox,
         )
-        result = await ts.run_command('bash -c "sleep 100 & sleep 100"')
+        result = await _call_shell_tool(ts, sandbox, 'run_command', command='bash -c "sleep 100 & sleep 100"')
         assert 'timed out' in result
 
     async def test_timeout_with_output_before_timeout(self, shell_dir: Path, sandbox: Sandbox) -> None:
@@ -709,9 +695,8 @@ class TestProcessGroupKill:
             max_output_chars=50_000,
             persist_cwd=False,
             allow_interactive=False,
-            sandbox=sandbox,
         )
-        result = await ts.run_command('echo before_timeout && sleep 100')
+        result = await _call_shell_tool(ts, sandbox, 'run_command', command='echo before_timeout && sleep 100')
         assert 'timed out' in result
 
     async def test_start_new_session_used(self, shell_dir: Path, sandbox: Sandbox) -> None:
@@ -725,10 +710,11 @@ class TestProcessGroupKill:
             max_output_chars=50_000,
             persist_cwd=False,
             allow_interactive=False,
-            sandbox=sandbox,
         )
         parent_pgrp = os.getpgrp()
-        result = await ts.run_command(f'{sys.executable} -c "import os; print(os.getpgrp() != {parent_pgrp})"')
+        result = await _call_shell_tool(
+            ts, sandbox, 'run_command', command=f'{sys.executable} -c "import os; print(os.getpgrp() != {parent_pgrp})"'
+        )
         assert 'True' in result
 
 
@@ -753,9 +739,8 @@ class TestEdgeCases:
             max_output_chars=50_000,
             persist_cwd=False,
             allow_interactive=False,
-            sandbox=sandbox,
         )
-        result = await ts.run_command('pwd')
+        result = await _call_shell_tool(ts, sandbox, 'run_command', command='pwd')
         assert str(shell_dir) in result
 
     async def test_persist_cwd_requires_all_three_conditions(self, shell_dir: Path, sandbox: Sandbox) -> None:
@@ -768,10 +753,9 @@ class TestEdgeCases:
             max_output_chars=50_000,
             persist_cwd=True,
             allow_interactive=False,
-            sandbox=sandbox,
         )
         # Successful echo -- sentinel shows same dir, cwd should remain valid
-        await ts.run_command('echo hi')
+        await _call_shell_tool(ts, sandbox, 'run_command', command='echo hi')
         assert isinstance(ts._cwd, str) and ts._cwd  # cwd is a str path in sandbox
 
 
@@ -797,8 +781,8 @@ class TestShellCapability:
         assert isinstance(toolset, ShellToolset)
 
         with pytest.raises(ModelRetry, match="'rm' is denied"):
-            await toolset.run_command('rm --version')
-        assert 'hello' in await toolset.run_command('echo hello')
+            await _call_shell_tool(toolset, sandbox, 'run_command', command='rm --version')
+        assert 'hello' in await _call_shell_tool(toolset, sandbox, 'run_command', command='echo hello')
 
     def test_explicit_default_denylist_conflicts_with_allowlist(self) -> None:
         denied_commands = Shell().denied_commands
@@ -844,22 +828,22 @@ class TestResolveEnv:
 
     async def test_inherits_when_unconfigured(self, shell_dir: Path, sandbox: Sandbox) -> None:
         # Neither env nor patterns set -> None, so the subprocess inherits.
-        assert _env_toolset(shell_dir, sandbox)._resolve_env() is None
+        assert _env_toolset(shell_dir)._resolve_env() is None
 
     async def test_explicit_env_replaces(self, shell_dir: Path, sandbox: Sandbox) -> None:
-        resolved = _env_toolset(shell_dir, sandbox, env={'FOO': 'bar'})._resolve_env()
+        resolved = _env_toolset(shell_dir, env={'FOO': 'bar'})._resolve_env()
         assert resolved == {'FOO': 'bar'}
 
     async def test_explicit_empty_env_is_not_inheritance(self, shell_dir: Path, sandbox: Sandbox) -> None:
         # {} is a hard boundary (no vars), distinct from None (inherit all).
-        assert _env_toolset(shell_dir, sandbox, env={})._resolve_env() == {}
+        assert _env_toolset(shell_dir, env={})._resolve_env() == {}
 
     async def test_patterns_strip_from_inherited(
         self, shell_dir: Path, sandbox: Sandbox, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         monkeypatch.setenv('OPENAI_API_KEY', 'secret')
         monkeypatch.setenv('SAFE_VAR', 'keep')
-        resolved = _env_toolset(shell_dir, sandbox, denied_env_patterns=['OPENAI_*'])._resolve_env()
+        resolved = _env_toolset(shell_dir, denied_env_patterns=['OPENAI_*'])._resolve_env()
         assert resolved is not None
         assert 'OPENAI_API_KEY' not in resolved
         assert resolved.get('SAFE_VAR') == 'keep'
@@ -867,7 +851,6 @@ class TestResolveEnv:
     async def test_patterns_strip_from_explicit_env(self, shell_dir: Path, sandbox: Sandbox) -> None:
         resolved = _env_toolset(
             shell_dir,
-            sandbox=sandbox,
             env={'OPENAI_API_KEY': 'secret', 'PATH': '/usr/bin'},
             denied_env_patterns=['OPENAI_*'],
         )._resolve_env()
@@ -876,7 +859,6 @@ class TestResolveEnv:
     async def test_patterns_no_match_keeps_base(self, shell_dir: Path, sandbox: Sandbox) -> None:
         resolved = _env_toolset(
             shell_dir,
-            sandbox=sandbox,
             env={'FOO': 'bar'},
             denied_env_patterns=['OPENAI_*'],
         )._resolve_env()
@@ -886,7 +868,6 @@ class TestResolveEnv:
         # Env var names are case-sensitive on POSIX; lowercase must not match.
         resolved = _env_toolset(
             shell_dir,
-            sandbox=sandbox,
             env={'openai_api_key': 'secret'},
             denied_env_patterns=['OPENAI_*'],
         )._resolve_env()
@@ -897,16 +878,16 @@ class TestEnvControlExecution:
     """End-to-end: the resolved env actually reaches spawned subprocesses."""
 
     async def test_explicit_env_seen_by_command(self, shell_dir: Path, sandbox: Sandbox) -> None:
-        ts = _env_toolset(shell_dir, sandbox, env={'MY_TOKEN': 'present', 'PATH': os.environ['PATH']})
-        result = await ts.run_command(_read_env_var('MY_TOKEN'))
+        ts = _env_toolset(shell_dir, env={'MY_TOKEN': 'present', 'PATH': os.environ['PATH']})
+        result = await _call_shell_tool(ts, sandbox, 'run_command', command=_read_env_var('MY_TOKEN'))
         assert 'present' in result
 
     async def test_explicit_env_hides_inherited_secret(
         self, shell_dir: Path, sandbox: Sandbox, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         monkeypatch.setenv('OPENROUTER_API_KEY', 'leak-me')
-        ts = _env_toolset(shell_dir, sandbox, env={'PATH': os.environ['PATH']})
-        result = await ts.run_command(_read_env_var('OPENROUTER_API_KEY'))
+        ts = _env_toolset(shell_dir, env={'PATH': os.environ['PATH']})
+        result = await _call_shell_tool(ts, sandbox, 'run_command', command=_read_env_var('OPENROUTER_API_KEY'))
         assert 'ABSENT' in result
         assert 'leak-me' not in result
 
@@ -914,8 +895,8 @@ class TestEnvControlExecution:
         self, shell_dir: Path, sandbox: Sandbox, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         monkeypatch.setenv('ANTHROPIC_API_KEY', 'leak-me')
-        ts = _env_toolset(shell_dir, sandbox, denied_env_patterns=['ANTHROPIC_*'])
-        result = await ts.run_command(_read_env_var('ANTHROPIC_API_KEY'))
+        ts = _env_toolset(shell_dir, denied_env_patterns=['ANTHROPIC_*'])
+        result = await _call_shell_tool(ts, sandbox, 'run_command', command=_read_env_var('ANTHROPIC_API_KEY'))
         assert 'ABSENT' in result
         assert 'leak-me' not in result
 
@@ -924,8 +905,8 @@ class TestEnvControlExecution:
     ) -> None:
         # A var not matched by any pattern is still inherited as before.
         monkeypatch.setenv('HARNESS_KEEP', 'visible')
-        ts = _env_toolset(shell_dir, sandbox, denied_env_patterns=['ANTHROPIC_*'])
-        result = await ts.run_command(_read_env_var('HARNESS_KEEP'))
+        ts = _env_toolset(shell_dir, denied_env_patterns=['ANTHROPIC_*'])
+        result = await _call_shell_tool(ts, sandbox, 'run_command', command=_read_env_var('HARNESS_KEEP'))
         assert 'visible' in result
 
     async def test_default_inherits_parent_env(
@@ -933,31 +914,30 @@ class TestEnvControlExecution:
     ) -> None:
         # Backward compatible: with no env control, inherited vars pass through.
         monkeypatch.setenv('HARNESS_INHERITED', 'yes')
-        ts = _env_toolset(shell_dir, sandbox)
-        result = await ts.run_command(_read_env_var('HARNESS_INHERITED'))
+        ts = _env_toolset(shell_dir)
+        result = await _call_shell_tool(ts, sandbox, 'run_command', command=_read_env_var('HARNESS_INHERITED'))
         assert 'yes' in result
 
     async def test_env_and_patterns_compose_at_spawn(self, shell_dir: Path, sandbox: Sandbox) -> None:
         # Both set: a pattern strips a key from the explicit env, the rest survives.
         ts = _env_toolset(
             shell_dir,
-            sandbox=sandbox,
             env={'SECRET_KEY': 'leak-me', 'KEEP_VAR': 'kept', 'PATH': os.environ['PATH']},
             denied_env_patterns=['SECRET_*'],
         )
-        stripped = await ts.run_command(_read_env_var('SECRET_KEY'))
+        stripped = await _call_shell_tool(ts, sandbox, 'run_command', command=_read_env_var('SECRET_KEY'))
         assert 'ABSENT' in stripped
         assert 'leak-me' not in stripped
-        survived = await ts.run_command(_read_env_var('KEEP_VAR'))
+        survived = await _call_shell_tool(ts, sandbox, 'run_command', command=_read_env_var('KEEP_VAR'))
         assert 'kept' in survived
 
     @pytest.mark.skip(reason='LocalSandbox does not implement `start()`; needs a `SupportsStart` backend.')
     async def test_background_command_honors_env(self, shell_dir: Path, sandbox: Sandbox) -> None:
-        ts = _env_toolset(shell_dir, sandbox, env={'BG_TOKEN': 'bg-present', 'PATH': os.environ['PATH']})
-        start_result = await ts.start_command(_read_env_var('BG_TOKEN'))
+        ts = _env_toolset(shell_dir, env={'BG_TOKEN': 'bg-present', 'PATH': os.environ['PATH']})
+        start_result = await _call_shell_tool(ts, sandbox, 'start_command', command=_read_env_var('BG_TOKEN'))
         command_id = _parse_command_id(start_result)
         await anyio.sleep(0.5)
-        stop_result = await ts.stop_command(command_id)
+        stop_result = await _call_shell_tool(ts, sandbox, 'stop_command', command_id=command_id)
         assert 'bg-present' in stop_result
 
 
@@ -965,7 +945,7 @@ class TestEnvControlPropagation:
     """The capability and `for_run` carry env control through unchanged."""
 
     async def test_for_run_propagates_env(self, shell_dir: Path, sandbox: Sandbox) -> None:
-        ts = _env_toolset(shell_dir, sandbox, env={'FOO': 'bar'}, denied_env_patterns=['OPENAI_*'])
+        ts = _env_toolset(shell_dir, env={'FOO': 'bar'}, denied_env_patterns=['OPENAI_*'])
         run_ts = await ts.for_run(_run_context())
         assert isinstance(run_ts, ShellToolset)
         assert run_ts._resolve_env() == {'FOO': 'bar'}

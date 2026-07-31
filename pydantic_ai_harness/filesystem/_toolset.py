@@ -15,7 +15,7 @@ from typing import Concatenate, ParamSpec
 from pydantic_ai.exceptions import ModelRetry
 from pydantic_ai.sandboxes import Sandbox
 from pydantic_ai.tools import AgentDepsT, RunContext
-from pydantic_ai.toolsets import AbstractToolset, FunctionToolset
+from pydantic_ai.toolsets import FunctionToolset
 
 _P = ParamSpec('_P')
 
@@ -67,17 +67,17 @@ def _content_hash(content: str) -> str:
 
 
 class FileSystemToolset(FunctionToolset[AgentDepsT]):
-    """Filesystem operations scoped to a sub-root inside `ctx.sandbox`.
+    """Toolset providing filesystem operations scoped to a root directory.
 
-    Paths resolve relative to `root_dir`, itself resolved against
-    [`Sandbox.working_dir`][pydantic_ai.sandboxes.Sandbox.working_dir]. Every read,
-    write, and listing goes through
-    [`ctx.sandbox.fs`][pydantic_ai.sandboxes.Sandbox.fs]; recursive walkers use
-    `list_dir` recursion.
+    Security model:
+    - All paths resolved relative to root with canonical path checks
+    - Glob-based allow/deny filtering
+    - Protected path patterns (e.g. `.git/`, `.env`)
+    - Binary file detection blocks text operations
 
-    Textual path validation rejects `..` traversal and absolute-path escape.
-    Symlink-realpath containment is not enforced here: isolation is the sandbox's
-    responsibility, per the sandbox protocol.
+    Every read, write, and listing routes through the run's
+    [`ctx.sandbox`][pydantic_ai.tools.RunContext.sandbox]; symlink-realpath
+    containment is delegated to the sandbox rather than enforced here.
     """
 
     def __init__(
@@ -90,7 +90,6 @@ class FileSystemToolset(FunctionToolset[AgentDepsT]):
         max_read_lines: int,
         max_search_results: int,
         max_find_results: int,
-        sandbox: Sandbox | None = None,
     ) -> None:
         super().__init__()
         self._root_dir = str(root_dir)
@@ -100,7 +99,6 @@ class FileSystemToolset(FunctionToolset[AgentDepsT]):
         self._max_read_lines = max_read_lines
         self._max_search_results = max_search_results
         self._max_find_results = max_find_results
-        self._sandbox = sandbox
 
         self.add_function(self.read_file, name='read_file')
         self.add_function(self.write_file, name='write_file')
@@ -110,26 +108,6 @@ class FileSystemToolset(FunctionToolset[AgentDepsT]):
         self.add_function(self.find_files, name='find_files')
         self.add_function(self.create_directory, name='create_directory')
         self.add_function(self.file_info, name='file_info')
-
-    async def for_run(self, ctx: RunContext[AgentDepsT]) -> AbstractToolset[AgentDepsT]:
-        return FileSystemToolset[AgentDepsT](
-            root_dir=self._root_dir,
-            allowed_patterns=self._allowed_patterns,
-            denied_patterns=self._denied_patterns,
-            protected_patterns=self._protected_patterns,
-            max_read_lines=self._max_read_lines,
-            max_search_results=self._max_search_results,
-            max_find_results=self._max_find_results,
-            sandbox=ctx.sandbox,
-        )
-
-    @property
-    def sandbox(self) -> Sandbox:
-        if self._sandbox is None:
-            raise RuntimeError(
-                'FileSystemToolset has no sandbox; construct it with sandbox=... or use it inside an agent run.'
-            )
-        return self._sandbox
 
     def _matches(self, path: str, pattern: str) -> bool:
         if fnmatch.fnmatch(path, pattern):
@@ -141,11 +119,11 @@ class FileSystemToolset(FunctionToolset[AgentDepsT]):
     def _first_matching_pattern(self, path: str, patterns: list[str]) -> str | None:
         return next((p for p in patterns if self._matches(path, p)), None)
 
-    async def _resolved_root(self) -> str:
-        return await self.sandbox.resolve(self._root_dir)
+    async def _resolved_root(self, sandbox: Sandbox) -> str:
+        return await sandbox.resolve(self._root_dir)
 
-    async def _resolve_path(self, path: str) -> tuple[str, str]:
-        root = await self._resolved_root()
+    async def _resolve_path(self, sandbox: Sandbox, path: str) -> tuple[str, str]:
+        root = await self._resolved_root(sandbox)
         joined = path if posixpath.isabs(path) else posixpath.join(root, path)
         candidate = posixpath.normpath(joined)
         relative = posixpath.relpath(candidate, root)
@@ -179,13 +157,17 @@ class FileSystemToolset(FunctionToolset[AgentDepsT]):
             return False
         return True
 
-    async def _safe_resolve(self, path: str, *, write: bool = False, check_allowed: bool = True) -> str:
-        absolute, relative = await self._resolve_path(path)
+    async def _safe_resolve(
+        self, sandbox: Sandbox, path: str, *, write: bool = False, check_allowed: bool = True
+    ) -> str:
+        absolute, relative = await self._resolve_path(sandbox, path)
         self._check_access(relative, write=write, check_allowed=check_allowed)
         return absolute
 
     @_recoverable
-    async def read_file(self, path: str, *, offset: int = 0, limit: int | None = None) -> str:
+    async def read_file(  # noqa: D417
+        self, ctx: RunContext[AgentDepsT], path: str, *, offset: int = 0, limit: int | None = None
+    ) -> str:
         """Read a text file with line numbers.
 
         Args:
@@ -193,17 +175,18 @@ class FileSystemToolset(FunctionToolset[AgentDepsT]):
             offset: Zero-based line offset to start reading from.
             limit: Maximum number of lines to return (default: 2000).
         """
+        sandbox = ctx.sandbox
         if limit is None:
             limit = self._max_read_lines
-        absolute = await self._safe_resolve(path)
+        absolute = await self._safe_resolve(sandbox, path)
         try:
-            entry = await self.sandbox.fs.stat(absolute)
+            entry = await sandbox.fs.stat(absolute)
         except FileNotFoundError as e:
             raise FileNotFoundError(f'File not found: {path}') from e
         if entry.is_dir:
             raise FileNotFoundError(f"'{path}' is a directory, not a file.")
 
-        raw = await self.sandbox.fs.read_bytes(absolute)
+        raw = await sandbox.fs.read_bytes(absolute)
         if _is_binary(raw):
             return f'[Binary file: {len(raw)} bytes. Use a binary-aware tool to inspect.]'
 
@@ -215,7 +198,9 @@ class FileSystemToolset(FunctionToolset[AgentDepsT]):
         return header + _format_lines(lines, offset, limit)
 
     @_recoverable
-    async def write_file(self, path: str, content: str, *, expected_hash: str | None = None) -> str:
+    async def write_file(  # noqa: D417
+        self, ctx: RunContext[AgentDepsT], path: str, content: str, *, expected_hash: str | None = None
+    ) -> str:
         """Create or overwrite a file with conflict detection.
 
         Args:
@@ -224,11 +209,12 @@ class FileSystemToolset(FunctionToolset[AgentDepsT]):
             expected_hash: If provided, the write is rejected when the file exists and its
                 current hash doesn't match (optimistic concurrency).
         """
-        absolute = await self._safe_resolve(path, write=True)
+        sandbox = ctx.sandbox
+        absolute = await self._safe_resolve(sandbox, path, write=True)
 
-        exists = await self.sandbox.fs.exists(absolute)
+        exists = await sandbox.fs.exists(absolute)
         if expected_hash is not None and exists:
-            current = (await self.sandbox.fs.read_bytes(absolute)).decode('utf-8', errors='replace')
+            current = (await sandbox.fs.read_bytes(absolute)).decode('utf-8', errors='replace')
             current_hash = _content_hash(current)
             if current_hash != expected_hash:
                 raise ValueError(
@@ -237,17 +223,25 @@ class FileSystemToolset(FunctionToolset[AgentDepsT]):
                 )
 
         parent = posixpath.dirname(absolute)
-        if parent and not await self.sandbox.fs.exists(parent):
-            parent_rel = posixpath.relpath(parent, await self._resolved_root())
+        if parent and not await sandbox.fs.exists(parent):
+            parent_rel = posixpath.relpath(parent, await self._resolved_root(sandbox))
             raise FileNotFoundError(f"Parent directory '{parent_rel}' does not exist. Use create_directory first.")
 
-        await self.sandbox.fs.write_bytes(absolute, content.encode('utf-8'))
+        await sandbox.fs.write_bytes(absolute, content.encode('utf-8'))
         new_hash = _content_hash(content)
         lines = len(content.splitlines())
         return f'Wrote {len(content)} chars ({lines} lines) to {path}. [hash:{new_hash}]'
 
     @_recoverable
-    async def edit_file(self, path: str, old_text: str, new_text: str, *, expected_hash: str | None = None) -> str:
+    async def edit_file(  # noqa: D417
+        self,
+        ctx: RunContext[AgentDepsT],
+        path: str,
+        old_text: str,
+        new_text: str,
+        *,
+        expected_hash: str | None = None,
+    ) -> str:
         """Edit a file by exact string replacement with conflict detection.
 
         `old_text` must appear exactly once in the file. Include surrounding
@@ -259,9 +253,10 @@ class FileSystemToolset(FunctionToolset[AgentDepsT]):
             new_text: The replacement text.
             expected_hash: If provided, rejects the edit when the file's current hash doesn't match.
         """
-        absolute = await self._safe_resolve(path, write=True)
+        sandbox = ctx.sandbox
+        absolute = await self._safe_resolve(sandbox, path, write=True)
         try:
-            raw = await self.sandbox.fs.read_bytes(absolute)
+            raw = await sandbox.fs.read_bytes(absolute)
         except FileNotFoundError as e:
             raise FileNotFoundError(f'File not found: {path}') from e
 
@@ -283,28 +278,29 @@ class FileSystemToolset(FunctionToolset[AgentDepsT]):
             )
 
         new_content = text.replace(old_text, new_text, 1)
-        await self.sandbox.fs.write_bytes(absolute, new_content.encode('utf-8'))
+        await sandbox.fs.write_bytes(absolute, new_content.encode('utf-8'))
         new_hash = _content_hash(new_content)
         return f'Edited {path}. [hash:{new_hash}]'
 
     @_recoverable
-    async def list_directory(self, path: str = '.') -> str:
+    async def list_directory(self, ctx: RunContext[AgentDepsT], path: str = '.') -> str:  # noqa: D417
         """List the contents of a directory.
 
         Args:
             path: Directory path relative to the root directory.
         """
-        absolute = await self._safe_resolve(path, check_allowed=False)
+        sandbox = ctx.sandbox
+        absolute = await self._safe_resolve(sandbox, path, check_allowed=False)
         try:
-            entry = await self.sandbox.fs.stat(absolute)
+            entry = await sandbox.fs.stat(absolute)
         except FileNotFoundError as e:
             raise NotADirectoryError(f'Not a directory: {path}') from e
         if not entry.is_dir:
             raise NotADirectoryError(f'Not a directory: {path}')
 
-        root = await self._resolved_root()
+        root = await self._resolved_root(sandbox)
         entries: list[str] = []
-        for child in await self.sandbox.fs.list_dir(absolute):
+        for child in await sandbox.fs.list_dir(absolute):
             rel = posixpath.relpath(child.path, root)
             if any(part.startswith('.') for part in rel.split('/')):
                 continue
@@ -318,7 +314,9 @@ class FileSystemToolset(FunctionToolset[AgentDepsT]):
         return '\n'.join(entries) if entries else '(empty directory)'
 
     @_recoverable
-    async def search_files(self, pattern: str, *, path: str = '.', include_glob: str | None = None) -> str:
+    async def search_files(  # noqa: D417
+        self, ctx: RunContext[AgentDepsT], pattern: str, *, path: str = '.', include_glob: str | None = None
+    ) -> str:
         """Search file contents using a regular expression.
 
         Args:
@@ -329,15 +327,16 @@ class FileSystemToolset(FunctionToolset[AgentDepsT]):
         Returns:
             str: Matching lines formatted as file:line_number:text.
         """
-        absolute = await self._safe_resolve(path, check_allowed=False)
+        sandbox = ctx.sandbox
+        absolute = await self._safe_resolve(sandbox, path, check_allowed=False)
         try:
             compiled = re.compile(pattern)
         except re.error as e:
             raise ValueError(f'Invalid regex pattern: {e}') from e
 
-        candidate_files = await self._walk_files(absolute)
+        candidate_files = await self._walk_files(sandbox, absolute)
         results: list[str] = []
-        root = await self._resolved_root()
+        root = await self._resolved_root(sandbox)
         for file_path in candidate_files:
             rel = posixpath.relpath(file_path, root)
             if any(part.startswith('.') for part in rel.split('/')):
@@ -347,7 +346,7 @@ class FileSystemToolset(FunctionToolset[AgentDepsT]):
             if include_glob and not fnmatch.fnmatch(rel, include_glob):
                 continue
             try:
-                raw = await self.sandbox.fs.read_bytes(file_path)
+                raw = await sandbox.fs.read_bytes(file_path)
             except OSError:  # pragma: no cover
                 continue
             if _is_binary(raw):
@@ -363,23 +362,24 @@ class FileSystemToolset(FunctionToolset[AgentDepsT]):
         return '\n'.join(results) if results else 'No matches found.'
 
     @_recoverable
-    async def find_files(self, pattern: str, *, path: str = '.') -> str:
+    async def find_files(self, ctx: RunContext[AgentDepsT], pattern: str, *, path: str = '.') -> str:  # noqa: D417
         """Find files by glob pattern (name matching, not content search).
 
         Args:
             pattern: Glob pattern to match (e.g. `*.py`, `**/*.json`).
             path: Directory to search in, relative to the root directory.
         """
-        absolute = await self._safe_resolve(path, check_allowed=False)
+        sandbox = ctx.sandbox
+        absolute = await self._safe_resolve(sandbox, path, check_allowed=False)
         try:
-            entry = await self.sandbox.fs.stat(absolute)
+            entry = await sandbox.fs.stat(absolute)
         except FileNotFoundError as e:
             raise NotADirectoryError(f'Not a directory: {path}') from e
         if not entry.is_dir:
             raise NotADirectoryError(f'Not a directory: {path}')
 
-        root = await self._resolved_root()
-        entries = sorted(await self._walk(absolute))
+        root = await self._resolved_root(sandbox)
+        entries = sorted(await self._walk(sandbox, absolute))
         matches: list[str] = []
         for entry_path, is_dir in entries:
             rel = posixpath.relpath(entry_path, root)
@@ -398,33 +398,35 @@ class FileSystemToolset(FunctionToolset[AgentDepsT]):
         return '\n'.join(matches) if matches else 'No matches found.'
 
     @_recoverable
-    async def create_directory(self, path: str) -> str:
+    async def create_directory(self, ctx: RunContext[AgentDepsT], path: str) -> str:  # noqa: D417
         """Create a directory and any missing parents.
 
         Args:
             path: Directory path relative to the root directory.
         """
-        absolute = await self._safe_resolve(path, write=True)
-        await self.sandbox.fs.make_dir(absolute)
+        sandbox = ctx.sandbox
+        absolute = await self._safe_resolve(sandbox, path, write=True)
+        await sandbox.fs.make_dir(absolute)
         return f'Created directory: {path}'
 
     @_recoverable
-    async def file_info(self, path: str) -> str:
+    async def file_info(self, ctx: RunContext[AgentDepsT], path: str) -> str:  # noqa: D417
         """Get metadata about a file or directory.
 
         Args:
             path: File or directory path relative to the root directory.
         """
-        absolute = await self._safe_resolve(path)
+        sandbox = ctx.sandbox
+        absolute = await self._safe_resolve(sandbox, path)
         try:
-            entry = await self.sandbox.fs.stat(absolute)
+            entry = await sandbox.fs.stat(absolute)
         except FileNotFoundError as e:
             raise FileNotFoundError(f'Path not found: {path}') from e
 
         parts = [f'path: {path}', f'type: {"directory" if entry.is_dir else "file"}', f'size: {entry.size or 0} bytes']
 
         if not entry.is_dir:
-            raw = await self.sandbox.fs.read_bytes(absolute)
+            raw = await sandbox.fs.read_bytes(absolute)
             is_bin = _is_binary(raw)
             parts.append(f'binary: {is_bin}')
             if not is_bin:
@@ -432,35 +434,35 @@ class FileSystemToolset(FunctionToolset[AgentDepsT]):
                 parts.append(f'lines: {len(text.splitlines())}')
                 parts.append(f'hash: {_content_hash(text)}')
 
-        target = await self._readlink(absolute)
+        target = await self._readlink(sandbox, absolute)
         if target is not None:
             parts.append(f'symlink_target: {target}')
 
         return '\n'.join(parts)
 
-    async def _walk(self, root: str) -> list[tuple[str, bool]]:
+    async def _walk(self, sandbox: Sandbox, root: str) -> list[tuple[str, bool]]:
         entries: list[tuple[str, bool]] = []
         stack = [root]
         while stack:
             current = stack.pop()
-            children = await self.sandbox.fs.list_dir(current)
+            children = await sandbox.fs.list_dir(current)
             for child in children:
                 entries.append((child.path, bool(child.is_dir)))
                 if child.is_dir:
                     stack.append(child.path)
         return entries
 
-    async def _walk_files(self, root: str) -> list[str]:
+    async def _walk_files(self, sandbox: Sandbox, root: str) -> list[str]:
         try:
-            entry = await self.sandbox.fs.stat(root)
+            entry = await sandbox.fs.stat(root)
         except FileNotFoundError:
             return []
         if not entry.is_dir:
             return [root]
-        return sorted(path for path, is_dir in await self._walk(root) if not is_dir)
+        return sorted(path for path, is_dir in await self._walk(sandbox, root) if not is_dir)
 
-    async def _readlink(self, path: str) -> str | None:
-        result = await self.sandbox.run(f'readlink {shlex.quote(path)}', shell=True)
+    async def _readlink(self, sandbox: Sandbox, path: str) -> str | None:
+        result = await sandbox.run(f'readlink {shlex.quote(path)}', shell=True)
         if result.exit_code != 0:
             return None
         target = result.stdout.strip()
