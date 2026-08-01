@@ -69,10 +69,11 @@ result = agent.run_sync('Refund my last order.')
 print(result.output)
 ```
 
-Resolving managed values needs a `LOGFIRE_API_KEY` with the `project:read_variables` scope. Publishing
-the code baseline also needs `project:write_variables`; these are different credentials from the write token that sends spans. Instrumentation is worth adding even if
-you have it elsewhere: without spans, neither the config's adoption nor the version that produced a
-given run makes it back to the Logfire UI.
+Resolving managed values needs a `LOGFIRE_API_KEY` with the `project:read_variables` scope, and
+publishing the code baseline also needs `project:write_variables` -- both different credentials from
+the write token that sends spans. Instrumentation is worth adding even if you have it elsewhere:
+without spans, neither the config's adoption nor the version that produced a given run makes it back
+to the Logfire UI.
 
 Pinning `label='production'` is the recommended default, for the same
 [prompt-cache reasons](managed-prompt.md#prompt-cache-trade-off) as a managed prompt.
