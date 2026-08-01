@@ -41,6 +41,7 @@ assert RootAgentControl is AgentControl
 def _forget_warned_drops() -> None:
     """Start each test with an empty once-per-process guard so every drop warns independently."""
     _agent_control._warned_drops.clear()
+    _agent_control._reset_baseline_publish_guard()
 
 
 def instructions_seen(messages: list[ModelMessage]) -> list[str]:
@@ -500,6 +501,112 @@ async def test_auto_create_snapshots_every_instruction_block(
     # `dynamic` is what powers the one warning that matters: replacing a computed block pins whatever
     # it evaluated to when the snapshot happened to be taken.
     assert [block['dynamic'] for block in example['instructions']] == [False, True, True, True]
+
+
+async def test_existing_variable_publishes_changed_baseline_once_without_clobbering_config(
+    capfire: CaptureLogfire, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(_agent_control, '_spawn_baseline_publish', _agent_control._publish_baseline)
+    config = published_value('agent__published_baseline', {})
+    original = config.variables['agent__published_baseline'].model_copy(
+        update={'description': 'Kept description.', 'aliases': ['kept_alias']}
+    )
+    config.variables['agent__published_baseline'] = original
+    today = ['Monday']
+    agent = Agent(
+        TestModel(),
+        name='published_baseline',
+        instructions='AGENT: code instructions.',
+        toolsets=[weather_toolset()],
+        capabilities=[AgentControl(label='production')],
+    )
+
+    @agent.instructions(id='today')
+    def dynamic(_ctx: RunContext[object]) -> str:
+        return f'DYNAMIC: today is {today[0]}.'
+
+    with variables_provider(capfire, config):
+        provider = logfire.DEFAULT_LOGFIRE_INSTANCE.config.get_variable_provider()
+        updates: list[VariableConfig] = []
+        original_update = provider.update_variable
+
+        def record_update(name: str, updated: VariableConfig) -> VariableConfig:
+            updates.append(updated)
+            return original_update(name, updated)
+
+        monkeypatch.setattr(provider, 'update_variable', record_update)
+        await agent.run('first')
+        _agent_control._reset_baseline_publish_guard()  # model a fresh process with the published baseline
+        await agent.run('unchanged')
+        _agent_control._reset_baseline_publish_guard()
+        today[0] = 'Tuesday'
+        await agent.run('changed')
+
+    assert len(updates) == 2
+    first_example = json.loads(updates[0].example or '{}')
+    assert first_example['instructions'] == [
+        {'id': 'agent', 'instructions': 'AGENT: code instructions.', 'dynamic': False},
+        {'id': 'agent:today', 'instructions': 'DYNAMIC: today is Monday.', 'dynamic': True},
+        {'id': 'toolset:weather', 'instructions': 'TOOLSET: call get_weather first.', 'dynamic': True},
+    ]
+    assert json.loads(updates[1].example or '{}')['instructions'][1]['instructions'] == 'DYNAMIC: today is Tuesday.'
+    for updated in updates:
+        assert updated.model_copy(update={'example': original.example}) == original
+
+
+async def test_baseline_publish_failure_does_not_affect_run_and_warns_once(
+    capfire: CaptureLogfire, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(_agent_control, '_spawn_baseline_publish', _agent_control._publish_baseline)
+    config = published_value('agent__publish_failure', {})
+    instruction = ['first']
+    agent = Agent(TestModel(), name='publish_failure', capabilities=[AgentControl(label='production')])
+
+    @agent.instructions(id='changing')
+    def changing(_ctx: RunContext[object]) -> str:
+        return instruction[0]
+
+    with variables_provider(capfire, config):
+        provider = logfire.DEFAULT_LOGFIRE_INSTANCE.config.get_variable_provider()
+
+        def fail_update(_name: str, _config: VariableConfig) -> VariableConfig:
+            raise PermissionError('missing project:write_variables')
+
+        monkeypatch.setattr(provider, 'update_variable', fail_update)
+        with pytest.warns(UserWarning, match='missing project:write_variables') as caught:
+            first = await agent.run('first')
+            instruction[0] = 'second'
+            second = await agent.run('second')
+
+    assert len(caught) == 1
+    assert first.output.startswith('success')
+    assert second.output.startswith('success')
+
+
+async def test_publish_baseline_opt_out(capfire: CaptureLogfire, monkeypatch: pytest.MonkeyPatch) -> None:
+    def fail_spawn(_variable: Variable[object], _example: str) -> None:
+        raise AssertionError('baseline publishing should be disabled')
+
+    monkeypatch.setattr(_agent_control, '_spawn_baseline_publish', fail_spawn)
+    with variables_provider(capfire, published_value('agent__no_publish', {})):
+        result = await Agent(
+            TestModel(), instructions='code', capabilities=[AgentControl('no_publish', publish_baseline=False)]
+        ).run('hello')
+    assert result.output.startswith('success')
+
+
+async def test_missing_variable_baseline_publish_warns_without_affecting_run(
+    capfire: CaptureLogfire, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(_agent_control, '_spawn_baseline_publish', _agent_control._publish_baseline)
+    with variables_provider(capfire, VariablesConfig(variables={})):
+        with pytest.warns(UserWarning, match="variable 'agent__missing_publish' was not found"):
+            result = await Agent(
+                TestModel(),
+                name='missing_publish',
+                capabilities=[AgentControl(auto_create=False)],
+            ).run('hello')
+    assert result.output.startswith('success')
 
 
 async def test_applied_sections_baggage() -> None:

@@ -60,13 +60,16 @@ fails the run. Because the variable it writes is persistent and visible to every
 the project, the outcome is reported into that same Logfire project: a log record on success, and a
 log record plus a `UserWarning` on failure. Opt out per capability with `auto_create=False`.
 
-`AgentControl` additionally writes the variable's `example` as an `AgentConfig`-shaped snapshot of
+`AgentControl` additionally publishes the variable's `example` as an `AgentConfig`-shaped snapshot of
 the code-side agent (instructions, model, effective settings, and each tool's description and
 parameter descriptions) -- the baseline the Logfire UI's override editor and optimizer diff managed
-values against. The snapshot is taken from whichever model request comes first in the process, so
+values against. It publishes in the background after the first model request that exposes a new
+snapshot. An unchanged baseline causes no write; a changed one is published at most once per process. The
+provider's current complete definition is copied and only `example` is replaced, preserving labels,
+rollout, overrides, and other metadata. The snapshot is taken from the triggering request, so
 for instructions or a toolset that vary with `deps`, run input, or the step within a run, it is one
 point-in-time sample rather than a description of the agent. An agent that never reaches a model
-request never auto-creates.
+request never publishes a baseline.
 
 Its `instructions` list one entry per instruction block the model was sent -- the agent's own text,
 this capability's contribution, each toolset's -- each carrying the `id` that addresses it and a
@@ -76,7 +79,10 @@ wholesale, and copying it wholesale is exactly [the mistake](#where-your-base-pr
 sending the agent's own text to the model twice with a frozen `Today is <date>` in the middle of it.
 
 An `example` describes the code rather than being a value to apply -- nothing resolves it -- which is
-what lets it use the same fields to say *what exists* instead of *what to change*.
+what lets publishing default to on: a failed or stale snapshot cannot change a run. Publishing needs
+a token with `project:write_variables`; a missing scope, network failure, or missing variable warns
+once per process and leaves the run untouched. Pass `publish_baseline=False` to disable it, for example
+when the process intentionally uses a read-only variables token.
 
 Install the extra:
 

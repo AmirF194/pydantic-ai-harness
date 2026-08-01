@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import threading
 import warnings
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field, replace
@@ -10,6 +11,7 @@ from typing import TYPE_CHECKING, Annotated, Any, ClassVar, Literal, TypeAlias, 
 
 import logfire
 from logfire.variables import Variable
+from logfire.variables.abstract import NoOpVariableProvider
 from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, ValidationError, field_validator, model_validator
 from pydantic_ai import AbstractToolset, RunContext, TemplateStr, ToolDefinition, WrapperToolset
 from pydantic_ai.exceptions import UserError
@@ -35,6 +37,12 @@ _EntryT = TypeVar('_EntryT')
 # Drop warnings already emitted in this process, keyed by the message itself. See `_warn_dropped`.
 _warned_drops: set[str] = set()
 
+# Destinations handed to a baseline publisher in this process. Marking before the thread starts
+# prevents concurrent first requests from scheduling duplicate work; a failure is not retried by
+# every later run.
+_baseline_publish_attempted: set[tuple[logfire.Logfire, str]] = set()
+_baseline_publish_lock = threading.Lock()
+
 
 def _warn_dropped(message: str) -> None:
     """Surface a dropped managed value once per process.
@@ -50,6 +58,38 @@ def _warn_dropped(message: str) -> None:
         return
     _warned_drops.add(message)
     warnings.warn(message)
+
+
+def _reset_baseline_publish_guard() -> None:  # pyright: ignore[reportUnusedFunction]
+    """Clear baseline publishing process state. Intended for tests only."""
+    with _baseline_publish_lock:
+        _baseline_publish_attempted.clear()
+
+
+def _spawn_baseline_publish(variable: Variable[Any], example: str) -> None:
+    """Move the provider read and targeted write off the model request's thread."""
+    threading.Thread(target=_publish_baseline, args=(variable, example), daemon=True).start()
+
+
+def _publish_baseline(variable: Variable[Any], example: str) -> None:
+    """Update only the `example` on the provider's current complete variable definition."""
+    provider = variable.logfire_instance.config.get_variable_provider()
+    try:
+        config = provider.get_variable_config(variable.name)
+        if config is None:
+            if isinstance(provider, NoOpVariableProvider):
+                return
+            raise LookupError(f'variable {variable.name!r} was not found')
+        if config.example == example:
+            return
+        provider.update_variable(variable.name, config.model_copy(update={'example': example}))
+    except Exception as exc:
+        variable.logfire_instance.warn(
+            'Failed to publish the code baseline for Logfire managed variable {variable_name}',
+            variable_name=variable.name,
+            _exc_info=True,
+        )
+        warnings.warn(f'Failed to publish the code baseline for Logfire managed variable {variable.name!r}: {exc}')
 
 
 class AgentConfigSettings(BaseModel):
@@ -813,6 +853,13 @@ class AgentControl(ManagedVariableCapability[AgentDepsT, AgentConfig]):
     An entry that addresses an existing block by `id` is applied to the assembled request and is never
     templated: it replaces a block with exactly the text that was published.
     """
+    publish_baseline: bool = True
+    """Publish the code-side agent snapshot to the variable's `example` when it changes.
+
+    Enabled by default because `example` is documentation for the Logfire editor and is never resolved
+    or applied to a run. A failed or stale publish therefore cannot change agent behavior. Disable it
+    when the variables token is intentionally read-only or code must not update variable metadata.
+    """
 
     _auto_create_in_wrap_run: ClassVar[bool] = False
 
@@ -983,7 +1030,7 @@ class AgentControl(ManagedVariableCapability[AgentDepsT, AgentConfig]):
         [`get_model`][pydantic_ai_harness.logfire.AgentControl.get_model] and `get_model_settings`, where
         Pydantic AI already gives them the right precedence.
         """
-        self._auto_create_snapshot(request_context)
+        self._publish_request_baseline(request_context)
         return self._apply_instruction_overrides(request_context)
 
     def _apply_instruction_overrides(self, request_context: ModelRequestContext) -> ModelRequestContext:
@@ -1023,8 +1070,8 @@ class AgentControl(ManagedVariableCapability[AgentDepsT, AgentConfig]):
         request_context.model_request_parameters = replace(parameters, instruction_parts=parts)
         return request_context
 
-    def _auto_create_snapshot(self, request_context: ModelRequestContext) -> None:
-        """Create the code-side `AgentConfig` baseline at the first eligible model request.
+    def _publish_request_baseline(self, request_context: ModelRequestContext) -> None:
+        """Publish the code-side `AgentConfig` baseline at the first eligible model request.
 
         The request context carries the real tool definitions, instructions, and settings after the
         agent has assembled them. Auto-create only fires when the provider does not know the variable,
@@ -1038,18 +1085,15 @@ class AgentControl(ManagedVariableCapability[AgentDepsT, AgentConfig]):
         ever be copied wholesale -- which, since managed instructions *add*, is how you get the agent's
         own text sent to the model twice with a frozen `Today is <date>` in the middle of it.
 
-        "First" is first in the process, not first in some canonical run: dynamic instructions and
-        dynamic toolsets make the snapshot a sample of one request, whichever run and step got there
-        first. It is stored as the variable's `example` and never revised, so the baseline stays
-        stable for the UI to diff against rather than drifting with traffic.
+        Dynamic instructions and dynamic toolsets make the snapshot a sample of one request. Only the
+        first request in a process is eligible, so request-to-request variation does not turn into
+        writes from live traffic. A new process publishes a changed deployed baseline.
 
         An `example` is a description of the code, not a value to apply -- nothing resolves it -- which
         is what lets it use these same fields to say *what exists* rather than *what to change*.
         """
         resolved = self.resolved
-        if resolved is None:
-            return
-        if not self._should_auto_create_for(resolved):
+        if resolved is None or not self.publish_baseline:
             return
         instructions: list[NonEmptyStr | InstructionBlock] = [
             InstructionBlock(id=part.id, instructions=part.content, dynamic=part.dynamic)
@@ -1081,4 +1125,13 @@ class AgentControl(ManagedVariableCapability[AgentDepsT, AgentConfig]):
             else None,
             tool_definitions=tool_definitions or None,
         )
-        self._maybe_auto_create(self._variable, example=json.dumps(example.model_dump(exclude_none=True), indent=2))
+        serialized = json.dumps(example.model_dump(exclude_none=True), indent=2)
+        key = (self._variable.logfire_instance, self._variable.name)
+        with _baseline_publish_lock:
+            if key in _baseline_publish_attempted:
+                return
+            _baseline_publish_attempted.add(key)
+        if self._should_auto_create_for(resolved):
+            self._maybe_auto_create(self._variable, example=serialized)
+            return
+        _spawn_baseline_publish(self._variable, serialized)

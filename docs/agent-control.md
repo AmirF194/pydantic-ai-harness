@@ -69,8 +69,8 @@ result = agent.run_sync('Refund my last order.')
 print(result.output)
 ```
 
-Resolving managed values needs a `LOGFIRE_API_KEY` with the `project:read_variables` scope; that is a
-different credential from the write token that sends spans. Instrumentation is worth adding even if
+Resolving managed values needs a `LOGFIRE_API_KEY` with the `project:read_variables` scope. Publishing
+the code baseline also needs `project:write_variables`; these are different credentials from the write token that sends spans. Instrumentation is worth adding even if
 you have it elsewhere: without spans, neither the config's adoption nor the version that produced a
 given run makes it back to the Logfire UI.
 
@@ -273,16 +273,29 @@ the variable is persistent and visible to everyone with access to the project, t
 back into that project: a log record on success, and a log record plus a `UserWarning` on failure. Opt
 out with `auto_create=False`.
 
-The variable's `example` is set to an `AgentConfig`-shaped snapshot of the code-side agent, which is
+The variable's `example` is an `AgentConfig`-shaped snapshot of the code-side agent, which is
 what the UI's editor and Logfire's optimizer diff managed values against. Instructions are snapshotted
 **per block**, each with the `id` that addresses it and its `dynamic` flag -- which is what makes a
 per-block override offerable in the first place. The joined prompt a trace records has no seams in it,
 so a baseline built from telemetry alone could only ever be copied wholesale.
 
-The snapshot comes from whichever model request happens to come first in the process, so for
+`AgentControl` publishes that snapshot in the background after the first model request that exposes a
+baseline. It compares against the provider's current definition first, so an unchanged baseline
+causes no write; a changed baseline is attempted at most once per process. The targeted update copies the
+complete current definition and changes only `example`, preserving its labels, rollout, overrides,
+schema, and other metadata.
+
+The snapshot comes from the model request that triggers publishing, so for
 instructions or a toolset that vary with `deps`, run input, or the step within a run, it is one
 point-in-time sample rather than a description of the agent. An agent that never reaches a model
-request never auto-creates at all.
+request never publishes a baseline.
+
+Publishing is on by default because `example` is documentation and is never resolved or applied to a
+run. A stale or failed publish cannot change agent behavior. A missing `project:write_variables`
+scope, network error, or missing variable warns once per process and otherwise leaves the run alone.
+Pass `publish_baseline=False` to disable publishing, for example when the process intentionally uses a
+read-only variables token. `auto_create=False` remains a separate opt-out for creating a missing
+variable.
 
 ## Naming and sharing
 
