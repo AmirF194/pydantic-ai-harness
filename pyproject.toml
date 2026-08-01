@@ -30,13 +30,8 @@ classifiers = [
 dependencies = [
     "genai-prices>=0.0.71",
     "httpx>=0.28.1",
-    # STACKED ON pydantic-ai#6770 -- BOTH THIS FLOOR AND THE `[tool.uv.sources]` BLOCK BELOW CHANGE WHEN IT RELEASES.
-    # `CodeMode` reads `ModelRequestParameters.revealed_tool_names` to tell a revealed deferred tool from a
-    # still-hidden one, which lands in the next pydantic-ai release (2.21.0 is the newest and does not carry it).
-    # The floor stays satisfiable because an unsatisfiable one breaks `uv run` outright -- lint, format and
-    # typecheck included -- so the repo would be undevelopable rather than merely red. The source below resolves
-    # the real thing until then. On release: raise this floor to the release version and delete that block.
-    "pydantic-ai-slim>=2.21.0",
+    # `CodeMode` reads `ModelRequestParameters.revealed_tool_names`, which lands in 2.22.0.
+    "pydantic-ai-slim>=2.22.0",
 ]
 
 [project.optional-dependencies]
@@ -108,10 +103,6 @@ lint = [
     'ruff>=0.14',
     'pyright>=1.1.408',
 ]
-
-# STACKED ON pydantic-ai#6770 -- DELETE THIS BLOCK WHEN IT RELEASES (see the base dependency above).
-[tool.uv.sources]
-pydantic-ai-slim = { git = "https://github.com/pydantic/pydantic-ai.git", subdirectory = "pydantic_ai_slim", branch = "main" }
 
 [tool.hatch.version]
 source = 'uv-dynamic-versioning'
