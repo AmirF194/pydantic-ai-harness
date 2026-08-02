@@ -26,6 +26,7 @@ from pydantic_ai.tools import AgentDepsT, RunContext
 if TYPE_CHECKING:
     from pydantic_ai.capabilities.abstract import WrapModelRequestHandler
     from pydantic_ai.models import ModelRequestContext
+    from pydantic_ai.usage import UsageLimits
 
 
 @dataclass
@@ -262,8 +263,11 @@ class LLMReminder(Generic[AgentDepsT]):
     failed generation never blocks the run. Add it to `SystemReminders.dynamic_reminders`.
 
     Like every dynamic reminder it is evaluated on every model request, so it issues one extra
-    model call per turn; its usage is threaded onto the parent run (`ctx.usage`). Gate it on a
-    cadence (see the docs) if per-turn generation is too costly.
+    model call per turn; its usage is threaded onto the parent run (`ctx.usage`) and it runs
+    under the parent's `usage_limits` minus one reserved request, so the reminder cannot push a
+    run past its `request_limit`. Once the budget is that tight the generation is skipped and
+    `GoalReanchor` text is used instead. Gate it on a cadence (see the docs) if per-turn
+    generation is too costly.
 
     The generation runs inside `wrap_model_request`, so under durable execution (Temporal,
     DBOS, Prefect) it executes in orchestration context rather than a durable step: the model
@@ -288,11 +292,24 @@ class LLMReminder(Generic[AgentDepsT]):
                 agent = Agent(self.model, instructions=self.instructions, output_type=str)
                 self._agent = agent
             transcript = _build_compact_transcript(ctx.messages, self.max_context_messages)
-            result = await agent.run(transcript, usage=ctx.usage)
+            result = await agent.run(transcript, usage=ctx.usage, usage_limits=_reserved_limits(ctx.usage_limits))
             text = result.output.strip()
             return text or None
         except Exception:
             return GoalReanchor[AgentDepsT]()(ctx)
+
+
+def _reserved_limits(limits: UsageLimits | None) -> UsageLimits | None:
+    """The parent run's limits with one request held back for the model call this reminder precedes.
+
+    `wrap_model_request` runs after the parent request already cleared `check_before_request`, so
+    a nested run spending the last slot would let that approved request push the run one past
+    `request_limit`. Holding the slot back makes the nested run raise `UsageLimitExceeded` first;
+    the caller falls back to `GoalReanchor`, which costs no request, and the budget holds.
+    """
+    if limits is None or limits.request_limit is None:
+        return limits
+    return replace(limits, request_limit=max(0, limits.request_limit - 1))
 
 
 def _should_fire(reminder: Reminder[AgentDepsT], count: int) -> bool:

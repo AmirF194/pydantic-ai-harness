@@ -24,7 +24,7 @@ from pydantic_ai.messages import (
 from pydantic_ai.models import ModelRequestContext, ModelRequestParameters
 from pydantic_ai.models.function import AgentInfo, FunctionModel
 from pydantic_ai.models.test import TestModel
-from pydantic_ai.usage import RunUsage
+from pydantic_ai.usage import RunUsage, UsageLimits
 
 from pydantic_ai_harness.planning import Planning
 from pydantic_ai_harness.system_reminders import (
@@ -44,11 +44,18 @@ def anyio_backend() -> str:
     return 'asyncio'
 
 
-def _ctx(*, run_step: int = 1, messages: list[ModelMessage] | None = None) -> Any:
+def _ctx(
+    *,
+    run_step: int = 1,
+    messages: list[ModelMessage] | None = None,
+    usage: RunUsage | None = None,
+    usage_limits: UsageLimits | None = None,
+) -> Any:
     ctx = MagicMock()
     ctx.run_step = run_step
     ctx.messages = messages if messages is not None else []
-    ctx.usage = RunUsage()
+    ctx.usage = usage if usage is not None else RunUsage()
+    ctx.usage_limits = usage_limits if usage_limits is not None else UsageLimits()
     return ctx
 
 
@@ -644,6 +651,40 @@ class TestLLMReminder:
         ctx = _ctx(messages=[ModelRequest(parts=[UserPromptPart('g')])])
         await LLMReminder(model=_capture_model(store))(ctx)
         assert ctx.usage.requests == 1
+
+    async def test_reserves_a_request_for_the_pending_parent_call(self) -> None:
+        """The last slot belongs to the parent request that already cleared its preflight check."""
+        store: dict[str, str] = {}
+        ctx = _ctx(
+            messages=[ModelRequest(parts=[UserPromptPart('ship the fix')])],
+            usage=RunUsage(requests=1),
+            usage_limits=UsageLimits(request_limit=2),
+        )
+        result = await LLMReminder(model=_capture_model(store))(ctx)
+        assert result is not None
+        assert 'ship the fix' in result  # GoalReanchor fallback, no nested request spent
+        assert ctx.usage.requests == 1
+
+    async def test_generates_while_budget_remains(self) -> None:
+        store: dict[str, str] = {}
+        ctx = _ctx(
+            messages=[ModelRequest(parts=[UserPromptPart('g')])],
+            usage=RunUsage(requests=1),
+            usage_limits=UsageLimits(request_limit=3),
+        )
+        assert await LLMReminder(model=_capture_model(store))(ctx) == 'generated'
+        assert ctx.usage.requests == 2
+
+    async def test_unlimited_requests_are_passed_through(self) -> None:
+        store: dict[str, str] = {}
+        ctx = _ctx(messages=[ModelRequest(parts=[UserPromptPart('g')])], usage_limits=UsageLimits(request_limit=None))
+        assert await LLMReminder(model=_capture_model(store))(ctx) == 'generated'
+
+    async def test_absent_limits_are_passed_through(self) -> None:
+        store: dict[str, str] = {}
+        ctx = _ctx(messages=[ModelRequest(parts=[UserPromptPart('g')])])
+        ctx.usage_limits = None
+        assert await LLMReminder(model=_capture_model(store))(ctx) == 'generated'
 
 
 # --- End-to-end through Agent ---
