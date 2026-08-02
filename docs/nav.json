@@ -26,6 +26,7 @@
       { "label": "Spend", "slug": "spend" },
       { "label": "Managed Prompt", "slug": "managed-prompt" },
       { "label": "LocalStack", "slug": "localstack" },
+      { "label": "StackOne", "slug": "stackone" },
       { "label": "Skills", "slug": "skills" },
       { "label": "ACP", "slug": "acp" }
     ]
