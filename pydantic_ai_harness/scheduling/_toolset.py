@@ -12,6 +12,7 @@ from pydantic_ai.tools import AgentDepsT, RunContext
 from pydantic_ai.toolsets import FunctionToolset, ToolsetTool
 
 from pydantic_ai_harness.scheduling._runner import scheduled_run_var
+from pydantic_ai_harness.scheduling._store import ScheduleConflictError
 from pydantic_ai_harness.scheduling._types import (
     CronTrigger,
     IntervalTrigger,
@@ -36,6 +37,8 @@ PAUSE_SCHEDULE_DESCRIPTION = 'Pause a schedule so the runner will not claim it.'
 RESUME_SCHEDULE_DESCRIPTION = 'Resume a schedule from its next future occurrence without replaying a backlog.'
 DELETE_SCHEDULE_DESCRIPTION = 'Delete a schedule permanently by id.'
 RUN_SCHEDULE_NOW_DESCRIPTION = 'Queue an enabled schedule for execution on the next runner tick.'
+_SAVE_ATTEMPTS = 3
+_CONFLICT_RETRY_MESSAGE = 'The schedule changed while this update was being applied. Try again.'
 
 
 def _trigger_display(trigger: ScheduleTrigger) -> str:
@@ -110,6 +113,15 @@ class SchedulingToolset(FunctionToolset[AgentDepsT]):
             return schedule
         known = ', '.join(item.id for item in await self._capability.resolved_store.list()) or '(none)'
         raise ModelRetry(f'Unknown schedule id {schedule_id!r}. Known ids: {known}.')
+
+    async def _save_or_retry(self, schedule: Schedule, attempt: int) -> bool:
+        try:
+            await self._capability.resolved_store.save(schedule)
+        except ScheduleConflictError as exc:
+            if attempt == _SAVE_ATTEMPTS - 1:
+                raise ModelRetry(_CONFLICT_RETRY_MESSAGE) from exc
+            return False
+        return True
 
     @staticmethod
     def _parse(text: str, *, timezone: str) -> ScheduleTrigger:
@@ -200,64 +212,78 @@ class SchedulingToolset(FunctionToolset[AgentDepsT]):
             name: Replacement name.
             prompt: Replacement prompt.
             schedule: Replacement compact schedule text.
-            deliver_to: Replacement opaque routing hint.
-            max_runs: Replacement recurring attempt limit.
+            deliver_to: Replacement routing hint; an empty string clears it.
+            max_runs: Replacement recurring attempt limit; zero removes the limit.
         """
         del ctx
-        existing = await self._known_or_retry(schedule_id)
-        if schedule is not None and existing.next_run_at is None:
-            raise ModelRetry('This schedule is completed. Create a new schedule instead.')
-        trigger = existing.trigger if schedule is None else self._parse(schedule, timezone=existing.timezone)
-        resulting_max_runs = existing.max_runs if max_runs is None else max_runs
-        self._validate_combination(trigger, resulting_max_runs)
-        updates: dict[str, object] = {}
-        if name is not None:
-            updates['name'] = name
-        if prompt is not None:
-            updates['prompt'] = prompt
-        if deliver_to is not None:
-            updates['deliver_to'] = deliver_to
-        if max_runs is not None:
-            updates['max_runs'] = max_runs
-        if schedule is not None:
-            now = datetime.now(datetime_timezone.utc)
-            next_run_at = next_run_time(trigger, after=now, timezone=existing.timezone)
-            if isinstance(trigger, OnceTrigger) and next_run_at is None:
-                raise ModelRetry('Cannot update this schedule because that time is in the past. Choose a future time.')
-            updates.update(trigger=trigger, next_run_at=next_run_at)
-            if trigger != existing.trigger:
-                updates['runs_completed'] = 0
-        try:
-            data = existing.model_dump()
-            data.update(updates)
-            updated = Schedule.model_validate(data)
-        except ValueError as exc:
-            raise ModelRetry(f'Invalid schedule update: {exc}') from exc
-        if updated.max_runs is not None and updated.runs_completed >= updated.max_runs:
-            updated.next_run_at = None
-        await self._capability.resolved_store.save(updated)
-        return f'Schedule updated.\n{_render_schedule(updated, full=False)}'
+        for attempt in range(_SAVE_ATTEMPTS):
+            existing = await self._known_or_retry(schedule_id)
+            if schedule is not None and existing.next_run_at is None:
+                raise ModelRetry('This schedule is completed. Create a new schedule instead.')
+            trigger = existing.trigger if schedule is None else self._parse(schedule, timezone=existing.timezone)
+            inherited_limit_on_once = schedule is not None and isinstance(trigger, OnceTrigger) and max_runs is None
+            resulting_max_runs = None if max_runs == 0 or inherited_limit_on_once else max_runs
+            if max_runs is None and not inherited_limit_on_once:
+                resulting_max_runs = existing.max_runs
+            self._validate_combination(trigger, resulting_max_runs)
+            updates: dict[str, object] = {}
+            if name is not None:
+                updates['name'] = name
+            if prompt is not None:
+                updates['prompt'] = prompt
+            if deliver_to is not None:
+                updates['deliver_to'] = deliver_to or None
+            if max_runs is not None or inherited_limit_on_once:
+                updates['max_runs'] = resulting_max_runs
+            if schedule is not None:
+                now = datetime.now(datetime_timezone.utc)
+                next_run_at = next_run_time(trigger, after=now, timezone=existing.timezone)
+                if isinstance(trigger, OnceTrigger) and next_run_at is None:
+                    raise ModelRetry(
+                        'Cannot update this schedule because that time is in the past. Choose a future time.'
+                    )
+                updates.update(trigger=trigger, next_run_at=next_run_at)
+                if trigger != existing.trigger:
+                    updates['runs_completed'] = 0
+            try:
+                data = existing.model_dump()
+                data.update(updates)
+                updated = Schedule.model_validate(data)
+            except ValueError as exc:
+                raise ModelRetry(f'Invalid schedule update: {exc}') from exc
+            if updated.max_runs is not None and updated.runs_completed >= updated.max_runs:
+                updated.next_run_at = None
+            if not await self._save_or_retry(updated, attempt):
+                continue
+            return f'Schedule updated.\n{_render_schedule(updated, full=False)}'
+        raise AssertionError('unreachable')  # pragma: no cover
 
     async def pause_schedule(self, ctx: RunContext[AgentDepsT], schedule_id: str) -> str:
         """Pause a schedule by id."""
         del ctx
-        schedule = await self._known_or_retry(schedule_id)
-        schedule.enabled = False
-        await self._capability.resolved_store.save(schedule)
-        return f'Schedule {schedule.id} paused.'
+        for attempt in range(_SAVE_ATTEMPTS):
+            schedule = await self._known_or_retry(schedule_id)
+            schedule.enabled = False
+            if not await self._save_or_retry(schedule, attempt):
+                continue
+            return f'Schedule {schedule.id} paused.'
+        raise AssertionError('unreachable')  # pragma: no cover
 
     async def resume_schedule(self, ctx: RunContext[AgentDepsT], schedule_id: str) -> str:
         """Resume from the next occurrence after now instead of replaying a backlog."""
         del ctx
-        schedule = await self._known_or_retry(schedule_id)
-        if schedule.enabled:
-            raise ModelRetry('This schedule is not paused.')
-        schedule.enabled = True
-        if schedule.next_run_at is not None:
-            now = datetime.now(datetime_timezone.utc)
-            schedule.next_run_at = next_run_time(schedule.trigger, after=now, timezone=schedule.timezone)
-        await self._capability.resolved_store.save(schedule)
-        return f'Schedule {schedule.id} resumed.\n{_render_schedule(schedule, full=False)}'
+        for attempt in range(_SAVE_ATTEMPTS):
+            schedule = await self._known_or_retry(schedule_id)
+            if schedule.enabled:
+                raise ModelRetry('This schedule is not paused.')
+            schedule.enabled = True
+            if schedule.next_run_at is not None:
+                now = datetime.now(datetime_timezone.utc)
+                schedule.next_run_at = next_run_time(schedule.trigger, after=now, timezone=schedule.timezone)
+            if not await self._save_or_retry(schedule, attempt):
+                continue
+            return f'Schedule {schedule.id} resumed.\n{_render_schedule(schedule, full=False)}'
+        raise AssertionError('unreachable')  # pragma: no cover
 
     async def delete_schedule(self, ctx: RunContext[AgentDepsT], schedule_id: str) -> str:
         """Delete a schedule by id."""
@@ -269,11 +295,14 @@ class SchedulingToolset(FunctionToolset[AgentDepsT]):
     async def run_schedule_now(self, ctx: RunContext[AgentDepsT], schedule_id: str) -> str:
         """Queue an enabled schedule for the next runner tick."""
         del ctx
-        schedule = await self._known_or_retry(schedule_id)
-        if not schedule.enabled:
-            raise ModelRetry('This schedule is paused. Resume it before queuing an immediate run.')
-        if schedule.next_run_at is None:
-            raise ModelRetry('This schedule is completed. Create a new schedule instead.')
-        schedule.next_run_at = datetime.now(datetime_timezone.utc)
-        await self._capability.resolved_store.save(schedule)
-        return f'Schedule {schedule.id} queued for the next runner tick.'
+        for attempt in range(_SAVE_ATTEMPTS):
+            schedule = await self._known_or_retry(schedule_id)
+            if not schedule.enabled:
+                raise ModelRetry('This schedule is paused. Resume it before queuing an immediate run.')
+            if schedule.next_run_at is None:
+                raise ModelRetry('This schedule is completed. Create a new schedule instead.')
+            schedule.next_run_at = datetime.now(datetime_timezone.utc)
+            if not await self._save_or_retry(schedule, attempt):
+                continue
+            return f'Schedule {schedule.id} queued for the next runner tick.'
+        raise AssertionError('unreachable')  # pragma: no cover

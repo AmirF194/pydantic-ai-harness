@@ -19,6 +19,8 @@ pip install 'pydantic-ai-harness[scheduling]'
 Attach the capability, then run the runner:
 
 ```python
+import asyncio
+
 from pydantic_ai import Agent
 from pydantic_ai_harness.scheduling import ScheduleResult, ScheduleRunner, Scheduling, SqliteScheduleStore
 
@@ -37,6 +39,9 @@ async def main():
 
     runner = ScheduleRunner(agent, deps=None, on_result=show)
     await runner.run_until_stopped()
+
+
+asyncio.run(main())
 ```
 
 The model calls `create_schedule` with a name, a prompt, and a schedule string. The runner claims due schedules once per `tick_interval` (default 60 seconds) and executes each one as a fresh, isolated agent run.
@@ -79,9 +84,15 @@ async def deliver(result: ScheduleResult) -> None:
     print(f'[{target}] {result.schedule.name}: {result.output}')
 ```
 
-## Scheduled runs cannot schedule
+## Scheduling tools inside scheduled runs
 
-Inside a scheduled run, the scheduling tools and instructions are absent. A scheduled prompt cannot create, change, or trigger schedules, so it cannot replicate itself.
+Inside a scheduled run, this capability's scheduling tools and instructions are absent. The application can still expose other tools that write to the same store, so this guard only prevents access through `Scheduling` itself.
+
+## Custom stores and concurrent writers
+
+`Schedule.version` is store bookkeeping for optimistic concurrency control. A `ScheduleStore.save()` implementation replaces a record only when the supplied version matches the stored version, persists it with `version + 1`, raises `ScheduleConflictError` for a stale version, and raises `ValueError` for an unknown id. Writers re-read and retry after conflicts so updates apply to current state.
+
+Use one runner per store. Versioned saves protect concurrent tool and runner updates within that design, but do not coordinate claims across runner processes.
 
 ## Driving the runner from outside
 
@@ -90,6 +101,8 @@ Inside a scheduled run, the scheduling tools and instructions are absent. A sche
 Invocations must not overlap for a given store; schedule the external trigger accordingly.
 
 ```python
+import asyncio
+
 from pydantic_ai import Agent
 from pydantic_ai_harness.scheduling import ScheduleRunner, Scheduling, SqliteScheduleStore
 
@@ -99,6 +112,9 @@ agent = Agent('anthropic:claude-sonnet-4-6', capabilities=[Scheduling(store=stor
 
 async def main():
     await ScheduleRunner(agent, deps=None, store=store).tick()
+
+
+asyncio.run(main())
 ```
 
 Durability capabilities on the agent compose transparently: scheduled runs execute like any other run.

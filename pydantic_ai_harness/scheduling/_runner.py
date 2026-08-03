@@ -15,7 +15,7 @@ from pydantic_ai.capabilities import AbstractCapability, WrapperCapability
 from pydantic_ai.tools import AgentDepsT
 from pydantic_ai.usage import UsageLimits
 
-from pydantic_ai_harness.scheduling._store import ScheduleStore
+from pydantic_ai_harness.scheduling._store import ScheduleConflictError, ScheduleStore
 from pydantic_ai_harness.scheduling._types import (
     CronTrigger,
     IntervalTrigger,
@@ -29,6 +29,8 @@ from pydantic_ai_harness.scheduling._types import (
 scheduled_run_var: ContextVar[str | None] = ContextVar('scheduled_run', default=None)
 """Id of the schedule running in the current context, or `None`."""
 
+_SAVE_ATTEMPTS = 3
+
 
 @dataclass(frozen=True)
 class _Claim:
@@ -40,7 +42,7 @@ class _Claim:
 class ScheduleRunner(Generic[AgentDepsT]):
     """Execute due schedules against an agent.
 
-    A runner assumes exclusive ownership of its store. Occurrences are advanced
+    A runner assumes no other runner uses its store. Occurrences are advanced
     before agent execution for at-most-once behavior, and `stop()` drains runs
     already in flight before `run_until_stopped()` returns.
     """
@@ -99,59 +101,72 @@ class ScheduleRunner(Generic[AgentDepsT]):
             raise ValueError('No Scheduling capability was found on the agent; pass `store=` explicitly.')
         return found[0].resolved_store
 
-    async def _claim_due(self, now: datetime) -> list[_Claim]:
-        claims: list[_Claim] = []
-        try:
-            for schedule in await self._store.list():
-                due_at = schedule.next_run_at
-                if not schedule.enabled or due_at is None or due_at > now:
-                    continue
+    async def _claim(self, schedule: Schedule, now: datetime) -> _Claim | None:
+        for attempt in range(_SAVE_ATTEMPTS):
+            due_at = schedule.next_run_at
+            if not schedule.enabled or due_at is None or due_at > now:
+                return None
+
+            execute = True
+            should_start = True
+            if schedule.max_runs is not None and schedule.runs_completed >= schedule.max_runs:
+                schedule.next_run_at = None
+                execute = False
+                should_start = False
+            elif schedule.id in self._running:
+                if isinstance(schedule.trigger, (CronTrigger, IntervalTrigger)):  # pragma: no branch
+                    schedule.next_run_at = next_run_time(schedule.trigger, after=now, timezone=schedule.timezone)
+                    execute = False
+                    should_start = False
+                else:  # pragma: no cover - a one-shot cannot become due again while its only run is in flight
+                    return None
+            elif now - due_at > self._misfire_grace and isinstance(schedule.trigger, OnceTrigger):
+                schedule.next_run_at = None
+                schedule.last_status = 'missed'
+                schedule.last_error = 'The runner was not running within the allowed grace period.'
+                execute = False
+            else:
+                if isinstance(schedule.trigger, (CronTrigger, IntervalTrigger)):
+                    schedule.next_run_at = next_run_time(schedule.trigger, after=now, timezone=schedule.timezone)
+                else:
+                    schedule.next_run_at = None
+                schedule.runs_completed += 1
                 if schedule.max_runs is not None and schedule.runs_completed >= schedule.max_runs:
                     schedule.next_run_at = None
-                    await self._store.save(schedule)
-                    continue
-                if schedule.id in self._running:
-                    if isinstance(schedule.trigger, (CronTrigger, IntervalTrigger)):  # pragma: no branch
-                        schedule.next_run_at = next_run_time(schedule.trigger, after=now, timezone=schedule.timezone)
-                        await self._store.save(schedule)
-                    continue
-                self._running.add(schedule.id)
-                try:
-                    overdue = now - due_at > self._misfire_grace
-                    if overdue and isinstance(schedule.trigger, OnceTrigger):
-                        schedule.next_run_at = None
-                        schedule.last_status = 'missed'
-                        schedule.last_error = 'The runner was not running within the allowed grace period.'
-                        await self._store.save(schedule)
-                        claims.append(_Claim(schedule, execute=False, claimed_at=now))
-                        continue
 
-                    if isinstance(schedule.trigger, (CronTrigger, IntervalTrigger)):
-                        schedule.next_run_at = next_run_time(schedule.trigger, after=now, timezone=schedule.timezone)
-                    else:
-                        schedule.next_run_at = None
-                    schedule.runs_completed += 1
-                    if schedule.max_runs is not None and schedule.runs_completed >= schedule.max_runs:
-                        schedule.next_run_at = None
-                    await self._store.save(schedule)
-                    claims.append(_Claim(schedule, execute=True, claimed_at=now))
-                except BaseException:
-                    self._running.discard(schedule.id)
+            try:
+                await self._store.save(schedule)
+            except ScheduleConflictError:
+                if attempt == _SAVE_ATTEMPTS - 1:
                     raise
-        except BaseException:
-            for claim in claims:
-                self._running.discard(claim.schedule.id)
-            raise
-        return claims
+                refreshed = await self._store.get(schedule.id)
+                if refreshed is None:
+                    return None
+                schedule = refreshed
+                continue
+
+            if should_start:
+                self._running.add(schedule.id)
+                return _Claim(schedule, execute=execute, claimed_at=now)
+            return None
+        raise AssertionError('unreachable')  # pragma: no cover
 
     async def _apply_outcome(self, schedule_id: str, fallback: Schedule, apply: Callable[[Schedule], None]) -> Schedule:
-        """Re-read so outcome fields preserve concurrent edits and a deleted schedule stays deleted."""
-        current = await self._store.get(schedule_id)
-        target = current if current is not None else fallback
-        apply(target)
-        if current is not None:
-            await self._store.save(target)
-        return target
+        """Retry against fresh state so outcome fields compose with concurrent edits."""
+        for attempt in range(_SAVE_ATTEMPTS):
+            current = await self._store.get(schedule_id)
+            target = current if current is not None else fallback
+            apply(target)
+            if current is None:
+                return target
+            try:
+                await self._store.save(target)
+            except ScheduleConflictError:
+                if attempt == _SAVE_ATTEMPTS - 1:
+                    raise
+                continue
+            return target
+        raise AssertionError('unreachable')  # pragma: no cover
 
     async def _deliver(self, result: ScheduleResult) -> None:
         if self._on_result is None:
@@ -249,21 +264,36 @@ class ScheduleRunner(Generic[AgentDepsT]):
         if reference.utcoffset() is None:
             raise ValueError('now must be timezone-aware')
         results: list[ScheduleResult] = []
-        claims = await self._claim_due(reference)
+        sweep_error: Exception | None = None
         async with anyio.create_task_group() as task_group:
-            for claim in claims:
-                task_group.start_soon(self._execute_collect, claim, results)
+            try:
+                for schedule in await self._store.list():
+                    claim = await self._claim(schedule, reference)
+                    if claim is not None:
+                        task_group.start_soon(self._execute_collect, claim, results)
+            except Exception as exc:
+                sweep_error = exc
+        if sweep_error is not None:
+            raise sweep_error
         return results
 
     async def run_until_stopped(self) -> None:
         """Claim on each interval until stopped, then drain in-flight runs."""
+        sweep_error: Exception | None = None
         async with anyio.create_task_group() as task_group:
             while not self._stop_event.is_set():
-                claims = await self._claim_due(datetime.now(timezone.utc))
-                for claim in claims:
-                    task_group.start_soon(self._execute, claim)
+                try:
+                    for schedule in await self._store.list():
+                        claim = await self._claim(schedule, datetime.now(timezone.utc))
+                        if claim is not None:
+                            task_group.start_soon(self._execute, claim)
+                except Exception as exc:
+                    sweep_error = exc
+                    break
                 with anyio.move_on_after(self._tick_interval):
                     await self._stop_event.wait()
+        if sweep_error is not None:
+            raise sweep_error
 
     def stop(self) -> None:
         """Request an idempotent graceful stop of the continuous loop."""

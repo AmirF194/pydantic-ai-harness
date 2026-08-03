@@ -10,7 +10,14 @@ from pydantic_ai.models.test import TestModel
 from pydantic_ai.tools import RunContext
 from pydantic_ai.usage import RunUsage
 
-from pydantic_ai_harness.scheduling import InMemoryScheduleStore, IntervalTrigger, OnceTrigger, Schedule, Scheduling
+from pydantic_ai_harness.scheduling import (
+    InMemoryScheduleStore,
+    IntervalTrigger,
+    OnceTrigger,
+    Schedule,
+    ScheduleConflictError,
+    Scheduling,
+)
 
 pytestmark = pytest.mark.anyio
 
@@ -48,6 +55,7 @@ class TestSchedulingTools:
         assert 'Review changes' not in listing
         details = await _call(capability, 'get_schedule', {'schedule_id': schedule_id})
         assert 'prompt: Review changes' in details
+        assert 'version:' not in details
         updated = await _call(
             capability,
             'update_schedule',
@@ -100,11 +108,7 @@ class TestSchedulingTools:
             )
         await _add(capability, _recurring('invalid-update'))
         with pytest.raises(ModelRetry, match='Invalid schedule update'):
-            await _call(
-                capability,
-                'update_schedule',
-                {'schedule_id': 'invalid-update', 'max_runs': 0},
-            )
+            await _call(capability, 'update_schedule', {'schedule_id': 'invalid-update', 'max_runs': -1})
 
     async def test_not_found_lists_known_ids(self) -> None:
         capability = Scheduling[None]()
@@ -190,17 +194,86 @@ class TestSchedulingTools:
         assert stored is not None
         assert stored.runs_completed == 3
 
-    async def test_update_to_once_rejects_existing_max_runs(self) -> None:
+    async def test_update_clears_fields_and_drops_inherited_limit_for_once(self) -> None:
         capability = Scheduling[None]()
         schedule = _recurring('limited')
         schedule.max_runs = 3
+        schedule.deliver_to = 'alerts'
         await _add(capability, schedule)
+
+        await _call(
+            capability,
+            'update_schedule',
+            {'schedule_id': 'limited', 'deliver_to': '', 'max_runs': 0},
+        )
+        cleared = await capability.resolved_store.get('limited')
+        assert cleared is not None
+        assert cleared.deliver_to is None
+        assert cleared.max_runs is None
+
+        cleared.max_runs = 3
+        await capability.resolved_store.save(cleared)
+        await _call(capability, 'update_schedule', {'schedule_id': 'limited', 'schedule': 'in 1h'})
+        converted = await capability.resolved_store.get('limited')
+        assert converted is not None
+        assert isinstance(converted.trigger, OnceTrigger)
+        assert converted.max_runs is None
+
+    async def test_update_to_once_rejects_explicit_max_runs(self) -> None:
+        capability = Scheduling[None]()
+        await _add(capability, _recurring('limited'))
         with pytest.raises(ModelRetry, match='only valid for recurring'):
             await _call(
                 capability,
                 'update_schedule',
-                {'schedule_id': 'limited', 'schedule': 'in 1h'},
+                {'schedule_id': 'limited', 'schedule': 'in 1h', 'max_runs': 2},
             )
+
+    async def test_pause_retries_on_a_concurrent_claim(self) -> None:
+        store = _ClaimAfterReadStore()
+        capability = Scheduling[None](store=store)
+        original = _recurring('racing')
+        original.next_run_at = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        await _add(capability, original)
+
+        await _call(capability, 'pause_schedule', {'schedule_id': 'racing'})
+
+        stored = await store.get('racing')
+        assert stored is not None
+        assert stored.enabled is False
+        assert stored.runs_completed == 1
+        assert stored.next_run_at == datetime(2026, 1, 1, 1, tzinfo=timezone.utc)
+
+    async def test_conflict_retry_exhaustion_is_a_model_retry(self) -> None:
+        store = _AlwaysConflictStore()
+        capability = Scheduling[None](store=store)
+        await _add(capability, _recurring('contended'))
+
+        with pytest.raises(ModelRetry, match='changed while this update was being applied'):
+            await _call(capability, 'pause_schedule', {'schedule_id': 'contended'})
+        assert store.save_attempts == 3
+
+    @pytest.mark.parametrize(
+        ('tool_name', 'arguments', 'paused'),
+        [
+            ('update_schedule', {'name': 'updated'}, False),
+            ('resume_schedule', {}, True),
+            ('run_schedule_now', {}, False),
+        ],
+    )
+    async def test_mutating_tools_retry_a_conflict(
+        self, tool_name: str, arguments: dict[str, object], paused: bool
+    ) -> None:
+        store = _ConflictOnceStore()
+        capability = Scheduling[None](store=store)
+        schedule = _recurring(tool_name)
+        schedule.enabled = not paused
+        await _add(capability, schedule)
+        arguments['schedule_id'] = tool_name
+
+        await _call(capability, tool_name, arguments)
+
+        assert store.save_attempts == 2
 
     async def test_pause_resume_recomputes_and_run_now_queues(self) -> None:
         capability = Scheduling[None]()
@@ -274,6 +347,46 @@ def _recurring(schedule_id: str) -> Schedule:
         trigger=IntervalTrigger(every=timedelta(hours=1)),
         next_run_at=datetime(2026, 1, 1, tzinfo=timezone.utc),
     )
+
+
+class _ClaimAfterReadStore(InMemoryScheduleStore):
+    def __init__(self) -> None:
+        super().__init__()
+        self._injected = False
+
+    async def get(self, schedule_id: str) -> Schedule | None:
+        read = await super().get(schedule_id)
+        if read is not None and not self._injected:
+            self._injected = True
+            claimed = await super().get(schedule_id)
+            assert claimed is not None
+            claimed.runs_completed += 1
+            claimed.next_run_at = claimed.next_run_at + timedelta(hours=1) if claimed.next_run_at is not None else None
+            await super().save(claimed)
+        return read
+
+
+class _AlwaysConflictStore(InMemoryScheduleStore):
+    def __init__(self) -> None:
+        super().__init__()
+        self.save_attempts = 0
+
+    async def save(self, schedule: Schedule) -> None:
+        del schedule
+        self.save_attempts += 1
+        raise ScheduleConflictError('forced conflict')
+
+
+class _ConflictOnceStore(InMemoryScheduleStore):
+    def __init__(self) -> None:
+        super().__init__()
+        self.save_attempts = 0
+
+    async def save(self, schedule: Schedule) -> None:
+        self.save_attempts += 1
+        if self.save_attempts == 1:
+            raise ScheduleConflictError('forced conflict')
+        await super().save(schedule)
 
 
 class TestToolsetIdentity:

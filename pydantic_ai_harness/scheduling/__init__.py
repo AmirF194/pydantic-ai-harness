@@ -4,7 +4,12 @@ from __future__ import annotations
 
 from pydantic_ai_harness.scheduling._capability import Scheduling
 from pydantic_ai_harness.scheduling._runner import ScheduleRunner
-from pydantic_ai_harness.scheduling._store import InMemoryScheduleStore, ScheduleStore, SqliteScheduleStore
+from pydantic_ai_harness.scheduling._store import (
+    InMemoryScheduleStore,
+    ScheduleConflictError,
+    ScheduleStore,
+    SqliteScheduleStore,
+)
 from pydantic_ai_harness.scheduling._types import (
     CronTrigger,
     IntervalTrigger,
@@ -22,6 +27,7 @@ __all__ = [
     'IntervalTrigger',
     'OnceTrigger',
     'Schedule',
+    'ScheduleConflictError',
     'ScheduleResult',
     'ScheduleResultCallback',
     'ScheduleRunner',

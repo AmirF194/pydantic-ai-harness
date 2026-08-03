@@ -146,6 +146,8 @@ class Schedule(BaseModel):
     """A persisted scheduled agent run."""
 
     id: str = Field(default_factory=lambda: uuid4().hex[:12])
+    version: int = 0
+    """Store-managed revision used for optimistic concurrency control."""
     name: str
     prompt: str
     trigger: ScheduleTrigger

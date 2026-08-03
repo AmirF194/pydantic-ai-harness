@@ -17,6 +17,7 @@ from pydantic_ai_harness.scheduling import (
     IntervalTrigger,
     OnceTrigger,
     Schedule,
+    ScheduleConflictError,
     ScheduleResult,
     ScheduleResultCallback,
     ScheduleRunner,
@@ -154,16 +155,24 @@ class TestScheduleRunnerExecution:
         with pytest.raises(ValueError, match='run_timeout'):
             ScheduleRunner(agent, deps=None, store=store, run_timeout=0)
 
-    async def test_partial_claim_failure_releases_every_overlap_guard(self) -> None:
+    async def test_partial_claim_failure_drains_started_occurrences_before_raising(self) -> None:
         store = _FailSecondScheduleStore()
         await store.add(_schedule('first'))
         await store.add(_schedule('second'))
         runner = ScheduleRunner(Agent(TestModel()), deps=None, store=store)
         with pytest.raises(RuntimeError, match='save failed'):
             await runner.tick(NOW)
-        results = await runner.tick(NOW + timedelta(hours=1))
-        assert {result.schedule.id for result in results} == {'first', 'second'}
-        assert all(result.status == 'success' for result in results)
+        first = await store.get('first')
+        second = await store.get('second')
+        assert first is not None
+        assert second is not None
+        assert first.runs_completed == 1
+        assert first.last_status == 'success'
+        assert second.runs_completed == 0
+
+        results = await runner.tick(NOW)
+        assert [result.schedule.id for result in results] == ['second']
+        assert results[0].status == 'success'
 
     async def test_queued_exhausted_schedule_completes_without_agent_call(self) -> None:
         calls = 0
@@ -294,7 +303,108 @@ class _FailSecondScheduleStore(InMemoryScheduleStore):
         await super().save(schedule)
 
 
+class _PauseOnClaimStore(InMemoryScheduleStore):
+    def __init__(self) -> None:
+        super().__init__()
+        self._injected = False
+
+    async def save(self, schedule: Schedule) -> None:
+        if schedule.runs_completed == 1 and not self._injected:  # pragma: no branch
+            self._injected = True
+            current = await super().get(schedule.id)
+            assert current is not None
+            current.enabled = False
+            await super().save(current)
+        await super().save(schedule)
+
+
+class _DeleteOnClaimConflictStore(InMemoryScheduleStore):
+    async def save(self, schedule: Schedule) -> None:
+        if schedule.runs_completed == 1:  # pragma: no branch
+            await self.remove(schedule.id)
+            raise ScheduleConflictError('deleted during claim')
+        await super().save(schedule)  # pragma: no cover - only claim saves use this test store
+
+
+class _AlwaysConflictOnClaimStore(InMemoryScheduleStore):
+    async def save(self, schedule: Schedule) -> None:
+        del schedule
+        raise ScheduleConflictError('forced claim conflict')
+
+
+class _EditOnOutcomeStore(InMemoryScheduleStore):
+    def __init__(self) -> None:
+        super().__init__()
+        self._injected = False
+
+    async def save(self, schedule: Schedule) -> None:
+        if schedule.last_status == 'success' and not self._injected:
+            self._injected = True
+            current = await super().get(schedule.id)
+            assert current is not None
+            current.name = 'concurrent edit'
+            await super().save(current)
+        await super().save(schedule)
+
+
+class _AlwaysConflictOnOutcomeStore(InMemoryScheduleStore):
+    async def save(self, schedule: Schedule) -> None:
+        if schedule.last_status is not None:
+            raise ScheduleConflictError('forced outcome conflict')
+        await super().save(schedule)
+
+
 class TestConcurrencyAndLoop:
+    async def test_claim_conflict_rechecks_current_state(self) -> None:
+        store = _PauseOnClaimStore()
+        await store.add(_schedule('paused-before-claim'))
+
+        results = await ScheduleRunner(Agent(TestModel()), deps=None, store=store).tick(NOW)
+
+        assert results == []
+        stored = await store.get('paused-before-claim')
+        assert stored is not None
+        assert stored.enabled is False
+        assert stored.runs_completed == 0
+        assert stored.next_run_at == NOW
+
+    async def test_claim_conflict_skips_a_deleted_schedule(self) -> None:
+        store = _DeleteOnClaimConflictStore()
+        await store.add(_schedule('deleted-before-retry'))
+
+        assert await ScheduleRunner(Agent(TestModel()), deps=None, store=store).tick(NOW) == []
+        assert await store.get('deleted-before-retry') is None
+
+    async def test_claim_conflict_exhaustion_propagates(self) -> None:
+        store = _AlwaysConflictOnClaimStore()
+        await store.add(_schedule('contended-claim'))
+
+        with pytest.raises(ScheduleConflictError, match='forced claim conflict'):
+            await ScheduleRunner(Agent(TestModel()), deps=None, store=store).tick(NOW)
+
+    async def test_outcome_conflict_preserves_concurrent_edit(self) -> None:
+        store = _EditOnOutcomeStore()
+        await store.add(_schedule('edited-during-outcome'))
+
+        result = (await ScheduleRunner(Agent(TestModel(custom_output_text='done')), deps=None, store=store).tick(NOW))[
+            0
+        ]
+
+        assert result.status == 'success'
+        assert result.schedule.name == 'concurrent edit'
+        stored = await store.get('edited-during-outcome')
+        assert stored is not None
+        assert stored.name == 'concurrent edit'
+        assert stored.last_status == 'success'
+        assert stored.last_output == 'done'
+
+    async def test_outcome_conflict_exhaustion_propagates(self) -> None:
+        store = _AlwaysConflictOnOutcomeStore()
+        await store.add(_schedule('contended-outcome'))
+
+        with pytest.RaisesGroup(pytest.RaisesExc(ScheduleConflictError, match='forced outcome conflict')):
+            await ScheduleRunner(Agent(TestModel()), deps=None, store=store).tick(NOW)
+
     async def test_overlap_guard_skips_same_schedule(self) -> None:
         started = anyio.Event()
         release = anyio.Event()
@@ -425,6 +535,33 @@ class TestConcurrencyAndLoop:
         )
         with anyio.fail_after(1):
             await runner.run_until_stopped()
+
+    async def test_run_until_stopped_drains_started_occurrences_before_raising(self) -> None:
+        store = _FailSecondScheduleStore()
+        await store.add(_schedule('first'))
+        await store.add(_schedule('second'))
+        delivered: list[str] = []
+        runner = ScheduleRunner(
+            Agent(TestModel()),
+            deps=None,
+            store=store,
+            on_result=lambda result: delivered.append(result.schedule.id),
+            tick_interval=0.01,
+        )
+
+        with pytest.raises(RuntimeError, match='save failed'):
+            await runner.run_until_stopped()
+        assert delivered == ['first']
+
+    async def test_run_until_stopped_skips_future_schedules(self) -> None:
+        store = InMemoryScheduleStore()
+        await store.add(_schedule('future', due_at=datetime.now(timezone.utc) + timedelta(hours=1)))
+        runner = ScheduleRunner(Agent(TestModel()), deps=None, store=store, tick_interval=0.01)
+
+        async with anyio.create_task_group() as task_group:
+            task_group.start_soon(runner.run_until_stopped)
+            await anyio.sleep(0.02)
+            runner.stop()
 
 
 class TestScheduledRunRecursionGuard:

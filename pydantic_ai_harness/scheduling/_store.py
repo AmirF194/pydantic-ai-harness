@@ -14,13 +14,16 @@ from pydantic_ai_harness.scheduling._types import Schedule
 _VALID_TABLE_RE = re.compile(r'[A-Za-z_][A-Za-z0-9_]{0,62}')
 
 
+class ScheduleConflictError(Exception):
+    """Raised when a schedule save uses a stale version."""
+
+
 @runtime_checkable
 class ScheduleStore(Protocol):
     """Async whole-record storage for schedules.
 
-    Use one runner per store. The protocol's read-modify-write operations are
-    not atomic, so concurrent writers such as a second runner or tool calls
-    while a run is in flight can interleave with last-write-wins results.
+    Use one runner per store. Writers must re-read and retry when `save` raises
+    `ScheduleConflictError` because another writer changed the record.
     """
 
     async def add(self, schedule: Schedule) -> Schedule:
@@ -36,7 +39,7 @@ class ScheduleStore(Protocol):
         ...  # pragma: no cover
 
     async def save(self, schedule: Schedule) -> None:
-        """Replace an existing schedule, raising `ValueError` for an unknown id."""
+        """Replace a matching version with `version + 1`, or raise on conflict or unknown id."""
         ...  # pragma: no cover
 
     async def remove(self, schedule_id: str) -> bool:
@@ -68,10 +71,13 @@ class InMemoryScheduleStore:
         return [schedule.model_copy(deep=True) for schedule in self._schedules.values()]
 
     async def save(self, schedule: Schedule) -> None:
-        """Replace an existing schedule with a deep copy."""
-        if schedule.id not in self._schedules:
+        """Replace a matching version with a bumped deep copy."""
+        stored = self._schedules.get(schedule.id)
+        if stored is None:
             raise ValueError(f'Unknown schedule id {schedule.id!r}.')
-        self._schedules[schedule.id] = schedule.model_copy(deep=True)
+        if schedule.version != stored.version:
+            raise ScheduleConflictError(f'Schedule {schedule.id!r} changed since it was read.')
+        self._schedules[schedule.id] = schedule.model_copy(update={'version': schedule.version + 1}, deep=True)
 
     async def remove(self, schedule_id: str) -> bool:
         """Remove a schedule and return whether it existed."""
@@ -102,7 +108,7 @@ class SqliteScheduleStore:
         connection = sqlite3.connect(self._database)
         if not self._ready:
             connection.execute(
-                f'CREATE TABLE IF NOT EXISTS {self._table} '
+                f'CREATE TABLE IF NOT EXISTS "{self._table}" '
                 '(seq INTEGER PRIMARY KEY AUTOINCREMENT, id TEXT UNIQUE NOT NULL, data TEXT NOT NULL)'
             )
             connection.commit()
@@ -114,7 +120,7 @@ class SqliteScheduleStore:
             connection = self._connect()
             try:
                 connection.execute(
-                    f'INSERT INTO {self._table} (id, data) VALUES (?, ?)',
+                    f'INSERT INTO "{self._table}" (id, data) VALUES (?, ?)',
                     (schedule.id, schedule.model_dump_json()),
                 )
                 connection.commit()
@@ -127,7 +133,7 @@ class SqliteScheduleStore:
         with self._lock:
             connection = self._connect()
             try:
-                row = connection.execute(f'SELECT data FROM {self._table} WHERE id = ?', (schedule_id,)).fetchone()
+                row = connection.execute(f'SELECT data FROM "{self._table}" WHERE id = ?', (schedule_id,)).fetchone()
             finally:
                 connection.close()
         return None if row is None else Schedule.model_validate_json(str(row[0]))
@@ -136,7 +142,7 @@ class SqliteScheduleStore:
         with self._lock:
             connection = self._connect()
             try:
-                rows = connection.execute(f'SELECT data FROM {self._table} ORDER BY seq').fetchall()
+                rows = connection.execute(f'SELECT data FROM "{self._table}" ORDER BY seq').fetchall()
             finally:
                 connection.close()
         return [Schedule.model_validate_json(str(row[0])) for row in rows]
@@ -145,12 +151,17 @@ class SqliteScheduleStore:
         with self._lock:
             connection = self._connect()
             try:
-                cursor = connection.execute(
-                    f'UPDATE {self._table} SET data = ? WHERE id = ?',
-                    (schedule.model_dump_json(), schedule.id),
-                )
-                if cursor.rowcount == 0:
+                row = connection.execute(f'SELECT data FROM "{self._table}" WHERE id = ?', (schedule.id,)).fetchone()
+                if row is None:
                     raise ValueError(f'Unknown schedule id {schedule.id!r}.')
+                stored = Schedule.model_validate_json(str(row[0]))
+                if schedule.version != stored.version:
+                    raise ScheduleConflictError(f'Schedule {schedule.id!r} changed since it was read.')
+                bumped = schedule.model_copy(update={'version': schedule.version + 1}, deep=True)
+                connection.execute(
+                    f'UPDATE "{self._table}" SET data = ? WHERE id = ?',
+                    (bumped.model_dump_json(), schedule.id),
+                )
                 connection.commit()
             finally:
                 connection.close()
@@ -159,7 +170,7 @@ class SqliteScheduleStore:
         with self._lock:
             connection = self._connect()
             try:
-                cursor = connection.execute(f'DELETE FROM {self._table} WHERE id = ?', (schedule_id,))
+                cursor = connection.execute(f'DELETE FROM "{self._table}" WHERE id = ?', (schedule_id,))
                 connection.commit()
                 return cursor.rowcount > 0
             finally:
@@ -179,7 +190,7 @@ class SqliteScheduleStore:
         return await anyio.to_thread.run_sync(self._list_sync)
 
     async def save(self, schedule: Schedule) -> None:
-        """Replace an existing persisted schedule."""
+        """Replace a matching persisted version with a bumped version."""
         await anyio.to_thread.run_sync(self._save_sync, schedule)
 
     async def remove(self, schedule_id: str) -> bool:

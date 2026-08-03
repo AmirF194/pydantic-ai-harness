@@ -13,6 +13,7 @@ from pydantic_ai_harness.scheduling import (
     InMemoryScheduleStore,
     IntervalTrigger,
     Schedule,
+    ScheduleConflictError,
     ScheduleStore,
     SqliteScheduleStore,
 )
@@ -57,7 +58,13 @@ class TestScheduleStoreCrud:
         first.name = 'Changed'
         assert (await store.get('first')).name == 'First'  # type: ignore[union-attr]
         await store.save(first)
-        assert (await store.get('first')).name == 'Changed'  # type: ignore[union-attr]
+        persisted = await store.get('first')
+        assert persisted is not None
+        assert persisted.name == 'Changed'
+        assert persisted.version == 1
+        assert (await store.list())[0].version == 1
+        with pytest.raises(ScheduleConflictError, match='changed since it was read'):
+            await store.save(first)
         assert await store.remove('first') is True
         assert await store.get('first') is None
 
@@ -97,3 +104,14 @@ class TestSqliteScheduleStore:
         loaded = await SqliteScheduleStore(database).get('kept')
         assert loaded is not None
         assert loaded.model_dump() == expected.model_dump()
+
+    async def test_reserved_word_table_name(self, tmp_path: Path) -> None:
+        store = SqliteScheduleStore(str(tmp_path / 'reserved.db'), table='select')
+        added = await store.add(_schedule('quoted'))
+        added.name = 'updated'
+        await store.save(added)
+        loaded = await store.get('quoted')
+        assert loaded is not None
+        assert loaded.name == 'updated'
+        assert [schedule.id for schedule in await store.list()] == ['quoted']
+        assert await store.remove('quoted') is True
