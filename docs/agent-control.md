@@ -255,6 +255,8 @@ to understand costs more than the part that contains it:
 - **A value it can't act on** -- a `thinking` effort level or `service_tier` a newer Pydantic AI
   accepts, a tool entry with no `name`, an instruction entry with empty text -- drops that one
   setting, that one tool, that one block.
+- **Malformed sections degrade locally.** A wrong settings or tool-definitions container drops that
+  section; malformed settings keys drop independently; valid sibling sections still apply.
 
 Every drop warns once per process, naming the offending value, because a config resolves on every
 single run and a per-run warning would bury the signal in its own repetition.
@@ -274,11 +276,21 @@ the variable is persistent and visible to everyone with access to the project, t
 back into that project: a log record on success, and a log record plus a `UserWarning` on failure. Opt
 out with `auto_create=False`.
 
+Inside a Temporal, DBOS, or other Pydantic AI durable workflow or flow, managed config remains
+readable. Auto-create and baseline publishing are skipped with one warning because background threads
+and remote writes are not replay-safe there. Create the variable in the Logfire UI, or run the SDK
+outside the workflow once to perform the write-backs.
+
 The variable's `example` is an `AgentConfig`-shaped snapshot of the code-side agent, which is
 what the UI's editor and Logfire's optimizer diff managed values against. Instructions are snapshotted
 **per block**, each with the `id` that addresses it and its `dynamic` flag -- which is what makes a
 per-block override offerable in the first place. The joined prompt a trace records has no seams in it,
 so a baseline built from telemetry alone could only ever be copied wholesale.
+
+The snapshot means what the agent would do with `AgentControl` removed. The capability records the
+code model and settings before replacing them and the original tool definitions before applying
+renames or descriptions. It excludes its own instruction contribution by capability id. This avoids
+trying to reverse managed behavior out of an already assembled request.
 
 `AgentControl` publishes that snapshot in the background after the first model request that exposes a
 baseline. It compares against the provider's current definition first, so an unchanged baseline
@@ -311,6 +323,9 @@ them apart, or to deliberately share one config across agents. `targeting_key`, 
 
 - **Resolves once per run.** A label flip that lands mid-run is picked up by the next run, not this
   one -- the trade-off for a run-stable config and a single baggage scope across all child spans.
+- **Callable targeting is consistent with model selection.** Static or callable `targeting_key` and
+  `attributes` are evaluated for model selection once, and the run reuses that exact resolution.
+  An unknown managed model warns and keeps the code model.
 - **Overrides apply at the last moment.** Instruction overrides are applied in `before_model_request`,
   the one point at which every contribution exists, which is what lets an entry reach a toolset's or
   an MCP server's text. They land on

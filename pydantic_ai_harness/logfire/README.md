@@ -59,11 +59,16 @@ thread, is attempted at most once per process per variable and Logfire instance,
 fails the run. Because the variable it writes is persistent and visible to everyone with access to
 the project, the outcome is reported into that same Logfire project: a log record on success, and a
 log record plus a `UserWarning` on failure. Opt out per capability with `auto_create=False`.
+Inside a durable workflow or flow, managed values remain readable but auto-create and baseline
+publishing are skipped with one warning: their background threads and remote writes are not replay-safe.
+Create the variable in the Logfire UI, or run the SDK outside the workflow once.
 
 `AgentControl` additionally publishes the variable's `example` as an `AgentConfig`-shaped snapshot of
 the code-side agent (instructions, model, effective settings, and each tool's description and
 parameter descriptions) -- the baseline the Logfire UI's override editor and optimizer diff managed
-values against. It publishes in the background after the first model request that exposes a new
+values against. Each component is recorded at the point before `AgentControl` replaces it, so managed
+settings, renamed tools, and managed instructions are not mistaken for code. It publishes in the
+background after the first model request that exposes a new
 snapshot. An unchanged baseline causes no write; a changed one is published at most once per process. The
 provider's current complete definition is copied and only `example` is replaced, preserving labels,
 rollout, overrides, and other metadata. The snapshot is taken from the triggering request, so
@@ -71,8 +76,8 @@ for instructions or a toolset that vary with `deps`, run input, or the step with
 point-in-time sample rather than a description of the agent. An agent that never reaches a model
 request never publishes a baseline.
 
-Its `instructions` list one entry per instruction block the model was sent -- the agent's own text,
-this capability's contribution, each toolset's -- each carrying the `id` that addresses it and a
+Its `instructions` list one entry per code-defined instruction block -- the agent's own text and each
+toolset's, but not `AgentControl`'s managed contribution -- each carrying the `id` that addresses it and a
 `dynamic` flag. That is what the UI needs to offer an override per block: the joined prompt a trace
 records has no seams in it, so a baseline built from telemetry alone could only ever be copied
 wholesale, and copying it wholesale is exactly [the mistake](#where-your-base-prompt-lives) of
@@ -493,10 +498,9 @@ Only `agent.override(instructions=...)` replaces the lot, and a capability can't
 - **Model precedence:** the managed `model` is sourced during model selection via the capability's
   `get_model` hook, so it slots in with the right precedence -- a call-site `run(model=...)` beats
   it, it beats the agent's constructor model, and a fully model-less agent (named or nameless) can be
-  driven entirely from Logfire. A named capability sources it statically (once per run); a nameless
-  one derives its variable from the agent when the model is first selected and then reuses that
-  choice for the run. Callable `targeting_key`/`attributes` don't participate in model selection (it
-  runs before a run context exists) -- only the static `label` and static targeting inputs do.
+  driven entirely from Logfire. Model selection evaluates static or callable targeting inputs once,
+  and the authoritative run resolution reuses that exact result. An unknown managed model warns and
+  keeps the code model instead of failing the run.
 - **Settings precedence:** managed settings merge **over** the agent's constructor `model_settings`
   and **under** per-run `model_settings=`, so run arguments always win.
 - **Adoption reporting:** for the run's duration, `logfire.managed.applied_sections` baggage names
@@ -516,7 +520,9 @@ Only `agent.override(instructions=...)` replaces the lot, and a capability can't
   override; an instruction entry that doesn't validate (an empty text, an entry naming neither what nor
   where) drops just that block -- each with a warning naming the offending value, emitted once per
   process so a per-run resolution can't turn it into noise. Everything else in the config still
-  applies. Each list entry is a unit of degradation for the same reason: it addresses exactly one
+  applies. A malformed settings key drops independently, and a wrong instructions, settings, or
+  tool-definitions container drops only that section. Each list entry is a unit of degradation for
+  the same reason: it addresses exactly one
   thing, so dropping it costs exactly that thing. The
   alternative isn't stricter, it's blunter: an `AgentConfig` that fails validation falls back to the
   code-defined agent *whole*, so one unfamiliar enum value would silently un-manage the instructions,

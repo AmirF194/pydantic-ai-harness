@@ -202,34 +202,24 @@ def test_repeated_resolutions_warn_once() -> None:
     ]
 
 
-def test_malformed_sections_are_left_to_pydantic() -> None:
-    # No validator can assume it was handed the shape it degrades entries within. A section that is
-    # not a list (or a mapping, for `settings`) is malformed rather than merely newer -- the stored
-    # schema rejects it at write time -- so it stays a validation error, and the whole value degrades
-    # to code through Logfire's resolution fallback. `tool_definitions` as a mapping is the one that
-    # can really turn up: it is the shape this section had before entries named the tool they patch.
+def test_malformed_sections_drop_without_losing_siblings() -> None:
+    # Remote values can predate the stored schema or bypass its editor. Degrading the smallest section
+    # keeps unrelated managed behavior active instead of reverting the complete config to code.
     malformed: list[dict[str, Any]] = [
         {'settings': 'nope'},
         {'tool_definitions': {'get_weather': {}}},
         {'instructions': 5},
     ]
-    with warnings.catch_warnings(record=True) as caught:
-        for value in malformed:
-            with pytest.raises(ValidationError):
-                AgentConfig.model_validate(value)
-        with pytest.raises(ValidationError):
-            AgentConfigSettings.model_validate(['nope'])
-    assert caught == []
+    for value in malformed:
+        with pytest.warns(UserWarning):
+            assert AgentConfig.model_validate({**value, 'model': 'test'}) == AgentConfig(model='test')
+    with pytest.raises(ValidationError):
+        AgentConfigSettings.model_validate(['nope'])
 
 
-def test_a_bare_empty_instructions_string_fails_the_whole_config() -> None:
-    # An entry inside a list is dropped because its siblings can still be applied. A bare string *is*
-    # the whole section, so there is no sibling to rescue and nothing to prefer over the ordinary
-    # validation error -- which reverts the config to code, the right outcome for a value this empty.
-    with warnings.catch_warnings(record=True) as caught:
-        with pytest.raises(ValidationError, match='String should have at least 1 character'):
-            AgentConfig.model_validate({'instructions': ''})
-    assert caught == []
+def test_a_bare_empty_instructions_string_drops_without_losing_siblings() -> None:
+    with pytest.warns(UserWarning, match='instructions section is invalid'):
+        assert AgentConfig.model_validate({'instructions': '', 'model': 'test'}) == AgentConfig(model='test')
 
 
 async def test_agent_keeps_managed_config_around_a_dropped_setting() -> None:

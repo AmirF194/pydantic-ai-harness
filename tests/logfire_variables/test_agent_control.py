@@ -182,13 +182,18 @@ TOOLSET_BLOCK = ('toolset:weather', 'TOOLSET: call get_weather first.', True)
         pytest.param(
             'blocks_bare',
             {'instructions': 'MANAGED: be brief.'},
-            [AGENT_BLOCK, TODAY_BLOCK, (None, 'MANAGED: be brief.', True), TOOLSET_BLOCK],
+            [AGENT_BLOCK, TODAY_BLOCK, ('capability:agent-control', 'MANAGED: be brief.', True), TOOLSET_BLOCK],
             id='bare-string-adds-a-block',
         ),
         pytest.param(
             'blocks_list',
             {'instructions': ['MANAGED: be brief.', 'MANAGED: cite sources.']},
-            [AGENT_BLOCK, TODAY_BLOCK, (None, 'MANAGED: be brief.\n\nMANAGED: cite sources.', True), TOOLSET_BLOCK],
+            [
+                AGENT_BLOCK,
+                TODAY_BLOCK,
+                ('capability:agent-control', 'MANAGED: be brief.\n\nMANAGED: cite sources.', True),
+                TOOLSET_BLOCK,
+            ],
             id='two-added-blocks-join-into-one-contribution',
         ),
         pytest.param(
@@ -197,7 +202,7 @@ TOOLSET_BLOCK = ('toolset:weather', 'TOOLSET: call get_weather first.', True)
             [
                 ('agent', 'REMOTE: refund specialist.', False),
                 TODAY_BLOCK,
-                (None, 'MANAGED: be brief.', True),
+                ('capability:agent-control', 'MANAGED: be brief.', True),
                 TOOLSET_BLOCK,
             ],
             id='one-list-can-add-and-address',
@@ -381,6 +386,23 @@ def test_agent_config_ignores_forward_keys() -> None:
     assert AgentConfig.model_validate({'instructions': 'x', 'future': True}) == AgentConfig(instructions='x')
 
 
+@pytest.mark.parametrize(
+    'value,expected',
+    [
+        ({'instructions': '', 'model': 'test'}, AgentConfig(model='test')),
+        (
+            {'instructions': 'managed', 'settings': {'temperature': 'bad', 'max_tokens': 10}},
+            AgentConfig(instructions='managed', settings=AgentConfigSettings(max_tokens=10)),
+        ),
+        ({'instructions': 'managed', 'settings': []}, AgentConfig(instructions='managed')),
+        ({'instructions': 'managed', 'tool_definitions': {}}, AgentConfig(instructions='managed')),
+    ],
+)
+def test_malformed_sections_degrade_independently(value: dict[str, Any], expected: AgentConfig) -> None:
+    with pytest.warns(UserWarning):
+        assert AgentConfig.model_validate(value) == expected
+
+
 def test_prebuilt_variable() -> None:
     variable = Variable(
         'agent__prebuilt',
@@ -388,7 +410,11 @@ def test_prebuilt_variable() -> None:
         default=AgentConfig(model='test'),
         logfire_instance=logfire.DEFAULT_LOGFIRE_INSTANCE,
     )
-    assert AgentControl(variable).get_model() == 'test'
+    assert callable(AgentControl(variable).get_model())
+
+
+def test_explicit_capability_id_is_preserved() -> None:
+    assert AgentControl('explicit_id', id='custom').id == 'custom'
 
 
 async def test_auto_create_uses_request_snapshot(capfire: CaptureLogfire, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -554,6 +580,43 @@ async def test_existing_variable_publishes_changed_baseline_once_without_clobber
         assert updated.model_copy(update={'example': original.example}) == original
 
 
+async def test_published_baseline_contains_only_code_side_behavior(
+    capfire: CaptureLogfire, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(_agent_control, '_spawn_baseline_publish', _agent_control._publish_baseline)
+    managed = {
+        'instructions': 'MANAGED instruction.',
+        'model': 'test',
+        'settings': {'temperature': 0.77},
+        'tool_definitions': [{'name': 'get_weather', 'new_name': 'weather_now', 'description': 'Managed description.'}],
+    }
+    config = published_value('agent__code_only_baseline', managed)
+    with variables_provider(capfire, config):
+        provider = logfire.DEFAULT_LOGFIRE_INSTANCE.config.get_variable_provider()
+        updates: list[VariableConfig] = []
+        original_update = provider.update_variable
+
+        def record_update(name: str, updated: VariableConfig) -> VariableConfig:
+            updates.append(updated)
+            return original_update(name, updated)
+
+        monkeypatch.setattr(provider, 'update_variable', record_update)
+        await Agent(
+            FunctionModel(lambda _messages, _info: ModelResponse(parts=[TextPart('done')])),
+            instructions='CODE instruction.',
+            model_settings={'temperature': 0.1},
+            tools=[get_weather],
+            capabilities=[AgentControl('code_only_baseline', label='production')],
+        ).run('hello')
+
+    assert json.loads(updates[0].example or '{}') == {
+        'instructions': [{'id': 'agent', 'instructions': 'CODE instruction.', 'dynamic': False}],
+        'model': 'function:function:<lambda>:',
+        'settings': {'temperature': 0.1},
+        'tool_definitions': [{'name': 'get_weather'}],
+    }
+
+
 async def test_baseline_publish_failure_does_not_affect_run_and_warns_once(
     capfire: CaptureLogfire, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -581,6 +644,17 @@ async def test_baseline_publish_failure_does_not_affect_run_and_warns_once(
     assert len(caught) == 1
     assert first.output.startswith('success')
     assert second.output.startswith('success')
+
+
+async def test_non_json_baseline_setting_does_not_affect_run(capfire: CaptureLogfire) -> None:
+    with variables_provider(capfire, published_value('agent__non_json_baseline', {})):
+        with pytest.warns(UserWarning, match='Failed to publish the code baseline'):
+            result = await Agent(
+                TestModel(),
+                model_settings={'extra_body': object()},
+                capabilities=[AgentControl('non_json_baseline')],
+            ).run('hello')
+    assert result.output.startswith('success')
 
 
 async def test_publish_baseline_opt_out(capfire: CaptureLogfire, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -756,17 +830,26 @@ async def test_managed_model_runs_model_less_agent_and_run_model_wins() -> None:
     assert result.output == 'call-site'
 
 
+async def test_unknown_managed_model_keeps_code_model() -> None:
+    with pytest.warns(UserWarning, match='selects unknown model'):
+        result = await Agent(
+            TestModel(),
+            capabilities=[AgentControl('unknown_model', default=AgentConfig(model='not-a-provider:not-a-model'))],
+        ).run('hello')
+    assert result.output.startswith('success')
+
+
 async def test_nameless_model_selector_resolves_once_per_run(monkeypatch: pytest.MonkeyPatch) -> None:
     # A nameless capability's selector is evaluated once per request step, but the managed model is a
     # run-stable value, so it memoizes and resolves the variable exactly once even across steps.
     resolves: list[str] = []
-    original = AgentControl[Any]._resolve_model_value
+    original = AgentControl[Any]._resolve_for_selection
 
-    def counting(self: AgentControl[Any], variable: Variable[Any]) -> str | None:
+    def counting(self: AgentControl[Any], variable: Variable[Any], ctx: Any) -> Any:
         resolves.append(variable.name)
-        return original(self, variable)
+        return original(self, variable, ctx)
 
-    monkeypatch.setattr(AgentControl, '_resolve_model_value', counting)
+    monkeypatch.setattr(AgentControl, '_resolve_for_selection', counting)
 
     def a_tool() -> str:
         return 'ok'
@@ -775,6 +858,22 @@ async def test_nameless_model_selector_resolves_once_per_run(monkeypatch: pytest
     # A model-less agent with one tool: `TestModel` calls the tool (step 1) then answers (step 2).
     await Agent(None, name='multi_step', tools=[a_tool], capabilities=[capability]).run('hello')
     assert resolves == ['agent__multi_step']
+
+
+async def test_callable_targeting_resolution_is_reused_for_run() -> None:
+    calls = 0
+
+    def targeting(_ctx: RunContext[object]) -> str:
+        nonlocal calls
+        calls += 1
+        return f'key-{calls}'
+
+    capability = AgentControl(
+        'callable_targeting', default=AgentConfig(model='test'), targeting_key=targeting, publish_baseline=False
+    )
+    result = await Agent(TestModel(), capabilities=[capability]).run('hello')
+    assert result.output.startswith('success')
+    assert calls == 1
 
 
 async def test_known_variable_skips_snapshot_build(capfire: CaptureLogfire, monkeypatch: pytest.MonkeyPatch) -> None:

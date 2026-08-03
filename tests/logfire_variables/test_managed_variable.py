@@ -11,13 +11,20 @@ prefix, value type, and default into this base correctly, plus its capability-sp
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, cast
+from typing import Any, ClassVar, cast
 
 import logfire
 import pytest
 from logfire.variables import Variable
+from pydantic_ai import Agent, RunContext
+from pydantic_ai.models.test import TestModel
+from pydantic_ai.usage import RunUsage
 
-from pydantic_ai_harness.logfire._managed_variable import ManagedVariableCapability, resolution_reason
+from pydantic_ai_harness.logfire._managed_variable import (
+    ManagedVariableCapability,
+    _in_durable_context,
+    resolution_reason,
+)
 
 _PREFIX = 'var__'
 
@@ -31,6 +38,23 @@ class _StrVariable(ManagedVariableCapability[None, str]):
     def __post_init__(self) -> None:
         self._resolved = self._new_resolved()
         self._variable = self._build_managed_variable(self.raw_name, prefix=_PREFIX, value_type=str, default='')
+
+
+@dataclass
+class _NoAutoStrVariable(_StrVariable):
+    _auto_create_in_wrap_run: ClassVar[bool] = False
+
+
+def test_context_without_capability_tree_is_not_durable() -> None:
+    ctx = RunContext(deps=None, model=TestModel(), usage=RunUsage())
+    assert not _in_durable_context(ctx)
+
+
+async def test_base_wrap_run_can_disable_auto_create() -> None:
+    capability = _NoAutoStrVariable('no_auto')
+    assert (
+        await Agent[None](TestModel(), deps_type=type(None), capabilities=[capability]).run('hello', deps=None)
+    ).output.startswith('success')
 
 
 @dataclass
@@ -86,6 +110,14 @@ def test_resolution_reason_falls_back_to_private_reason() -> None:
         _reason = 'unrecognized_variable'
 
     assert resolution_reason(cast(Any, _OldResolved())) == 'unrecognized_variable'
+
+
+def test_resolution_reason_prefers_public_reason() -> None:
+    class _Resolved:
+        reason = 'resolved'
+        _reason = 'old'
+
+    assert resolution_reason(cast(Any, _Resolved())) == 'resolved'
 
 
 def test_resolution_reason_none_when_neither_attribute_present() -> None:

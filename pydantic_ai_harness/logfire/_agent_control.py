@@ -6,6 +6,7 @@ import json
 import threading
 import warnings
 from collections.abc import Callable, Mapping
+from contextvars import ContextVar
 from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Annotated, Any, ClassVar, Literal, TypeAlias, TypeVar, cast, get_args, get_origin
 
@@ -16,14 +17,19 @@ from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, ValidationError,
 from pydantic_ai import AbstractToolset, RunContext, TemplateStr, ToolDefinition, WrapperToolset
 from pydantic_ai.exceptions import UserError
 from pydantic_ai.messages import InstructionPart
-from pydantic_ai.models import ModelRequestContext
+from pydantic_ai.models import ModelRequestContext, infer_model
 from pydantic_ai.settings import ModelSettings
 from pydantic_ai.tools import AgentDepsT
 from pydantic_ai.toolsets.abstract import ToolsetTool
 
-from pydantic_ai_harness.logfire._managed_variable import ManagedVariableCapability
+from pydantic_ai_harness.logfire._managed_variable import (
+    ManagedVariableCapability,
+    _in_durable_context,  # pyright: ignore[reportPrivateUsage]
+    _warn_durable_write_skipped,  # pyright: ignore[reportPrivateUsage]
+)
 
 if TYPE_CHECKING:
+    from logfire.variables import ResolvedVariable
     from pydantic_ai.agent.abstract import AgentModelSettings
     from pydantic_ai.capabilities import AgentModel, ModelSelection
     from pydantic_ai.capabilities.abstract import WrapRunHandler
@@ -160,6 +166,35 @@ class AgentConfigSettings(BaseModel):
                 f'recognize; ignoring that setting and keeping the rest of the managed config.'
             )
         return {name: value for name, value in values.items() if name not in dropped}
+
+    @model_validator(mode='before')
+    @classmethod
+    def _drop_malformed_values(cls, data: Any) -> Any:
+        """Drop malformed setting values independently so valid siblings still apply."""
+        if not isinstance(data, dict):
+            return data
+        values = cast(dict[str, Any], data)
+        kept: dict[str, Any] = {}
+        for name, value in values.items():
+            field_info = cls.model_fields.get(name)
+            if field_info is None:
+                kept[name] = value
+                continue
+            if _enumerates_values(field_info.annotation):
+                # The version-skew validator owns enumerated fields so its warning distinguishes a
+                # newer value from structurally malformed input.
+                kept[name] = value
+                continue
+            try:
+                TypeAdapter(field_info.annotation).validate_python(value)
+            except ValidationError:
+                _warn_dropped(
+                    f'Managed agent config setting {name!r} has invalid value {value!r}; ignoring that setting '
+                    'and keeping the rest of the managed config.'
+                )
+            else:
+                kept[name] = value
+        return kept
 
 
 def _enumerates_values(annotation: object) -> bool:
@@ -425,7 +460,21 @@ class AgentConfig(BaseModel):
         looking the way its author wrote it. Entries in a list are returned already validated so the
         field doesn't validate them a second time.
         """
+        if isinstance(data, str):
+            if data:
+                return data
+            _warn_dropped(
+                "Managed instructions section is invalid -- instructions=''; ignoring that section and keeping "
+                'the rest of the managed config.'
+            )
+            return None
         if not isinstance(data, list):
+            if data is not None:
+                _warn_dropped(
+                    f'Managed instructions section has invalid container {data!r}; ignoring that section and '
+                    'keeping the rest of the managed config.'
+                )
+                return None
             return data
         blocks: list[InstructionBlock] = []
         for entry in cast(list[Any], data):
@@ -461,6 +510,12 @@ class AgentConfig(BaseModel):
         Entries are returned already validated so the field doesn't validate them a second time.
         """
         if not isinstance(data, list):
+            if data is not None:
+                _warn_dropped(
+                    f'Managed tool definitions section has invalid container {data!r}; ignoring that section and '
+                    'keeping the rest of the managed config.'
+                )
+                return None
             return data
         overrides: list[ToolDefinitionOverride] = []
         for entry in cast(list[Any], data):
@@ -472,6 +527,19 @@ class AgentConfig(BaseModel):
                     f'ignoring that override and keeping the rest of the managed config.'
                 )
         return overrides
+
+    @field_validator('settings', mode='before')
+    @classmethod
+    def _drop_invalid_settings_container(cls, data: Any) -> Any:
+        if isinstance(data, AgentConfigSettings):
+            return data
+        if data is None or isinstance(data, dict):
+            return None if data is None else cast(dict[str, Any], data)
+        _warn_dropped(
+            f'Managed settings section has invalid container {data!r}; ignoring that section and keeping the rest '
+            'of the managed config.'
+        )
+        return None
 
 
 AGENT_CONFIG_JSON_SCHEMA: dict[str, Any] = {
@@ -621,6 +689,7 @@ applied to anything, so accepting it would only let the UI save a row that silen
 
 
 OverridesProvider: TypeAlias = Callable[[], Mapping[str, ToolDefinitionOverride]]
+ToolsObserver: TypeAlias = Callable[[list[ToolDefinition]], None]
 
 
 def _with_parameter_descriptions(
@@ -664,6 +733,7 @@ class _ToolDefinitionOverridesToolset(WrapperToolset[AgentDepsT]):
     """Overlay advertised definitions while routing calls to their code-side tool names."""
 
     get_overrides: OverridesProvider = field(repr=False, compare=False)
+    observe_code_tools: ToolsObserver = field(repr=False, compare=False)
 
     def _effective_tools(
         self, tools: dict[str, ToolsetTool[AgentDepsT]], *, warn: bool
@@ -698,6 +768,7 @@ class _ToolDefinitionOverridesToolset(WrapperToolset[AgentDepsT]):
     async def get_tools(self, ctx: RunContext[AgentDepsT]) -> dict[str, ToolsetTool[AgentDepsT]]:
         """Return tools with managed definitions and collision-safe advertised names."""
         tools = await super().get_tools(ctx)
+        self.observe_code_tools([tool.tool_def for tool in tools.values()])
         if not self.get_overrides():
             return tools
         return {name: tool for name, (_, tool) in self._effective_tools(tools, warn=True).items()}
@@ -774,11 +845,9 @@ class AgentControl(ManagedVariableCapability[AgentDepsT, AgentConfig]):
     capabilities nearer the model call are merged last. That is deliberate: this capability sets the
     remotely controlled baseline, and code that deliberately overrides it for a run should win, the
     same way `run(model=...)` does.
-    A named capability supplies the model statically (resolved once at run setup); a nameless one
-    supplies a selector that derives its variable from the agent when the model is first selected,
-    then reuses that choice for the rest of the run. Callable `targeting_key`/`attributes` don't
-    participate in model selection (it runs before a run context exists) -- only the static `label`
-    and static targeting inputs do.
+    Static or callable targeting inputs participate in model selection, and the resulting variable
+    resolution is reused for the rest of the run so the selected model and applied config cannot
+    diverge. An unknown managed model warns and keeps the code model.
 
     Tool overrides change only the definitions shown to the model. Renames route back to the original
     implementation, collisions retain the original name with a warning, unknown tool keys are inert,
@@ -799,9 +868,9 @@ class AgentControl(ManagedVariableCapability[AgentDepsT, AgentConfig]):
     baseline to diff managed values against, so it is worth knowing what it really is: for instructions
     or a toolset that vary with `deps`, run input, or the step within a run, it is one point-in-time
     sample rather than a description of the agent. An agent that never reaches a model request never
-    auto-creates at all. Its `instructions` are every block the model was sent -- the agent's own text,
-    this capability's contribution, each toolset's -- listed separately with the `id` that addresses it
-    and a `dynamic` flag, which is what lets the UI offer an override per block instead of one
+    auto-creates at all. Its `instructions` are the code-defined blocks, excluding this capability's
+    own managed contribution by id, listed separately with the `id` that addresses each block and a
+    `dynamic` flag. This lets the UI offer an override per block instead of one
     copy-the-whole-prompt button that would produce exactly the duplication described above.
 
     ```python
@@ -862,9 +931,26 @@ class AgentControl(ManagedVariableCapability[AgentDepsT, AgentConfig]):
     """
 
     _auto_create_in_wrap_run: ClassVar[bool] = False
+    _selection_resolved: ContextVar[ResolvedVariable[AgentConfig] | None] = field(init=False, repr=False)
+    _code_model: ContextVar[str | None] = field(init=False, repr=False)
+    _code_settings: ContextVar[ModelSettings | None] = field(init=False, repr=False)
+    _code_tools: ContextVar[list[ToolDefinition] | None] = field(init=False, repr=False)
 
     def __post_init__(self) -> None:
+        if self.id is None:
+            # A stable id lets the baseline exclude this capability's own instruction contribution
+            # without comparing text, which would confuse identical code and managed blocks.
+            self.id = 'agent-control'
+        self._selection_resolved = ContextVar('agent_control_selection_resolved', default=None)
+        self._code_model = ContextVar('agent_control_code_model', default=None)
+        self._code_settings = ContextVar('agent_control_code_settings', default=None)
+        self._code_tools = ContextVar('agent_control_code_tools', default=None)
         if self.instructions is not None:
+            if self.instructions == '':
+                raise UserError(
+                    "`AgentControl` was given '' as `instructions`, which has no text to contribute. Pass "
+                    'instruction text, a list of blocks, or leave it out entirely to keep the code-defined instructions.'
+                )
             if self.default is not None:
                 raise UserError(
                     '`AgentControl` was given both `instructions` and `default`, which set the same value: '
@@ -874,19 +960,7 @@ class AgentControl(ManagedVariableCapability[AgentDepsT, AgentConfig]):
                 )
             # Normalized into `default` so the resolved value -- and every reader of it -- sees one
             # code-side config, and `get_instructions` keeps a single path through `resolved.value`.
-            try:
-                self.default = AgentConfig(instructions=self.instructions)
-            except ValidationError as error:
-                # A published value that fails validation is a remote-data problem and degrades to code;
-                # this one is a mistake in the code itself, so it gets the same treatment as passing both
-                # `instructions` and `default` rather than a raw Pydantic traceback out of `__post_init__`.
-                # Pydantic's own message names the union branches it tried, which is noise here: there is
-                # only one way to get this wrong.
-                raise UserError(
-                    f'`AgentControl` was given {self.instructions!r} as `instructions`, which has no text to '
-                    f'contribute. Pass instruction text, a list of blocks, or leave it out entirely to keep '
-                    f'the code-defined instructions.'
-                ) from error
+            self.default = AgentConfig(instructions=self.instructions)
         self._setup_variable(
             self.name,
             prefix=_AGENT_VARIABLE_PREFIX,
@@ -922,6 +996,7 @@ class AgentControl(ManagedVariableCapability[AgentDepsT, AgentConfig]):
         """Contribute the lowered managed settings patch for each model request."""
 
         def model_settings(ctx: RunContext[AgentDepsT]) -> ModelSettings:
+            self._code_settings.set(ModelSettings(ctx.model_settings or {}))
             resolved = self.resolved
             if resolved is None or resolved.value.settings is None:
                 return ModelSettings()
@@ -932,33 +1007,22 @@ class AgentControl(ManagedVariableCapability[AgentDepsT, AgentConfig]):
     def get_model(self) -> AgentModel[AgentDepsT] | None:
         """Source the managed model with the right precedence (`run(model=...)` > managed > constructor).
 
-        When the backing variable is already known (an explicit `name` or `Variable`), the model is
-        sourced statically here, so Pydantic AI resolves it once at run setup. When the capability is
-        nameless, the variable is derived from the agent's `name`, which isn't available until a
-        [`ModelSelectionContext`][pydantic_ai.models.ModelSelectionContext] exists, so a selector
-        callable is returned instead: it derives and resolves the variable the first time Pydantic AI
-        selects the model for the run. Either way a fully model-less agent can be driven entirely
-        from Logfire, and a call-site `run(model=...)` still wins.
-
-        Both paths read the value with a **bare** `variable.get()` -- they read `.value` and never
-        enter the [`ResolvedVariable`][logfire.variables.ResolvedVariable] as a context manager -- so
-        model selection contributes no baggage: [`wrap_run`][pydantic_ai_harness.logfire.AgentControl.wrap_run]
-        stays the sole owner of the run's resolution baggage. Model selection runs before a
-        `RunContext` exists, so callable `targeting_key`/`attributes` can't participate (a
-        `ModelSelectionContext` is deliberately narrower); only the static `label` and static
-        targeting inputs do. That early read and `wrap_run`'s authoritative resolve return a
-        consistent value -- `get()` is a cheap lookup over the SDK's cached config, and resolution is
-        deterministic within a run.
+        The selector records the lower-precedence code model, resolves static or callable targeting
+        inputs, and saves that exact resolution for `wrap_run`. This keeps model selection consistent
+        with the config and telemetry used by the run even when a targeting callable is stateful. The
+        selector does not enter the resolution as a context manager; `wrap_run` remains the owner of
+        its baggage. A fully model-less agent can be driven from Logfire, and a call-site
+        `run(model=...)` still wins. An unknown managed model warns and falls back to the code model.
         """
-        if not self._name_omitted:
-            return self._resolve_model_value(self._variable)
         return self._model_selector()
 
-    def _resolve_model_value(self, variable: Variable[AgentConfig]) -> str | None:
-        """Bare-read the managed value's `model` via static targeting -- no CM entry, so no baggage."""
-        targeting_key = None if callable(self.targeting_key) else self.targeting_key
-        attributes = None if callable(self.attributes) else self.attributes
-        return variable.get(targeting_key=targeting_key, attributes=attributes, label=self.label).value.model
+    def _resolve_for_selection(
+        self, variable: Variable[AgentConfig], ctx: ModelSelectionContext[AgentDepsT]
+    ) -> ResolvedVariable[AgentConfig]:
+        """Resolve with the same callable targeting inputs that the authoritative run will reuse."""
+        targeting_key = self.targeting_key(ctx) if callable(self.targeting_key) else self.targeting_key  # pyright: ignore[reportArgumentType]
+        attributes = self.attributes(ctx) if callable(self.attributes) else self.attributes  # pyright: ignore[reportArgumentType]
+        return variable.get(targeting_key=targeting_key, attributes=attributes, label=self.label)
 
     def _model_selector(self) -> Callable[[ModelSelectionContext[AgentDepsT]], ModelSelection]:
         """Build the per-run selector a nameless `get_model` returns.
@@ -977,7 +1041,19 @@ class AgentControl(ManagedVariableCapability[AgentDepsT, AgentConfig]):
 
         def select(ctx: ModelSelectionContext[AgentDepsT]) -> ModelSelection:
             if not selected:
-                model = self._resolve_model_value(self._ensure_variable_for_agent(ctx.agent))
+                code_model = ctx.model
+                self._code_model.set(f'{code_model.system}:{code_model.model_name}' if code_model is not None else None)
+                resolved = self._resolve_for_selection(self._ensure_variable_for_agent(ctx.agent), ctx)
+                self._selection_resolved.set(resolved)
+                model = resolved.value.model
+                if model is not None:
+                    try:
+                        infer_model(model)
+                    except (UserError, ValueError) as error:
+                        _warn_dropped(
+                            f'Managed agent config selects unknown model {model!r} ({error}); keeping the code model.'
+                        )
+                        model = None
                 if model is not None:
                     selected.append(model)
                 elif ctx.model is not None:
@@ -994,7 +1070,12 @@ class AgentControl(ManagedVariableCapability[AgentDepsT, AgentConfig]):
 
     def get_wrapper_toolset(self, toolset: AbstractToolset[AgentDepsT]) -> AbstractToolset[AgentDepsT]:
         """Wrap the agent toolset with managed LLM-facing definition overlays."""
-        return _ToolDefinitionOverridesToolset(wrapped=toolset, get_overrides=self._current_overrides)
+        return _ToolDefinitionOverridesToolset(
+            wrapped=toolset, get_overrides=self._current_overrides, observe_code_tools=self._observe_code_tools
+        )
+
+    def _observe_code_tools(self, tools: list[ToolDefinition]) -> None:
+        self._code_tools.set(tools)
 
     def _current_overrides(self) -> Mapping[str, ToolDefinitionOverride]:
         """Return the active run's overrides by tool name, or an empty mapping outside a resolved run."""
@@ -1003,21 +1084,22 @@ class AgentControl(ManagedVariableCapability[AgentDepsT, AgentConfig]):
 
     async def wrap_run(self, ctx: RunContext[AgentDepsT], *, handler: WrapRunHandler) -> AgentRunResult[Any]:
         """Add applied-section baggage inside the base's once-per-run resolution context."""
-
-        async def wrapped() -> AgentRunResult[Any]:
-            resolved = self.resolved
-            assert resolved is not None  # set by the base's wrap_run before it invokes the handler
-            sections = ','.join(
-                name
-                for name in ('instructions', 'model', 'settings', 'tool_definitions')
-                if getattr(resolved.value, name) is not None
-            )
-            if sections:
-                with logfire.set_baggage(**{'logfire.managed.applied_sections': sections}):
-                    return await handler()
-            return await handler()
-
-        return await super().wrap_run(ctx, handler=wrapped)
+        resolved = self._selection_resolved.get() or self._resolve(ctx)
+        with resolved:
+            token = self._resolved.set(resolved)
+            try:
+                sections = ','.join(
+                    name
+                    for name in ('instructions', 'model', 'settings', 'tool_definitions')
+                    if getattr(resolved.value, name) is not None
+                )
+                if sections:
+                    with logfire.set_baggage(**{'logfire.managed.applied_sections': sections}):
+                        return await handler()
+                return await handler()
+            finally:
+                self._resolved.reset(token)
+                self._selection_resolved.set(None)
 
     async def before_model_request(
         self, ctx: RunContext[AgentDepsT], request_context: ModelRequestContext
@@ -1030,7 +1112,7 @@ class AgentControl(ManagedVariableCapability[AgentDepsT, AgentConfig]):
         [`get_model`][pydantic_ai_harness.logfire.AgentControl.get_model] and `get_model_settings`, where
         Pydantic AI already gives them the right precedence.
         """
-        self._publish_request_baseline(request_context)
+        self._publish_request_baseline(ctx, request_context)
         return self._apply_instruction_overrides(request_context)
 
     def _apply_instruction_overrides(self, request_context: ModelRequestContext) -> ModelRequestContext:
@@ -1070,13 +1152,14 @@ class AgentControl(ManagedVariableCapability[AgentDepsT, AgentConfig]):
         request_context.model_request_parameters = replace(parameters, instruction_parts=parts)
         return request_context
 
-    def _publish_request_baseline(self, request_context: ModelRequestContext) -> None:
+    def _publish_request_baseline(self, ctx: RunContext[AgentDepsT], request_context: ModelRequestContext) -> None:
         """Publish the code-side `AgentConfig` baseline at the first eligible model request.
 
-        The request context carries the real tool definitions, instructions, and settings after the
-        agent has assembled them. Auto-create only fires when the provider does not know the variable,
-        so this effective request is the code baseline. The snapshot is built synchronously while the
-        HTTP creation itself remains in the background.
+        Model, settings, and tool definitions are captured at their override sites before managed
+        behavior replaces them. Instructions are filtered by this capability's stable id. The result
+        is what the agent would do with `AgentControl` removed, without reverse-engineering an already
+        modified request. Snapshot serialization is guarded with the background write so neither can
+        affect the run.
 
         Instructions are snapshotted per block, straight off
         [`instruction_parts`][pydantic_ai.models.ModelRequestParameters.instruction_parts], keeping each
@@ -1095,13 +1178,17 @@ class AgentControl(ManagedVariableCapability[AgentDepsT, AgentConfig]):
         resolved = self.resolved
         if resolved is None or not self.publish_baseline:
             return
+        if _in_durable_context(ctx):
+            _warn_durable_write_skipped(self._variable)
+            return
+        own_instruction_id = f'capability:{self.id}'
         instructions: list[NonEmptyStr | InstructionBlock] = [
             InstructionBlock(id=part.id, instructions=part.content, dynamic=part.dynamic)
             for part in request_context.model_request_parameters.instruction_parts or []
-            if part.content.strip()
+            if part.content.strip() and part.id != own_instruction_id
         ]
         tool_definitions: list[ToolDefinitionOverride] = []
-        for tool in request_context.model_request_parameters.function_tools:
+        for tool in self._code_tools.get() or []:
             descriptions: dict[str, str] = {}
             properties = tool.parameters_json_schema.get('properties')
             if isinstance(properties, dict):
@@ -1119,19 +1206,25 @@ class AgentControl(ManagedVariableCapability[AgentDepsT, AgentConfig]):
             )
         example = AgentConfig(
             instructions=instructions or None,
-            model=f'{request_context.model.system}:{request_context.model.model_name}',
-            settings=AgentConfigSettings.model_validate(request_context.model_settings)
-            if request_context.model_settings
+            model=self._code_model.get(),
+            settings=AgentConfigSettings.model_validate(self._code_settings.get())
+            if self._code_settings.get()
             else None,
             tool_definitions=tool_definitions or None,
         )
-        serialized = json.dumps(example.model_dump(exclude_none=True), indent=2)
+        try:
+            serialized = json.dumps(example.model_dump(exclude_none=True), indent=2)
+        except Exception as error:
+            warnings.warn(
+                f'Failed to publish the code baseline for Logfire managed variable {self._variable.name!r}: {error}'
+            )
+            return
         key = (self._variable.logfire_instance, self._variable.name)
         with _baseline_publish_lock:
             if key in _baseline_publish_attempted:
                 return
             _baseline_publish_attempted.add(key)
         if self._should_auto_create_for(resolved):
-            self._maybe_auto_create(self._variable, example=serialized)
+            self._maybe_auto_create(self._variable, example=serialized, ctx=ctx)
             return
         _spawn_baseline_publish(self._variable, serialized)

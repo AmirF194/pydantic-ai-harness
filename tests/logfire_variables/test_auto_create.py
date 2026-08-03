@@ -20,8 +20,16 @@ from typing import Any
 import logfire
 import pytest
 from logfire.testing import CaptureLogfire
-from logfire.variables import Rollout, Variable, VariableAlreadyExistsError, VariableConfig, VariablesConfig
+from logfire.variables import (
+    ResolvedVariable,
+    Rollout,
+    Variable,
+    VariableAlreadyExistsError,
+    VariableConfig,
+    VariablesConfig,
+)
 from pydantic_ai import Agent
+from pydantic_ai.capabilities import AbstractCapability
 from pydantic_ai.messages import ModelMessage, ModelRequest
 from pydantic_ai.models.test import TestModel
 
@@ -60,6 +68,7 @@ def _existing_config(name: str) -> VariablesConfig:
 def _reset_guard() -> None:
     # The once-per-process guard is module-level state; clear it so each test starts fresh.
     _managed_variable._reset_auto_create_guard()
+    _managed_variable._durable_write_warnings.clear()
 
 
 @pytest.fixture
@@ -113,6 +122,23 @@ async def test_unknown_variable_is_auto_created(capfire: CaptureLogfire, spawned
         'Created Logfire managed variable prompt__auto_new from the code default; '
         'set a value in Logfire to manage this agent from there'
     ]
+
+
+async def test_durable_context_skips_auto_create_and_warns_once(capfire: CaptureLogfire, spawned: list[str]) -> None:
+    class DurableContext(AbstractCapability[object]):
+        @property
+        def in_durable_context(self) -> bool:
+            return True
+
+    with variables_provider(capfire, VariablesConfig(variables={})):
+        agent = Agent(
+            TestModel(), capabilities=[ManagedPrompt('durable_auto_create', default=DEFAULT), DurableContext()]
+        )
+        with pytest.warns(UserWarning, match='Create the variable in the Logfire UI') as caught:
+            await agent.run('hello')
+            await agent.run('again')
+    assert len(caught) == 1
+    assert spawned == []
 
 
 async def test_code_default_fallback_reason_still_triggers_create(
@@ -173,6 +199,17 @@ async def test_auto_create_false_skips_creation(capfire: CaptureLogfire, spawned
         agent = Agent(TestModel(), capabilities=[ManagedPrompt('auto_off', default=DEFAULT, auto_create=False)])
         await agent.run('hello')
 
+    assert spawned == []
+
+
+async def test_code_default_with_no_provider_does_not_create(
+    monkeypatch: pytest.MonkeyPatch, spawned: list[str]
+) -> None:
+    def code_default(_resolved: ResolvedVariable[Any]) -> str:
+        return 'code_default'
+
+    monkeypatch.setattr(_managed_variable, 'resolution_reason', code_default)
+    await Agent(TestModel(), capabilities=[ManagedPrompt('no_provider', default=DEFAULT)]).run('hello')
     assert spawned == []
 
 

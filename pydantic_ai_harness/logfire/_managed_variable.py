@@ -21,6 +21,7 @@ import logfire
 from logfire.variables import Variable, VariableAlreadyExistsError
 from logfire.variables.abstract import NoOpVariableProvider
 from pydantic_ai.capabilities import AbstractCapability, CapabilityOrdering, Instrumentation
+from pydantic_ai.capabilities.abstract import leaf_capabilities
 from pydantic_ai.exceptions import UserError
 from pydantic_ai.tools import AgentDepsT, RunContext
 from typing_extensions import TypeVar
@@ -58,6 +59,7 @@ def resolution_reason(resolved: ResolvedVariable[Any]) -> str | None:
 # e.g. a read-only token -- does not retry on every run.
 _auto_create_attempted: set[tuple[Logfire, str]] = set()
 _auto_create_lock = threading.Lock()
+_durable_write_warnings: set[tuple[Logfire, str]] = set()
 
 
 def _auto_create_key(variable: Variable[Any]) -> tuple[Logfire, str]:
@@ -100,6 +102,27 @@ def _spawn_create(variable: Variable[Any], config: VariableConfig) -> None:
     inline for determinism.
     """
     threading.Thread(target=_create_variable, args=(variable, config), daemon=True).start()
+
+
+def _in_durable_context(ctx: RunContext[Any]) -> bool:
+    """Use the active durability capability's engine-specific context detection."""
+    root = ctx.root_capability
+    if root is None:
+        return False
+    return any(getattr(capability, 'in_durable_context', False) is True for capability in leaf_capabilities(root))
+
+
+def _warn_durable_write_skipped(variable: Variable[Any]) -> None:
+    """Explain a skipped workflow-side write once per destination."""
+    key = _auto_create_key(variable)
+    if key in _durable_write_warnings:
+        return
+    _durable_write_warnings.add(key)
+    warnings.warn(
+        f'Skipping the write-back for Logfire managed variable {variable.name!r} inside a durable workflow '
+        'because background threads and remote writes are not replay-safe there. Reading managed config '
+        'still works. Create the variable in the Logfire UI, or run the SDK outside a workflow once.'
+    )
 
 
 def _create_variable(variable: Variable[Any], config: VariableConfig) -> None:
@@ -261,15 +284,6 @@ class ManagedVariableCapability(AbstractCapability[AgentDepsT], Generic[AgentDep
             self._deferred = _DeferredVariable(prefix=prefix, value_type=value_type, default=default)
 
     @property
-    def _name_omitted(self) -> bool:
-        """Whether the capability was constructed without an explicit `name`.
-
-        When it was, the backing variable is derived from the agent's own `name` at run time rather
-        than built at construction.
-        """
-        return self._deferred is not None
-
-    @property
     def _built_variable(self) -> Variable[ValueT] | None:
         """The backing variable if it has been built yet, else `None`.
 
@@ -391,8 +405,13 @@ class ManagedVariableCapability(AbstractCapability[AgentDepsT], Generic[AgentDep
             updates['example'] = example
         return variable.to_config().model_copy(update=updates)
 
-    def _maybe_auto_create(self, variable: Variable[ValueT], *, example: str | None = None) -> None:
+    def _maybe_auto_create(
+        self, variable: Variable[ValueT], *, example: str | None = None, ctx: RunContext[Any] | None = None
+    ) -> None:
         """Kick off background creation of the backing variable, at most once per process per key."""
+        if ctx is not None and _in_durable_context(ctx):
+            _warn_durable_write_skipped(variable)
+            return
         key = _auto_create_key(variable)
         with _auto_create_lock:
             if key in _auto_create_attempted:
@@ -422,7 +441,7 @@ class ManagedVariableCapability(AbstractCapability[AgentDepsT], Generic[AgentDep
             return False
         return provider.get_variable_config(variable.name) is None
 
-    def _maybe_auto_create_for(self, resolved: ResolvedVariable[ValueT]) -> None:
+    def _maybe_auto_create_for(self, resolved: ResolvedVariable[ValueT], *, ctx: RunContext[Any] | None = None) -> None:
         """Trigger background auto-create when a configured provider doesn't recognize the variable yet.
 
         Auto-create is for exactly one case: a provider is configured but has no entry for this name,
@@ -434,7 +453,7 @@ class ManagedVariableCapability(AbstractCapability[AgentDepsT], Generic[AgentDep
         all, and is filtered out by the reason check up front.
         """
         if self._should_auto_create_for(resolved):
-            self._maybe_auto_create(self._variable)
+            self._maybe_auto_create(self._variable, ctx=ctx)
 
     def _resolve(self, ctx: RunContext[AgentDepsT]) -> ResolvedVariable[ValueT]:
         """Resolve the backing variable for this run using the capability's targeting inputs.
@@ -461,7 +480,7 @@ class ManagedVariableCapability(AbstractCapability[AgentDepsT], Generic[AgentDep
         """Resolve the variable once and keep its baggage active for the duration of the run."""
         resolved = self._resolve(ctx)
         if self._auto_create_in_wrap_run:
-            self._maybe_auto_create_for(resolved)
+            self._maybe_auto_create_for(resolved, ctx=ctx)
         with resolved:
             token = self._resolved.set(resolved)
             try:
