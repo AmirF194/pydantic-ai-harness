@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import warnings
 from collections.abc import Mapping
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
@@ -31,6 +32,7 @@ from pydantic_ai_harness.spend import (
     SpendSnapshot,
     Spent,
     UnpricedModelError,
+    UnpricedModelWarning,
 )
 
 pytestmark = pytest.mark.anyio
@@ -506,6 +508,64 @@ class TestPricing:
 
         with pytest.raises(UserError, match='returned a negative amount'):
             await _record(guard)
+
+    async def test_an_unpriced_response_warns_once_per_model_against_a_usd_ceiling(self):
+        """A USD ceiling cannot be reached by requests nothing can price, so it says so -- once."""
+        guard = SpendLimits(budgets=[Budget(usd=Decimal('5'), window='day')])
+
+        with pytest.warns(UnpricedModelWarning, match='not-a-real-model') as caught:
+            await _record(guard, model_name='not-a-real-model', provider_name=None)
+            await _record(guard, model_name='not-a-real-model', provider_name=None)
+
+        assert len(caught) == 1
+
+    async def test_a_second_unpriced_model_warns_separately(self):
+        guard = SpendLimits(budgets=[Budget(usd=Decimal('5'), window='day')])
+
+        with pytest.warns(UnpricedModelWarning) as caught:
+            await _record(guard, model_name='unknown-one', provider_name=None)
+            await _record(guard, model_name='unknown-two', provider_name=None)
+
+        assert len(caught) == 2
+
+    async def test_a_response_with_no_model_name_warns_under_one_label(self):
+        guard = SpendLimits(budgets=[Budget(usd=Decimal('5'), window='day')])
+
+        with pytest.warns(UnpricedModelWarning, match='<unnamed>') as caught:
+            await _record(guard, model_name=None)
+            await _record(guard, model_name=None)
+
+        assert len(caught) == 1
+
+    async def test_a_token_only_ceiling_does_not_warn(self):
+        """Tokens are counted whether or not a price was found, so that ceiling still holds."""
+        guard = SpendLimits(budgets=[Budget(tokens=5000, window='day')])
+
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter('always')
+            await _record(guard, model_name='not-a-real-model', provider_name=None)
+
+        assert [w for w in caught if issubclass(w.category, UnpricedModelWarning)] == []
+
+    async def test_raising_does_not_also_warn(self):
+        """`on_unpriced='raise'` already stops the run; a warning beside it would be noise."""
+        guard = SpendLimits(budgets=[Budget(usd=Decimal('5'), window='day')], on_unpriced='raise')
+
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter('always')
+            with pytest.raises(UnpricedModelError):
+                await _record(guard, model_name='not-a-real-model', provider_name=None)
+
+        assert [w for w in caught if issubclass(w.category, UnpricedModelWarning)] == []
+
+    async def test_a_priced_response_does_not_warn(self):
+        guard = SpendLimits(budgets=[Budget(usd=Decimal('5'), window='day')])
+
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter('always')
+            await _record(guard)
+
+        assert [w for w in caught if issubclass(w.category, UnpricedModelWarning)] == []
 
     async def test_raising_on_a_model_the_registry_does_not_know(self):
         guard = SpendLimits(budgets=[Budget(window='total')], on_unpriced='raise')

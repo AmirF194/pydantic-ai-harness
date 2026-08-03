@@ -16,6 +16,7 @@ counter, not enough to stop the request a runaway loop is about to make.
 from __future__ import annotations
 
 import inspect
+import warnings
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -28,7 +29,7 @@ from pydantic_ai.messages import ModelResponse
 from pydantic_ai.tools import AgentDepsT, RunContext
 
 from pydantic_ai_harness.spend._budget import Budget, bucket, scope_key, store_key
-from pydantic_ai_harness.spend._exceptions import SpendLimitExceeded, UnpricedModelError
+from pydantic_ai_harness.spend._exceptions import SpendLimitExceeded, UnpricedModelError, UnpricedModelWarning
 from pydantic_ai_harness.spend._snapshot import BudgetStatus, SpendSnapshot, Spent
 from pydantic_ai_harness.spend._store import InMemorySpendStore, SpendStore, utc_now
 
@@ -123,6 +124,13 @@ class SpendLimits(AbstractCapability[AgentDepsT]):
     It does not reach a default-constructed `store`, which keeps its own `utc_now` for
     expiry. Both remain absolute instants, so a custom clock buckets on one and expires on
     the other; pass the same callable to the store when that matters.
+    """
+
+    _warned_unpriced: set[str] = field(default_factory=set[str], init=False, repr=False, compare=False)
+    """Model names already reported by `UnpricedModelWarning`, so each reports once.
+
+    Instance-level and never reset, matching the capability's own posture that state
+    outlives a run: a per-run set would warn again on every run for the same model.
     """
 
     def __post_init__(self) -> None:
@@ -234,6 +242,21 @@ class SpendLimits(AbstractCapability[AgentDepsT]):
             result = self.on_spend(snapshot)
             if inspect.isawaitable(result):
                 await result
+
+        if not priced and self.on_unpriced == 'zero' and any(budget.usd is not None for budget in self.budgets):
+            # Only this combination is silent: the response adds nothing in dollars, so a
+            # USD ceiling can never be reached by requests the registry cannot price. A
+            # token ceiling still holds, so it is not warned about.
+            model = response.model_name or '<unnamed>'
+            if model not in self._warned_unpriced:
+                self._warned_unpriced.add(model)
+                warnings.warn(
+                    f'No price for model {model}, so it counts as $0 against a USD budget. '
+                    "Supply `SpendLimits.price` to price it, or set `on_unpriced='raise'` to "
+                    'stop the run instead. Token ceilings are unaffected.',
+                    UnpricedModelWarning,
+                    stacklevel=2,
+                )
 
         if not priced and self.on_unpriced == 'raise':
             # Raised last, after the store is updated and `on_spend` has seen the
