@@ -92,6 +92,12 @@ class TestSchedulingTools:
                 'create_schedule',
                 {'name': 'Bad limit', 'prompt': 'work', 'schedule': 'every 1h', 'max_runs': 0},
             )
+        with pytest.raises(ModelRetry, match='Invalid schedule: Duration is too large'):
+            await _call(
+                capability,
+                'create_schedule',
+                {'name': 'Huge interval', 'prompt': 'work', 'schedule': 'every 1000000000d'},
+            )
         await _add(capability, _recurring('invalid-update'))
         with pytest.raises(ModelRetry, match='Invalid schedule update'):
             await _call(
@@ -227,6 +233,17 @@ class TestSchedulingTools:
 
         with pytest.raises(ModelRetry, match='completed.*Create a new schedule'):
             await _call(capability, 'run_schedule_now', {'schedule_id': 'completed'})
+        with pytest.raises(ModelRetry, match='completed.*Create a new schedule'):
+            await _call(
+                capability,
+                'update_schedule',
+                {'schedule_id': 'completed', 'schedule': 'every 2h'},
+            )
+        await _call(capability, 'update_schedule', {'schedule_id': 'completed', 'name': 'renamed'})
+        renamed = await capability.resolved_store.get('completed')
+        assert renamed is not None
+        assert renamed.name == 'renamed'
+        assert renamed.next_run_at is None
         with pytest.raises(ModelRetry, match='not paused'):
             await _call(capability, 'resume_schedule', {'schedule_id': 'completed'})
 

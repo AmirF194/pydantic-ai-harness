@@ -246,6 +246,8 @@ class ScheduleRunner(Generic[AgentDepsT]):
         infrastructure.
         """
         reference = now or datetime.now(timezone.utc)
+        if reference.utcoffset() is None:
+            raise ValueError('now must be timezone-aware')
         results: list[ScheduleResult] = []
         claims = await self._claim_due(reference)
         async with anyio.create_task_group() as task_group:

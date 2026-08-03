@@ -98,6 +98,11 @@ class TestScheduleRunnerExecution:
         await store.add(_schedule('future', due_at=NOW + timedelta(hours=1)))
         assert await ScheduleRunner(Agent(TestModel()), deps=None, store=store).tick(NOW) == []
 
+    async def test_tick_rejects_naive_now(self) -> None:
+        runner = ScheduleRunner(Agent(TestModel()), deps=None, store=InMemoryScheduleStore())
+        with pytest.raises(ValueError, match='now must be timezone-aware'):
+            await runner.tick(datetime(2026, 5, 1, 12))
+
     async def test_error_records_and_recurring_schedule_continues(self) -> None:
         async def fail(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
             del messages, info

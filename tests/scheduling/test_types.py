@@ -57,6 +57,15 @@ class TestScheduleParsing:
         with pytest.raises(ValidationError, match='at least every 1 minute'):
             parse_schedule('every 0m')
 
+    def test_interval_ceiling(self) -> None:
+        with pytest.raises(ValidationError, match='cron expression for longer cadences'):
+            IntervalTrigger(every=timedelta(days=366))
+
+    @pytest.mark.parametrize('value', ['every 1000000000d', 'in 999999999d'])
+    def test_duration_overflow(self, value: str) -> None:
+        with pytest.raises(ValueError, match='Duration is too large'):
+            parse_schedule(value, now=datetime(2026, 1, 1, tzinfo=timezone.utc))
+
     def test_missing_cronsim_has_install_hint(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setitem(sys.modules, 'cronsim', None)
         with pytest.raises(ImportError, match=r'pip install pydantic-ai-harness\[scheduling\]'):

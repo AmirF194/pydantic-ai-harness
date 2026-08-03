@@ -59,7 +59,7 @@ Naive datetimes and cron expressions are interpreted in the schedule's IANA time
 - **At most once.** A schedule's next occurrence is advanced and saved before the agent runs, so a crash mid-run skips an occurrence instead of running it twice.
 - **No automatic retry.** A failed run records `last_error` and the schedule keeps its next occurrence; for recurring work, the next occurrence is the retry.
 - **No overlap.** A schedule still running when it comes due again is skipped, never run concurrently with itself.
-- **One runner per store.** At-most-once and no-overlap hold within a single runner process. Two runners sharing a store can both claim the same occurrence.
+- **One runner per store.** At-most-once and no-overlap hold within a single runner process. Two runners sharing a store can both claim the same occurrence. The store carries no per-user scoping: every schedule belongs to the agent's principal, so give each tenant its own store.
 - **No backlog replay.** A recurring schedule overdue beyond `misfire_grace` (default 10 minutes) runs once now and continues from the next future occurrence. An overdue one-shot is recorded as `missed` instead of running hours late. Resuming a paused schedule continues from its next future occurrence.
 - **Bounded runs.** `max_runs` counts attempts; when reached, the schedule completes. `run_timeout` and per-schedule or runner-wide `usage_limits` cap each run's wall-clock time and spend.
 - Empty output is a success, not an error.

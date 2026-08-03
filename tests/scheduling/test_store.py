@@ -83,8 +83,9 @@ class TestInMemoryScheduleStoreCopies:
 
 class TestSqliteScheduleStore:
     def test_rejects_memory_and_bad_table(self, tmp_path: Path) -> None:
-        with pytest.raises(ValueError, match="does not support ':memory:'"):
-            SqliteScheduleStore(':memory:')
+        for database in ('', ':memory:'):
+            with pytest.raises(ValueError, match='does not support'):
+                SqliteScheduleStore(database)
         with pytest.raises(ValueError, match='invalid table name'):
             SqliteScheduleStore(str(tmp_path / 'db.sqlite'), table='bad name; drop')
 

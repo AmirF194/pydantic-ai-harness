@@ -58,7 +58,7 @@ class CronTrigger(BaseModel):
 
 
 class IntervalTrigger(BaseModel):
-    """A recurring fixed interval of at least one minute."""
+    """A recurring fixed interval from one minute through 365 days."""
 
     kind: Literal['interval'] = 'interval'
     every: timedelta
@@ -66,9 +66,11 @@ class IntervalTrigger(BaseModel):
     @field_validator('every')
     @classmethod
     def validate_every(cls, value: timedelta) -> timedelta:
-        """Reject intervals below the runner's supported cadence."""
+        """Reject intervals outside the runner's supported cadence."""
         if value < timedelta(minutes=1):
             raise ValueError('Interval schedules must run at least every 1 minute.')
+        if value > timedelta(days=365):
+            raise ValueError('Interval schedules cannot exceed 365 days. Use a cron expression for longer cadences.')
         return value
 
 
@@ -103,13 +105,16 @@ def parse_schedule(text: str, *, timezone: str = 'UTC', now: datetime | None = N
     value = text.strip()
     match = _DURATION_RE.fullmatch(value)
     if match is not None:
-        duration = _duration(int(match.group('count')), match.group('unit'))
-        if match.group('form').lower() == 'every':
-            return IntervalTrigger(every=duration)
-        reference = now or datetime.now(tz=ZoneInfo(timezone))
-        if reference.tzinfo is None:
-            reference = reference.replace(tzinfo=ZoneInfo(timezone))
-        return OnceTrigger(at=reference + duration)
+        try:
+            duration = _duration(int(match.group('count')), match.group('unit'))
+            if match.group('form').lower() == 'every':
+                return IntervalTrigger(every=duration)
+            reference = now or datetime.now(tz=ZoneInfo(timezone))
+            if reference.tzinfo is None:
+                reference = reference.replace(tzinfo=ZoneInfo(timezone))
+            return OnceTrigger(at=reference + duration)
+        except OverflowError as exc:
+            raise ValueError('Duration is too large.') from exc
 
     # Only a leading date marks an ISO datetime: a bare `T` also appears in cron day and
     # month names such as `TUE` or `OCT`.

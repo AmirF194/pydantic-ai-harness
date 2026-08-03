@@ -205,6 +205,8 @@ class SchedulingToolset(FunctionToolset[AgentDepsT]):
         """
         del ctx
         existing = await self._known_or_retry(schedule_id)
+        if schedule is not None and existing.next_run_at is None:
+            raise ModelRetry('This schedule is completed. Create a new schedule instead.')
         trigger = existing.trigger if schedule is None else self._parse(schedule, timezone=existing.timezone)
         resulting_max_runs = existing.max_runs if max_runs is None else max_runs
         self._validate_combination(trigger, resulting_max_runs)

@@ -19,8 +19,8 @@ class ScheduleStore(Protocol):
     """Async whole-record storage for schedules.
 
     Use one runner per store. The protocol's read-modify-write operations are
-    not atomic across processes; a backend with claim or compare-and-swap
-    semantics can provide multi-process coordination later.
+    not atomic, so concurrent writers such as a second runner or tool calls
+    while a run is in flight can interleave with last-write-wins results.
     """
 
     async def add(self, schedule: Schedule) -> Schedule:
@@ -81,16 +81,17 @@ class InMemoryScheduleStore:
 class SqliteScheduleStore:
     """File-backed SQLite schedule storage.
 
-    `:memory:` is unsupported because each operation uses a fresh connection.
+    Empty and `:memory:` databases are unsupported because each operation uses a fresh connection.
     Blocking SQLite work runs in a worker thread under one process-local lock.
     """
 
     def __init__(self, database: str = '.agent-schedules.db', *, table: str = 'schedules') -> None:
         if not _VALID_TABLE_RE.fullmatch(table):
             raise ValueError(f'invalid table name: {table!r}')
-        if database == ':memory:':
+        if database in ('', ':memory:'):
             raise ValueError(
-                "SqliteScheduleStore does not support ':memory:'; use InMemoryScheduleStore or a file-backed database."
+                "SqliteScheduleStore does not support empty or ':memory:' databases; "
+                'use InMemoryScheduleStore or a file-backed database.'
             )
         self._database = database
         self._table = table
