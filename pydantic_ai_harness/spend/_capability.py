@@ -442,6 +442,11 @@ class SpendLimits(AbstractCapability[AgentDepsT]):
         if self.price is not None:
             supplied = self.price(response)
             if supplied is not None:
+                if not supplied.is_finite():
+                    # Checked before the comparison below, which raises `InvalidOperation`
+                    # on a NaN rather than returning False. An infinity would pass that
+                    # comparison and then exhaust every budget it reached at once.
+                    raise UserError(f'`SpendLimits.price` returned a non-finite amount ({supplied}) for a response.')
                 if supplied < 0:
                     # A credit would move a budget away from its ceiling, which
                     # turns a bug in the pricing function into a gate that never

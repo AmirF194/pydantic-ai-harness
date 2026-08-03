@@ -509,6 +509,14 @@ class TestPricing:
         with pytest.raises(UserError, match='returned a negative amount'):
             await _record(guard)
 
+    @pytest.mark.parametrize('amount', ['NaN', 'Infinity', '-Infinity'])
+    async def test_a_non_finite_price_is_refused(self, amount: str):
+        """`NaN < 0` raises `InvalidOperation`, and an infinity would exhaust every budget at once."""
+        guard = SpendLimits(budgets=[Budget(window='total')], price=lambda r: Decimal(amount))
+
+        with pytest.raises(UserError, match='returned a non-finite amount'):
+            await _record(guard)
+
     async def test_an_unpriced_response_warns_once_per_model_against_a_usd_ceiling(self):
         """A USD ceiling cannot be reached by requests nothing can price, so it says so -- once."""
         guard = SpendLimits(budgets=[Budget(usd=Decimal('5'), window='day')])
