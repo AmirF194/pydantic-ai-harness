@@ -106,6 +106,27 @@ class TestSqliteScheduleStore:
         assert loaded is not None
         assert loaded.model_dump() == expected.model_dump()
 
+    async def test_version_check_holds_across_store_instances(self, tmp_path: Path) -> None:
+        database = str(tmp_path / 'shared.db')
+        store_a = SqliteScheduleStore(database)
+        store_b = SqliteScheduleStore(database)
+        await store_a.add(_schedule('shared'))
+
+        from_a = await store_a.get('shared')
+        from_b = await store_b.get('shared')
+        assert from_a is not None
+        assert from_b is not None
+        from_a.name = 'from a'
+        from_b.name = 'from b'
+        await store_a.save(from_a)
+
+        with pytest.raises(ScheduleConflictError, match='changed since it was read'):
+            await store_b.save(from_b)
+        stored = await store_b.get('shared')
+        assert stored is not None
+        assert stored.name == 'from a'
+        assert stored.version == 1
+
     async def test_schema_failure_closes_the_connection(self, tmp_path: Path) -> None:
         database = tmp_path / 'corrupt.db'
         database.write_bytes(b'not a sqlite database')

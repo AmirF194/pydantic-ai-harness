@@ -88,7 +88,8 @@ class SqliteScheduleStore:
     """File-backed SQLite schedule storage.
 
     Empty and `:memory:` databases are unsupported because each operation uses a fresh connection.
-    Blocking SQLite work runs in a worker thread under one process-local lock.
+    Blocking SQLite work runs in a worker thread. The version check runs inside the `UPDATE`
+    statement itself, so it holds across store instances and processes sharing one database file.
     """
 
     def __init__(self, database: str = '.agent-schedules.db', *, table: str = 'schedules') -> None:
@@ -110,7 +111,8 @@ class SqliteScheduleStore:
             try:
                 connection.execute(
                     f'CREATE TABLE IF NOT EXISTS "{self._table}" '
-                    '(seq INTEGER PRIMARY KEY AUTOINCREMENT, id TEXT UNIQUE NOT NULL, data TEXT NOT NULL)'
+                    '(seq INTEGER PRIMARY KEY AUTOINCREMENT, id TEXT UNIQUE NOT NULL, '
+                    'data TEXT NOT NULL, version INTEGER NOT NULL DEFAULT 0)'
                 )
                 connection.commit()
             except BaseException:
@@ -124,8 +126,8 @@ class SqliteScheduleStore:
             connection = self._connect()
             try:
                 connection.execute(
-                    f'INSERT INTO "{self._table}" (id, data) VALUES (?, ?)',
-                    (schedule.id, schedule.model_dump_json()),
+                    f'INSERT INTO "{self._table}" (id, data, version) VALUES (?, ?, ?)',
+                    (schedule.id, schedule.model_dump_json(), schedule.version),
                 )
                 connection.commit()
             except sqlite3.IntegrityError as exc:
@@ -155,17 +157,16 @@ class SqliteScheduleStore:
         with self._lock:
             connection = self._connect()
             try:
-                row = connection.execute(f'SELECT data FROM "{self._table}" WHERE id = ?', (schedule.id,)).fetchone()
-                if row is None:
-                    raise ValueError(f'Unknown schedule id {schedule.id!r}.')
-                stored = Schedule.model_validate_json(str(row[0]))
-                if schedule.version != stored.version:
-                    raise ScheduleConflictError(f'Schedule {schedule.id!r} changed since it was read.')
                 bumped = schedule.model_copy(update={'version': schedule.version + 1}, deep=True)
-                connection.execute(
-                    f'UPDATE "{self._table}" SET data = ? WHERE id = ?',
-                    (bumped.model_dump_json(), schedule.id),
+                cursor = connection.execute(
+                    f'UPDATE "{self._table}" SET data = ?, version = ? WHERE id = ? AND version = ?',
+                    (bumped.model_dump_json(), bumped.version, schedule.id, schedule.version),
                 )
+                if cursor.rowcount == 0:
+                    row = connection.execute(f'SELECT 1 FROM "{self._table}" WHERE id = ?', (schedule.id,)).fetchone()
+                    if row is None:
+                        raise ValueError(f'Unknown schedule id {schedule.id!r}.')
+                    raise ScheduleConflictError(f'Schedule {schedule.id!r} changed since it was read.')
                 connection.commit()
             finally:
                 connection.close()
