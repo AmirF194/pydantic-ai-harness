@@ -1,0 +1,340 @@
+"""Tests for scheduled execution semantics."""
+
+from __future__ import annotations
+
+from datetime import datetime, timedelta, timezone
+
+import anyio
+import pytest
+from pydantic_ai import Agent
+from pydantic_ai.messages import ModelMessage, ModelResponse, TextPart
+from pydantic_ai.models.function import AgentInfo, FunctionModel
+from pydantic_ai.models.test import TestModel
+
+from pydantic_ai_harness.scheduling import (
+    InMemoryScheduleStore,
+    IntervalTrigger,
+    OnceTrigger,
+    Schedule,
+    ScheduleResult,
+    ScheduleResultCallback,
+    ScheduleRunner,
+    Scheduling,
+)
+
+pytestmark = pytest.mark.anyio
+
+NOW = datetime(2026, 5, 1, 12, tzinfo=timezone.utc)
+
+
+@pytest.fixture
+def anyio_backend() -> str:
+    """Run agent integration tests on the backend used by Pydantic AI's graph."""
+    return 'asyncio'
+
+
+def _schedule(
+    schedule_id: str,
+    *,
+    trigger: IntervalTrigger | OnceTrigger | None = None,
+    due_at: datetime = NOW,
+    max_runs: int | None = None,
+) -> Schedule:
+    return Schedule(
+        id=schedule_id,
+        name=schedule_id,
+        prompt=f'run {schedule_id}',
+        trigger=trigger or IntervalTrigger(every=timedelta(hours=1)),
+        next_run_at=due_at,
+        max_runs=max_runs,
+    )
+
+
+class TestScheduleRunnerExecution:
+    async def test_success_advances_before_run_and_records_usage(self) -> None:
+        store = InMemoryScheduleStore()
+        await store.add(_schedule('success'))
+        results = await ScheduleRunner(
+            Agent(TestModel(custom_output_text='done')),
+            deps=None,
+            store=store,
+        ).tick(NOW)
+        assert len(results) == 1
+        assert results[0].status == 'success'
+        assert results[0].output == 'done'
+        assert results[0].usage is not None
+        stored = await store.get('success')
+        assert stored is not None
+        assert stored.runs_completed == 1
+        assert stored.next_run_at == NOW + timedelta(hours=1)
+        assert stored.last_run_at == NOW
+        assert stored.last_status == 'success'
+        assert stored.last_output == 'done'
+        assert stored.last_error is None
+
+    async def test_empty_output_is_success(self) -> None:
+        def empty_output() -> str:
+            return ''
+
+        store = InMemoryScheduleStore()
+        await store.add(_schedule('empty'))
+        result = (await ScheduleRunner(Agent(TestModel(), output_type=empty_output), deps=None, store=store).tick(NOW))[
+            0
+        ]
+        assert result.status == 'success'
+        assert result.output == ''
+
+    async def test_max_runs_exhaustion_completes(self) -> None:
+        store = InMemoryScheduleStore()
+        await store.add(_schedule('limited', max_runs=1))
+        result = (await ScheduleRunner(Agent(TestModel()), deps=None, store=store).tick(NOW))[0]
+        assert result.schedule.runs_completed == 1
+        assert result.schedule.next_run_at is None
+        assert result.schedule.status == 'completed'
+
+    async def test_error_records_and_recurring_schedule_continues(self) -> None:
+        async def fail(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+            del messages, info
+            raise RuntimeError('model broke')
+
+        store = InMemoryScheduleStore()
+        await store.add(_schedule('failure'))
+        result = (await ScheduleRunner(Agent(FunctionModel(fail)), deps=None, store=store).tick(NOW))[0]
+        assert result.status == 'error'
+        assert result.error == 'RuntimeError: model broke'
+        assert result.schedule.next_run_at == NOW + timedelta(hours=1)
+        assert result.schedule.last_output is None
+
+    async def test_timeout_is_recorded_without_retry(self) -> None:
+        async def slow(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+            del messages, info
+            await anyio.sleep(1)
+            return ModelResponse(parts=[TextPart('late')])  # pragma: no cover - cancelled by run_timeout first
+
+        store = InMemoryScheduleStore()
+        await store.add(_schedule('timeout'))
+        result = (await ScheduleRunner(Agent(FunctionModel(slow)), deps=None, store=store, run_timeout=0.01).tick(NOW))[
+            0
+        ]
+        assert result.status == 'error'
+        assert result.error is not None
+        assert result.error.startswith('TimeoutError:')
+
+    async def test_invalid_runner_configuration(self) -> None:
+        agent = Agent(TestModel())
+        store = InMemoryScheduleStore()
+        with pytest.raises(ValueError, match='tick_interval'):
+            ScheduleRunner(agent, deps=None, store=store, tick_interval=0)
+        with pytest.raises(ValueError, match='misfire_grace'):
+            ScheduleRunner(agent, deps=None, store=store, misfire_grace=timedelta(seconds=-1))
+        with pytest.raises(ValueError, match='run_timeout'):
+            ScheduleRunner(agent, deps=None, store=store, run_timeout=0)
+
+    async def test_failed_claim_save_releases_overlap_guard(self) -> None:
+        store = _FailOnceScheduleStore()
+        await store.add(_schedule('claim-failure'))
+        runner = ScheduleRunner(Agent(TestModel()), deps=None, store=store)
+        with pytest.raises(RuntimeError, match='save failed'):
+            await runner.tick(NOW)
+        results = await runner.tick(NOW)
+        assert len(results) == 1
+        assert results[0].status == 'success'
+
+
+class TestMisfires:
+    async def test_recurring_misfire_runs_once_and_fast_forwards(self) -> None:
+        store = InMemoryScheduleStore()
+        await store.add(_schedule('catch-up', due_at=NOW - timedelta(days=3)))
+        result = (
+            await ScheduleRunner(
+                Agent(TestModel()),
+                deps=None,
+                store=store,
+                misfire_grace=timedelta(minutes=10),
+            ).tick(NOW)
+        )[0]
+        assert result.status == 'success'
+        assert result.schedule.runs_completed == 1
+        assert result.schedule.next_run_at == NOW + timedelta(hours=1)
+
+    async def test_once_misfire_is_missed_without_agent_call(self) -> None:
+        calls = 0
+
+        def model(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:  # pragma: no cover
+            # Never reached when the missed path is correct; `calls` catches a regression.
+            nonlocal calls
+            del messages, info
+            calls += 1
+            return ModelResponse(parts=[TextPart('unexpected')])
+
+        store = InMemoryScheduleStore()
+        due = NOW - timedelta(hours=1)
+        await store.add(_schedule('missed', trigger=OnceTrigger(at=due), due_at=due))
+        result = (
+            await ScheduleRunner(
+                Agent(FunctionModel(model)),
+                deps=None,
+                store=store,
+                misfire_grace=timedelta(minutes=5),
+            ).tick(NOW)
+        )[0]
+        assert calls == 0
+        assert result.status == 'missed'
+        assert result.schedule.next_run_at is None
+        assert result.schedule.runs_completed == 0
+        assert result.error is not None
+        assert 'runner was not running' in result.error
+
+
+class TestCallbacks:
+    async def test_sync_and_async_callbacks(self) -> None:
+        sync_seen: list[str] = []
+        async_seen: list[str] = []
+
+        def sync_callback(result: ScheduleResult) -> None:
+            sync_seen.append(result.status)
+
+        sync_store = InMemoryScheduleStore()
+        await sync_store.add(_schedule('callback-sync'))
+        await ScheduleRunner(Agent(TestModel()), deps=None, store=sync_store, on_result=sync_callback).tick(NOW)
+        assert sync_seen == ['success']
+
+        async_store = InMemoryScheduleStore()
+        await async_store.add(_schedule('callback-async'))
+        await ScheduleRunner(
+            Agent(TestModel()), deps=None, store=async_store, on_result=_async_callback(async_seen)
+        ).tick(NOW)
+        assert async_seen == ['success']
+
+    async def test_callback_failure_is_delivery_error_not_run_error(self) -> None:
+        def fail(result: ScheduleResult) -> None:
+            del result
+            raise RuntimeError('delivery broke')
+
+        store = InMemoryScheduleStore()
+        await store.add(_schedule('delivery'))
+        result = (await ScheduleRunner(Agent(TestModel()), deps=None, store=store, on_result=fail).tick(NOW))[0]
+        assert result.status == 'success'
+        assert result.schedule.last_delivery_error == 'RuntimeError: delivery broke'
+        stored = await store.get('delivery')
+        assert stored is not None
+        assert stored.last_status == 'success'
+
+    async def test_successful_delivery_clears_previous_error(self) -> None:
+        store = InMemoryScheduleStore()
+        schedule = _schedule('clear-delivery')
+        schedule.last_delivery_error = 'old error'
+        await store.add(schedule)
+        result = (
+            await ScheduleRunner(Agent(TestModel()), deps=None, store=store, on_result=lambda result: None).tick(NOW)
+        )[0]
+        assert result.schedule.last_delivery_error is None
+
+
+def _async_callback(seen: list[str]) -> ScheduleResultCallback:
+    async def callback(result: ScheduleResult) -> None:
+        seen.append(result.status)
+
+    return callback
+
+
+class _FailOnceScheduleStore(InMemoryScheduleStore):
+    def __init__(self) -> None:
+        super().__init__()
+        self._fail = True
+
+    async def save(self, schedule: Schedule) -> None:
+        if self._fail:
+            self._fail = False
+            raise RuntimeError('save failed')
+        await super().save(schedule)
+
+
+class TestConcurrencyAndLoop:
+    async def test_overlap_guard_skips_same_schedule(self) -> None:
+        started = anyio.Event()
+        release = anyio.Event()
+
+        async def slow(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+            del messages, info
+            started.set()
+            await release.wait()
+            return ModelResponse(parts=[TextPart('done')])
+
+        store = InMemoryScheduleStore()
+        await store.add(_schedule('overlap'))
+        first_results: list[ScheduleResult] = []
+
+        async def first_tick() -> None:
+            first_results.extend(await runner.tick(NOW))
+
+        runner = ScheduleRunner(Agent(FunctionModel(slow)), deps=None, store=store)
+        async with anyio.create_task_group() as task_group:
+            task_group.start_soon(first_tick)
+            await started.wait()
+            running = await store.get('overlap')
+            assert running is not None
+            running.next_run_at = NOW
+            await store.save(running)
+            assert await runner.tick(NOW) == []
+            release.set()
+        assert len(first_results) == 1
+
+    async def test_run_until_stopped_can_stop_from_callback(self) -> None:
+        store = InMemoryScheduleStore()
+        await store.add(
+            _schedule(
+                'loop',
+                trigger=OnceTrigger(at=datetime.now(timezone.utc) + timedelta(seconds=1)),
+                due_at=datetime.now(timezone.utc),
+            )
+        )
+        runner: ScheduleRunner[None]
+
+        def stop(result: ScheduleResult) -> None:
+            assert result.status == 'success'
+            runner.stop()
+            runner.stop()
+
+        runner = ScheduleRunner(
+            Agent(TestModel()),
+            deps=None,
+            store=store,
+            on_result=stop,
+            tick_interval=0.01,
+        )
+        with anyio.fail_after(1):
+            await runner.run_until_stopped()
+
+
+class TestScheduledRunRecursionGuard:
+    async def test_scheduled_run_has_no_scheduling_tools_or_instructions(self) -> None:
+        captured: list[tuple[list[str], str | None]] = []
+
+        def inspect_request(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+            del messages
+            captured.append(([tool.name for tool in info.function_tools], info.instructions))
+            return ModelResponse(parts=[TextPart('done')])
+
+        capability = Scheduling[None]()
+        await capability.resolved_store.add(_schedule('guard'))
+        agent: Agent[None, str] = Agent(FunctionModel(inspect_request), deps_type=type(None), capabilities=[capability])
+        results = await ScheduleRunner(agent, deps=None).tick(NOW)
+        assert results[0].status == 'success'
+        assert captured == [([], None)]
+
+    async def test_ordinary_run_keeps_scheduling_tools_and_instructions(self) -> None:
+        captured: list[tuple[list[str], str | None]] = []
+
+        def inspect_request(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+            del messages
+            captured.append(([tool.name for tool in info.function_tools], info.instructions))
+            return ModelResponse(parts=[TextPart('done')])
+
+        agent: Agent[None, str] = Agent(
+            FunctionModel(inspect_request), deps_type=type(None), capabilities=[Scheduling[None]()]
+        )
+        await agent.run('hello')
+        assert 'create_schedule' in captured[0][0]
+        assert captured[0][1] is not None
+        assert 'ScheduleRunner' in captured[0][1]
