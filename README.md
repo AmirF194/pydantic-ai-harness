@@ -149,6 +149,7 @@ We studied leading coding agents, agent frameworks, and Claw-style assistants to
 
 | Category | Capability | Description | Status | Community&nbsp;alternatives |
 |---|---|---|---|---|
+| **Model collaboration** | **Advisor** | Let an executor consult a stronger model through a provider-native tool or a local Pydantic AI fallback | :white_check_mark: [Docs](pydantic_ai_harness/advisor/) | |
 | **Tools &&nbsp;execution** | **Code mode** | Sandboxed Python execution via [Monty](https://github.com/pydantic/monty) -- one `run_code` call replaces N tool calls | :white_check_mark: [Docs](pydantic_ai_harness/code_mode/) | |
 | | **Tool search** | Progressive tool discovery for large tool sets | :white_check_mark: [Pydantic&nbsp;AI](https://pydantic.dev/docs/ai/tools-toolsets/toolsets/#deferred-loading) | |
 | | **File system** | Read, write, edit, search files with path traversal prevention | :white_check_mark: [Docs](pydantic_ai_harness/filesystem/) | [pydantic-ai-backend](https://github.com/vstorm-co/pydantic-ai-backend) (vstorm&#8209;co) |
@@ -172,7 +173,7 @@ We studied leading coding agents, agent frameworks, and Claw-style assistants to
 | | **Context usage reporting** | Report how full the context is, for a live gauge in your UI | :white_check_mark: [Docs](pydantic_ai_harness/compaction/) | [pydantic-deep](https://github.com/vstorm-co/pydantic-deepagents) (vstorm&#8209;co) |
 | | **Tool output limits** | Truncate, summarize, or spill large tool outputs | :white_check_mark: [Docs](pydantic_ai_harness/tool_output_limits/) | |
 | | **Cache-bust monitoring** | Warn when a run's prompt-cache prefix collapses between model requests | :white_check_mark: [Docs](pydantic_ai_harness/warn_on_cache_busts/) | |
-| | **System reminders** | Inject periodic reminders to counteract instruction drift | :construction: [PR&nbsp;#414](https://github.com/pydantic/pydantic-ai-harness/pull/414) | |
+| | **System reminders** | Re-inject periodic or conditional reminders to counteract instruction fade, cache-safely | :white_check_mark: [Docs](pydantic_ai_harness/system_reminders/) | |
 | **Memory &&nbsp;persistence** | **Memory** | Persistent, namespaced notebook with bounded prompt injection, on-demand search, and concurrency-safe stores | :white_check_mark: [Docs](pydantic_ai_harness/memory/) | [pydantic-deep](https://github.com/vstorm-co/pydantic-deepagents) (vstorm&#8209;co) |
 | | **Session persistence** | Save and restore full conversation state | :white_check_mark: [Docs](pydantic_ai_harness/step_persistence/) | |
 | | **Checkpointing** | Snapshot, resume (`continue_run`), and fork (`fork_run`) a run | :white_check_mark: [Docs](pydantic_ai_harness/step_persistence/) | [pydantic-deep](https://github.com/vstorm-co/pydantic-deepagents) (vstorm&#8209;co) |
@@ -190,7 +191,7 @@ We studied leading coding agents, agent frameworks, and Claw-style assistants to
 | | **Tool access control** | Block, redact, or defer tool calls for approval before execution | :white_check_mark: [Docs](pydantic_ai_harness/guardrails/) | [pydantic-ai-shields](https://github.com/vstorm-co/pydantic-ai-shields) (vstorm&#8209;co) |
 | | **Tool result guardrails** | Screen what a tool returns before the model sees it | :white_check_mark: [Docs](pydantic_ai_harness/guardrails/) | |
 | | **Async guardrails** | Run input validation concurrently with the model request (`parallel=True`), cancelling the model call on failure | :white_check_mark: [Docs](pydantic_ai_harness/guardrails/) | [pydantic-ai-shields](https://github.com/vstorm-co/pydantic-ai-shields) (vstorm&#8209;co) |
-| | **Secret masking** | Detect and redact secrets in agent I/O | :construction: [PR&nbsp;#478](https://github.com/pydantic/pydantic-ai-harness/pull/478) | [pydantic-ai-shields](https://github.com/vstorm-co/pydantic-ai-shields) (vstorm&#8209;co) |
+| | **Secret masking** | Redact API keys, tokens, and personal data out of prompts and output | :white_check_mark: [Docs](pydantic_ai_harness/guardrails/) | [pydantic-ai-shields](https://github.com/vstorm-co/pydantic-ai-shields) (vstorm&#8209;co) |
 | | **Approval workflows** | Require human approval for sensitive operations | :white_check_mark: [Pydantic&nbsp;AI](https://pydantic.dev/docs/ai/tools-toolsets/deferred-tools/#human-in-the-loop-tool-approval) | [pydantic-ai-shields](https://github.com/vstorm-co/pydantic-ai-shields) (vstorm&#8209;co) |
 | **Reliability** | **Stuck loop detection** | Detect and break out of repetitive agent loops | :construction: [PR&nbsp;#336](https://github.com/pydantic/pydantic-ai-harness/pull/336) | [pydantic-deep](https://github.com/vstorm-co/pydantic-deepagents) (vstorm&#8209;co) |
 | | **Tool error recovery** | Retry failed tool calls with backoff and budget | :construction: [PR&nbsp;#171](https://github.com/pydantic/pydantic-ai-harness/pull/171) | |
