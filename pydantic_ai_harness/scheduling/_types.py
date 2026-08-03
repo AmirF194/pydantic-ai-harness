@@ -142,10 +142,15 @@ def next_run_time(trigger: ScheduleTrigger, *, after: datetime, timezone: str) -
     return trigger.at if trigger.at > after else None
 
 
+def new_schedule_id() -> str:
+    """Return a short random schedule id; creators retry on the rare collision."""
+    return uuid4().hex[:12]
+
+
 class Schedule(BaseModel):
     """A persisted scheduled agent run."""
 
-    id: str = Field(default_factory=lambda: uuid4().hex[:12])
+    id: str = Field(default_factory=new_schedule_id)
     version: int = 0
     """Store-managed revision used for optimistic concurrency control."""
     name: str

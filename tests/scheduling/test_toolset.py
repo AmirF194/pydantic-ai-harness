@@ -338,6 +338,45 @@ class TestSchedulingTools:
         assert updated.max_runs == 2
         assert updated.next_run_at is None
 
+    async def test_resume_of_an_expired_once_is_a_retry(self) -> None:
+        capability = Scheduling[None]()
+        past = datetime.now(timezone.utc) - timedelta(hours=1)
+        expired = Schedule(
+            id='expired-once',
+            name='expired-once',
+            prompt='work',
+            trigger=OnceTrigger(at=past),
+            enabled=False,
+            next_run_at=past,
+        )
+        await _add(capability, expired)
+
+        with pytest.raises(ModelRetry, match='expired while paused'):
+            await _call(capability, 'resume_schedule', {'schedule_id': 'expired-once'})
+
+        stored = await capability.resolved_store.get('expired-once')
+        assert stored is not None
+        assert stored.enabled is False
+        assert stored.next_run_at == past
+
+    async def test_create_retries_a_colliding_generated_id(self) -> None:
+        store = _DuplicateIdOnceStore()
+        capability = Scheduling[None](store=store)
+
+        created = await _call(capability, 'create_schedule', {'name': 'n', 'prompt': 'p', 'schedule': 'every 2h'})
+
+        assert created.startswith('Schedule created.')
+        assert len(store.attempted_ids) == 2
+        assert store.attempted_ids[0] != store.attempted_ids[1]
+
+    async def test_create_id_collision_exhaustion_is_a_model_retry(self) -> None:
+        store = _AlwaysDuplicateIdStore()
+        capability = Scheduling[None](store=store)
+
+        with pytest.raises(ModelRetry, match='fresh id'):
+            await _call(capability, 'create_schedule', {'name': 'n', 'prompt': 'p', 'schedule': 'every 2h'})
+        assert len(store.attempted_ids) == 3
+
 
 def _recurring(schedule_id: str) -> Schedule:
     return Schedule(
@@ -347,6 +386,28 @@ def _recurring(schedule_id: str) -> Schedule:
         trigger=IntervalTrigger(every=timedelta(hours=1)),
         next_run_at=datetime(2026, 1, 1, tzinfo=timezone.utc),
     )
+
+
+class _DuplicateIdOnceStore(InMemoryScheduleStore):
+    def __init__(self) -> None:
+        super().__init__()
+        self.attempted_ids: list[str] = []
+
+    async def add(self, schedule: Schedule) -> Schedule:
+        self.attempted_ids.append(schedule.id)
+        if len(self.attempted_ids) == 1:
+            raise ValueError(f'A schedule with id {schedule.id!r} already exists.')
+        return await super().add(schedule)
+
+
+class _AlwaysDuplicateIdStore(InMemoryScheduleStore):
+    def __init__(self) -> None:
+        super().__init__()
+        self.attempted_ids: list[str] = []
+
+    async def add(self, schedule: Schedule) -> Schedule:
+        self.attempted_ids.append(schedule.id)
+        raise ValueError(f'A schedule with id {schedule.id!r} already exists.')
 
 
 class _ClaimAfterReadStore(InMemoryScheduleStore):

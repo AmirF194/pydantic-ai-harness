@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import sqlite3
 from collections.abc import Callable
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -104,6 +105,13 @@ class TestSqliteScheduleStore:
         loaded = await SqliteScheduleStore(database).get('kept')
         assert loaded is not None
         assert loaded.model_dump() == expected.model_dump()
+
+    async def test_schema_failure_closes_the_connection(self, tmp_path: Path) -> None:
+        database = tmp_path / 'corrupt.db'
+        database.write_bytes(b'not a sqlite database')
+        store = SqliteScheduleStore(str(database))
+        with pytest.raises(sqlite3.DatabaseError):
+            await store.add(_schedule('any'))
 
     async def test_reserved_word_table_name(self, tmp_path: Path) -> None:
         store = SqliteScheduleStore(str(tmp_path / 'reserved.db'), table='select')

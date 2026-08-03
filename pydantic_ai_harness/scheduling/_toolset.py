@@ -19,6 +19,7 @@ from pydantic_ai_harness.scheduling._types import (
     OnceTrigger,
     Schedule,
     ScheduleTrigger,
+    new_schedule_id,
     next_run_time,
     parse_schedule,
 )
@@ -173,8 +174,16 @@ class SchedulingToolset(FunctionToolset[AgentDepsT]):
             )
         except ValueError as exc:
             raise ModelRetry(f'Invalid schedule: {exc}') from exc
-        await self._capability.resolved_store.add(created)
-        return f'Schedule created.\n{_render_schedule(created, full=False)}'
+        for attempt in range(_SAVE_ATTEMPTS):
+            try:
+                await self._capability.resolved_store.add(created)
+            except ValueError as exc:
+                if attempt == _SAVE_ATTEMPTS - 1:
+                    raise ModelRetry('Could not store the schedule under a fresh id. Try again.') from exc
+                created = created.model_copy(update={'id': new_schedule_id()})
+                continue
+            return f'Schedule created.\n{_render_schedule(created, full=False)}'
+        raise AssertionError('unreachable')  # pragma: no cover
 
     async def list_schedules(self, ctx: RunContext[AgentDepsT]) -> str:
         """List all schedules without prompt or output bodies."""
@@ -279,7 +288,10 @@ class SchedulingToolset(FunctionToolset[AgentDepsT]):
             schedule.enabled = True
             if schedule.next_run_at is not None:
                 now = datetime.now(datetime_timezone.utc)
-                schedule.next_run_at = next_run_time(schedule.trigger, after=now, timezone=schedule.timezone)
+                next_run_at = next_run_time(schedule.trigger, after=now, timezone=schedule.timezone)
+                if next_run_at is None:
+                    raise ModelRetry('This schedule expired while paused. Create a new schedule instead.')
+                schedule.next_run_at = next_run_at
             if not await self._save_or_retry(schedule, attempt):
                 continue
             return f'Schedule {schedule.id} resumed.\n{_render_schedule(schedule, full=False)}'

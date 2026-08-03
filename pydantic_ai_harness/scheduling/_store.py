@@ -107,11 +107,15 @@ class SqliteScheduleStore:
     def _connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(self._database)
         if not self._ready:
-            connection.execute(
-                f'CREATE TABLE IF NOT EXISTS "{self._table}" '
-                '(seq INTEGER PRIMARY KEY AUTOINCREMENT, id TEXT UNIQUE NOT NULL, data TEXT NOT NULL)'
-            )
-            connection.commit()
+            try:
+                connection.execute(
+                    f'CREATE TABLE IF NOT EXISTS "{self._table}" '
+                    '(seq INTEGER PRIMARY KEY AUTOINCREMENT, id TEXT UNIQUE NOT NULL, data TEXT NOT NULL)'
+                )
+                connection.commit()
+            except BaseException:
+                connection.close()
+                raise
             self._ready = True
         return connection
 
