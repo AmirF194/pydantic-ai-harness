@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pytest
 from pydantic_ai import Agent
+from pydantic_ai.capabilities import PrefixTools
 from pydantic_ai.messages import InstructionPart
 from pydantic_ai.models.test import TestModel
 
@@ -32,6 +33,20 @@ class TestSchedulingCapability:
 
     def test_each_default_store_is_fresh(self) -> None:
         assert Scheduling[None]().resolved_store is not Scheduling[None]().resolved_store
+
+    def test_explicit_falsey_store_wins(self) -> None:
+        store = _FalseyScheduleStore()
+        assert not store
+        ScheduleRunner(Agent(TestModel()), deps=None, store=store)
+
+    def test_runner_resolves_wrapped_scheduling_store(self) -> None:
+        capability = Scheduling[None]()
+        agent: Agent[None, str] = Agent(
+            TestModel(),
+            deps_type=type(None),
+            capabilities=[PrefixTools(wrapped=capability, prefix='sched')],
+        )
+        ScheduleRunner(agent, deps=None)
 
     def test_invalid_timezone_rejected(self) -> None:
         with pytest.raises(ValueError, match='Unknown IANA timezone'):
@@ -87,3 +102,8 @@ class TestSchedulingCapability:
                 assert instructions is not None
                 assert expected in instructions
             assert result.output == 'success (no tool calls)'
+
+
+class _FalseyScheduleStore(InMemoryScheduleStore):
+    def __bool__(self) -> bool:
+        return False

@@ -7,6 +7,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
+from pydantic_ai.usage import UsageLimits
 
 from pydantic_ai_harness.scheduling import (
     InMemoryScheduleStore,
@@ -90,6 +91,7 @@ class TestSqliteScheduleStore:
     async def test_roundtrip_across_instances(self, tmp_path: Path) -> None:
         database = str(tmp_path / 'persistent.db')
         expected = _schedule('kept')
+        expected.usage_limits = UsageLimits(request_limit=3, total_tokens_limit=10_000)
         await SqliteScheduleStore(database).add(expected)
         loaded = await SqliteScheduleStore(database).get('kept')
         assert loaded is not None

@@ -96,19 +96,8 @@ def parse_schedule(text: str, *, timezone: str = 'UTC', now: datetime | None = N
 
     Accepted forms are `every <N><m|h|d>`, `in <N><m|h|d>`, an ISO 8601
     datetime, or a five-field cron expression. A naive ISO datetime is
-    interpreted in `timezone`.
-
-    Args:
-        text: Schedule text to parse.
-        timezone: IANA timezone for naive datetimes and cron schedules.
-        now: Current time override used by relative one-shot schedules.
-
-    Returns:
-        The parsed trigger.
-
-    Raises:
-        ValueError: If the timezone or schedule text is invalid.
-        ImportError: If a cron expression is used without the scheduling extra.
+    interpreted in `timezone`. Cron expressions raise `ImportError` when the
+    scheduling extra is not installed.
     """
     timezone = _validate_timezone(timezone)
     value = text.strip()

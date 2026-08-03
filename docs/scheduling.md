@@ -64,6 +64,7 @@ Naive datetimes and cron expressions are interpreted in the schedule's IANA time
 - **At most once.** A schedule's next occurrence is advanced and saved before the agent runs, so a crash mid-run skips an occurrence instead of running it twice.
 - **No automatic retry.** A failed run records `last_error` and the schedule keeps its next occurrence; for recurring work, the next occurrence is the retry.
 - **No overlap.** A schedule still running when it comes due again is skipped, never run concurrently with itself.
+- **One runner per store.** At-most-once and no-overlap hold within a single runner process. Two runners sharing a store can both claim the same occurrence.
 - **No backlog replay.** A recurring schedule overdue beyond `misfire_grace` (default 10 minutes) runs once now and continues from the next future occurrence. An overdue one-shot is recorded as `missed` instead of running hours late. Resuming a paused schedule continues from its next future occurrence.
 - **Bounded runs.** `max_runs` counts attempts; when reached, the schedule completes. `run_timeout` and per-schedule or runner-wide `usage_limits` cap each run's wall-clock time and spend.
 - Empty output is a success, not an error.
@@ -79,8 +80,8 @@ from pydantic_ai_harness.scheduling import ScheduleResult
 
 
 async def deliver(result: ScheduleResult) -> None:
-    if result.schedule.deliver_to == 'slack:#eng':
-        await post_to_slack(result.output)
+    target = result.schedule.deliver_to or 'stdout'
+    print(f'[{target}] {result.schedule.name}: {result.output}')
 ```
 
 ## Scheduled runs cannot schedule
@@ -90,6 +91,8 @@ Inside a scheduled run, the scheduling tools and instructions are absent. A sche
 ## Driving the runner from outside
 
 `tick()` claims and executes everything due, then returns. Call it from system cron, a workflow engine, or serverless infrastructure instead of keeping `run_until_stopped()` alive:
+
+Invocations must not overlap for a given store; schedule the external trigger accordingly.
 
 ```python
 from pydantic_ai import Agent

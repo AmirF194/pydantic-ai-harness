@@ -231,6 +231,8 @@ class SchedulingToolset(FunctionToolset[AgentDepsT]):
             updated = Schedule.model_validate(data)
         except ValueError as exc:
             raise ModelRetry(f'Invalid schedule update: {exc}') from exc
+        if updated.max_runs is not None and updated.runs_completed >= updated.max_runs:
+            updated.next_run_at = None
         await self._capability.resolved_store.save(updated)
         return f'Schedule updated.\n{_render_schedule(updated, full=False)}'
 
@@ -246,9 +248,12 @@ class SchedulingToolset(FunctionToolset[AgentDepsT]):
         """Resume from the next occurrence after now instead of replaying a backlog."""
         del ctx
         schedule = await self._known_or_retry(schedule_id)
-        now = datetime.now(datetime_timezone.utc)
+        if schedule.enabled:
+            raise ModelRetry('This schedule is not paused.')
         schedule.enabled = True
-        schedule.next_run_at = next_run_time(schedule.trigger, after=now, timezone=schedule.timezone)
+        if schedule.next_run_at is not None:
+            now = datetime.now(datetime_timezone.utc)
+            schedule.next_run_at = next_run_time(schedule.trigger, after=now, timezone=schedule.timezone)
         await self._capability.resolved_store.save(schedule)
         return f'Schedule {schedule.id} resumed.\n{_render_schedule(schedule, full=False)}'
 
@@ -265,6 +270,8 @@ class SchedulingToolset(FunctionToolset[AgentDepsT]):
         schedule = await self._known_or_retry(schedule_id)
         if not schedule.enabled:
             raise ModelRetry('This schedule is paused. Resume it before queuing an immediate run.')
+        if schedule.next_run_at is None:
+            raise ModelRetry('This schedule is completed. Create a new schedule instead.')
         schedule.next_run_at = datetime.now(datetime_timezone.utc)
         await self._capability.resolved_store.save(schedule)
         return f'Schedule {schedule.id} queued for the next runner tick.'

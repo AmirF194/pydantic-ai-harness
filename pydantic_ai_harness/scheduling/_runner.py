@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import inspect
+from collections.abc import Callable
 from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -10,7 +11,7 @@ from typing import Any, Generic, Literal
 
 import anyio
 from pydantic_ai.agent import AbstractAgent
-from pydantic_ai.capabilities import AbstractCapability
+from pydantic_ai.capabilities import AbstractCapability, WrapperCapability
 from pydantic_ai.tools import AgentDepsT
 from pydantic_ai.usage import UsageLimits
 
@@ -58,18 +59,9 @@ class ScheduleRunner(Generic[AgentDepsT]):
     ) -> None:
         """Initialize a schedule runner.
 
-        Args:
-            agent: Agent used for each isolated scheduled run.
-            deps: Dependencies passed to every agent run.
-            store: Schedule store, or `None` to find the agent's `Scheduling` store.
-            on_result: Optional sync or async outcome callback.
-            tick_interval: Seconds between claims in the continuous loop.
-            misfire_grace: Maximum lateness before one-shot schedules are missed.
-            run_timeout: Optional wall-clock limit for one agent run.
-            usage_limits: Default usage limits for schedules without their own limits.
-
-        Raises:
-            ValueError: If configuration is invalid or no unambiguous store can be found.
+        Store resolution falls back to the agent's `Scheduling` capability. `misfire_grace`
+        bounds how late an occurrence may fire, and `usage_limits` is the default when a
+        schedule has none.
         """
         if tick_interval <= 0:
             raise ValueError('tick_interval must be greater than zero')
@@ -78,7 +70,7 @@ class ScheduleRunner(Generic[AgentDepsT]):
         if run_timeout is not None and run_timeout <= 0:
             raise ValueError('run_timeout must be greater than zero')
         self._agent = agent
-        self._store = store or self._store_from_agent(agent)
+        self._store = store if store is not None else self._store_from_agent(agent)
         self._deps = deps
         self._on_result = on_result
         self._tick_interval = tick_interval
@@ -92,66 +84,91 @@ class ScheduleRunner(Generic[AgentDepsT]):
     def _store_from_agent(agent: AbstractAgent[AgentDepsT, Any]) -> ScheduleStore:
         from pydantic_ai_harness.scheduling._capability import Scheduling
 
-        found: ScheduleStore | None = None
-        multiple = False
+        found: list[Scheduling[AgentDepsT]] = []
 
         def inspect_capability(capability: AbstractCapability[AgentDepsT]) -> None:
-            nonlocal found, multiple
-            if isinstance(capability, Scheduling):
-                if found is not None:
-                    multiple = True
-                else:
-                    found = capability.resolved_store
+            while isinstance(capability, WrapperCapability):
+                capability = capability.wrapped
+            if isinstance(capability, Scheduling) and all(match is not capability for match in found):
+                found.append(capability)
 
         agent.root_capability.apply(inspect_capability)
-        if multiple:
+        if len(found) > 1:
             raise ValueError('The agent has multiple Scheduling capabilities; pass `store=` explicitly.')
-        if found is None:
+        if not found:
             raise ValueError('No Scheduling capability was found on the agent; pass `store=` explicitly.')
-        return found
+        return found[0].resolved_store
 
     async def _claim_due(self, now: datetime) -> list[_Claim]:
         claims: list[_Claim] = []
-        for schedule in await self._store.list():
-            due_at = schedule.next_run_at
-            if not schedule.enabled or due_at is None or due_at > now or schedule.id in self._running:
-                continue
-            self._running.add(schedule.id)
-            try:
-                overdue = now - due_at > self._misfire_grace
-                if overdue and isinstance(schedule.trigger, OnceTrigger):
-                    schedule.next_run_at = None
-                    schedule.last_status = 'missed'
-                    schedule.last_error = 'The runner was not running within the allowed grace period.'
-                    await self._store.save(schedule)
-                    claims.append(_Claim(schedule, execute=False, claimed_at=now))
+        try:
+            for schedule in await self._store.list():
+                due_at = schedule.next_run_at
+                if not schedule.enabled or due_at is None or due_at > now:
                     continue
-
-                if isinstance(schedule.trigger, (CronTrigger, IntervalTrigger)):
-                    schedule.next_run_at = next_run_time(schedule.trigger, after=now, timezone=schedule.timezone)
-                else:
-                    schedule.next_run_at = None
-                schedule.runs_completed += 1
                 if schedule.max_runs is not None and schedule.runs_completed >= schedule.max_runs:
                     schedule.next_run_at = None
-                await self._store.save(schedule)
-                claims.append(_Claim(schedule, execute=True, claimed_at=now))
-            except BaseException:
-                self._running.discard(schedule.id)
-                raise
+                    await self._store.save(schedule)
+                    continue
+                if schedule.id in self._running:
+                    if isinstance(schedule.trigger, (CronTrigger, IntervalTrigger)):  # pragma: no branch
+                        schedule.next_run_at = next_run_time(schedule.trigger, after=now, timezone=schedule.timezone)
+                        await self._store.save(schedule)
+                    continue
+                self._running.add(schedule.id)
+                try:
+                    overdue = now - due_at > self._misfire_grace
+                    if overdue and isinstance(schedule.trigger, OnceTrigger):
+                        schedule.next_run_at = None
+                        schedule.last_status = 'missed'
+                        schedule.last_error = 'The runner was not running within the allowed grace period.'
+                        await self._store.save(schedule)
+                        claims.append(_Claim(schedule, execute=False, claimed_at=now))
+                        continue
+
+                    if isinstance(schedule.trigger, (CronTrigger, IntervalTrigger)):
+                        schedule.next_run_at = next_run_time(schedule.trigger, after=now, timezone=schedule.timezone)
+                    else:
+                        schedule.next_run_at = None
+                    schedule.runs_completed += 1
+                    if schedule.max_runs is not None and schedule.runs_completed >= schedule.max_runs:
+                        schedule.next_run_at = None
+                    await self._store.save(schedule)
+                    claims.append(_Claim(schedule, execute=True, claimed_at=now))
+                except BaseException:
+                    self._running.discard(schedule.id)
+                    raise
+        except BaseException:
+            for claim in claims:
+                self._running.discard(claim.schedule.id)
+            raise
         return claims
+
+    async def _apply_outcome(self, schedule_id: str, fallback: Schedule, apply: Callable[[Schedule], None]) -> Schedule:
+        """Re-read so outcome fields preserve concurrent edits and a deleted schedule stays deleted."""
+        current = await self._store.get(schedule_id)
+        target = current if current is not None else fallback
+        apply(target)
+        if current is not None:
+            await self._store.save(target)
+        return target
 
     async def _deliver(self, result: ScheduleResult) -> None:
         if self._on_result is None:
             return
-        result.schedule.last_delivery_error = None
+        delivery_error: str | None = None
         try:
             callback_result = self._on_result(result)
             if inspect.isawaitable(callback_result):
                 await callback_result
         except Exception as exc:
-            result.schedule.last_delivery_error = f'{type(exc).__name__}: {exc}'[:1000]
-        await self._store.save(result.schedule)
+            delivery_error = f'{type(exc).__name__}: {exc}'[:1000]
+
+        def apply_delivery(schedule: Schedule) -> None:
+            schedule.last_delivery_error = delivery_error
+            result.schedule.last_delivery_error = delivery_error
+
+        await self._apply_outcome(result.schedule.id, result.schedule, apply_delivery)
 
     async def _execute(self, claim: _Claim) -> ScheduleResult:
         schedule = claim.schedule
@@ -196,13 +213,16 @@ class ScheduleRunner(Generic[AgentDepsT]):
             finally:
                 scheduled_run_var.reset(token)
 
-            schedule.last_run_at = claim.claimed_at
-            schedule.last_status = status
-            schedule.last_output = output if status == 'success' else schedule.last_output
-            schedule.last_error = error
-            await self._store.save(schedule)
+            def apply_outcome(target: Schedule) -> None:
+                target.last_run_at = claim.claimed_at
+                target.last_status = status
+                target.last_error = error
+                if status == 'success':
+                    target.last_output = output
+
+            updated = await self._apply_outcome(schedule.id, schedule, apply_outcome)
             result = ScheduleResult(
-                schedule=schedule,
+                schedule=updated,
                 status=status,
                 output=output,
                 error=error,
@@ -224,12 +244,6 @@ class ScheduleRunner(Generic[AgentDepsT]):
         This method does not require the continuous runner loop, so an external
         scheduler can drive it from system cron, a workflow engine, or serverless
         infrastructure.
-
-        Args:
-            now: UTC-aware claim time override for deterministic callers and tests.
-
-        Returns:
-            Results from every occurrence claimed by this tick.
         """
         reference = now or datetime.now(timezone.utc)
         results: list[ScheduleResult] = []

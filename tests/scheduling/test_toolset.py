@@ -215,6 +215,39 @@ class TestSchedulingTools:
         assert queued.next_run_at is not None
         assert queued.next_run_at <= datetime.now(timezone.utc)
 
+    async def test_completed_schedules_are_terminal(self) -> None:
+        capability = Scheduling[None]()
+        completed = _recurring('completed')
+        completed.next_run_at = None
+        paused_completed = _recurring('paused-completed')
+        paused_completed.enabled = False
+        paused_completed.next_run_at = None
+        await _add(capability, completed)
+        await _add(capability, paused_completed)
+
+        with pytest.raises(ModelRetry, match='completed.*Create a new schedule'):
+            await _call(capability, 'run_schedule_now', {'schedule_id': 'completed'})
+        with pytest.raises(ModelRetry, match='not paused'):
+            await _call(capability, 'resume_schedule', {'schedule_id': 'completed'})
+
+        await _call(capability, 'resume_schedule', {'schedule_id': 'paused-completed'})
+        resumed = await capability.resolved_store.get('paused-completed')
+        assert resumed is not None
+        assert resumed.enabled is True
+        assert resumed.next_run_at is None
+
+    async def test_lowering_max_runs_below_attempt_count_completes_schedule(self) -> None:
+        capability = Scheduling[None]()
+        schedule = _recurring('lower-limit')
+        schedule.runs_completed = 3
+        await _add(capability, schedule)
+
+        await _call(capability, 'update_schedule', {'schedule_id': 'lower-limit', 'max_runs': 2})
+        updated = await capability.resolved_store.get('lower-limit')
+        assert updated is not None
+        assert updated.max_runs == 2
+        assert updated.next_run_at is None
+
 
 def _recurring(schedule_id: str) -> Schedule:
     return Schedule(
