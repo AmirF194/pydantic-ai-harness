@@ -2436,9 +2436,10 @@ lint = [
 
 [[package]]
 name = "pydantic-ai-slim"
-version = "2.21.1.dev41+dbd14240"
-source = { git = "https://github.com/pydantic/pydantic-ai.git?subdirectory=pydantic_ai_slim&branch=instruction-part-id#dbd142409b5aaf0427f5a56215d8861c53d1c791" }
+version = "2.22.1.dev23+d8ba477f"
+source = { git = "https://github.com/pydantic/pydantic-ai.git?subdirectory=pydantic_ai_slim&branch=instruction-part-id#d8ba477fb1f7b3b772f99e069fa29116f4c5b50c" }
 dependencies = [
+    { name = "anyio" },
     { name = "exceptiongroup", marker = "python_full_version < '3.11'" },
     { name = "genai-prices" },
     { name = "griffelib" },
@@ -2582,9 +2583,10 @@ wheels = [
 
 [[package]]
 name = "pydantic-graph"
-version = "2.21.1.dev41+dbd14240"
-source = { git = "https://github.com/pydantic/pydantic-ai.git?subdirectory=pydantic_graph&branch=instruction-part-id#dbd142409b5aaf0427f5a56215d8861c53d1c791" }
+version = "2.22.1.dev23+d8ba477f"
+source = { git = "https://github.com/pydantic/pydantic-ai.git?subdirectory=pydantic_graph&branch=instruction-part-id#d8ba477fb1f7b3b772f99e069fa29116f4c5b50c" }
 dependencies = [
+    { name = "anyio" },
     { name = "httpx" },
     { name = "logfire-api" },
     { name = "pydantic" },
