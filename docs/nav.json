@@ -3,6 +3,7 @@
     "label": "Pydantic AI Harness",
     "items": [
       { "label": "Overview", "slug": "index" },
+      { "label": "Advisor", "slug": "advisor" },
       { "label": "Code Mode", "slug": "code-mode" },
       { "label": "FileSystem", "slug": "filesystem" },
       { "label": "Shell", "slug": "shell" },
@@ -19,6 +20,7 @@
       { "label": "Subagents", "slug": "subagents" },
       { "label": "Dynamic Workflow", "slug": "dynamic-workflow" },
       { "label": "Planning", "slug": "planning" },
+      { "label": "System Reminders", "slug": "system-reminders" },
       { "label": "Memory", "slug": "memory" },
       { "label": "Modal Sandbox", "slug": "modal-sandbox" },
       { "label": "Runtime Capability Creation", "slug": "capability-creation" },
