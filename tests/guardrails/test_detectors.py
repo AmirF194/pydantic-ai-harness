@@ -507,12 +507,13 @@ class TestForToolResultText:
 
         assert verdict == GuardrailResult.allow()
 
-    def test_a_text_detector_must_replace_with_text(self):
+    @pytest.mark.parametrize('result', ['secret', ToolReturn('secret')])
+    def test_a_text_detector_must_replace_with_text(self, result: object):
         def invalid_detector(_: str) -> GuardrailResult:
             return GuardrailResult.replace(42)
 
         with pytest.raises(UserError, match='must replace a tool result with text'):
-            for_tool_result_text(invalid_detector)(self._info(ToolReturn('secret')))
+            for_tool_result_text(invalid_detector)(self._info(result))
 
     async def test_a_real_tool_return_is_redacted_without_losing_its_metadata(self):
         metadata = {'request_id': 'r1'}

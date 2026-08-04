@@ -422,7 +422,12 @@ def for_tool_result_text(
     def guard(info: ToolResultInfo) -> GuardrailResult:
         result = info.result
         if isinstance(result, str):
-            return detector(result)
+            verdict = detector(result)
+            if verdict.action == 'replace' and not isinstance(verdict.replacement, str):
+                raise UserError(
+                    'A text detector used with for_tool_result_text() must replace a tool result with text.'
+                )
+            return verdict
         if _is_text_tool_return(result):
             assert isinstance(result.return_value, str)
             verdict = detector(result.return_value)

@@ -212,9 +212,9 @@ class ToolGuardrail(AbstractCapability[AgentDepsT]):
     An empty sequence guards nothing, which is the same as configuring no guard at all --
     write `None` when you mean every tool.
 
-    A configured name that no offered tool matches warns after the run. Toolsets
-    can vary between run steps, so absence from one step is not enough to diagnose
-    a typo.
+    A configured name that no offered tool matches warns after a successful run when
+    `guard` or `result_guard` is set. Toolsets can vary between run steps, so absence
+    from one step is not enough to diagnose a typo.
     """
 
     hidden: Sequence[str] = field(default_factory=tuple)
