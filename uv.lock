@@ -2436,8 +2436,8 @@ lint = [
 
 [[package]]
 name = "pydantic-ai-slim"
-version = "2.23.1.dev38+78ac6e7d"
-source = { git = "https://github.com/pydantic/pydantic-ai.git?subdirectory=pydantic_ai_slim&branch=sandbox-concept#78ac6e7d537078b2c5dbdc9a7a1c198339e839dd" }
+version = "2.23.1.dev39+aacd404d"
+source = { git = "https://github.com/pydantic/pydantic-ai.git?subdirectory=pydantic_ai_slim&branch=sandbox-concept#aacd404d0ce50559cc2ac242403e6d06ea11e9b7" }
 dependencies = [
     { name = "anyio" },
     { name = "exceptiongroup", marker = "python_full_version < '3.11'" },
@@ -2583,8 +2583,8 @@ wheels = [
 
 [[package]]
 name = "pydantic-graph"
-version = "2.23.1.dev38+78ac6e7d"
-source = { git = "https://github.com/pydantic/pydantic-ai.git?subdirectory=pydantic_graph&branch=sandbox-concept#78ac6e7d537078b2c5dbdc9a7a1c198339e839dd" }
+version = "2.23.1.dev39+aacd404d"
+source = { git = "https://github.com/pydantic/pydantic-ai.git?subdirectory=pydantic_graph&branch=sandbox-concept#aacd404d0ce50559cc2ac242403e6d06ea11e9b7" }
 dependencies = [
     { name = "anyio" },
     { name = "httpx" },
