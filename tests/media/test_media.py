@@ -13,9 +13,10 @@ from typing import TypeGuard
 import httpx
 import pytest
 from httpx import AsyncClient, MockTransport, Request, Response
+from pydantic_ai import ModelMessagesTypeAdapter
 from pydantic_ai.messages import (
+    BinaryContent,
     ModelMessage,
-    ModelMessagesTypeAdapter,
     ModelRequest,
     ModelResponse,
     TextContent,
@@ -274,6 +275,28 @@ class TestExternalizeRestoreWalker:
         restored_text = json.dumps(restored)
         assert '"kind": "binary"' in restored_text
         assert b64_payload in restored_text  # bytes restored exactly
+
+    async def test_binary_round_trip_accepts_pydantic_urlsafe_base64(self, tmp_path: Path) -> None:
+        payload = bytes(range(256)) * 500
+        messages: list[ModelMessage] = [
+            ModelRequest(
+                parts=[UserPromptPart(content=[BinaryContent(data=payload, media_type='application/octet-stream')])]
+            )
+        ]
+        node: object = json.loads(ModelMessagesTypeAdapter.dump_json(messages))
+        store = DiskMediaStore(tmp_path)
+
+        externalized = await externalize_media(node, media_store=store, threshold_bytes=64 * 1024)
+        restored = await restore_media(externalized, media_store=store)
+        [restored_message] = ModelMessagesTypeAdapter.validate_python(restored)
+        assert isinstance(restored_message, ModelRequest)
+        [restored_part] = restored_message.parts
+        assert isinstance(restored_part, UserPromptPart)
+        assert not isinstance(restored_part.content, str)
+        [restored_binary] = restored_part.content
+        assert isinstance(restored_binary, BinaryContent)
+
+        assert restored_binary.data == payload
 
     async def test_binary_restore_reuses_write_context(self, tmp_path: Path) -> None:
         """A context-dependent storage key is found with the binary media type."""
