@@ -11,11 +11,11 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from decimal import Decimal
-from typing import Any, Generic, Literal, TypedDict
+from typing import Any, Generic, Literal
 
 from pydantic_ai.exceptions import UserError
 from pydantic_ai.tools import AgentDepsT, RunContext
-from typing_extensions import assert_never
+from typing_extensions import TypedDict, assert_never
 
 Window = Literal['run', 'conversation', 'day', 'month', 'total']
 """The period a budget counts over."""
