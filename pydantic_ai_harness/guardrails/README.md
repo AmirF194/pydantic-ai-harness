@@ -379,7 +379,7 @@ ToolGuardrail(
 
 `hidden` is not a blocklist with a nicer name. A hidden tool is dropped from the definitions sent to the model, so it costs no tokens and the model never attempts it; a blocked tool stays visible and the model learns it was refused. Hiding takes a static list of names -- for policy that depends on `deps` or on the arguments, use `guard`.
 
-Configured `tools` and `hidden` names are checked when the run finishes. A
+Configured `tools` and `hidden` names are checked when a run completes successfully. A
 dynamic toolset may omit a tool on one step and offer it later, so a name that
 never appears is the only typo signal. That warning catches `tools=['send_monye']`,
 which otherwise leaves the intended tool unguarded, and a misspelled `hidden`
