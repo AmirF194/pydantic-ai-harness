@@ -639,6 +639,20 @@ class TestHiddenTools:
 class TestHiddenNameWarning:
     """`hidden` is the one setting whose typo fails open."""
 
+    async def test_an_unstarted_agent_iteration_does_not_warn_about_hidden_names(self):
+        agent = Agent(
+            _scripted(ModelResponse(parts=[TextPart(content='done')])),
+            deps_type=type(None),
+            capabilities=[ToolGuardrail(hidden=['danger'])],
+        )
+
+        with warnings.catch_warnings(record=True) as raised:
+            warnings.simplefilter('always')
+            async with agent.iter('hi'):
+                pass
+
+        assert raised == []
+
     async def test_a_run_without_function_tools_warns_about_hidden_names(self):
         agent = Agent(
             _scripted(ModelResponse(parts=[TextPart(content='done')])),
@@ -651,6 +665,30 @@ class TestHiddenNameWarning:
             result = await agent.run('hi')
 
         assert result.output == 'done'
+        assert [str(warning.message) for warning in raised] == [
+            "ToolGuardrail.hidden names 'danger', which no tool offered during this run is called. "
+            'The name stays available to the model.'
+        ]
+
+    async def test_a_prepared_run_that_errors_still_warns_about_hidden_names(self):
+        def fail(_: list[ModelMessage], __: AgentInfo) -> ModelResponse:
+            raise RuntimeError('boom')
+
+        agent = Agent(
+            FunctionModel(fail),
+            deps_type=type(None),
+            capabilities=[ToolGuardrail(hidden=['danger'])],
+        )
+
+        @agent.tool_plain
+        def safe() -> str:  # pragma: no cover - the model fails before tool execution
+            return 'safe'
+
+        with warnings.catch_warnings(record=True) as raised:
+            warnings.simplefilter('always')
+            with pytest.raises(RuntimeError, match='boom'):
+                await agent.run('hi')
+
         assert [str(warning.message) for warning in raised] == [
             "ToolGuardrail.hidden names 'danger', which no tool offered during this run is called. "
             'The name stays available to the model.'

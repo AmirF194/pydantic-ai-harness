@@ -237,6 +237,9 @@ class ToolGuardrail(AbstractCapability[AgentDepsT]):
     _seen_tools: set[str] = field(default_factory=set[str], init=False, repr=False, compare=False)
     """`tools` names that appeared during this run."""
 
+    _prepared_tools: bool = field(default=False, init=False, repr=False, compare=False)
+    """Whether this run reached function-tool preparation."""
+
     def __post_init__(self) -> None:
         """Reject a bare string where a collection of tool names is meant.
 
@@ -281,6 +284,7 @@ class ToolGuardrail(AbstractCapability[AgentDepsT]):
         may legitimately offer a tool only on some steps, so first absence is not
         evidence of a typo.
         """
+        self._prepared_tools = True
         offered = {tool_def.name for tool_def in tool_defs}
         self._seen_tools.update(set(self.tools or ()).intersection(offered))
         self._seen_hidden.update(set(self.hidden).intersection(offered))
@@ -302,6 +306,8 @@ class ToolGuardrail(AbstractCapability[AgentDepsT]):
 
     def _warn_unmatched_names(self) -> None:
         """Warn when a configured selector never appeared in this run."""
+        if not self._prepared_tools:
+            return
         if self.tools and (self.guard is not None or self.result_guard is not None):
             for name in sorted(set(self.tools) - self._seen_tools):
                 warnings.warn(
