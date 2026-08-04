@@ -191,7 +191,8 @@ class BrowserUse(AbstractCapability[AgentDepsT]):
     """Custom delegation guidance for the system prompt.
 
     Leave as `None` for the default guidance, or set `''` to contribute no
-    instructions at all.
+    instructions at all. Custom guidance must retain the untrusted web-content
+    safety rule from the default guidance.
     """
 
     browser_agent: BrowserAgentFactory | None = None
@@ -206,17 +207,18 @@ class BrowserUse(AbstractCapability[AgentDepsT]):
 
     def __post_init__(self) -> None:
         """Warn when flat secrets have no effective navigation allowlist."""
-        if self.allowed_domains is not None:
-            has_allowlist = bool(self.allowed_domains)
-        else:
-            has_allowlist = self.browser_profile is not None and bool(self.browser_profile.allowed_domains)
+        effective_allowed_domains = self.allowed_domains
+        if effective_allowed_domains is None and self.browser_profile is not None:
+            effective_allowed_domains = self.browser_profile.allowed_domains
+        has_restrictive_allowlist = bool(effective_allowed_domains) and '*' not in effective_allowed_domains
         has_flat_secrets = self.sensitive_data is not None and any(
             isinstance(value, str) for value in self.sensitive_data.values()
         )
-        if has_flat_secrets and not has_allowlist:
+        if has_flat_secrets and not has_restrictive_allowlist:
             warnings.warn(
-                'Flat `sensitive_data` values apply to every domain when no `allowed_domains` are configured. '
-                'Set `allowed_domains`, configure them on `browser_profile`, or use domain-scoped nested values.',
+                'Flat `sensitive_data` values apply to every domain when no restrictive `allowed_domains` are '
+                'configured. Set a concrete allowlist on the capability or `browser_profile`, or use domain-scoped '
+                'nested values.',
                 UserWarning,
                 stacklevel=2,
             )
