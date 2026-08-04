@@ -6,14 +6,14 @@ import asyncio
 import json
 import warnings
 from collections.abc import Callable
-from typing import Any
+from typing import Any, NoReturn
 
 import pytest
 from opentelemetry.sdk.trace import ReadableSpan, TracerProvider
 from opentelemetry.sdk.trace.export import SimpleSpanProcessor
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 from opentelemetry.trace import NoOpTracer, Tracer
-from pydantic_ai import Agent, AgentSpec, DeferredToolRequests, DeferredToolResults, ToolDenied
+from pydantic_ai import Agent, AgentRunResult, AgentSpec, DeferredToolRequests, DeferredToolResults, ToolDenied
 from pydantic_ai.capabilities import AbstractCapability, CapabilityOrdering
 from pydantic_ai.exceptions import ApprovalRequired, ModelRetry, SkipToolExecution, ToolFailed, UserError
 from pydantic_ai.messages import (
@@ -653,6 +653,19 @@ class TestHiddenNameWarning:
 
         assert raised == []
 
+    async def test_an_unprepared_successful_run_does_not_warn_about_hidden_names(self):
+        guard = ToolGuardrail[object](hidden=['danger'])
+
+        async def succeed() -> AgentRunResult[object]:
+            return AgentRunResult(output='done')
+
+        with warnings.catch_warnings(record=True) as raised:
+            warnings.simplefilter('always')
+            result = await guard.wrap_run(_run_ctx(), handler=succeed)
+
+        assert result.output == 'done'
+        assert raised == []
+
     async def test_a_run_without_function_tools_warns_about_hidden_names(self):
         agent = Agent(
             _scripted(ModelResponse(parts=[TextPart(content='done')])),
@@ -670,7 +683,19 @@ class TestHiddenNameWarning:
             'The name stays available to the model.'
         ]
 
-    async def test_a_prepared_run_that_errors_still_warns_about_hidden_names(self):
+    async def test_a_warning_does_not_mask_a_prepared_run_error(self):
+        guard = ToolGuardrail[object](hidden=['danger'])
+        await guard.prepare_tools(_run_ctx(), [_tool_def('safe')])
+
+        async def fail() -> NoReturn:
+            raise RuntimeError('boom')
+
+        with warnings.catch_warnings():
+            warnings.simplefilter('error')
+            with pytest.raises(RuntimeError, match='boom'):
+                await guard.wrap_run(_run_ctx(), handler=fail)
+
+    async def test_a_prepared_run_error_does_not_warn_about_hidden_names(self):
         def fail(_: list[ModelMessage], __: AgentInfo) -> ModelResponse:
             raise RuntimeError('boom')
 
@@ -689,10 +714,7 @@ class TestHiddenNameWarning:
             with pytest.raises(RuntimeError, match='boom'):
                 await agent.run('hi')
 
-        assert [str(warning.message) for warning in raised] == [
-            "ToolGuardrail.hidden names 'danger', which no tool offered during this run is called. "
-            'The name stays available to the model.'
-        ]
+        assert raised == []
 
     async def test_a_name_no_tool_answers_to_is_warned_about(self):
         agent, _ = _agent_with(

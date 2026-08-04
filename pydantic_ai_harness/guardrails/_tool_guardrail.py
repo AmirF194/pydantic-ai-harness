@@ -298,11 +298,10 @@ class ToolGuardrail(AbstractCapability[AgentDepsT]):
         *,
         handler: WrapRunHandler,
     ) -> AgentRunResult[object]:
-        """Report selector names only after dynamic tool preparation has finished."""
-        try:
-            return await handler()
-        finally:
-            self._warn_unmatched_names()
+        """Report unmatched selector names after a successful, prepared run."""
+        result = await handler()
+        self._warn_unmatched_names()
+        return result
 
     def _warn_unmatched_names(self) -> None:
         """Warn when a configured selector never appeared in this run."""
