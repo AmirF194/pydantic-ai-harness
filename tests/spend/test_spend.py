@@ -9,7 +9,6 @@ from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Any
 
-import jsonschema
 import pytest
 from opentelemetry.sdk.trace import ReadableSpan, TracerProvider
 from opentelemetry.sdk.trace.export import SimpleSpanProcessor
@@ -1390,23 +1389,57 @@ class TestSpec:
         for runtime_only in ('"store"', '"price"', '"on_spend"', '"clock"', '"scope"'):
             assert runtime_only not in schema, runtime_only
 
-    def test_the_documented_yaml_validates_against_the_published_schema(self):
-        """The README's example, checked against the schema an editor reads from `$schema`."""
-        spec = {
-            'model': 'openai:gpt-5.4',
-            'capabilities': [
-                {
-                    'SpendLimits': {
-                        'budgets': [
-                            {'usd': '100', 'window': 'day'},
-                            {'usd': '2000', 'window': 'month', 'warn_at': 0.8},
-                        ],
-                        'on_unpriced': 'raise',
-                    }
-                }
-            ],
+    def test_the_schema_describes_a_budget_rather_than_an_open_object(self):
+        """A `Sequence[Budget]` cannot generate -- `scope` is a callable -- so entries take `BudgetSpec`."""
+        definitions = AgentSpec.model_json_schema_with_capabilities([SpendLimits])['$defs']
+
+        assert definitions['spec_params_SpendLimits']['properties']['budgets']['items'] == {
+            '$ref': '#/$defs/BudgetSpec'
         }
-        jsonschema.validate(spec, AgentSpec.model_json_schema_with_capabilities([SpendLimits]))
+        entry = definitions['BudgetSpec']
+        assert set(entry['properties']) == {'usd', 'tokens', 'window', 'warn_at', 'name', 'retain'}
+        # A price given as a string so YAML cannot round it through a float.
+        assert {'type': 'string'} in entry['properties']['usd']['anyOf']
+        assert entry['additionalProperties'] is False
+
+    async def test_the_documented_yaml_loads_and_the_budget_it_names_holds(self):
+        """The README's example, through the real loader rather than through `from_spec` directly."""
+        agent = Agent.from_spec(
+            {
+                'model': 'test',
+                'capabilities': [
+                    {
+                        'SpendLimits': {
+                            'budgets': [
+                                {'usd': '100', 'window': 'day'},
+                                {'usd': '2000', 'window': 'month', 'warn_at': 0.8},
+                            ],
+                            'on_unpriced': 'raise',
+                        }
+                    }
+                ],
+            },
+            custom_capability_types=[SpendLimits],
+        )
+
+        # `on_unpriced: raise` reached the capability: `TestModel` names no model, so
+        # nothing can price its response.
+        with pytest.raises(UnpricedModelError):
+            await agent.run('hi')
+
+    async def test_a_spec_budget_refuses_a_request_once_it_is_spent(self):
+        """A ceiling small enough to trip, so the loaded budget is shown to be wired to the gate."""
+        agent = Agent.from_spec(
+            {
+                'model': 'test',
+                'capabilities': [{'SpendLimits': {'budgets': [{'tokens': 1, 'window': 'total'}]}}],
+            },
+            custom_capability_types=[SpendLimits],
+        )
+        await agent.run('hi')
+
+        with pytest.raises(SpendLimitExceeded, match='tokens'):
+            await agent.run('hi')
 
 
 class TestDurableClock:
