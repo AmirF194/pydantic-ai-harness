@@ -38,6 +38,7 @@ from collections.abc import AsyncGenerator
 from datetime import timedelta
 from decimal import Decimal
 from typing import NoReturn
+from urllib.parse import urlsplit
 
 import pytest
 from redis.asyncio import Redis
@@ -62,6 +63,21 @@ def _redis_url() -> str:
     return os.environ.get('REDIS_TEST_URL', 'redis://127.0.0.1:6379')
 
 
+def _redis_target() -> str:
+    """Host and port, without the credentials a Redis URL may carry.
+
+    `REDIS_TEST_URL` accepts `redis://user:password@host:6379`, and the only place
+    this string is used is a skip or failure message -- which CI keeps. Naming the
+    variable rather than echoing an unparsable value keeps that true for a URL
+    `urlsplit` cannot make sense of.
+    """
+    host = urlsplit(_redis_url()).hostname
+    if host is None:
+        return 'the server named by REDIS_TEST_URL'
+    port = urlsplit(_redis_url()).port
+    return host if port is None else f'{host}:{port}'
+
+
 def _unavailable(message: str) -> NoReturn:
     if _requires_live():
         pytest.fail(message)
@@ -76,7 +92,7 @@ async def store() -> AsyncGenerator[RedisSpendStore, None]:
         await client.ping()
     except (RedisError, OSError) as error:
         await client.aclose()
-        _unavailable(f'no reachable Redis at {_redis_url()}: {error}')
+        _unavailable(f'no reachable Redis at {_redis_target()}: {error}')
 
     prefix = f'harness-test:{uuid.uuid4().hex}'
     try:
