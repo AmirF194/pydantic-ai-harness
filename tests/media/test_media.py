@@ -363,7 +363,8 @@ class TestExternalizeRestoreWalker:
             'future_field': 'keep-me',
         }
         externalized = await externalize_media(node, media_store=store, threshold_bytes=64 * 1024)
-        assert '"data"' not in json.dumps(externalized)  # bytes field went external
+        # The key, not the string: `__harness_external_field__` records the value `"data"`.
+        assert '"data":' not in json.dumps(externalized)  # bytes field went external
         restored = await restore_media(externalized, media_store=store)
         assert restored == node
 
@@ -605,7 +606,8 @@ class TestExternalizeRestoreWalker:
         rolled_back = await _restore_as_pre_pr_reader(marker, store)
         # The old reader keeps keys it does not know; pydantic ignores the extra
         # field on validation, so the part is intact apart from it.
-        assert {k: v for k, v in rolled_back.items() if k != '__harness_external_uri__'} == node
+        bookkeeping = {'__harness_external_uri__', '__harness_external_field__'}
+        assert {k: v for k, v in rolled_back.items() if k not in bookkeeping} == node
 
         # The current reader drops the mirror, so the marker still round-trips exactly.
         assert await restore_media(marker, media_store=store) == node
@@ -712,6 +714,70 @@ class TestExternalizeRestoreWalker:
         externalized = await externalize_media(node, media_store=store, threshold_bytes=64 * 1024)
         assert externalized != node
         assert await restore_media(externalized, media_store=store) == node
+
+    async def test_binary_payload_that_also_looks_like_text_restores_as_binary(self, tmp_path: Path) -> None:
+        """A mapping matching both discriminators round-trips as whatever it was written as.
+
+        `ToolReturnContent` permits any mapping, so one payload can carry `kind`,
+        `data`, a string `part_kind` and the text-marker key at once.
+        `externalize_media` writes it as binary; a restore that re-derived the kind
+        from shape would decode those bytes as UTF-8 -- corrupting them, or raising
+        `UnicodeDecodeError` on bytes that are not valid UTF-8 at all.
+        """
+        store = DiskMediaStore(tmp_path)
+        payload: dict[str, object] = {
+            'kind': 'binary',
+            # Not valid UTF-8, so a text restore raises rather than silently corrupting.
+            'data': base64.b64encode(b'\xff\xfe' * 35_000).decode('ascii'),
+            'media_type': 'image/png',
+            'part_kind': 'tool-return',
+            '__harness_external_text__': True,
+        }
+        messages: list[ModelMessage] = [
+            ModelRequest(parts=[ToolReturnPart(tool_name='render', tool_call_id='c1', content=payload)])
+        ]
+        dumped = json.loads(ModelMessagesTypeAdapter.dump_json(messages))
+        externalized = await externalize_media(dumped, media_store=store, threshold_bytes=64 * 1024)
+        assert json.dumps(externalized) != json.dumps(dumped)
+        assert await restore_media(externalized, media_store=store) == dumped
+
+    async def test_text_payload_shaped_like_binary_restores_as_text(self, tmp_path: Path) -> None:
+        """The mirror image: `kind == 'binary'` but no `data`, so it was written as text.
+
+        Deciding by shape with binary tested first would read this back as binary and
+        base64-decode UTF-8 text. Only the recorded field name gets both directions right.
+        """
+        store = DiskMediaStore(tmp_path)
+        node: dict[str, object] = {'kind': 'binary', 'content': 'z' * 70_000, 'part_kind': 'tool-return'}
+        externalized = await externalize_media(node, media_store=store, threshold_bytes=64 * 1024)
+        assert externalized != node
+        assert await restore_media(externalized, media_store=store) == node
+
+    async def test_marker_naming_an_unknown_field_is_not_a_marker(self, tmp_path: Path) -> None:
+        """An unrecognized field name is data, not a marker to resolve through the store."""
+        store = DiskMediaStore(tmp_path)
+        node = {
+            '__harness_external_media__': True,
+            '__harness_external_field__': 'somewhere_else',
+            '__harness_external_uri__': 'media+sha256://' + '0' * 64,
+            'kind': 'binary',
+        }
+        assert await restore_media(node, media_store=store) == node
+
+    async def test_legacy_text_flag_without_a_text_shape_is_not_a_marker(self, tmp_path: Path) -> None:
+        """Pre-`__harness_external_field__` fallback: the flag alone does not make a marker.
+
+        Without the recorded field name the walker falls back to shape, and a node
+        carrying the text flag but neither a string `part_kind` nor
+        `kind == 'text-content'` is a payload that happens to hold the key.
+        """
+        store = DiskMediaStore(tmp_path)
+        node = {
+            '__harness_external_media__': True,
+            '__harness_external_text__': True,
+            '__harness_external_uri__': 'media+sha256://' + '0' * 64,
+        }
+        assert await restore_media(node, media_store=store) == node
 
     async def test_sentinel_payload_keeping_its_data_is_not_a_binary_marker(self, tmp_path: Path) -> None:
         """Same on the binary side: a node still carrying `data` was never externalized."""

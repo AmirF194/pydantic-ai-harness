@@ -42,6 +42,13 @@ _TEXT_MARKER = '__harness_external_text__'
 # `part_kind`/`content`/`uri`, and a plain `uri` key alone would drop the
 # original. See `_write_reference` for the backward-compatible `uri` mirror.
 _URI_KEY = '__harness_external_uri__'
+# Names the field the walker moved out (`data` or `content`), so restore reads back
+# the one that was actually written instead of re-deriving it from the marker's shape.
+# Shape cannot decide it: `ToolReturnContent` permits any `Mapping[str, ...]`, so one
+# payload can satisfy both the binary and the text discriminator at once, and either
+# precedence then mis-reads some legitimate node. Always written by the externalize
+# side, overwriting any value the source carried.
+_FIELD_KEY = '__harness_external_field__'
 # `TextContent.kind` (`pydantic_ai.messages.TextContent`). Unlike a message
 # part it carries no `part_kind`, so it needs its own discriminator match.
 _TEXT_CONTENT_KIND = 'text-content'
@@ -105,32 +112,42 @@ def _marker_kind(node: dict[str, object]) -> str | None:
     `uri` would be resolved through the store, either failing the whole
     snapshot load or inlining unrelated bytes into the tool return.
 
-    So restore matches the same discriminators the externalize side gates on,
-    plus the absence of the field that was moved out: a text marker keeps its
-    `part_kind` (or `kind == 'text-content'`) and has no `content`, a binary
-    marker keeps `kind == 'binary'` and has no `data`. Markers written before
-    text externalization existed are all binary and all carry `kind`, so they
-    still match.
+    `_FIELD_KEY` is authoritative: it names the field the externalize side moved
+    out, so a node that satisfies both the binary and the text discriminator is
+    still read back as whatever it was written as. Inferring that from shape
+    cannot work in both directions -- a `kind == 'binary'` payload with a string
+    `part_kind` is written as binary, and a `kind == 'binary'` payload with no
+    `data` but a string `content` is written as text, so neither precedence is
+    right for both.
 
-    Shape decides, `_TEXT_MARKER` alone does not. `_preserve_fields` copies
-    every field of the source node onto the marker, so a binary payload that
-    already carried a `_TEXT_MARKER` key hands its marker that key too; keying
-    the text branch on the flag would then strand the binary marker as
-    unrestorable. The text branch therefore requires a text *shape*, and a
-    binary marker falls through to the binary branch regardless of the flag.
+    Markers written before `_FIELD_KEY` existed fall back to shape, mirroring
+    the precedence the writer used at the time (`_is_binary_part` before
+    `_is_text_part`, see `externalize_media`). That inherits the ambiguity above
+    for those older snapshots; it cannot be recovered from what they recorded.
+
+    Either way the node must still be marker-*shaped* -- carry the sentinel and
+    lack the field that was moved out. That keeps a tool payload that merely
+    contains the sentinel key from being resolved through the store.
 
     This narrows the collision rather than closing it -- an in-band JSON
     sentinel is collidable by construction. A payload that sets the sentinel
-    *and* mimics a part shape *and* omits the moved field is still read as a
-    marker; nothing short of out-of-band framing prevents that.
+    *and* names a field *and* omits that field is still read as a marker;
+    nothing short of out-of-band framing prevents that.
     """
     if node.get(_EXTERNAL_MARKER) is not True:
         return None
+    field = node.get(_FIELD_KEY)
+    if field == 'data':
+        return 'binary' if 'data' not in node else None
+    if field == 'content':
+        return 'text' if 'content' not in node else None
+    if field is not None:
+        return None
+    if node.get('kind') == 'binary' and 'data' not in node:
+        return 'binary'
     if node.get(_TEXT_MARKER) is True and 'content' not in node:
         if isinstance(node.get('part_kind'), str) or node.get('kind') == _TEXT_CONTENT_KIND:
             return 'text'
-    if node.get('kind') == 'binary' and 'data' not in node:
-        return 'binary'
     return None
 
 
@@ -181,6 +198,7 @@ async def _maybe_externalize_binary(
     # are recursively walked so any nested externalizable payload still goes out.
     marker = await _preserve_fields(node, 'data', media_store, threshold_bytes)
     marker[_EXTERNAL_MARKER] = True
+    marker[_FIELD_KEY] = 'data'
     _write_reference(marker, node, uri)
     return marker
 
@@ -208,6 +226,7 @@ async def _maybe_externalize_text(
     marker = await _preserve_fields(node, 'content', media_store, threshold_bytes)
     marker[_EXTERNAL_MARKER] = True
     marker[_TEXT_MARKER] = True
+    marker[_FIELD_KEY] = 'content'
     _write_reference(marker, node, uri)
     return marker
 
@@ -277,7 +296,7 @@ async def _restore_external(node: dict[str, object], media_store: MediaStore, ki
     is_text = kind == 'text'
     # `_TEXT_MARKER` is only ours on a text marker. On a binary one it came from the
     # source payload via `_preserve_fields`, so dropping it would delete user data.
-    dropped = {_EXTERNAL_MARKER, _TEXT_MARKER} if is_text else {_EXTERNAL_MARKER}
+    dropped = {_EXTERNAL_MARKER, _FIELD_KEY, _TEXT_MARKER} if is_text else {_EXTERNAL_MARKER, _FIELD_KEY}
     if _URI_KEY in node:
         uri_value = node[_URI_KEY]
         dropped.add(_URI_KEY)
