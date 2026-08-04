@@ -98,10 +98,14 @@ async def store() -> AsyncGenerator[RedisSpendStore, None]:
     try:
         yield RedisSpendStore(client, prefix=prefix)
     finally:
-        keys = [key async for key in client.scan_iter(match=f'{prefix}:*')]
-        if keys:
-            await client.delete(*keys)
-        await client.aclose()
+        # Closing sits in its own `finally` so a server that went away mid-test takes the
+        # key cleanup down without also leaking the connection into the rest of the suite.
+        try:
+            keys = [key async for key in client.scan_iter(match=f'{prefix}:*')]
+            if keys:
+                await client.delete(*keys)
+        finally:
+            await client.aclose()
 
 
 async def _ttl(store: RedisSpendStore, key: str) -> int:
