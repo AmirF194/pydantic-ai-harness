@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import importlib.util
 from collections.abc import Iterator
 from datetime import datetime
 from pathlib import Path
@@ -54,16 +55,25 @@ def is_missing_optional_extra(error: ImportError) -> bool:
     visible -- tolerating any `ImportError` would let both disappear from
     `tests/test_capability_specs.py`'s sweep and from the doc-snippet check.
 
-    Two things have to hold. The failure must bottom out in a `ModuleNotFoundError`, which
+    Three things have to hold. The failure must bottom out in a `ModuleNotFoundError`, which
     a capability's import gate hides: `browser_use`, `exa` and `stackone` catch it and
     re-raise their own `ImportError` carrying an install hint, so the module name lives on
     the `__cause__` chain rather than on the exception raised (`stackone` nests two deep).
-    And the module it names must be one an extra declared in `pyproject.toml` provides.
+    The module it names must be one an extra declared in `pyproject.toml` provides. And that
+    module has to be genuinely absent.
+
+    The last check is what separates "the extra is not installed" from "something inside an
+    installed extra is missing". `browser_use.browser` going missing while `browser_use`
+    imports is a version skew or a broken install -- a real failure, and one that hits
+    exactly the capabilities this tolerance covers, so it has to be reported rather than
+    skipped. Matching on the top-level name alone cannot tell the two apart; asking whether
+    that top-level module resolves can.
     """
     cause: BaseException | None = error
     while cause is not None:
         if isinstance(cause, ModuleNotFoundError) and cause.name is not None:
-            return cause.name.split('.')[0] in EXTRA_MODULES
+            top, _, _ = cause.name.partition('.')
+            return top in EXTRA_MODULES and importlib.util.find_spec(top) is None
         cause = cause.__cause__
     return False
 

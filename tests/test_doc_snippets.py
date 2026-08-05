@@ -23,9 +23,11 @@ from __future__ import annotations as _annotations
 
 import ast
 import importlib
+import importlib.util
 import os
 import warnings
 from collections.abc import Iterable
+from importlib.machinery import ModuleSpec
 from pathlib import Path
 
 import pytest
@@ -117,10 +119,17 @@ def test_snippet_problem_detects_each_failure_mode() -> None:
 def test_missing_optional_extra_is_not_a_failure(monkeypatch: pytest.MonkeyPatch) -> None:
     # Simulate the `slim` environment: the harness module exists, but importing it
     # fails because its third-party extra is absent. That is not a broken snippet.
+    # `acp` is installed here, so its absence has to be simulated too -- the tolerance
+    # asks whether the module resolves, not only what the exception names.
     def _extra_missing(module: str) -> object:
         raise ModuleNotFoundError("No module named 'acp'", name='acp')
 
     monkeypatch.setattr(importlib, 'import_module', _extra_missing)
+
+    def _nothing_resolves(name: str) -> ModuleSpec | None:
+        return None
+
+    monkeypatch.setattr(importlib.util, 'find_spec', _nothing_resolves)
     assert _snippet_problem('from pydantic_ai_harness.experimental.acp import run_acp_stdio') is None
 
 

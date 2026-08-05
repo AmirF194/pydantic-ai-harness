@@ -43,11 +43,13 @@ from __future__ import annotations
 
 import functools
 import importlib
+import importlib.util
 import pkgutil
 import types
 import warnings
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
+from importlib.machinery import ModuleSpec
 from pathlib import Path
 from types import ModuleType
 from typing import TYPE_CHECKING, Any, TypeGuard
@@ -262,8 +264,18 @@ def test_a_subscripted_generic_is_not_mistaken_for_a_capability() -> None:
     assert _is_capability_type(_Unschematizable) is True
 
 
-def test_only_an_absent_declared_extra_is_tolerated() -> None:
-    """`is_missing_optional_extra` decides what may vanish from the sweep, so pin its edges."""
+def _nothing_resolves(name: str) -> ModuleSpec | None:
+    """Stand-in for `importlib.util.find_spec` in an environment where nothing is installed."""
+    return None
+
+
+def test_an_absent_declared_extra_is_tolerated(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The predicate reads two things: the exception, and whether the module resolves.
+
+    Every extra is installed in some environment that runs these tests and absent in
+    another, so the second input is pinned here rather than left to the environment.
+    """
+    monkeypatch.setattr(importlib.util, 'find_spec', _nothing_resolves)
     assert is_missing_optional_extra(ModuleNotFoundError('no modal', name='modal')) is True
     # `browser_use`, `exa` and `stackone` re-raise a bare `ImportError` naming their extra.
     re_raised = ImportError('browser-use is required for BrowserUse')
@@ -273,6 +285,24 @@ def test_only_an_absent_declared_extra_is_tolerated() -> None:
     nested = ImportError('stackone needs fastmcp')
     nested.__cause__ = re_raised
     assert is_missing_optional_extra(nested) is True
+
+
+def test_a_missing_submodule_inside_an_installed_extra_is_reported() -> None:
+    """A version skew or a broken install is a real failure, not an absent extra.
+
+    `logfire` is in the `dev` group, so it is present in every environment that runs these
+    tests. Reducing `logfire.variables` to its top-level name would tolerate this, and the
+    capability would drop out of the sweep exactly when its dependency is broken.
+    """
+    assert importlib.util.find_spec('logfire') is not None
+    assert is_missing_optional_extra(ModuleNotFoundError('gone', name='logfire.variables')) is False
+    gated = ImportError('logfire is required for ManagedPrompt')
+    gated.__cause__ = ModuleNotFoundError('gone', name='logfire.variables')
+    assert is_missing_optional_extra(gated) is False
+
+
+def test_anything_other_than_a_declared_extra_is_reported() -> None:
+    """`is_missing_optional_extra` decides what may vanish from the sweep, so pin its edges."""
     # A harness module that no longer exists, and a third party nothing declares, are defects.
     assert is_missing_optional_extra(ModuleNotFoundError('gone', name='pydantic_ai_harness.exa')) is False
     assert is_missing_optional_extra(ModuleNotFoundError('gone', name='requests')) is False
