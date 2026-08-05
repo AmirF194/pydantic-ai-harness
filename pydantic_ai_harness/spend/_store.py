@@ -332,7 +332,8 @@ class InMemorySpendStore:
 
         A token outliving its window would skip the replay of a response against a counter
         that has since rolled over, and the window would read as zero rather than as the
-        response it should hold.
+        response it should hold. The two horizons cannot be kept exactly equal, and which
+        way to err is settled in `RedisSpendStore._marker_seconds`.
         """
         retain = self.dedup_retain or timedelta(0)
         return retain if entry.ttl is None else min(retain, entry.ttl)

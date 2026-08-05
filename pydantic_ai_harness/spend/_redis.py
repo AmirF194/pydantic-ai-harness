@@ -404,6 +404,14 @@ class RedisSpendStore:
         Never longer than the counter it guards. A marker outliving its window would skip
         the replay of a response against a counter that has since rolled over, and the
         window would read as zero rather than as the response it should hold.
+
+        The two horizons cannot be kept exactly equal: a later write extends the counter's
+        expiry, and the markers already written for that window are not reachable to
+        extend with it. So a marker can expire while its window is still live, and a
+        replay landing in that gap is counted twice. That is the direction to err in --
+        over-counting a billed response is a brake that trips early, and under-counting
+        one is a brake that releases late. The gap needs a `Budget.retain` shorter than
+        `dedup_retain`; none of the window defaults are.
         """
         if entry.token is None or self.dedup_retain is None:
             return 0
