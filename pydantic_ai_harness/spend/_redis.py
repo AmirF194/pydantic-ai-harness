@@ -16,6 +16,7 @@ from typing import Protocol, runtime_checkable
 
 from pydantic_ai.exceptions import UserError
 
+from pydantic_ai_harness.spend._budget import SEPARATOR, delimited
 from pydantic_ai_harness.spend._snapshot import Spent
 from pydantic_ai_harness.spend._store import DEFAULT_DEDUP_RETAIN, SpendEntry
 
@@ -32,15 +33,10 @@ local n = tonumber(ARGV[1])
 local out = {{}}
 for i = 1, n do
   local key = KEYS[i]
+  local marker = KEYS[n + i]
   local base = 1 + (i - 1) * 6
   local marker_ttl = tonumber(ARGV[base + 6])
-  local existed = redis.call('EXISTS', key)
-  local apply = true
-  if marker_ttl > 0 and not redis.call('SET', KEYS[n + i], '1', 'NX', 'EX', marker_ttl) then
-    apply = false
-    existed = 1
-  end
-  if apply then
+  if marker_ttl == 0 or redis.call('EXISTS', marker) == 0 then
     redis.call('HINCRBY', key, '{_USD_FIELD}', ARGV[base + 1])
     redis.call('HINCRBY', key, '{_TOKENS_FIELD}', ARGV[base + 2])
     redis.call('HINCRBY', key, '{_REQUESTS_FIELD}', ARGV[base + 3])
@@ -51,12 +47,14 @@ for i = 1, n do
     else
       redis.call('PERSIST', key)
     end
+    if marker_ttl > 0 then
+      redis.call('SET', marker, '1', 'EX', marker_ttl)
+    end
   end
   local totals = redis.call('HMGET', key, '{_USD_FIELD}', '{_TOKENS_FIELD}', '{_REQUESTS_FIELD}', '{_UNPRICED_FIELD}')
   for j = 1, 4 do
     if not totals[j] then totals[j] = '0' end
   end
-  totals[5] = tostring(existed)
   out[i] = totals
 end
 return out
@@ -86,9 +84,12 @@ field. It aborts the script there, and Redis does not roll back what earlier com
 script already did, so a multi-window response would keep the windows applied before the one
 that overflowed.
 
-`SET ... NX` on a per-entry marker is how an entry carrying a `SpendEntry.token` is applied at
-most once. A claim that fails means this response already reached this window, so the entry is
-skipped and the current totals are returned unchanged.
+A per-entry marker is how an entry carrying a `SpendEntry.token` is applied at most once: the
+marker is read before the increments and written after them, rather than claimed with a single
+`SET ... NX` up front. Up front, an increment that overflowed would abort the script with the
+marker already committed, and the retry that could have completed the window would be skipped
+as a replay instead. Read-then-write is safe here without `NX` because Redis runs the whole
+script without interleaving another client's commands.
 
 A zero `ttl` means "keep this key", and says so with `PERSIST` rather than by doing nothing.
 `HINCRBY` leaves an existing expiry in place, so a budget moved from a finite `retain` to
@@ -96,9 +97,6 @@ A zero `ttl` means "keep this key", and says so with `PERSIST` rather than by do
 schedule nothing in the configuration mentions any more, and diverging from
 `InMemorySpendStore`, which drops the expiry on the next write.
 
-The fifth value of each row reports whether the key existed before this write, which is what
-tells the store a key may still have a counter under the pre-0.18 name. See
-`RedisSpendStore._carry_legacy`.
 """
 
 
@@ -196,6 +194,16 @@ def _spent(fields: Mapping[str | bytes, str | bytes]) -> Spent:
     )
 
 
+def _merged(current: Spent, previous: Spent) -> Spent:
+    """One window's counters across the two key names it may be spread over."""
+    return Spent(
+        usd=current.usd + previous.usd,
+        tokens=current.tokens + previous.tokens,
+        requests=current.requests + previous.requests,
+        unpriced_requests=current.unpriced_requests + previous.unpriced_requests,
+    )
+
+
 @dataclass
 class RedisSpendStore:
     """Spend counters in Redis, so every worker enforces one budget.
@@ -250,10 +258,12 @@ class RedisSpendStore:
         against its separator: the failure otherwise arrives as a `CROSSSLOT` error on a
         model request.
         """
-        if '{' in self.prefix or '}' in self.prefix:
+        if not self.prefix or '{' in self.prefix or '}' in self.prefix:
             raise UserError(
-                f'RedisSpendStore.prefix must not contain braces; got {self.prefix!r}. The prefix is wrapped in '
-                'a Redis Cluster hash tag, and a brace inside it would change which slot the keys hash to.'
+                f'RedisSpendStore.prefix must be non-empty and must not contain braces; got {self.prefix!r}. '
+                'The prefix is wrapped in a Redis Cluster hash tag: a brace inside it would change which slot '
+                'the keys hash to, and an empty one leaves `{}`, which Redis Cluster does not read as a tag at '
+                'all -- it would hash each key whole and refuse a script spanning two windows with `CROSSSLOT`.'
             )
 
     async def get(self, key: str) -> Spent:
@@ -282,25 +292,21 @@ class RedisSpendStore:
     async def get_many(self, keys: Sequence[str]) -> Mapping[str, Spent]:
         """What each key has accumulated. An absent hash reads as zero.
 
-        One round trip per key, and a second for a key that reads as absent and may still
-        have a counter under the pre-0.18 name; see `_carry_legacy`.
+        Two round trips per key while the pre-0.18 fallback is in place: the key's own
+        hash, and the one a pre-0.18 harness would have written; see `_before_hash_tags`.
         """
         totals: dict[str, Spent] = {}
         for key in keys:
-            fields = await self.client.hgetall(self._name(key))
-            if not fields:
-                fields = await self.client.hgetall(self._legacy_name(key))
-            totals[key] = _spent(fields)
+            current = _spent(await self.client.hgetall(self._name(key)))
+            totals[key] = _merged(current, await self._before_hash_tags(key))
         return totals
 
     async def add_many(self, entries: Sequence[SpendEntry]) -> Mapping[str, Spent]:
         """Apply every entry as one script and return each key's new total.
 
         One unit of work: every window of the response lands or none does, and the script
-        returns each new total, so the result needs no second read. One round trip too,
-        for a key this store has written before -- a key it finds cold costs a read of the
-        pre-0.18 name, and a second script when there is a counter there to carry; see
-        `_carry_legacy`.
+        returns each new total, so the totals need no second read. What does cost a read
+        is the pre-0.18 fallback, one per key, until it goes away; see `_before_hash_tags`.
 
         A failure before the server runs the script -- the client cannot connect, the
         request never lands -- writes nothing. A failure after it does not say which:
@@ -312,18 +318,20 @@ class RedisSpendStore:
         brake can survive; under-counting is not.
 
         A `SpendEntry.token` makes the retry that *is* safe: a durable engine
-        re-executing an accrual it already committed claims a marker that is already
-        held, so the entry is skipped and the current total is returned.
+        re-executing an accrual it already committed finds the marker for it already
+        written, so the entry is skipped and the current total is returned.
         """
         if not entries:
             return {}
         applied = await self._apply(entries)
-        cold = [entry for entry in entries if not applied[entry.key][1]]
-        carried: Mapping[str, Spent] = await self._carry_legacy(cold) if cold else {}
-        return {key: carried.get(key, spent) for key, (spent, _) in applied.items()}
+        return {key: _merged(spent, await self._before_hash_tags(key)) for key, spent in applied.items()}
 
-    async def _apply(self, entries: Sequence[SpendEntry]) -> dict[str, tuple[Spent, bool]]:
-        """Run `_ADD_SCRIPT` over the entries, returning each key's totals and whether it existed."""
+    async def _apply(self, entries: Sequence[SpendEntry]) -> dict[str, Spent]:
+        """Run `_ADD_SCRIPT` over the entries, returning each key's new totals.
+
+        Entries sharing a key are applied in order and the last row holds the running
+        total, which is what a caller reading the result by key wants.
+        """
         keys = [self._name(entry.key) for entry in entries]
         markers = [self._marker_name(entry) for entry in entries]
         arguments: list[str | int] = [len(entries)]
@@ -338,53 +346,34 @@ class RedisSpendStore:
             ]
         rows = await self.client.eval(_ADD_SCRIPT, 2 * len(entries), *keys, *markers, *arguments)
         return {
-            entry.key: (
-                Spent(
-                    usd=_from_nanos(int(_text(row[0]))),
-                    tokens=int(_text(row[1])),
-                    requests=int(_text(row[2])),
-                    unpriced_requests=int(_text(row[3])),
-                ),
-                _text(row[4]) == '1',
+            entry.key: Spent(
+                usd=_from_nanos(int(_text(row[0]))),
+                tokens=int(_text(row[1])),
+                requests=int(_text(row[2])),
+                unpriced_requests=int(_text(row[3])),
             )
             for entry, row in zip(entries, rows)
         }
 
-    # Everything below carries counters written before 0.18, when the keys had no hash
-    # tag. Delete `_carry_legacy`, `_legacy_name`, and their two call sites (`get_many`
-    # and `add_many`) in 0.20.0, by which point every window written under the old name
-    # has passed the longest `Budget.retain` default.
-    async def _carry_legacy(self, entries: Sequence[SpendEntry]) -> Mapping[str, Spent]:
-        """Move any pre-0.18 counter into the tagged key, for entries whose key was cold.
+    # `_before_hash_tags` and `_legacy_name` carry counters written before 0.18, when the
+    # keys had no hash tag. Delete both and their three call sites (`get_many` and the two
+    # in `add_many`) in 0.20.0, by which point every window written under the old name has
+    # passed the longest `Budget.retain` default.
+    async def _before_hash_tags(self, key: str) -> Spent:
+        """What this budget key accumulated under the name a pre-0.18 harness used.
 
-        Which worker folds is settled by the script that just ran: it applies the whole
-        entry atomically, so exactly one caller can see a key that did not exist before
-        its own write, and only that caller reaches here. The legacy hash is read outside
-        the script because it hashes to a different slot, which a cluster would refuse
-        inside one.
+        Added to what the tagged key holds rather than moved into it. Moving it would have
+        to decide when the move is complete, and nothing here can know that: a worker
+        still running the old version can write to the old name at any time during a
+        rolling deploy, and a move that already ran would never pick that up. Summing has
+        no such moment -- the old name is read every time until it expires or an operator
+        removes it, so a late write to it is counted like any other.
 
-        A process that dies between the write and this fold leaves the old counter where
-        it is: no other caller will see that key cold again, so the amount is not carried.
-        That is the one gap, and it is bounded by the pre-0.18 counters that still exist.
+        The read is a separate round trip rather than part of the script because the old
+        name has no hash tag, so it lands in a different slot and a cluster would refuse a
+        script spanning both.
         """
-        carried: list[SpendEntry] = []
-        for entry in entries:
-            fields = await self.client.hgetall(self._legacy_name(entry.key))
-            if fields:
-                previous = _spent(fields)
-                carried.append(
-                    SpendEntry(
-                        key=entry.key,
-                        usd=previous.usd,
-                        tokens=previous.tokens,
-                        requests=previous.requests,
-                        unpriced=previous.unpriced_requests,
-                        ttl=entry.ttl,
-                    )
-                )
-        if not carried:
-            return {}
-        return {key: spent for key, (spent, _) in (await self._apply(carried)).items()}
+        return _spent(await self.client.hgetall(self._legacy_name(key)))
 
     def _legacy_name(self, key: str) -> str:
         """The Redis key a pre-0.18 harness wrote this budget key under."""
@@ -395,12 +384,19 @@ class RedisSpendStore:
         return f'{{{self.prefix}}}:{key}'
 
     def _marker_name(self, entry: SpendEntry) -> str:
-        """The key claimed to record that this entry's response reached this window.
+        """The key written to record that this entry's response reached this window.
+
+        The key and the token are length-prefixed rather than joined on a separator: both
+        can contain anything, so `key='a|b'` with `token='c'` and `key='a'` with
+        `token='b|c'` would otherwise name the same marker, and the second response would
+        be dropped as a replay of the first.
 
         An entry with no token still needs a name here, because the script reads a marker
         per entry: it gets one nothing writes to, since its horizon is zero.
         """
-        return self._name('dedup' if entry.token is None else f'dedup|{entry.key}|{entry.token}')
+        if entry.token is None:
+            return self._name('dedup')
+        return self._name(f'dedup{SEPARATOR}{delimited(entry.key, entry.token)}')
 
     def _marker_seconds(self, entry: SpendEntry) -> int:
         """How long this entry's marker is held, or zero to apply the entry unconditionally."""

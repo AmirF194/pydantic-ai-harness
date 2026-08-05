@@ -262,7 +262,8 @@ class InMemorySpendStore:
         a sync endpoint -- and any key is read past its horizon.
         """
         with self._lock:
-            return {key: self._live(key) for key in keys}
+            now = self.clock()
+            return {key: self._live(key, now) for key in keys}
 
     async def add_many(self, entries: Sequence[SpendEntry]) -> Mapping[str, Spent]:
         """Apply every entry and return each key's new total.
@@ -272,40 +273,47 @@ class InMemorySpendStore:
         not the rest. The lock covers the case that is not free: `run_sync` called from a
         thread pool, or a free-threaded interpreter, where a read-modify-write loses
         updates in the direction that under-counts spend.
+
+        The clock is read once, before anything is applied, and an entry's token is
+        remembered only once its counter has moved. A token remembered ahead of the write
+        it stands for would be consumed by a call that then failed, and the retry that
+        could have recorded the response would be skipped as a replay of it.
         """
         with self._lock:
+            now = self.clock()
             self._writes_since_sweep += len(entries)
             if self._writes_since_sweep >= self.sweep_every:
-                self._sweep()
+                self._sweep(now)
             totals: dict[str, Spent] = {}
             for entry in entries:
-                if self._already_applied(entry):
-                    totals[entry.key] = self._live(entry.key)
+                if self._already_applied(entry, now):
+                    totals[entry.key] = self._live(entry.key, now)
                     continue
-                current = self._live(entry.key)
+                current = self._live(entry.key, now)
                 updated = Spent(
                     usd=current.usd + entry.usd,
                     tokens=current.tokens + entry.tokens,
                     requests=current.requests + entry.requests,
                     unpriced_requests=current.unpriced_requests + entry.unpriced,
                 )
-                self._entries[entry.key] = (updated, None if entry.ttl is None else self.clock() + entry.ttl)
+                self._entries[entry.key] = (updated, None if entry.ttl is None else now + entry.ttl)
+                self._remember(entry, now)
                 totals[entry.key] = updated
             return totals
 
-    def _already_applied(self, entry: SpendEntry) -> bool:
-        """Whether this entry's token has already reached its key, remembering it if not."""
+    def _already_applied(self, entry: SpendEntry, now: datetime) -> bool:
+        """Whether this entry's token has already reached its key."""
         if entry.token is None or self.dedup_retain is None:
             return False
-        marker = (entry.key, entry.token)
-        now = self.clock()
-        seen = self._applied.get(marker)
-        if seen is not None and now < seen:
-            return True
-        self._applied[marker] = now + self.dedup_retain
-        return False
+        seen = self._applied.get((entry.key, entry.token))
+        return seen is not None and now < seen
 
-    def _sweep(self) -> None:
+    def _remember(self, entry: SpendEntry, now: datetime) -> None:
+        """Record that this entry's token has reached its key, so a replay of it does not add again."""
+        if entry.token is not None and self.dedup_retain is not None:
+            self._applied[(entry.key, entry.token)] = now + self.dedup_retain
+
+    def _sweep(self, now: datetime) -> None:
         """Drop every entry whose window has rolled over, and every token past its horizon.
 
         Amortised over `sweep_every` writes rather than run on each one. The scan is linear in
@@ -316,7 +324,6 @@ class InMemorySpendStore:
         every model request.
         """
         self._writes_since_sweep = 0
-        now = self.clock()
         stale = [key for key, (_, expires_at) in self._entries.items() if expires_at is not None and now >= expires_at]
         for key in stale:
             del self._entries[key]
@@ -324,7 +331,7 @@ class InMemorySpendStore:
         for marker in expired:
             del self._applied[marker]
 
-    def _live(self, key: str) -> Spent:
+    def _live(self, key: str, now: datetime) -> Spent:
         """The entry at `key`, dropping it first if its window has rolled over.
 
         A read also expires the key it touches, so a rolled-over window reads as
@@ -334,7 +341,7 @@ class InMemorySpendStore:
         if entry is None:
             return Spent()
         spent, expires_at = entry
-        if expires_at is not None and self.clock() >= expires_at:
+        if expires_at is not None and now >= expires_at:
             del self._entries[key]
             return Spent()
         return spent

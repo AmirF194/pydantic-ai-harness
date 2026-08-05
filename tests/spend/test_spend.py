@@ -6,7 +6,7 @@ import json
 import warnings
 from collections.abc import Mapping, Sequence
 from datetime import datetime, timedelta, timezone
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from typing import Any
 
 import pytest
@@ -1004,6 +1004,24 @@ class TestInMemoryStore:
 
         assert totals == {'k': Spent(usd=Decimal('2'), requests=2)}
 
+    async def test_a_call_that_fails_does_not_consume_the_token(self):
+        """The token is recorded once the counter has moved, not before it.
+
+        Recorded first, a call that then failed left the token consumed and the retry
+        that could have recorded the response was skipped as a replay of it. Two
+        infinities are the smallest way to make the addition itself fail; any failure
+        between the two writes has the same shape.
+        """
+        store = InMemorySpendStore()
+        await store.add_many([SpendEntry(key='k', usd=Decimal('Infinity'))])
+
+        with pytest.raises(InvalidOperation):
+            await store.add_many([SpendEntry(key='k', usd=Decimal('-Infinity'), requests=1, token='resp-1')])
+
+        retried = await store.add_many([SpendEntry(key='k', requests=1, token='resp-1')])
+
+        assert retried['k'].requests == 1
+
     async def test_a_token_past_its_horizon_is_forgotten(self):
         """Remembering every token forever would grow with traffic, so the sweep drops them."""
         clock = Clock()
@@ -1059,11 +1077,7 @@ class FakeRedis:
         for index in range(count):
             key, marker = keys[index], keys[count + index]
             usd, tokens, requests, unpriced, ttl, marker_ttl = arguments[1 + index * 6 : 7 + index * 6]
-            existed = key in self.hashes
-            claimed = marker_ttl <= 0 or marker not in self.markers
-            if marker_ttl > 0:
-                self.markers[marker] = marker_ttl
-            if claimed:
+            if marker_ttl <= 0 or marker not in self.markers:
                 fields = self.hashes.setdefault(key, {})
                 for field, amount in zip(self._FIELDS, (usd, tokens, requests, unpriced)):
                     fields[field] = fields.get(field, 0) + amount
@@ -1071,12 +1085,12 @@ class FakeRedis:
                     self.expiries[key] = ttl
                 else:
                     self.expiries.pop(key, None)
-            else:
-                existed = True
+                # Written after the increments, not claimed before them: an increment that
+                # errors must not leave a marker that would skip the retry.
+                if marker_ttl > 0:
+                    self.markers[marker] = marker_ttl
             totals = self.hashes.get(key, {})
-            rows.append(
-                [self._out(str(totals.get(field, 0))) for field in self._FIELDS] + [self._out(str(int(existed)))]
-            )
+            rows.append([self._out(str(totals.get(field, 0))) for field in self._FIELDS])
         return rows
 
 
@@ -1129,10 +1143,15 @@ class TestRedisStore:
         assert set(client.hashes) == {'{acme}:b|day|*|2026-08-04', '{acme}:b|month|*|2026-08'}
         assert all(marker.startswith('{acme}:dedup|') for marker in client.markers)
 
-    def test_a_prefix_with_a_brace_is_refused(self):
-        """A brace inside the prefix moves the hash tag, so two windows stop sharing a slot."""
-        with pytest.raises(UserError, match='must not contain braces'):
-            RedisSpendStore(FakeRedis(), prefix='{acme}')
+    @pytest.mark.parametrize('prefix', ['{acme}', ''])
+    def test_a_prefix_that_would_break_the_hash_tag_is_refused(self, prefix: str):
+        """A brace moves the tag; an empty prefix leaves `{}`, which is not a tag at all.
+
+        Redis Cluster reads `{}` as no tag and hashes the whole key, so two windows land in
+        different slots and the script that applies them together is refused.
+        """
+        with pytest.raises(UserError, match='must be non-empty and must not contain braces'):
+            RedisSpendStore(FakeRedis(), prefix=prefix)
 
     async def test_a_response_is_one_round_trip_and_one_unit_of_work(self):
         """Split across commands, a failure between them leaves a window holding part of a response."""
@@ -1240,8 +1259,8 @@ class TestRedisStore:
 
         assert await RedisSpendStore(client).get('k') == Spent(usd=Decimal('3'), tokens=8, requests=2)
 
-    async def test_a_counter_written_before_the_hash_tag_is_carried_forward(self):
-        """Carried on the first write to the tagged key, so the read fallback stops being needed."""
+    async def test_a_counter_written_before_the_hash_tag_is_added_to_the_one_after_it(self):
+        """The old name is read alongside the new one, so an upgrade counts both."""
         client = FakeRedis()
         client.hashes['pydantic-ai-harness:spend:k'] = {'usd_nanos': 3_000_000_000, 'tokens': 8, 'requests': 2}
         store = RedisSpendStore(client)
@@ -1251,8 +1270,8 @@ class TestRedisStore:
         assert totals == {'k': Spent(usd=Decimal('4'), tokens=9, requests=3)}
         assert await store.get('k') == Spent(usd=Decimal('4'), tokens=9, requests=3)
 
-    async def test_a_counter_is_carried_forward_once(self):
-        """Only the write that found the key cold looks for an old counter, so nothing doubles."""
+    async def test_the_old_counter_is_never_added_twice(self):
+        """Summed rather than moved, so repeating the read cannot repeat the amount."""
         client = FakeRedis()
         client.hashes['pydantic-ai-harness:spend:k'] = {'usd_nanos': 3_000_000_000, 'requests': 1}
         store = RedisSpendStore(client)
@@ -1262,14 +1281,50 @@ class TestRedisStore:
 
         assert totals == {'k': Spent(usd=Decimal('5'), requests=3)}
 
-    async def test_a_cold_key_with_no_old_counter_writes_nothing_extra(self):
+    async def test_a_write_to_the_old_name_after_the_new_one_exists_still_counts(self):
+        """A rolling deploy leaves pre-0.18 workers writing the old name for a while.
+
+        Moving the old counter once would have read it before that write and never looked
+        again, so the spend a still-running old worker recorded would be enforced against
+        nothing.
+        """
         client = FakeRedis()
         store = RedisSpendStore(client)
+        await store.add_many([SpendEntry(key='k', usd=Decimal('1'), requests=1)])
 
+        client.hashes['pydantic-ai-harness:spend:k'] = {'usd_nanos': 2_000_000_000, 'requests': 1}
+
+        assert await store.get('k') == Spent(usd=Decimal('3'), requests=2)
         totals = await store.add_many([SpendEntry(key='k', usd=Decimal('1'), requests=1)])
+        assert totals == {'k': Spent(usd=Decimal('4'), requests=3)}
 
-        assert totals == {'k': Spent(usd=Decimal('1'), requests=1)}
-        assert len(client.calls) == 1
+    async def test_one_key_twice_in_a_call_keeps_the_old_counter(self):
+        """Two entries on one key report the running total, and neither loses the old name."""
+        client = FakeRedis()
+        client.hashes['pydantic-ai-harness:spend:k'] = {'usd_nanos': 3_000_000_000, 'requests': 1}
+        store = RedisSpendStore(client)
+
+        totals = await store.add_many(
+            [
+                SpendEntry(key='k', usd=Decimal('1'), requests=1),
+                SpendEntry(key='k', usd=Decimal('1'), requests=1),
+            ]
+        )
+
+        assert totals == {'k': Spent(usd=Decimal('5'), requests=3)}
+
+    async def test_two_keys_that_would_share_a_marker_are_both_applied(self):
+        """A key and a token joined on a separator collide; length-prefixed they cannot.
+
+        `key='a|b'` with `token='c'` and `key='a'` with `token='b|c'` are different
+        responses against different windows, and the second was dropped as a replay.
+        """
+        store = RedisSpendStore(FakeRedis())
+
+        await store.add_many([SpendEntry(key='a|b', usd=Decimal('1'), requests=1, token='c')])
+        totals = await store.add_many([SpendEntry(key='a', usd=Decimal('1'), requests=1, token='b|c')])
+
+        assert totals == {'a': Spent(usd=Decimal('1'), requests=1)}
 
     @pytest.mark.parametrize(
         ('retain', 'expected'),
@@ -1423,6 +1478,19 @@ class TestIdempotentAccrual:
 
         await _record(guard, response=_response(provider_response_id='resp-1'))
         await _record(guard, response=_response(provider_response_id='resp-2'))
+
+        assert (await guard.status())[0].spent.requests == 2
+
+    async def test_two_responses_that_would_share_a_token_both_count(self):
+        """A provider name and a response id joined on a separator can collide.
+
+        `provider_name='a|b'` with id `'c'` and `provider_name='a'` with id `'b|c'` named
+        the same response, so the second one's spend was dropped as a replay of the first.
+        """
+        guard = SpendLimits(budgets=[Budget(window='total')], price=lambda r: Decimal('1'))
+
+        await _record(guard, response=_response(provider_name='a|b', provider_response_id='c'))
+        await _record(guard, response=_response(provider_name='a', provider_response_id='b|c'))
 
         assert (await guard.status())[0].spent.requests == 2
 

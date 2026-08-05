@@ -28,7 +28,7 @@ from pydantic_ai.exceptions import UserError
 from pydantic_ai.messages import ModelResponse
 from pydantic_ai.tools import AgentDepsT, RunContext
 
-from pydantic_ai_harness.spend._budget import Budget, BudgetSpec, bucket, scope_key, store_key
+from pydantic_ai_harness.spend._budget import Budget, BudgetSpec, bucket, delimited, scope_key, store_key
 from pydantic_ai_harness.spend._exceptions import SpendLimitExceeded, UnpricedModelError, UnpricedModelWarning
 from pydantic_ai_harness.spend._snapshot import BudgetStatus, SpendSnapshot, Spent
 from pydantic_ai_harness.spend._store import (
@@ -552,10 +552,15 @@ class SpendLimits(AbstractCapability[AgentDepsT]):
 
         `ModelResponse.run_id` is not usable here: `fill_run_metadata` stamps it after this
         wrapper returns, so it is still `None` at this point.
+
+        The parts are `delimited` rather than joined, because a provider id and a
+        caller-supplied run id can contain anything: joined on a separator,
+        `provider_name='a|b'` with id `'c'` and `provider_name='a'` with id `'b|c'` name
+        the same response, and the second one's spend is dropped as a replay of the first.
         """
         if response.provider_response_id is not None:
-            return f'{response.provider_name or ""}|{response.provider_response_id}'
-        return f'{ctx.run_id}|{ctx.run_step}|{response.timestamp.isoformat()}'
+            return delimited(response.provider_name or '', response.provider_response_id)
+        return delimited(ctx.run_id or '', str(ctx.run_step), response.timestamp.isoformat())
 
     def _check(self, budget: Budget[AgentDepsT], spent: Spent, ctx: RunContext[AgentDepsT]) -> None:
         """Raise if `spent` has reached either of the budget's ceilings."""

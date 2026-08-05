@@ -225,7 +225,7 @@ class TestLiveScript:
         assert await _ttl(store, 'total') == -1
 
     async def test_a_repeated_token_adds_nothing(self, store: RedisSpendStore):
-        """The marker is claimed inside the same script, so a replay is one round trip."""
+        """The marker is read and written inside the same script, so a replay is one round trip."""
         entry = SpendEntry(key='k', usd=Decimal('1'), tokens=5, requests=1, token='resp-1')
 
         first = await store.add_many([entry])
@@ -234,10 +234,29 @@ class TestLiveScript:
         assert first == second == {'k': Spent(usd=Decimal('1'), tokens=5, requests=1)}
         assert await store.get('k') == first['k']
 
-    async def test_a_counter_written_before_the_hash_tag_is_carried_forward(self, store: RedisSpendStore):
+    async def test_an_overflow_leaves_no_marker_to_skip_the_retry(self, store: RedisSpendStore):
+        """The marker is written after the increments, not claimed before them.
+
+        Redis does not roll back a script, so a marker claimed up front would survive the
+        overflow that aborted the script and the retry that could have completed the
+        window would be skipped as a replay of a response that never fully landed.
+        """
+        await store.add('k', usd=Decimal(2**63 - 1) / _NANOS, tokens=0, requests=0, unpriced=0, ttl=None)
+        entry = SpendEntry(key='k', usd=_ONE_NANO, tokens=1, requests=1, token='resp-1')
+
+        with pytest.raises(ResponseError, match='overflow'):
+            await store.add_many([entry])
+
+        recovered = await store.add_many([SpendEntry(key='k', tokens=1, requests=1, token='resp-1')])
+
+        assert recovered['k'].requests == 1
+
+    async def test_a_counter_written_before_the_hash_tag_is_added_to_the_one_after_it(self, store: RedisSpendStore):
         """Keys gained a hash tag in 0.18, so an upgrade must not strand what was counted.
 
         Written here the way a pre-0.18 harness wrote it: the same name without the tag.
+        The second write models a worker still running the old version during a rolling
+        deploy, which is why the old name is read every time rather than moved once.
         """
         await store.client.hset(  # pyright: ignore[reportAttributeAccessIssue]
             f'{store.prefix}:k', mapping={'usd_nanos': 3_000_000_000, 'tokens': 8, 'requests': 2}
@@ -245,6 +264,8 @@ class TestLiveScript:
         assert await store.get('k') == Spent(usd=Decimal('3'), tokens=8, requests=2)
 
         totals = await store.add_many([SpendEntry(key='k', usd=Decimal('1'), tokens=1, requests=1)])
-
         assert totals == {'k': Spent(usd=Decimal('4'), tokens=9, requests=3)}
-        assert await store.get('k') == totals['k']
+
+        await store.client.hincrby(f'{store.prefix}:k', 'requests', 1)  # pyright: ignore[reportAttributeAccessIssue]
+
+        assert await store.get('k') == Spent(usd=Decimal('4'), tokens=9, requests=4)
