@@ -6,7 +6,9 @@ import asyncio
 import logging
 from collections.abc import Awaitable
 from dataclasses import dataclass, field, replace
-from typing import Literal, Protocol
+from fnmatch import fnmatch
+from typing import Literal, Protocol, overload
+from urllib.parse import urlsplit
 
 import anyio
 from pydantic import BaseModel, ValidationError
@@ -30,11 +32,60 @@ logger = logging.getLogger(__name__)
 
 _TOOL_NAME = 'browse_web'
 _LOCALHOST_PATTERNS = ['localhost', 'localhost.*', '*.localhost']
+_LOCALHOST_HOSTS = ('localhost', 'localhost.example', 'example.localhost')
+_LOCALHOST_URLS = (
+    'http://localhost/',
+    'https://localhost/',
+    'http://localhost.localhost/',
+    'https://localhost.localhost/',
+    'http://example.localhost/',
+    'https://example.localhost/',
+)
 
 # Teardown runs shielded from cancellation, so an unresponsive browser could otherwise hang the
 # caller forever on exit. Bound it instead: a browser that will not close within this window is
 # retained for a later cleanup attempt, which is strictly better than wedging the run.
 _TEARDOWN_TIMEOUT = 30
+
+
+def _is_localhost_hostname(hostname: str) -> bool:
+    """Recognize the hostname forms covered by the capability's localhost block."""
+    return hostname == 'localhost' or hostname.startswith('localhost.') or hostname.endswith('.localhost')
+
+
+def _pattern_allows_localhost(pattern: str) -> bool:
+    """Whether a browser-use allowlist pattern would permit a localhost URL."""
+    if '*' in pattern:
+        if pattern.startswith('*.'):
+            domain = pattern[2:]
+            return any(host == domain or host.endswith(f'.{domain}') for host in _LOCALHOST_HOSTS)
+        values = _LOCALHOST_URLS if '://' in pattern else _LOCALHOST_HOSTS
+        return any(fnmatch(value, pattern) for value in values)
+    if '://' in pattern:
+        return _is_localhost_hostname(urlsplit(pattern).hostname or '')
+    return _is_localhost_hostname(pattern.lower())
+
+
+@overload
+def _exclude_localhost_allowlist_entries(allowed_domains: list[str]) -> list[str]: ...
+
+
+@overload
+def _exclude_localhost_allowlist_entries(allowed_domains: set[str]) -> set[str]: ...
+
+
+@overload
+def _exclude_localhost_allowlist_entries(allowed_domains: None) -> None: ...
+
+
+def _exclude_localhost_allowlist_entries(allowed_domains: list[str] | set[str] | None) -> list[str] | set[str] | None:
+    """Keep a profile allowlist from overriding localhost prohibitions."""
+    if allowed_domains is None:
+        return None
+    filtered = [domain for domain in allowed_domains if not _pattern_allows_localhost(domain)]
+    if allowed_domains and not filtered:
+        raise ValueError('An `allowed_domains` entry that permits only localhost requires `block_ip_addresses=False`.')
+    return set(filtered) if isinstance(allowed_domains, set) else filtered
 
 
 async def _kill(session: BrowserSession) -> bool:
@@ -315,19 +366,26 @@ class BrowserUseToolset(FunctionToolset[AgentDepsT]):
         if headless is None and self._browser_profile is None:
             headless = True
         browser_profile = self._browser_profile
+        allowed_domains = self._allowed_domains
         if self._block_ip_addresses:
+            allowed_domains = _exclude_localhost_allowlist_entries(allowed_domains)
             if browser_profile is None:
                 browser_profile = BrowserProfile(
                     block_ip_addresses=True,
                     prohibited_domains=_LOCALHOST_PATTERNS,
                 )
             else:
+                if allowed_domains is None:
+                    profile_allowed_domains = _exclude_localhost_allowlist_entries(browser_profile.allowed_domains)
+                else:
+                    profile_allowed_domains = browser_profile.allowed_domains
                 prohibited_domains = list(browser_profile.prohibited_domains or ())
                 prohibited_domains.extend(
                     pattern for pattern in _LOCALHOST_PATTERNS if pattern not in prohibited_domains
                 )
                 browser_profile = browser_profile.model_copy(
                     update={
+                        'allowed_domains': profile_allowed_domains,
                         'block_ip_addresses': True,
                         'prohibited_domains': prohibited_domains,
                     }
@@ -338,7 +396,7 @@ class BrowserUseToolset(FunctionToolset[AgentDepsT]):
             cdp_url=self._cdp_url,
             browser_profile=browser_profile,
             headless=headless,
-            allowed_domains=self._allowed_domains,
+            allowed_domains=allowed_domains,
             keep_alive=True if self._session_scope == 'agent' else None,
         )
 
@@ -400,10 +458,10 @@ class BrowserUseToolset(FunctionToolset[AgentDepsT]):
             The browser agent's final text result, or JSON conforming to the
             configured output schema when one is set.
         """
-        await self._retry_pending_cleanup()
         if self._session_scope == 'call':
             history = await self._run_in_fresh_session(task)
         else:
+            await self._retry_pending_cleanup()
             history = await self._run_in_shared_session(task)
         return self._render_result(history)
 
@@ -424,15 +482,18 @@ class BrowserUseToolset(FunctionToolset[AgentDepsT]):
 
     async def _run_in_fresh_session(self, task: str) -> BrowserAgentHistory:
         """One disposable session for one call, killed when the call ends, on success or failure."""
-        session = self._build_session()
         async with self._call_condition:
             await self._call_condition.wait_for(lambda: not self._call_cleanup_in_progress)
+            await self._retry_pending_cleanup()
             self._active_call_sessions += 1
+        session: BrowserSession | None = None
         try:
+            session = self._build_session()
             return await self._run_agent(task, session)
         finally:
             with anyio.CancelScope(shield=True):
-                await self._close_session(session)
+                if session is not None:
+                    await self._close_session(session)
                 async with self._call_condition:
                     self._active_call_sessions -= 1
                     self._call_condition.notify_all()

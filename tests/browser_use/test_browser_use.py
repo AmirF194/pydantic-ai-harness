@@ -249,6 +249,59 @@ class TestBrowserUseToolset:
         assert session_profile.headless is True
         assert session_profile.allowed_domains == ['example.com']
 
+    @pytest.mark.parametrize(
+        ('profile_allowed_domains', 'expected_allowed_domains'),
+        [
+            (
+                [
+                    'trusted.example',
+                    'localhost',
+                    'localhost.*',
+                    '*.localhost',
+                    '*',
+                    'https://localhost/*',
+                    'https://localhost/private',
+                ],
+                ['trusted.example'],
+            ),
+            ({'trusted.example', 'localhost'}, {'trusted.example'}),
+        ],
+    )
+    async def test_localhost_is_removed_from_a_profile_allowlist(
+        self,
+        kill_calls: list[BrowserSession],
+        profile_allowed_domains: list[str] | set[str],
+        expected_allowed_domains: list[str] | set[str],
+    ) -> None:
+        factory = _success_factory()
+
+        await (
+            BrowserUse[None](
+                browser_profile=BrowserProfile(allowed_domains=profile_allowed_domains),
+                browser_agent=factory,
+            )
+            .get_toolset()
+            .browse_web('task')
+        )
+
+        session_profile = factory.requests[0].browser_session.browser_profile
+        assert session_profile.allowed_domains == expected_allowed_domains
+        assert session_profile.prohibited_domains == ['localhost', 'localhost.*', '*.localhost']
+
+    @pytest.mark.parametrize(
+        'capability',
+        [
+            BrowserUse[None](allowed_domains=['localhost']),
+            BrowserUse[None](browser_profile=BrowserProfile(allowed_domains=['localhost'])),
+        ],
+    )
+    async def test_localhost_only_allowlist_requires_explicit_opt_in(
+        self,
+        capability: BrowserUse[None],
+    ) -> None:
+        with pytest.raises(ValueError, match='block_ip_addresses=False'):
+            await capability.get_toolset().browse_web('task')
+
     async def test_bare_scheme_domain_has_a_path_boundary(self, kill_calls: list[BrowserSession]) -> None:
         factory = _success_factory()
 
@@ -659,6 +712,61 @@ class TestTeardownFailure:
             factory.requests[0].browser_session,
             factory.requests[1].browser_session,
         ]
+
+    async def test_session_build_failure_releases_the_call_slot(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        def fail_to_build(self: BrowserUseToolset[None]) -> BrowserSession:
+            raise RuntimeError('browser session could not be created')
+
+        monkeypatch.setattr(BrowserUseToolset, '_build_session', fail_to_build)
+        toolset = BrowserUse[None]().get_toolset()
+
+        with pytest.raises(RuntimeError, match='could not be created'):
+            await toolset.browse_web('task')
+
+        await toolset.aclose()
+
+    async def test_aclose_cannot_finish_while_a_call_is_registering(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        retry_started = anyio.Event()
+        second_retry = anyio.Event()
+        release_retry = anyio.Event()
+        running = anyio.Event()
+        release_run = anyio.Event()
+        retry_count = 0
+
+        async def pause_first_retry(self: BrowserUseToolset[None]) -> None:
+            nonlocal retry_count
+            retry_count += 1
+            if retry_count == 1:
+                retry_started.set()
+                await release_retry.wait()
+            elif retry_count == 2:
+                second_retry.set()
+
+        class _BlockingAgent:
+            async def run(self, max_steps: int = 500) -> _FakeHistory:
+                running.set()
+                await release_run.wait()
+                return _FakeHistory(result='done', success=True)
+
+        monkeypatch.setattr(BrowserUseToolset, '_retry_pending_cleanup', pause_first_retry)
+        toolset = BrowserUse[None](browser_agent=lambda request: _BlockingAgent()).get_toolset()
+
+        async with anyio.create_task_group() as task_group:
+            task_group.start_soon(toolset.browse_web, 'task')
+            await retry_started.wait()
+            task_group.start_soon(toolset.aclose)
+            with anyio.move_on_after(0.1):
+                await second_retry.wait()
+            assert not second_retry.is_set()
+            release_retry.set()
+            await running.wait()
+            assert not second_retry.is_set()
+            release_run.set()
+
+        assert second_retry.is_set()
 
     @pytest.mark.parametrize('scope', ['call', 'agent'])
     async def test_aclose_retries_cleanup_after_an_in_flight_call(
