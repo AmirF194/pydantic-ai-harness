@@ -1059,7 +1059,12 @@ class TestInMemoryStore:
         assert await store.add_many([entry, entry]) == {'k': Spent(usd=Decimal('1'), requests=1)}
 
     async def test_a_token_past_its_horizon_is_forgotten(self):
-        """Remembering every token forever would grow with traffic, so the sweep drops them."""
+        """`dedup_retain` is the window a replay is recognised in, not the counter's lifetime.
+
+        The counter here never expires, so it is the marker's own horizon that decides:
+        past it the response counts again. Remembering every token instead would grow with
+        traffic, which is the price the bound buys.
+        """
         clock = Clock()
         store = InMemorySpendStore(clock=clock, sweep_every=2, dedup_retain=timedelta(hours=1))
         entry = SpendEntry(key='k', usd=Decimal('1'), requests=1, token='resp-1')
