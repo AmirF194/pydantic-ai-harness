@@ -87,8 +87,8 @@ class SpendLimits(AbstractCapability[AgentDepsT]):
     through, while DBOS recovery and Prefect flow retry report nothing and leave the
     counter higher than what was spent. `exhausted()` works without a `RunContext`
     so a workflow can at least be refused admission on what is already recorded --
-    but a workflow admitted that way records nothing of its own, so it is a gate on
-    the door, not a budget on what happens inside. Tracked in
+    but it reserves nothing, so it is a gate on the door, not a budget on what
+    happens inside. Tracked in
     <https://github.com/pydantic/pydantic-ai-harness/issues/531>.
     """
 
@@ -413,11 +413,14 @@ class SpendLimits(AbstractCapability[AgentDepsT]):
 
         An admission check, and only that. It reads the counters; it reserves nothing and
         records nothing, so work started on the strength of it goes unmeasured unless
-        something else accrues it. Under Temporal that is the whole of what is available --
-        the hooks cannot reach a shared store mid-run -- so a workflow admitted here spends
-        against a counter that never moves, and the next workflow is admitted on the same
-        stale reading. Sound as a floor on runaway spend already recorded, not as a ceiling
-        on what the workflow goes on to spend.
+        something else accrues it. That makes it the pre-flight option on every durable
+        engine, though what it stands in for differs: under Temporal the run fails before
+        anything accrues, because the sandbox refuses the clock these hooks read, so a
+        workflow admitted here spends against a counter that never moves; under DBOS and
+        Prefect the accrual does run, and recovery or a flow retry replays it, so the next
+        caller is admitted against a reading that has drifted up rather than held still.
+        Either way this is a floor on runaway spend already recorded, not a ceiling on what
+        the workflow goes on to spend.
 
         `status()` omits what it cannot resolve, and `any(...)` over the remainder is a brake
         that silently checks nothing when every budget is scoped -- so this raises instead,
