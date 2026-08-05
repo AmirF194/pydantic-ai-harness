@@ -48,6 +48,8 @@ import pytest
 from pydantic_ai.agent.spec import AgentSpec
 from pydantic_ai.capabilities import AbstractCapability
 
+from tests.conftest import is_missing_optional_extra  # pyright: ignore[reportMissingTypeStubs]
+
 _ROOT = Path(__file__).parent.parent
 _PACKAGE = _ROOT / 'pydantic_ai_harness'
 _HARNESS = 'pydantic_ai_harness'
@@ -104,28 +106,18 @@ _NO_BASE_FIELDS = {
 }
 
 
-def _is_missing_optional_extra(exc_name: str | None) -> bool:
-    """True when an import failed because an optional extra is absent, not because of a defect.
+def _import_capability_module(module: str) -> ModuleType | ImportError:
+    """Import a capability package, returning the failure rather than raising it.
 
-    A missing extra always names a third-party distribution (`modal`, `exa_py`, `fastmcp`).
-    Anything under `pydantic_ai` -- harness itself or its one required dependency -- is
-    installed in every environment, so a failure naming one of those is a real break and
-    must not be tolerated here: the annotation defect above surfaces as an unresolvable
-    name, and tolerating "the import failed" would hide it.
+    Discovery runs at module import, so raising here is a collection error that takes every
+    check in this file down with it. Returned, an unimportable package is one named test.
     """
-    return exc_name is not None and not exc_name.startswith('pydantic_ai')
-
-
-def _import_capability_module(module: str) -> ModuleType | None:
-    """Import a capability package, or `None` when its optional extra is not installed."""
     try:
         with warnings.catch_warnings():
             warnings.simplefilter('ignore')  # deprecation shims and `experimental` warn on import
             return importlib.import_module(module)
-    except ModuleNotFoundError as exc:  # pragma: no cover -- only reached without an extra installed
-        if _is_missing_optional_extra(exc.name):
-            return None
-        raise
+    except ImportError as error:  # pragma: no cover -- only reached without an extra installed
+        return error
 
 
 def _capability_modules() -> list[str]:
@@ -141,12 +133,19 @@ def _is_capability_type(obj: object) -> TypeGuard[type[AbstractCapability[Any]]]
     return isinstance(obj, type) and issubclass(obj, AbstractCapability)
 
 
-def _discover_capabilities() -> list[type[AbstractCapability[Any]]]:
-    """Every spec-registerable capability class, keyed by serialization name to dedupe re-exports."""
+def _discover() -> tuple[list[type[AbstractCapability[Any]]], dict[str, ImportError]]:
+    """Every spec-registerable capability, plus the packages that would not import.
+
+    Capabilities are keyed by serialization name to dedupe re-exports. Only failures that
+    are not an absent extra are reported: those are the ones a test has to fail on.
+    """
     found: dict[str, type[AbstractCapability[Any]]] = {}
+    unimportable: dict[str, ImportError] = {}
     for module_name in _capability_modules():
         module = _import_capability_module(module_name)
-        if module is None:  # pragma: no cover -- only reached without an extra installed
+        if isinstance(module, ImportError):  # pragma: no cover -- only reached without an extra installed
+            if not is_missing_optional_extra(module):
+                unimportable[module_name] = module
             continue
         for obj in vars(module).values():
             # `AbstractCapability` has no abstract methods, so `inspect.isabstract` does not
@@ -157,10 +156,11 @@ def _discover_capabilities() -> list[type[AbstractCapability[Any]]]:
             name = obj.get_serialization_name()
             if name is not None:
                 found[name] = obj
-    return [found[name] for name in sorted(found)]
+    return [found[name] for name in sorted(found)], unimportable
 
 
-_CAPABILITIES = _discover_capabilities()
+_CAPABILITY_MODULES = _capability_modules()
+_CAPABILITIES, _UNIMPORTABLE = _discover()
 
 if TYPE_CHECKING:
 
@@ -219,16 +219,46 @@ def _defs(capability: type[AbstractCapability[Any]]) -> dict[str, Any]:
 
 
 def test_capabilities_discovered() -> None:
-    # Guard against a moved package root making every check below vacuously pass. The slim
-    # CI job has no `modal`/`exa`/`browser-use`/`stackone` extras, so it finds five fewer.
+    # Half of the anti-vacuity guard: a moved package root, or an environment where most
+    # capabilities skipped, cannot make the parametrized checks below pass on nothing. The
+    # `slim` CI job lacks the `browser-use`, `exa` and `stackone` extras and still finds 27.
+    # The other half is `test_capability_package_imports`, which keeps the only reason a
+    # capability may go missing to an extra this repo declares.
     assert len(_CAPABILITIES) >= 25
+    assert len(_CAPABILITY_MODULES) >= 25
 
 
-def test_is_missing_optional_extra_only_tolerates_third_party() -> None:
-    assert _is_missing_optional_extra('modal') is True
-    assert _is_missing_optional_extra('pydantic_ai_harness.exa') is False
-    assert _is_missing_optional_extra('pydantic_ai.agent.spec') is False
-    assert _is_missing_optional_extra(None) is False
+@pytest.mark.parametrize('module', _CAPABILITY_MODULES, ids=lambda m: m.removeprefix(f'{_HARNESS}.'))
+def test_capability_package_imports(module: str) -> None:
+    error = _UNIMPORTABLE.get(module)
+    assert error is None, (
+        f"{module} does not import, and the failure is not one of this repo's optional extras "
+        f'({type(error).__name__}: {error}).\n'
+        'Add the missing module to `EXTRA_MODULES` in `tests/conftest.py` if a new extra provides '
+        'it; otherwise this is a defect, and tolerating it here would drop the capability out of '
+        'the schema sweep below without anything saying so.'
+    )
+
+
+def test_only_an_absent_declared_extra_is_tolerated() -> None:
+    """`is_missing_optional_extra` decides what may vanish from the sweep, so pin its edges."""
+    assert is_missing_optional_extra(ModuleNotFoundError('no modal', name='modal')) is True
+    # `browser_use`, `exa` and `stackone` re-raise a bare `ImportError` naming their extra.
+    re_raised = ImportError('browser-use is required for BrowserUse')
+    re_raised.__cause__ = ModuleNotFoundError('no browser_use', name='browser_use')
+    assert is_missing_optional_extra(re_raised) is True
+    # `stackone` nests two `ImportError`s over the `ModuleNotFoundError`.
+    nested = ImportError('stackone needs fastmcp')
+    nested.__cause__ = re_raised
+    assert is_missing_optional_extra(nested) is True
+    # A harness module that no longer exists, and a third party nothing declares, are defects.
+    assert is_missing_optional_extra(ModuleNotFoundError('gone', name='pydantic_ai_harness.exa')) is False
+    assert is_missing_optional_extra(ModuleNotFoundError('gone', name='requests')) is False
+    # A name that vanished from a module never reaches a `ModuleNotFoundError` at all.
+    assert is_missing_optional_extra(ImportError('cannot import name X')) is False
+    nameless_cause = ImportError('wrapped')
+    nameless_cause.__cause__ = ModuleNotFoundError('no name on this one')
+    assert is_missing_optional_extra(nameless_cause) is False
 
 
 def _generation_problem(capability: type[AbstractCapability[Any]]) -> str | None:
