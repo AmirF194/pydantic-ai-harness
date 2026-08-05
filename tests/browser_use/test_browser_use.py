@@ -742,7 +742,7 @@ class TestTeardownFailure:
             if retry_count == 1:
                 retry_started.set()
                 await release_retry.wait()
-            elif retry_count == 2:
+            else:
                 second_retry.set()
 
         class _BlockingAgent:

@@ -67,15 +67,15 @@ def _pattern_allows_localhost(pattern: str) -> bool:
 
 
 @overload
-def _exclude_localhost_allowlist_entries(allowed_domains: list[str]) -> list[str]: ...
+def _exclude_localhost_allowlist_entries(allowed_domains: list[str]) -> list[str]: ...  # pragma: no cover
 
 
 @overload
-def _exclude_localhost_allowlist_entries(allowed_domains: set[str]) -> set[str]: ...
+def _exclude_localhost_allowlist_entries(allowed_domains: set[str]) -> set[str]: ...  # pragma: no cover
 
 
 @overload
-def _exclude_localhost_allowlist_entries(allowed_domains: None) -> None: ...
+def _exclude_localhost_allowlist_entries(allowed_domains: None) -> None: ...  # pragma: no cover
 
 
 def _exclude_localhost_allowlist_entries(allowed_domains: list[str] | set[str] | None) -> list[str] | set[str] | None:
