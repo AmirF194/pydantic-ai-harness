@@ -209,7 +209,9 @@ class InMemorySpendStore:
     dedup_retain: timedelta | None = DEFAULT_DEDUP_RETAIN
     """How long an applied `SpendEntry.token` is remembered, or `None` to apply every entry.
 
-    A remembered token costs one small entry per response per window until it is swept.
+    This is the window a replay is recognised in, not the counter's lifetime: a response
+    replayed later than this is counted again. A remembered token costs one small entry
+    per response per window until it is swept.
     """
 
     _entries: _Entries = field(default_factory=_Entries, init=False, repr=False)
@@ -332,8 +334,8 @@ class InMemorySpendStore:
 
         A token outliving its window would skip the replay of a response against a counter
         that has since rolled over, and the window would read as zero rather than as the
-        response it should hold. The two horizons cannot be kept exactly equal, and which
-        way to err is settled in `RedisSpendStore._marker_seconds`.
+        response it should hold. What the horizon does and does not promise, and which way
+        it errs, is settled in `RedisSpendStore._marker_seconds`.
         """
         retain = self.dedup_retain or timedelta(0)
         return retain if entry.ttl is None else min(retain, entry.ttl)

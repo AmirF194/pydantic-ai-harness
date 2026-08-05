@@ -244,9 +244,13 @@ class RedisSpendStore:
     dedup_retain: timedelta | None = DEFAULT_DEDUP_RETAIN
     """How long an applied `SpendEntry.token` is remembered, or `None` to apply every entry.
 
-    Each remembered token is one small key per response per window, expiring on this
-    horizon. Shorten it where the write rate makes that memory matter more than an
-    accrual replayed by a durable engine after a long recovery.
+    This is the window a replay is recognised in, not the counter's lifetime: a response
+    replayed later than this is counted again, because the marker it would have matched
+    has expired. The counter usually lives far longer, since every write extends it.
+
+    Each remembered token is one small key per response per window. Raise it where a
+    durable engine may recover long after the fact; lower it where the write rate makes
+    that memory matter more.
     """
 
     def __post_init__(self) -> None:
@@ -401,17 +405,21 @@ class RedisSpendStore:
     def _marker_seconds(self, entry: SpendEntry) -> int:
         """How long this entry's marker is held, or zero to apply the entry unconditionally.
 
-        Never longer than the counter it guards. A marker outliving its window would skip
-        the replay of a response against a counter that has since rolled over, and the
-        window would read as zero rather than as the response it should hold.
+        `dedup_retain` is the whole of the guarantee: a response replayed within it is
+        applied once, and a response replayed after it is counted again. A marker has to
+        expire for the memory it costs to be bounded, and the counter it guards usually
+        outlives it by a long way, since every write to a window extends that window's
+        horizon by `Budget.retain`.
 
-        The two horizons cannot be kept exactly equal: a later write extends the counter's
-        expiry, and the markers already written for that window are not reachable to
-        extend with it. So a marker can expire while its window is still live, and a
-        replay landing in that gap is counted twice. That is the direction to err in --
-        over-counting a billed response is a brake that trips early, and under-counting
-        one is a brake that releases late. The gap needs a `Budget.retain` shorter than
-        `dedup_retain`; none of the window defaults are.
+        Capped at this entry's horizon on top of that, so a marker cannot outlive the
+        counter. One that did would skip the replay of a response against a counter that
+        had already rolled over, and the window would read as zero rather than as the
+        response it should hold. The cap only bites where `Budget.retain` is shorter than
+        `dedup_retain`, and it can only shorten the window a replay is recognised in.
+
+        Both err towards counting a billed response twice rather than not at all, which is
+        the preference `add` states: over-counting is a brake that trips early, and
+        under-counting is one that releases late.
         """
         if entry.token is None or self.dedup_retain is None:
             return 0
