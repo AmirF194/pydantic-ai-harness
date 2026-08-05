@@ -216,7 +216,7 @@ class BrowserUse(AbstractCapability[AgentDepsT]):
     `browser_profile` with a `user_data_dir` also works in `'call'` scope.
     """
 
-    cdp_url: str | None = None
+    cdp_url: str | None = field(default=None, repr=False)
     """Attach to an existing Chromium over CDP instead of launching one locally.
 
     Points the session at a remote browser, e.g. a container or a hosted
@@ -224,6 +224,8 @@ class BrowserUse(AbstractCapability[AgentDepsT]):
     `cdp_url`. Ending a call disconnects from an attached browser rather than
     terminating it: browser-use only kills a browser process it launched
     itself, so a browser you manage survives `'call'` scope.
+
+    Kept out of `repr()` because hosted endpoints can include credentials.
     """
 
     guidance: str | None = None

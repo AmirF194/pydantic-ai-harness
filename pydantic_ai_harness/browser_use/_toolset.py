@@ -33,14 +33,6 @@ logger = logging.getLogger(__name__)
 _TOOL_NAME = 'browse_web'
 _LOCALHOST_PATTERNS = ['localhost', 'localhost.*', '*.localhost']
 _LOCALHOST_HOSTS = ('localhost', 'localhost.example', 'example.localhost')
-_LOCALHOST_URLS = (
-    'http://localhost/',
-    'https://localhost/',
-    'http://localhost.localhost/',
-    'https://localhost.localhost/',
-    'http://example.localhost/',
-    'https://example.localhost/',
-)
 
 # Teardown runs shielded from cancellation, so an unresponsive browser could otherwise hang the
 # caller forever on exit. Bound it instead: a browser that will not close within this window is
@@ -55,14 +47,15 @@ def _is_localhost_hostname(hostname: str) -> bool:
 
 def _pattern_allows_localhost(pattern: str) -> bool:
     """Whether a browser-use allowlist pattern would permit a localhost URL."""
+    if '://' in pattern:
+        hostname = urlsplit(pattern).hostname
+        if hostname is not None:
+            return any(fnmatch(host, hostname.lower()) for host in _LOCALHOST_HOSTS)
     if '*' in pattern:
         if pattern.startswith('*.'):
             domain = pattern[2:]
             return any(host == domain or host.endswith(f'.{domain}') for host in _LOCALHOST_HOSTS)
-        values = _LOCALHOST_URLS if '://' in pattern else _LOCALHOST_HOSTS
-        return any(fnmatch(value, pattern) for value in values)
-    if '://' in pattern:
-        return _is_localhost_hostname(urlsplit(pattern).hostname or '')
+        return any(fnmatch(host, pattern) for host in _LOCALHOST_HOSTS)
     return _is_localhost_hostname(pattern.lower())
 
 

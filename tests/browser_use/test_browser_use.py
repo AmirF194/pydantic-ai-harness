@@ -261,6 +261,8 @@ class TestBrowserUseToolset:
                     '*',
                     'https://localhost/*',
                     'https://localhost/private',
+                    'http://localhost:*/*',
+                    'https://*.localhost:*/*',
                 ],
                 ['trusted.example'],
             ),
@@ -839,6 +841,11 @@ class TestCredentialsStayOutOfRepr:
         capability = BrowserUse[None](browser_profile=BrowserProfile(user_data_dir='/tmp/secret-profile'))
 
         assert 'secret-profile' not in repr(capability)
+
+    def test_the_capability_does_not_print_its_cdp_credentials(self) -> None:
+        capability = BrowserUse[None](cdp_url='https://browser.example?token=secret-token')
+
+        assert 'secret-token' not in repr(capability)
 
     def test_a_task_does_not_print_its_secrets(self) -> None:
         task = BrowserTask(
