@@ -214,6 +214,8 @@ class TestBrowserUseToolset:
 
         session_profile = factory.requests[0].browser_session.browser_profile
         assert session_profile.headless is True
+        assert session_profile.block_ip_addresses is True
+        assert session_profile.prohibited_domains == ['localhost', 'localhost.*', '*.localhost']
         # In 'call' scope the sub-agent may tear the session down itself; the
         # tool kills it in `finally` regardless.
         assert not session_profile.keep_alive
@@ -228,6 +230,8 @@ class TestBrowserUseToolset:
         assert session_profile.headless is False
         assert session_profile.allowed_domains == ['docs.example.com']
         assert session_profile.user_agent == 'harness-test'
+        assert session_profile.block_ip_addresses is True
+        assert session_profile.prohibited_domains == ['localhost', 'localhost.*', '*.localhost']
 
     async def test_capability_fields_override_browser_profile(self, kill_calls: list[BrowserSession]) -> None:
         profile = BrowserProfile(headless=False, allowed_domains=['docs.example.com'])
@@ -244,6 +248,65 @@ class TestBrowserUseToolset:
         session_profile = factory.requests[0].browser_session.browser_profile
         assert session_profile.headless is True
         assert session_profile.allowed_domains == ['example.com']
+
+    async def test_bare_scheme_domain_has_a_path_boundary(self, kill_calls: list[BrowserSession]) -> None:
+        factory = _success_factory()
+
+        await (
+            BrowserUse[None](
+                allowed_domains=['https://trusted.example'],
+                browser_agent=factory,
+            )
+            .get_toolset()
+            .browse_web('task')
+        )
+
+        assert factory.requests[0].browser_session.browser_profile.allowed_domains == ['https://trusted.example/*']
+
+    async def test_profile_bare_scheme_domain_has_a_path_boundary(self, kill_calls: list[BrowserSession]) -> None:
+        factory = _success_factory()
+
+        await (
+            BrowserUse[None](
+                browser_profile=BrowserProfile(allowed_domains=['https://trusted.example']),
+                browser_agent=factory,
+            )
+            .get_toolset()
+            .browse_web('task')
+        )
+
+        assert factory.requests[0].browser_session.browser_profile.allowed_domains == ['https://trusted.example/*']
+
+    async def test_private_network_blocking_can_be_disabled(self, kill_calls: list[BrowserSession]) -> None:
+        factory = _success_factory()
+
+        await (
+            BrowserUse[None](
+                block_ip_addresses=False,
+                browser_agent=factory,
+            )
+            .get_toolset()
+            .browse_web('task')
+        )
+
+        session_profile = factory.requests[0].browser_session.browser_profile
+        assert session_profile.block_ip_addresses is False
+        assert session_profile.prohibited_domains is None
+
+    async def test_private_network_setting_overrides_browser_profile(self, kill_calls: list[BrowserSession]) -> None:
+        factory = _success_factory()
+
+        await (
+            BrowserUse[None](
+                browser_profile=BrowserProfile(block_ip_addresses=True),
+                block_ip_addresses=False,
+                browser_agent=factory,
+            )
+            .get_toolset()
+            .browse_web('task')
+        )
+
+        assert factory.requests[0].browser_session.browser_profile.block_ip_addresses is False
 
     async def test_session_killed_after_success(self, kill_calls: list[BrowserSession]) -> None:
         factory = _success_factory()
@@ -881,8 +944,11 @@ class TestBrowserUse:
         assert isinstance(instructions, str)
         assert '`browse_web`' in instructions
 
-    def test_custom_guidance_replaces_default(self) -> None:
-        assert BrowserUse[None](guidance='Delegate web tasks.').get_instructions() == 'Delegate web tasks.'
+    def test_custom_guidance_retains_the_untrusted_content_rule(self) -> None:
+        instructions = BrowserUse[None](guidance='Delegate web tasks.').get_instructions()
+        assert isinstance(instructions, str)
+        assert instructions.startswith('Delegate web tasks.')
+        assert 'untrusted' in instructions
 
     def test_empty_guidance_disables_instructions(self) -> None:
         assert BrowserUse[None](guidance='').get_instructions() is None
@@ -911,6 +977,7 @@ class TestAgentSpec:
     def test_from_spec_builds_capability(self) -> None:
         capability = BrowserUse[None].from_spec(
             allowed_domains=['example.com'],
+            block_ip_addresses=False,
             headless=False,
             max_steps=10,
             use_vision='auto',
@@ -921,6 +988,7 @@ class TestAgentSpec:
             guidance='Delegate.',
         )
         assert capability.allowed_domains == ['example.com']
+        assert capability.block_ip_addresses is False
         assert capability.headless is False
         assert capability.max_steps == 10
         assert capability.use_vision == 'auto'

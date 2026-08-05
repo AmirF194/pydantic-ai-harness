@@ -29,6 +29,7 @@ except ImportError as _import_error:  # pragma: no cover
 logger = logging.getLogger(__name__)
 
 _TOOL_NAME = 'browse_web'
+_LOCALHOST_PATTERNS = ['localhost', 'localhost.*', '*.localhost']
 
 # Teardown runs shielded from cancellation, so an unresponsive browser could otherwise hang the
 # caller forever on exit. Bound it instead: a browser that will not close within this window is
@@ -251,6 +252,7 @@ class BrowserUseToolset(FunctionToolset[AgentDepsT]):
         llm: BaseChatModel | None,
         browser_profile: BrowserProfile | None,
         allowed_domains: list[str] | None,
+        block_ip_addresses: bool,
         headless: bool | None,
         max_steps: int,
         use_vision: bool | Literal['auto'],
@@ -266,6 +268,7 @@ class BrowserUseToolset(FunctionToolset[AgentDepsT]):
         self._llm = llm
         self._browser_profile = browser_profile
         self._allowed_domains = allowed_domains
+        self._block_ip_addresses = block_ip_addresses
         self._headless = headless
         self._max_steps = max_steps
         self._use_vision: bool | Literal['auto'] = use_vision
@@ -311,9 +314,29 @@ class BrowserUseToolset(FunctionToolset[AgentDepsT]):
         headless = self._headless
         if headless is None and self._browser_profile is None:
             headless = True
+        browser_profile = self._browser_profile
+        if self._block_ip_addresses:
+            if browser_profile is None:
+                browser_profile = BrowserProfile(
+                    block_ip_addresses=True,
+                    prohibited_domains=_LOCALHOST_PATTERNS,
+                )
+            else:
+                prohibited_domains = list(browser_profile.prohibited_domains or ())
+                prohibited_domains.extend(
+                    pattern for pattern in _LOCALHOST_PATTERNS if pattern not in prohibited_domains
+                )
+                browser_profile = browser_profile.model_copy(
+                    update={
+                        'block_ip_addresses': True,
+                        'prohibited_domains': prohibited_domains,
+                    }
+                )
+        elif browser_profile is not None:
+            browser_profile = browser_profile.model_copy(update={'block_ip_addresses': False})
         return BrowserSession(
             cdp_url=self._cdp_url,
-            browser_profile=self._browser_profile,
+            browser_profile=browser_profile,
             headless=headless,
             allowed_domains=self._allowed_domains,
             keep_alive=True if self._session_scope == 'agent' else None,
