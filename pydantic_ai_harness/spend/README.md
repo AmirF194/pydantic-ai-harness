@@ -112,51 +112,68 @@ Set `expose_tools=True` to give the agent a `get_spend` tool. It is off by defau
 
 ## Reacting to a threshold
 
-`on_spend` is awaited inside `wrap_model_request`, after the response is priced and before it reaches the rest of the run. An async `on_spend` that waits therefore holds the run between one turn and the next, which is the point at which a decision about continuing can still be acted on:
+`on_spend` is awaited inside `wrap_model_request`, so an async callback does hold the run there. It is still the wrong place to ask for approval: it fires after every priced response, including the one carrying the final answer, and `SpendSnapshot` says nothing about whether another turn follows -- so a callback that waits there leaves a run that has already finished waiting for a decision nothing will act on. Use `on_spend` to report.
+
+The seam that runs only when more spending is about to happen is `before_model_request`. A small capability of your own can read `status(ctx)` there and hold the run until someone decides:
 
 ```python
 import asyncio
+from dataclasses import dataclass
 from decimal import Decimal
 
-from pydantic_ai_harness.spend import Budget, SpendLimits, SpendSnapshot
+from pydantic_ai import Agent
+from pydantic_ai.capabilities import AbstractCapability
+from pydantic_ai.models import ModelRequestContext
+from pydantic_ai.tools import RunContext
 
+from pydantic_ai_harness.spend import Budget, SpendLimits
+
+limits = SpendLimits[None](budgets=[Budget(usd=Decimal('100'), warn_at=0.8)])
 approvals: asyncio.Queue[bool] = asyncio.Queue()
 
 
-async def ask_before_continuing(snapshot: SpendSnapshot) -> None:
-    for status in snapshot.budgets:
-        if status.warning and not await approvals.get():
-            raise RuntimeError(f'{status.budget.name}: spending was not approved to continue')
+@dataclass
+class ApproveBeforeSpending(AbstractCapability[None]):
+    async def before_model_request(
+        self, ctx: RunContext[None], request_context: ModelRequestContext
+    ) -> ModelRequestContext:
+        if any(status.warning for status in await limits.status(ctx)) and not await approvals.get():
+            raise RuntimeError('spending past the warning threshold was not approved')
+        return request_context
 
 
-limits = SpendLimits(budgets=[Budget(usd=Decimal('100'), warn_at=0.8)], on_spend=ask_before_continuing)
+agent = Agent('openai:gpt-5.4', capabilities=[limits, ApproveBeforeSpending()])
 ```
+
+The gate reads numbers `SpendLimits` has already accrued, because the previous response was counted inside `wrap_model_request` before this request was prepared. It gates the first request of a run too, which is what carries a threshold crossed by an earlier run into the next one.
 
 That pause holds a coroutine, so it lasts as long as the process does and no longer. A *serializable* pause at a model-request boundary is not available: Pydantic AI's deferral path is tool-boundary only, and a hook raising `CallDeferred` or `ApprovalRequired` anywhere else is refused with an error naming the positions that are legal. [#151](https://github.com/pydantic/pydantic-ai-harness/issues/151) tracks a general interrupt with a serializable continuation.
 
-For a ceiling that expands rather than stops, `budgets` is read fresh on every request. Replacing it after a refusal and running again continues against the larger ceiling, and because the counter is keyed on `name`, `window`, and `scope`, what is already spent carries over:
+For a ceiling that expands rather than stops, `budgets` is read fresh on every request, so replacing it after a refusal lets the work continue against the larger ceiling. The counter is keyed on `name`, `window`, and `scope`, so what is already spent carries over.
+
+A refusal can land mid-run, after tool calls have already run and been paid for. Re-running the original prompt would repeat that work and any side effects it had, so resume from what the refused run produced instead: `capture_run_messages` holds the partial history, and a run given that history and no new prompt continues from the request that was refused.
 
 ```python
 import dataclasses
 from decimal import Decimal
 
-from pydantic_ai import Agent
-from pydantic_ai.messages import ModelMessage
+from pydantic_ai import Agent, capture_run_messages
 
 from pydantic_ai_harness.spend import Budget, SpendLimitExceeded, SpendLimits
 
-limits = SpendLimits(budgets=[Budget(usd=Decimal('1'), name='session')])
+limits = SpendLimits[None](budgets=[Budget(usd=Decimal('1'), name='session')])
 agent = Agent('openai:gpt-5.4', capabilities=[limits])
 
 
-async def ask(prompt: str, history: list[ModelMessage], ceiling: Decimal) -> str:
-    try:
-        result = await agent.run(prompt, message_history=history)
-    except SpendLimitExceeded:
-        (budget,) = limits.budgets
-        limits.budgets = [dataclasses.replace(budget, usd=ceiling)]
-        result = await agent.run(prompt, message_history=history)
-    return result.output
+async def ask(prompt: str, ceiling: Decimal) -> str:
+    with capture_run_messages() as messages:
+        try:
+            return (await agent.run(prompt)).output
+        except SpendLimitExceeded:
+            (budget,) = limits.budgets
+            limits.budgets = [dataclasses.replace(budget, usd=ceiling)]
+            resumable = list(messages)
+    return (await agent.run(message_history=resumable)).output
 ```
 
 Assigning `budgets` does not repeat the checks the constructor runs over budget combinations, so keep a replacement to the same names, windows, and scopes.
