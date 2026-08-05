@@ -26,6 +26,13 @@ signature yields nothing usable, all of them silent:
    only `X` is dropped.)
 4. Schema generation raises outright, so no capability in the spec gets a schema.
 
+Cases 2 and 3 are silent because core swallows them: `_get_schema_target` catches the
+`NameError` and falls back, and pydantic's union handling drops a member it cannot
+schematize instead of raising. Proposed upstream in
+<https://github.com/pydantic/pydantic-ai/issues/7180>. This file is the downstream half --
+if either path stops being silent, cases 2 and 3 arrive as a real error and layers 1 and 2
+change character.
+
 The opt-out is in the code, not in a list here: `get_capability_registry` keys on
 `get_serialization_name()`, so returning `None` removes a capability from the spec system
 entirely and the sweep below skips it by construction. `SubAgents`, the guardrails and
@@ -62,15 +69,16 @@ _HARNESS = 'pydantic_ai_harness'
 _BASE_FIELDS = frozenset({'id', 'description', 'defer_loading'})
 
 _REPO = 'https://github.com/pydantic/pydantic-ai-harness'
-# The sweep that catalogued the causes below, until each has its own issue.
-_SWEEP = f'{_REPO}/pull/546'
 
 # Tracking issue per root cause -- one line to change when an issue is opened or closed.
+# Every issue carries its own per-capability breakdown; the maps below only say which
+# capability belongs to which. Fixing a capability means deleting its entry here too, since
+# the xfails are strict and an unexpected pass fails the build.
 _TRACKERS = {
     'variadic-from-spec': f'{_REPO}/issues/537',
-    'unresolvable-annotation': _SWEEP,
-    'unrepresentable-field': _SWEEP,
-    'missing-base-fields': _SWEEP,
+    'unresolvable-annotation': f'{_REPO}/issues/552',
+    'unrepresentable-field': f'{_REPO}/issues/553',
+    'missing-base-fields': f'{_REPO}/issues/554',
 }
 
 # Capabilities that publish no schema entry at all, by root cause. An entry leaves this map
@@ -81,7 +89,8 @@ _NO_SCHEMA_ENTRY = {
     # `model: ModelSelection`, whose `'Model | ...'` alias resolves against this module.
     'Advisor': 'unresolvable-annotation',
     'SummarizingCompaction': 'unresolvable-annotation',
-    # `logfire_instance: Logfire | None`, imported under `TYPE_CHECKING`.
+    # `logfire_instance: Logfire | None`, imported under `TYPE_CHECKING`. Resolving the name
+    # is not enough here -- `Logfire | None` then lands in cause 3 (see #553).
     'ManagedPrompt': 'unresolvable-annotation',
     # Inherits `local_docs_path: Path | None`, but `@dataclass` rebuilds `__init__` in
     # `_deprecated.py`, which does not import `Path` at runtime.
@@ -101,8 +110,9 @@ _NO_BASE_FIELDS = {
     'ExaSearch': 'missing-base-fields',
     'Memory': 'missing-base-fields',
     'Planning': 'missing-base-fields',
-    # Not a forgotten `from_spec`: `include`/`exclude` are `Collection[str] | None`, so the
-    # long form is dropped and only the one-parameter short form survives.
+    # Tracked under #553, not #554: `include`/`exclude` are `Collection[str] | None`, so the
+    # long form is dropped and only the one-parameter short form survives. Naming the base
+    # fields in `from_spec` would not bring it back.
     'Skills': 'unrepresentable-field',
 }
 

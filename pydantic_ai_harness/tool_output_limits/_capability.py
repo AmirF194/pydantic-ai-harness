@@ -174,13 +174,20 @@ class ToolOutputLimits(AbstractCapability[AgentDepsT]):
         so a spec that mentions this capability at all cannot produce a schema for any
         capability.
 
+        Moving that `Model` import out of `TYPE_CHECKING` looks like the smaller fix and is
+        the worse one: it makes the name resolve, and pydantic then drops the whole
+        `spec_ToolOutputLimits` entry from the capabilities union instead of raising. The
+        loud failure becomes a silent one, and every field here disappears from the schema
+        while the spec keeps loading. Verified, not assumed. Keep the import deferred.
+
         `bands` and `per_tool` carry `Action` dataclasses with a recursive `then` fallback
         and a model or callable on `Summarize`; `tokenizer` and `store` are a callable and a
         live backend. None of them has a spec representation, so they are rejected rather
         than dropped -- a spec that promises a summarize band and silently gets the default
         spill band is worse than a spec that refuses to load. `**unsupported` stays so that
         rejection keeps naming the field; core drops it from the schema, so it costs nothing
-        there.
+        there. Making `bands` spec-expressible through a `BandSpec` is tracked in
+        <https://github.com/pydantic/pydantic-ai-harness/issues/555>.
         """
         runtime_only = sorted({'bands', 'per_tool', 'tokenizer', 'store'} & unsupported.keys())
         if runtime_only:

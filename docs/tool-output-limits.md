@@ -252,7 +252,8 @@ built-in prompt entirely. The `summary_prompt` template on the capability must c
 backend. A spec naming any of them is rejected rather than silently ignored, because a spec
 that promises a summarize band and quietly gets the default spill band is worse than one that
 refuses to load. A spec that names none of them gets the default `Spill(then=Truncate())`
-band.
+band. Giving `bands` a spec form is tracked in
+[#555](https://github.com/pydantic/pydantic-ai-harness/issues/555).
 
 The fields above are what `ToolOutputLimits.from_spec` names in its signature, which is also
 what Pydantic AI reads to generate the spec's JSON schema -- so an editor following the
