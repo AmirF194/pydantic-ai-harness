@@ -37,8 +37,9 @@ from __future__ import annotations
 import functools
 import importlib
 import pkgutil
+import types
 import warnings
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from types import ModuleType
@@ -129,8 +130,13 @@ def _capability_modules() -> list[str]:
 
 
 def _is_capability_type(obj: object) -> TypeGuard[type[AbstractCapability[Any]]]:
-    """`vars(module)` is untyped, so narrow before reaching for a capability's classmethods."""
-    return isinstance(obj, type) and issubclass(obj, AbstractCapability)
+    """`vars(module)` is untyped, so narrow before reaching for a capability's classmethods.
+
+    A subscripted generic (`Callable[[str], int]`, exported by `media`, `spend`, `subagents`
+    and others) satisfies `isinstance(obj, type)` on Python 3.10 but is not a class, so
+    `issubclass` raises `TypeError` on it there while returning False everywhere else.
+    """
+    return isinstance(obj, type) and not isinstance(obj, types.GenericAlias) and issubclass(obj, AbstractCapability)
 
 
 def _discover() -> tuple[list[type[AbstractCapability[Any]]], dict[str, ImportError]]:
@@ -238,6 +244,12 @@ def test_capability_package_imports(module: str) -> None:
         'it; otherwise this is a defect, and tolerating it here would drop the capability out of '
         'the schema sweep below without anything saying so.'
     )
+
+
+def test_a_subscripted_generic_is_not_mistaken_for_a_capability() -> None:
+    """`isinstance(Callable[...], type)` is True on Python 3.10, where `issubclass` then raises."""
+    assert _is_capability_type(Callable[[str], int]) is False
+    assert _is_capability_type(_Unschematizable) is True
 
 
 def test_only_an_absent_declared_extra_is_tolerated() -> None:
