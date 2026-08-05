@@ -112,6 +112,57 @@ Without a run context, budgets on a `run` or `conversation` window are omitted, 
 
 Set `expose_tools=True` to give the agent a `get_spend` tool. It is off by default: a tool costs schema tokens on every request, and most applications want the number on a screen rather than in the model's context.
 
+## Reacting to a threshold
+
+`on_spend` is awaited inside `wrap_model_request`, after the response is priced and before it reaches the rest of the run. An async `on_spend` that waits therefore holds the run between one turn and the next, which is the point at which a decision about continuing can still be acted on:
+
+```python
+import asyncio
+from decimal import Decimal
+
+from pydantic_ai_harness.spend import Budget, SpendLimits, SpendSnapshot
+
+approvals: asyncio.Queue[bool] = asyncio.Queue()
+
+
+async def ask_before_continuing(snapshot: SpendSnapshot) -> None:
+    for status in snapshot.budgets:
+        if status.warning and not await approvals.get():
+            raise RuntimeError(f'{status.budget.name}: spending was not approved to continue')
+
+
+limits = SpendLimits(budgets=[Budget(usd=Decimal('100'), warn_at=0.8)], on_spend=ask_before_continuing)
+```
+
+That pause holds a coroutine, so it lasts as long as the process does and no longer. A *serializable* pause at a model-request boundary is not available: Pydantic AI's deferral path is tool-boundary only, and a hook raising `CallDeferred` or `ApprovalRequired` anywhere else is refused with an error naming the positions that are legal. [#151](https://github.com/pydantic/pydantic-ai-harness/issues/151) tracks a general interrupt with a serializable continuation.
+
+For a ceiling that expands rather than stops, `budgets` is read fresh on every request. Replacing it after a refusal and running again continues against the larger ceiling, and because the counter is keyed on `name`, `window`, and `scope`, what is already spent carries over:
+
+```python
+import dataclasses
+from decimal import Decimal
+
+from pydantic_ai import Agent
+from pydantic_ai.messages import ModelMessage
+
+from pydantic_ai_harness.spend import Budget, SpendLimitExceeded, SpendLimits
+
+limits = SpendLimits(budgets=[Budget(usd=Decimal('1'), name='session')])
+agent = Agent('openai:gpt-5.4', capabilities=[limits])
+
+
+async def ask(prompt: str, history: list[ModelMessage], ceiling: Decimal) -> str:
+    try:
+        result = await agent.run(prompt, message_history=history)
+    except SpendLimitExceeded:
+        (budget,) = limits.budgets
+        limits.budgets = [dataclasses.replace(budget, usd=ceiling)]
+        result = await agent.run(prompt, message_history=history)
+    return result.output
+```
+
+Assigning `budgets` does not repeat the checks the constructor runs over budget combinations, so keep a replacement to the same names, windows, and scopes.
+
 ## Sharing a counter across processes
 
 The default store keeps counters in the process, which catches a runaway loop inside one worker and does nothing for a budget spread across a queue. `RedisSpendStore` is the shared counter:
@@ -165,19 +216,19 @@ State lives across runs deliberately, so `for_run` is not overridden: a daily bu
 
 `defer_loading=True` is refused. A deferred capability's hooks do not run until the model loads it, so an exhausted budget would not stop a request and the requests made meanwhile would go uncounted -- a brake the thing being braked decides when to apply.
 
-The accrual happens in `wrap_model_request`, immediately around the provider call, and the capability declares itself innermost so that wrapper is the innermost one. Every other capability's wrapper, and every capability's `after_model_request`, therefore runs outside it and cannot reject a response the counter has not already seen.
+The accrual happens in `wrap_model_request`, immediately around the provider call, and the capability declares itself innermost so that wrapper sits inside every capability outside the innermost tier. Every `after_model_request` runs outside it, and so does every wrapper except an innermost-tier capability listed after it.
 
 `after_model_request` is the wrong hook for this. It runs once the whole wrap chain has returned, so a capability whose own `wrap_model_request` awaits the response and then raises `ModelRetry` sends the run straight to a fresh request and the rejected one -- generated, billed, kept in history -- is never counted. Ordering cannot reach that case: the rejecting capability need not be innermost, and one listed *before* `SpendLimits` still wraps outside it.
 
 Wrapping also means a request the provider never saw is not charged for. `SkipModelRequest` from an earlier capability's `before_model_request` reaches `after_model_request` with a response the run never paid for, but never reaches the wrapped handler.
 
-What is left is siblings. Pydantic AI orders innermost capabilities against non-innermost ones only, and among themselves the one listed *later* nests further in. `TemporalDurability` and `InputGuardrail` also declare themselves innermost, so either of them listed after `SpendLimits` wraps inside it and can still reject a billed response before it is counted. List `SpendLimits` last among your innermost capabilities when that matters. Closing it outright needs a way to order innermost capabilities against each other, or the public composition-validation hook being decided in [pydantic-ai#5477](https://github.com/pydantic/pydantic-ai/issues/5477); tracked in [#534](https://github.com/pydantic/pydantic-ai-harness/issues/534).
+What is left is siblings. Pydantic AI orders innermost capabilities against non-innermost ones only, and among themselves the one listed *later* nests further in. `TemporalDurability` and `InputGuardrail` also declare themselves innermost, so either of them listed after `SpendLimits` wraps inside it and can still reject a billed response before it is counted. For `InputGuardrail(parallel=True)` that only under-counts when the guard is slower than the model call: a guard that trips first cancels the request, and no response comes back to price. List `SpendLimits` last among your innermost capabilities where the difference matters. Closing it outright needs a way to order innermost capabilities against each other, tracked in [#534](https://github.com/pydantic/pydantic-ai-harness/issues/534).
 
-**Durable execution.** `SpendLimits` is not supported inside a Temporal workflow.
+**Durable execution.** `SpendLimits` is not supported inside a durable workflow, on Temporal, DBOS, or Prefect.
 
-The capability hooks run in workflow code; only the model request itself is the activity. Temporal replays workflow code, so it replays the accrual with it, and a window ends up counting the same response more than once -- one `$1` model activity leaves `$2` in the store once the workflow replays. The day and month buckets have the same problem from the other side: they come from a wall clock the workflow sandbox restricts, and under time-skipping the workflow's day and the key's day drift apart.
+The capability hooks run in orchestration code; only the model request itself is the durable unit -- a Temporal activity, a DBOS step, a Prefect task. All three recover by re-executing orchestration code, so they re-execute the accrual with it, and a window counts the same response more than once: one `$1` model request leaves `$2` in the store after one replay. Pydantic AI wraps its own hook dispatch for that reason -- DBOS routes the event-stream handler through a step "so its side effects are checkpointed and don't re-run when the workflow recovers", and Prefect caches the handler task so "a flow retry that re-executes the same run reproduces the same numbers and replays from cache". The accrual has no such wrapper.
 
-The sandbox refusing that clock is what surfaces this first, and `SpendLimits` translates the error into what it means rather than into the setting that silences it. Passing the package through the sandbox removes the message, not the replay.
+What differs between the engines is whether you find out. Temporal raises on the first request: its workflow sandbox restricts the wall clock the day and month buckets come from, `pydantic_ai_harness` is not among the modules `PydanticAIPlugin` passes through the sandbox, and `SpendLimits` translates that error into what it means rather than into the setting that silences it. Passing the package through the sandbox removes the message, not the replay, and under time-skipping the workflow's day and the key's day still drift apart. DBOS recovery and Prefect flow retry report nothing at all: the counter is simply higher than what was spent, so the budget refuses a request earlier than it should.
 
 Refuse the workflow **admission** before starting it instead. That is why `exhausted()` works without a `RunContext`:
 
@@ -194,16 +245,20 @@ inspected nothing -- which is exactly what a `SpendLimits` whose budgets are all
 the scope is missing. `exhausted` raises there instead, naming the budgets that need a
 `scope` or a run context. Use `status` for a reading, `exhausted` for a decision.
 
-Making the accrual replay-safe needs the store write to happen inside an activity, which the
-capability cannot arrange without depending on `temporalio` and detecting the engine -- so it
-belongs in Pydantic AI core rather than here. Tracked in
-[#531](https://github.com/pydantic/pydantic-ai-harness/issues/531).
+Making the accrual replay-safe needs the store write to happen inside the engine's own durable
+unit, which the capability cannot arrange without depending on `temporalio`, `dbos` or `prefect`
+and detecting which one is running -- so it belongs in Pydantic AI core rather than here. Tracked
+in [#531](https://github.com/pydantic/pydantic-ai-harness/issues/531).
 
 For a per-run token ceiling and nothing else, Pydantic AI's own
 [`UsageLimits(total_tokens_limit=...)`](https://pydantic.dev/docs/ai/core-concepts/agent/#usage-limits)
-does the same job in-process with no store and no capability. Reach for `Budget(tokens=...,
-window='run')` when the same configuration also has to express money, a longer window, a
-tenant scope, or a counter shared between processes.
+does the same job in-process with no store and no capability. `UsageLimits` also carries the two
+input-token granularities `SpendLimits` has no equivalent for: `input_tokens_limit` is cumulative
+over the run, and `per_request_input_tokens_limit` caps one request -- measured against the model's
+own `count_tokens` before the request is sent when `count_tokens_before_request=True`, so an
+oversized context is refused rather than billed. Reach for `Budget(tokens=..., window='run')` when
+the same configuration also has to express money, a longer window, a tenant scope, or a counter
+shared between processes.
 
 ## Tracing
 

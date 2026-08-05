@@ -78,13 +78,18 @@ class SpendLimits(AbstractCapability[AgentDepsT]):
     budget that reset every run would not be a daily budget. Per-run isolation
     comes from `Budget(window='run')`, whose key carries the run id.
 
-    Durable execution: not supported inside a Temporal workflow. The hooks run in
-    workflow code while only the model request is the activity, so Temporal replays
-    the accrual and a window counts the same response more than once. `exhausted()`
-    works without a `RunContext` so a workflow can at least be refused admission on
-    what is already recorded -- but a workflow admitted that way records nothing of
-    its own, so it is a gate on the door, not a budget on what happens inside.
-    Tracked in <https://github.com/pydantic/pydantic-ai-harness/issues/531>.
+    Durable execution: not supported inside a durable workflow, on Temporal, DBOS,
+    or Prefect. The hooks run in orchestration code while only the model request is
+    the durable unit, so re-execution replays the accrual and a window counts the
+    same response more than once. What differs is whether you find out: Temporal
+    raises, because its workflow sandbox restricts the clock these hooks read and
+    `pydantic_ai_harness` is not one of the modules the Pydantic AI plugin passes
+    through, while DBOS recovery and Prefect flow retry report nothing and leave the
+    counter higher than what was spent. `exhausted()` works without a `RunContext`
+    so a workflow can at least be refused admission on what is already recorded --
+    but a workflow admitted that way records nothing of its own, so it is a gate on
+    the door, not a budget on what happens inside. Tracked in
+    <https://github.com/pydantic/pydantic-ai-harness/issues/531>.
     """
 
     budgets: Sequence[Budget[AgentDepsT]] = ()
@@ -222,12 +227,11 @@ class SpendLimits(AbstractCapability[AgentDepsT]):
         return 'SpendLimits'
 
     def get_ordering(self) -> CapabilityOrdering:
-        """Sit innermost, so the accrual is the first thing to happen to a billed response.
+        """Sit innermost, so the accrual happens as close to the provider call as ordering allows.
 
-        Innermost puts this capability's `wrap_model_request` closest to the provider call,
-        so every other capability's wrapper -- and every capability's
-        `after_model_request` -- runs outside the accrual and cannot reject a response the
-        counter has not already seen.
+        Innermost puts this capability's `wrap_model_request` inside every capability outside
+        that tier, so their wrappers -- and every capability's `after_model_request` -- run
+        outside the accrual and cannot reject a response the counter has not already seen.
 
         This orders against non-innermost capabilities only. Innermost members are not
         ordered among themselves, and the one listed later nests further in, so another
@@ -268,7 +272,7 @@ class SpendLimits(AbstractCapability[AgentDepsT]):
         request_context: ModelRequestContext,
         handler: WrapModelRequestHandler,
     ) -> ModelResponse:
-        """Price what the provider returned and add it to every window, before anything can reject it.
+        """Price what the provider returned and add it to every window, before an outer capability can reject it.
 
         The accrual belongs here rather than in `after_model_request` because
         `after_model_request` runs outside this chain, once the whole chain has returned.
@@ -478,7 +482,8 @@ class SpendLimits(AbstractCapability[AgentDepsT]):
         Temporal's workflow sandbox restricts. The sandbox's own error names
         `datetime.datetime.now` and not what it means here, so it is translated. Matched by
         class name rather than by importing `temporalio`, which this package does not depend
-        on, and which `durable_exec/AGENTS.md` rules out detecting.
+        on, and which core's own `pydantic_ai/durable_exec/AGENTS.md` rules out: "Prefer generic
+        capabilities/toolsets/models extension points over engine-specific escape hatches."
 
         The message leads with the unsafety rather than the passthrough that silences it: the
         sandbox is refusing a symptom, and a caller who only removes the symptom gets a
