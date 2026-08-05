@@ -133,7 +133,8 @@ squiggle on a block that loads perfectly at runtime, and a failure in any CI
 that validates specs. Nothing fails until a user opens the file, which is why
 this has now shipped from three separate authors.
 
-Four ways a signature publishes nothing, all silent:
+Four ways a signature silently publishes less than it should. The first three
+erase the whole entry; the fourth drops only the base fields:
 
 - **Variadic parameters are dropped.** `from_spec(*args, **kwargs)` leaves no
   type hints, so the capability publishes the bare string `"<Name>"` and no

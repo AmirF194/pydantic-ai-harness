@@ -103,10 +103,11 @@ README, or source code.
 - A new or changed capability publishes its configurable fields -- including
   `id`, `description` and `defer_loading` -- to the `AgentSpec` schema. Check by
   generating it:
-  `AgentSpec.model_json_schema_with_capabilities([C])['$defs']` carries
-  `spec_<Name>` with those properties. See `capability-authoring.md` "The Read
-  Signature Is The Published Schema" for the four ways a signature ends up
-  publishing nothing.
+  `AgentSpec.model_json_schema_with_capabilities([C])['$defs']` carries a
+  `spec_<Name>` entry, and `$defs['spec_params_<Name>']['properties']` covers
+  those three fields. See `capability-authoring.md` "The Read Signature Is The
+  Published Schema" for the four ways a signature ends up publishing less than
+  it should.
 - `make lint`, `make typecheck`, and `make test` pass before handoff.
 
 ## Docs
