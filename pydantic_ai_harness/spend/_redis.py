@@ -228,6 +228,9 @@ class RedisSpendStore:
     store's keys land in one slot and a script may take several of them at once.
     Applying one response to a day and a month window in one script is what that buys,
     and the cost is that a cluster cannot spread this store's keys across its nodes.
+
+    A prefix carrying a brace of its own is refused at construction, since it would move
+    the tag and put two windows of one budget in different slots.
     """
 
     dedup_retain: timedelta | None = DEFAULT_DEDUP_RETAIN
@@ -293,8 +296,11 @@ class RedisSpendStore:
     async def add_many(self, entries: Sequence[SpendEntry]) -> Mapping[str, Spent]:
         """Apply every entry as one script and return each key's new total.
 
-        One round trip, and one unit of work: every window of the response lands or none
-        does, and the script returns each new total, so the result needs no second read.
+        One unit of work: every window of the response lands or none does, and the script
+        returns each new total, so the result needs no second read. One round trip too,
+        for a key this store has written before -- a key it finds cold costs a read of the
+        pre-0.18 name, and a second script when there is a counter there to carry; see
+        `_carry_legacy`.
 
         A failure before the server runs the script -- the client cannot connect, the
         request never lands -- writes nothing. A failure after it does not say which:
