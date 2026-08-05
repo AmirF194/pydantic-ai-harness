@@ -60,7 +60,7 @@ _BASE_FIELDS = frozenset({'id', 'description', 'defer_loading'})
 
 _REPO = 'https://github.com/pydantic/pydantic-ai-harness'
 # The sweep that catalogued the causes below, until each has its own issue.
-_SWEEP = f'{_REPO}/pull/PENDING'
+_SWEEP = f'{_REPO}/pull/546'
 
 # Tracking issue per root cause -- one line to change when an issue is opened or closed.
 _TRACKERS = {
