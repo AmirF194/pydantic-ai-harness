@@ -1,13 +1,19 @@
 """Where spend counters live.
 
-`SpendStore` is the seam between the gate and its counter. The default keeps
+`BatchSpendStore` is the seam between the gate and its counter. The default keeps
 counters in the process, which catches a runaway loop inside one worker; a
 shared store is what makes a budget hold across the workers of a queue.
+
+The seam takes every window of a response at once. One response counts against
+every configured window, so applying them one at a time leaves a failure between
+two of them counted in one window and not the other, which reads as less spend
+than really happened.
 """
 
 from __future__ import annotations
 
-from collections.abc import Callable
+import warnings
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
@@ -19,22 +25,77 @@ from pydantic_ai_harness.spend._snapshot import Spent
 _Entries = dict[str, tuple[Spent, 'datetime | None']]
 """Each key's counter and the moment it stops counting, if it ever does."""
 
+DEFAULT_DEDUP_RETAIN = timedelta(hours=1)
+"""How long a store remembers a `SpendEntry.token` by default.
+
+Long enough for a durable engine to re-execute an accrual it had already committed:
+DBOS recovers a workflow when the process that owned it comes back, and a Prefect
+flow retry replays from its cache. Short enough that the markers are bounded by an
+hour of traffic rather than a day of it.
+"""
+
 
 def utc_now() -> datetime:
     """Current UTC time. The default clock for windows and expiry."""
     return datetime.now(timezone.utc)
 
 
+@dataclass(frozen=True, kw_only=True)
+class SpendEntry:
+    """One window's share of one response.
+
+    Everything except `key` defaults to nothing, so a reconciler correcting drift
+    against an external source can post a `usd` delta on its own without inflating
+    the request count.
+    """
+
+    key: str
+    """The window's store key."""
+
+    usd: Decimal = Decimal(0)
+    """Priced cost to add. May be negative, which is how a reconciler corrects drift."""
+
+    tokens: int = 0
+    """Total tokens to add."""
+
+    requests: int = 0
+    """Model requests to add. Explicit rather than an implied `+= 1` so a correction
+    can move the money without moving the count."""
+
+    unpriced: int = 0
+    """How many of `requests` had no resolvable price."""
+
+    ttl: timedelta | None = None
+    """How long the key may be kept after this write. `None` means indefinitely."""
+
+    token: str | None = None
+    """Identifies the response this entry came from, so it is applied at most once.
+
+    A capability hook runs in orchestration code, which a durable engine re-executes:
+    DBOS recovers a workflow by running it again, and a Prefect flow retry replays the
+    model request from its cache. Both hand the same response back to the accrual, and
+    without a token the window counts it twice. A store that recognises a token it has
+    already applied to `key` returns the current total instead of adding again.
+
+    `None` means "apply unconditionally", which is what a reconciler posting a delta
+    wants: two corrections of the same size are two corrections.
+    """
+
+
 @runtime_checkable
 class SpendStore(Protocol):
-    """Reads and accumulates the counter behind each budget window.
+    """Reads and accumulates the counter behind one budget window at a time.
 
-    `add` returns the state **after** the increment so an atomic backend can
-    answer without a second round trip. `requests` is an explicit parameter
-    rather than an implied `+= 1` so a reconciler correcting drift against an
-    external source can post a delta (including a negative `usd`) without
-    inflating the request count, and without the protocol growing a second
-    method for it.
+    Deprecated, and removed in 0.20.0. Implement
+    [`BatchSpendStore`][pydantic_ai_harness.spend.BatchSpendStore] instead: it takes
+    every window of a response in one call, which is what lets a backend apply them
+    together, and it carries the replay token that keeps a re-executed accrual from
+    counting twice. `SpendLimits` still accepts a store of this shape and drives it
+    through an adapter, one window per call, warning once about what that costs.
+
+    The two protocols are separate names rather than two versions of one, because
+    `runtime_checkable` tests method presence and not signatures: reusing `add` and
+    `get` would leave nothing able to tell a store that batches from one that cannot.
     """
 
     async def get(self, key: str) -> Spent:
@@ -53,6 +114,73 @@ class SpendStore(Protocol):
     ) -> Spent:
         """Add to `key` and return the result. `ttl` is how long the key may be kept."""
         ...  # pragma: no cover
+
+
+@runtime_checkable
+class BatchSpendStore(Protocol):
+    """Reads and accumulates the counters behind every window of one response.
+
+    `add_many` returns the state **after** the increment so an atomic backend can
+    answer without a second round trip, keyed by `SpendEntry.key` rather than
+    positionally so entries sharing a key collapse the way the caller expects.
+
+    Both methods take a sequence rather than a single key so a backend that can read
+    or apply the whole set as one unit does, and one that cannot still sees the whole
+    set and can say so.
+    """
+
+    async def get_many(self, keys: Sequence[str]) -> Mapping[str, Spent]:
+        """What each key has accumulated. A key that was never written reads as zero."""
+        ...  # pragma: no cover
+
+    async def add_many(self, entries: Sequence[SpendEntry]) -> Mapping[str, Spent]:
+        """Apply every entry and return each key's new total."""
+        ...  # pragma: no cover
+
+
+@dataclass
+class _LegacyStoreAdapter:
+    """Drives a `SpendStore` one window per call, because that is all it can do."""
+
+    store: SpendStore
+
+    async def get_many(self, keys: Sequence[str]) -> Mapping[str, Spent]:
+        """Read each key on its own."""
+        return {key: await self.store.get(key) for key in keys}
+
+    async def add_many(self, entries: Sequence[SpendEntry]) -> Mapping[str, Spent]:
+        """Apply each entry on its own, dropping `SpendEntry.token` the store cannot use."""
+        return {
+            entry.key: await self.store.add(
+                entry.key,
+                usd=entry.usd,
+                tokens=entry.tokens,
+                requests=entry.requests,
+                unpriced=entry.unpriced,
+                ttl=entry.ttl,
+            )
+            for entry in entries
+        }
+
+
+def as_batch_store(store: SpendStore | BatchSpendStore) -> BatchSpendStore:
+    """The store as a batch store, wrapping a legacy one and saying what that costs.
+
+    Warned about here rather than on every request: this runs once per `SpendLimits`,
+    at construction, so the message lands next to the line that chose the store.
+    """
+    if isinstance(store, BatchSpendStore):
+        return store
+    warnings.warn(
+        f'{type(store).__name__} implements the deprecated `SpendStore` protocol, so each response is applied '
+        'one window at a time: a response counting against a day and a month budget is two writes, and a failure '
+        'between them leaves the day counted and the month not. `SpendEntry.token` is dropped too, so a durable '
+        'engine that re-executes the accrual (DBOS recovery, a Prefect flow retry) counts the response twice. '
+        'Implement `get_many` and `add_many` (`BatchSpendStore`) to get both. `SpendStore` is removed in 0.20.0.',
+        DeprecationWarning,
+        stacklevel=4,
+    )
+    return _LegacyStoreAdapter(store)
 
 
 @dataclass
@@ -78,7 +206,16 @@ class InMemorySpendStore:
     the scan.
     """
 
+    dedup_retain: timedelta | None = DEFAULT_DEDUP_RETAIN
+    """How long an applied `SpendEntry.token` is remembered, or `None` to apply every entry.
+
+    A remembered token costs one small entry per response per window until it is swept.
+    """
+
     _entries: _Entries = field(default_factory=_Entries, init=False, repr=False)
+    _applied: dict[tuple[str, str], datetime] = field(
+        default_factory=dict[tuple[str, str], datetime], init=False, repr=False
+    )
     _lock: Lock = field(default_factory=Lock, init=False, repr=False)
     _writes_since_sweep: int = field(default=0, init=False, repr=False)
 
@@ -98,16 +235,8 @@ class InMemorySpendStore:
             return sum(1 for _, expires_at in self._entries.values() if expires_at is None or now < expires_at)
 
     async def get(self, key: str) -> Spent:
-        """What `key` has accumulated, treating an expired key as absent.
-
-        Under the lock, because `_live` deletes the key it finds expired: unlocked, that
-        `del` races the `_sweep` iteration inside `add` (`RuntimeError: dictionary changed
-        size during iteration`) and a second concurrent reader (`KeyError`). Reachable
-        whenever the guard is shared across threads -- `run_sync` from a pool, a sync
-        endpoint -- and any key is read past its horizon.
-        """
-        with self._lock:
-            return self._live(key)
+        """What `key` has accumulated. Deprecated in favour of `get_many`, removed in 0.20.0."""
+        return (await self.get_many([key]))[key]
 
     async def add(
         self,
@@ -119,30 +248,65 @@ class InMemorySpendStore:
         unpriced: int,
         ttl: timedelta | None,
     ) -> Spent:
-        """Add to `key` and return the result.
+        """Add to `key` and return the result. Deprecated in favour of `add_many`, removed in 0.20.0."""
+        entry = SpendEntry(key=key, usd=usd, tokens=tokens, requests=requests, unpriced=unpriced, ttl=ttl)
+        return (await self.add_many([entry]))[key]
 
-        The mutation spans no `await`, so concurrent runs on one event loop
-        cannot interleave halfway through it. The lock covers the case that is
-        not free: `run_sync` called from a thread pool, or a free-threaded
-        interpreter, where a read-modify-write loses updates in the direction
-        that under-counts spend.
+    async def get_many(self, keys: Sequence[str]) -> Mapping[str, Spent]:
+        """What each key has accumulated, treating an expired key as absent.
+
+        Under the lock, because `_live` deletes the key it finds expired: unlocked, that
+        `del` races the `_sweep` iteration inside `add_many` (`RuntimeError: dictionary
+        changed size during iteration`) and a second concurrent reader (`KeyError`).
+        Reachable whenever the guard is shared across threads -- `run_sync` from a pool,
+        a sync endpoint -- and any key is read past its horizon.
         """
         with self._lock:
-            self._writes_since_sweep += 1
+            return {key: self._live(key) for key in keys}
+
+    async def add_many(self, entries: Sequence[SpendEntry]) -> Mapping[str, Spent]:
+        """Apply every entry and return each key's new total.
+
+        The mutation spans no `await`, so concurrent runs on one event loop cannot
+        interleave halfway through it and no reader sees some of a response applied and
+        not the rest. The lock covers the case that is not free: `run_sync` called from a
+        thread pool, or a free-threaded interpreter, where a read-modify-write loses
+        updates in the direction that under-counts spend.
+        """
+        with self._lock:
+            self._writes_since_sweep += len(entries)
             if self._writes_since_sweep >= self.sweep_every:
                 self._sweep()
-            current = self._live(key)
-            updated = Spent(
-                usd=current.usd + usd,
-                tokens=current.tokens + tokens,
-                requests=current.requests + requests,
-                unpriced_requests=current.unpriced_requests + unpriced,
-            )
-            self._entries[key] = (updated, None if ttl is None else self.clock() + ttl)
-            return updated
+            totals: dict[str, Spent] = {}
+            for entry in entries:
+                if self._already_applied(entry):
+                    totals[entry.key] = self._live(entry.key)
+                    continue
+                current = self._live(entry.key)
+                updated = Spent(
+                    usd=current.usd + entry.usd,
+                    tokens=current.tokens + entry.tokens,
+                    requests=current.requests + entry.requests,
+                    unpriced_requests=current.unpriced_requests + entry.unpriced,
+                )
+                self._entries[entry.key] = (updated, None if entry.ttl is None else self.clock() + entry.ttl)
+                totals[entry.key] = updated
+            return totals
+
+    def _already_applied(self, entry: SpendEntry) -> bool:
+        """Whether this entry's token has already reached its key, remembering it if not."""
+        if entry.token is None or self.dedup_retain is None:
+            return False
+        marker = (entry.key, entry.token)
+        now = self.clock()
+        seen = self._applied.get(marker)
+        if seen is not None and now < seen:
+            return True
+        self._applied[marker] = now + self.dedup_retain
+        return False
 
     def _sweep(self) -> None:
-        """Drop every entry whose window has rolled over.
+        """Drop every entry whose window has rolled over, and every token past its horizon.
 
         Amortised over `sweep_every` writes rather than run on each one. The scan is linear in
         resident keys, and `run` and `conversation` budgets hold one key per run and per
@@ -156,6 +320,9 @@ class InMemorySpendStore:
         stale = [key for key, (_, expires_at) in self._entries.items() if expires_at is not None and now >= expires_at]
         for key in stale:
             del self._entries[key]
+        expired = [marker for marker, seen in self._applied.items() if now >= seen]
+        for marker in expired:
+            del self._applied[marker]
 
     def _live(self, key: str) -> Spent:
         """The entry at `key`, dropping it first if its window has rolled over.

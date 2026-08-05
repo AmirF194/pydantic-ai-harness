@@ -127,17 +127,21 @@ limits = SpendLimits(budgets=[Budget(usd=Decimal('100'), window='day')], store=s
 
 It adds no dependency: `RedisClient` is a protocol of the two coroutines used, so any compatible client satisfies it. Amounts are stored as integer billionths of a dollar rather than through `INCRBYFLOAT`, which accumulates rounding error over the tens of thousands of requests a busy day produces. Billionths rather than millionths because the residue does not average out: an agent repeats requests of near-identical shape, so the same fraction rounds the same way every time.
 
-Each window is applied as one Lua script, in one round trip, so no other client sees a window holding part of a response and the exact-integer ceiling is checked before anything is written. That guarantee is per window, not across them: a response counting against a day budget and a month budget is two scripts, so a failure between the two leaves the day counted and the month not. Widening it needs a store operation that takes every window at once, tracked in [#536](https://github.com/pydantic/pydantic-ai-harness/issues/536).
+Every window a response counts against is applied as one Lua script, in one round trip, so no other client sees the response part-applied: not across the four counters of one window, and not across the windows themselves. A response counting against a day budget and a month budget is one script, so nothing can fail between them and leave the day counted and the month not.
 
-A failure *after* the server has run a script does not say whether it committed -- the connection can drop once `EVAL` has landed -- so an `add` that errors leaves the outcome unknown rather than untried. Nothing retries it: counting a billed response twice is a direction the brake survives, and counting it zero times is not.
+A failure *after* the server has run a script does not say whether it committed -- the connection can drop once `EVAL` has landed -- so a write that errors leaves the outcome unknown rather than untried. Nothing retries it: counting a billed response twice is a direction the brake survives, and counting it zero times is not.
 
-The cost of doing it server-side is a ceiling -- the counters pass through Lua, whose numbers stop being exact integers above `2**53` billionths, about **$9,007,199** against a single key. Past that the store raises rather than rounding silently. Settling a protocol without that ceiling is [#532](https://github.com/pydantic/pydantic-ai-harness/issues/532).
+The counters do not round. `HINCRBY` is 64-bit integer arithmetic and takes its increment as a string, so what Redis holds is exact, and the totals come back as bulk strings read with `HMGET` rather than as the integer replies `HINCRBY` returns -- those become Lua numbers, which are doubles, and would round a total past `2**53` billionths on the way out. What is left is `HINCRBY`'s own range: a counter passing the signed 64-bit range, around **$9.22 billion** against a single key, which Redis refuses before writing that field.
+
+Keys are `{prefix}:{budget key}`, braces included. That is a Redis Cluster hash tag, so the slot comes from the prefix alone and every key of one store lands in the same slot, which is what lets one script take several of them. The cost is that a cluster cannot spread a store's keys across its nodes. `BudgetStatus.key` reports the budget key without the prefix, so what it shows is unchanged. A counter written by an earlier version, under the untagged name, is read when the tagged key is absent and carried into it on the next write, so an upgrade strands nothing and asks nothing of an operator; that fallback goes away in 0.20.0.
+
+`add_many` carries a token identifying the response, and `RedisSpendStore` claims a marker for it inside the same script. A durable engine that re-executes the accrual around a response it already holds -- DBOS recovering a workflow, a Prefect flow retry -- therefore adds it once rather than twice. The token is the provider's own response id where the provider reports one; without one it falls back to the run id and step, which survives a replay only for a `run_id` the caller chose rather than the generated default. Markers are held for `dedup_retain`, an hour by default, and cost one small key per response per window.
 
 The default store is built per capability, so two `SpendLimits` instances do not quietly share one counter. Pass the same store object to both when you want them to.
 
 A store that fails does not fail quietly. An error reading the counter refuses the request, which is the safe direction. An error writing it propagates out of the run after the model has already answered and been charged. That is deliberate: a swallowed write would drift the counter down and weaken the gate, which is worse than a visible failure. If your deployment would rather keep the answer than the count, wrap the store and decide there.
 
-Any object with `get` and `add` works, so a Postgres or DynamoDB counter is a small class rather than a fork.
+Any object with `get_many` and `add_many` works, so a Postgres or DynamoDB counter is a small class rather than a fork. `SpendStore`, the single-key `get` and `add` pair released in 0.17.0, is deprecated and removed in 0.20.0: a store of that shape still works, driven one window per call, and warns once at construction naming what that costs -- windows applied one at a time, and no token, so an accrual a durable engine re-executes counts twice.
 
 ## Pricing
 
@@ -225,9 +229,9 @@ The fields above are what `SpendLimits.from_spec` names in its signature, which 
 
 ## API
 
-`SpendLimits`, `Budget`, `SpendSnapshot`, `BudgetStatus`, `Spent`, `SpendStore`,
-`InMemorySpendStore`, `RedisSpendStore`, `SpendLimitExceeded`, and `UnpricedModelError` are
-exported from `pydantic_ai_harness.spend`. Signatures and defaults are rendered from the
+`SpendLimits`, `Budget`, `SpendSnapshot`, `BudgetStatus`, `Spent`, `BatchSpendStore`,
+`SpendEntry`, `SpendStore`, `InMemorySpendStore`, `RedisSpendStore`, `SpendLimitExceeded`,
+and `UnpricedModelError` are exported from `pydantic_ai_harness.spend`. Signatures and defaults are rendered from the
 source on the [docs page](https://pydantic.dev/docs/ai/harness/spend/), which is the copy
 that cannot drift.
 
