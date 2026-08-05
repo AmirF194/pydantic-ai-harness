@@ -1022,6 +1022,42 @@ class TestInMemoryStore:
 
         assert retried['k'].requests == 1
 
+    async def test_a_failing_entry_leaves_the_whole_response_unapplied(self):
+        """The split write `add_many` exists to prevent, inside one process rather than across a network.
+
+        Two infinities are the smallest way to make one entry's arithmetic raise; any
+        failure part-way through a response has the same shape.
+        """
+        store = InMemorySpendStore()
+        await store.add_many([SpendEntry(key='month', usd=Decimal('Infinity'))])
+
+        with pytest.raises(InvalidOperation):
+            await store.add_many(
+                [
+                    SpendEntry(key='day', usd=Decimal('1'), requests=1),
+                    SpendEntry(key='month', usd=Decimal('-Infinity'), requests=1),
+                ]
+            )
+
+        assert (await store.get_many(['day']))['day'] == Spent()
+
+    async def test_a_token_is_remembered_no_longer_than_its_counter(self):
+        """A marker outliving its window would skip a replay against a counter that rolled over."""
+        clock = Clock()
+        store = InMemorySpendStore(clock=clock, dedup_retain=timedelta(hours=24))
+        entry = SpendEntry(key='k', usd=Decimal('1'), requests=1, ttl=timedelta(hours=1), token='resp-1')
+        await store.add_many([entry])
+
+        clock.advance(timedelta(hours=2))
+
+        assert await store.add_many([entry]) == {'k': Spent(usd=Decimal('1'), requests=1)}
+
+    async def test_one_token_twice_in_a_call_is_applied_once(self):
+        store = InMemorySpendStore()
+        entry = SpendEntry(key='k', usd=Decimal('1'), requests=1, token='resp-1')
+
+        assert await store.add_many([entry, entry]) == {'k': Spent(usd=Decimal('1'), requests=1)}
+
     async def test_a_token_past_its_horizon_is_forgotten(self):
         """Remembering every token forever would grow with traffic, so the sweep drops them."""
         clock = Clock()
@@ -1231,6 +1267,17 @@ class TestRedisStore:
         totals = await store.add_many([SpendEntry(key='month', usd=Decimal('1'), requests=1, token='resp-1')])
 
         assert totals == {'month': Spent(usd=Decimal('1'), requests=1)}
+
+    async def test_a_marker_is_held_no_longer_than_its_counter(self):
+        """A marker outliving its window would skip a replay against a counter that rolled over,
+        and the window would read as zero rather than as the response it should hold."""
+        client = FakeRedis()
+        store = RedisSpendStore(client, dedup_retain=timedelta(hours=24))
+
+        await store.add_many([SpendEntry(key='k', requests=1, ttl=timedelta(hours=1), token='resp-1')])
+
+        assert set(client.markers.values()) == {3600}
+        assert client.expiries == {'{pydantic-ai-harness:spend}:k': 3600}
 
     async def test_dedup_can_be_turned_off(self):
         """A deployment that would rather not hold a marker per response can say so."""

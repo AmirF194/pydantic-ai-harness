@@ -274,44 +274,68 @@ class InMemorySpendStore:
         thread pool, or a free-threaded interpreter, where a read-modify-write loses
         updates in the direction that under-counts spend.
 
-        The clock is read once, before anything is applied, and an entry's token is
-        remembered only once its counter has moved. A token remembered ahead of the write
-        it stands for would be consumed by a call that then failed, and the retry that
-        could have recorded the response would be skipped as a replay of it.
+        Every entry is worked out before any of them is stored, so a response that fails
+        part-way through -- an amount whose arithmetic raises, say -- leaves none of its
+        windows applied rather than the ones before the failure. Applying the whole set
+        together is what this method exists for.
+
+        The clock is read once, before anything is applied, and a token is remembered
+        only once the counter it stands for has moved. A token remembered ahead of that
+        write would be consumed by a call that then failed, and the retry that could have
+        recorded the response would be skipped as a replay of it.
         """
         with self._lock:
             now = self.clock()
             self._writes_since_sweep += len(entries)
             if self._writes_since_sweep >= self.sweep_every:
                 self._sweep(now)
+            pending: dict[str, tuple[Spent, datetime | None]] = {}
+            claimed: dict[tuple[str, str], datetime] = {}
             totals: dict[str, Spent] = {}
             for entry in entries:
-                if self._already_applied(entry, now):
-                    totals[entry.key] = self._live(entry.key, now)
+                held = pending.get(entry.key)
+                current = held[0] if held is not None else self._live(entry.key, now)
+                if self._already_applied(entry, now, claimed):
+                    totals[entry.key] = current
                     continue
-                current = self._live(entry.key, now)
                 updated = Spent(
                     usd=current.usd + entry.usd,
                     tokens=current.tokens + entry.tokens,
                     requests=current.requests + entry.requests,
                     unpriced_requests=current.unpriced_requests + entry.unpriced,
                 )
-                self._entries[entry.key] = (updated, None if entry.ttl is None else now + entry.ttl)
-                self._remember(entry, now)
+                pending[entry.key] = (updated, None if entry.ttl is None else now + entry.ttl)
+                if entry.token is not None and self.dedup_retain is not None:
+                    claimed[(entry.key, entry.token)] = now + self._remembered_for(entry)
                 totals[entry.key] = updated
+            self._entries.update(pending)
+            self._applied.update(claimed)
             return totals
 
-    def _already_applied(self, entry: SpendEntry, now: datetime) -> bool:
-        """Whether this entry's token has already reached its key."""
+    def _already_applied(
+        self,
+        entry: SpendEntry,
+        now: datetime,
+        claimed: Mapping[tuple[str, str], datetime],
+    ) -> bool:
+        """Whether this entry's token has reached its key, in an earlier call or earlier in this one."""
         if entry.token is None or self.dedup_retain is None:
             return False
-        seen = self._applied.get((entry.key, entry.token))
+        marker = (entry.key, entry.token)
+        if marker in claimed:
+            return True
+        seen = self._applied.get(marker)
         return seen is not None and now < seen
 
-    def _remember(self, entry: SpendEntry, now: datetime) -> None:
-        """Record that this entry's token has reached its key, so a replay of it does not add again."""
-        if entry.token is not None and self.dedup_retain is not None:
-            self._applied[(entry.key, entry.token)] = now + self.dedup_retain
+    def _remembered_for(self, entry: SpendEntry) -> timedelta:
+        """How long this entry's token is remembered, never past the counter it guards.
+
+        A token outliving its window would skip the replay of a response against a counter
+        that has since rolled over, and the window would read as zero rather than as the
+        response it should hold.
+        """
+        retain = self.dedup_retain or timedelta(0)
+        return retain if entry.ttl is None else min(retain, entry.ttl)
 
     def _sweep(self, now: datetime) -> None:
         """Drop every entry whose window has rolled over, and every token past its horizon.

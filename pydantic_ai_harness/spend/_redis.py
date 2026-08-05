@@ -399,7 +399,13 @@ class RedisSpendStore:
         return self._name(f'dedup{SEPARATOR}{delimited(entry.key, entry.token)}')
 
     def _marker_seconds(self, entry: SpendEntry) -> int:
-        """How long this entry's marker is held, or zero to apply the entry unconditionally."""
+        """How long this entry's marker is held, or zero to apply the entry unconditionally.
+
+        Never longer than the counter it guards. A marker outliving its window would skip
+        the replay of a response against a counter that has since rolled over, and the
+        window would read as zero rather than as the response it should hold.
+        """
         if entry.token is None or self.dedup_retain is None:
             return 0
-        return _expiry_seconds(self.dedup_retain)
+        retain = self.dedup_retain if entry.ttl is None else min(self.dedup_retain, entry.ttl)
+        return _expiry_seconds(retain)
