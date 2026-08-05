@@ -140,11 +140,12 @@ class SpendLimits(AbstractCapability[AgentDepsT]):
     outlives a run: a per-run set would warn again on every run for the same model.
     """
 
-    _checked_composition: bool = field(default=False, init=False, repr=False, compare=False)
-    """Whether the capability chain has been inspected for wrappers nested inside the accrual.
+    _reported_arrangements: set[str] = field(default_factory=set[str], init=False, repr=False, compare=False)
+    """Capability arrangements already reported by `SpendCompositionWarning`, so each reports once.
 
-    Instance-level like `_warned_unpriced`, so the arrangement reports once rather than once
-    per model request.
+    Instance-level and never reset, like `_warned_unpriced`. Keyed on the arrangement rather
+    than being a single flag because `agent.run(capabilities=...)` can put a different chain
+    around this instance on each run, and a flag set by a safe first run would hide the rest.
     """
 
     def __post_init__(self) -> None:
@@ -266,11 +267,10 @@ class SpendLimits(AbstractCapability[AgentDepsT]):
         the capabilities the agent was constructed with, and `RunContext.root_capability`
         is not yet populated when `for_run` runs, so neither covers a capability added
         through `agent.run(capabilities=...)`. This still runs before the first billed
-        response.
+        response, and reads the chain on every request rather than only the first, since
+        a per-run addition can change it between runs.
         """
-        if not self._checked_composition:
-            self._checked_composition = True
-            warn_about_inner_wrappers(ctx.root_capability, self)
+        warn_about_inner_wrappers(ctx.root_capability, self, self._reported_arrangements)
         read: dict[str, Spent] = {}
         for budget, key in self._keyed(ctx):
             if not budget.enforces:

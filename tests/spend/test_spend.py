@@ -553,9 +553,28 @@ class _InnermostWithoutAWrapper(AbstractCapability[None]):
 
 
 class _EngineDurability(AbstractCapability[None]):
-    """Stands in for a durable-execution capability, which core marks with `engine_name`."""
+    """Stands in for a durable-execution capability, carrying both members its base declares."""
 
     engine_name = 'Stand-in'
+    in_durable_context = False
+
+    def get_ordering(self) -> CapabilityOrdering:
+        return CapabilityOrdering(position='innermost')
+
+    async def wrap_model_request(
+        self,
+        ctx: RunContext[None],
+        *,
+        request_context: ModelRequestContext,
+        handler: WrapModelRequestHandler,
+    ) -> ModelResponse:
+        return await handler(request_context)
+
+
+class _StrayEngineName(AbstractCapability[None]):
+    """Carries one of the two markers by coincidence, and is not a durable-execution capability."""
+
+    engine_name = 'not a durable engine'
 
     def get_ordering(self) -> CapabilityOrdering:
         return CapabilityOrdering(position='innermost')
@@ -707,7 +726,7 @@ class TestCompositionWarning:
             with pytest.raises(RuntimeError):
                 await agent.run('hi')
 
-    async def test_it_reports_once_rather_than_once_per_request(self):
+    async def test_it_reports_one_arrangement_once_across_runs(self):
         guard = SpendLimits[None](budgets=[Budget(window='total')])
         agent = Agent(_scripted_usage(), deps_type=type(None), capabilities=[guard, _InnermostWithAWrapper()])
 
@@ -761,6 +780,14 @@ class TestCompositionWarning:
 
         await agent.run('hi')
 
+    async def test_one_durability_marker_alone_does_not_suppress_the_report(self):
+        """`engine_name` is a plausible name for anything; both public members are required."""
+        guard = SpendLimits[None](budgets=[Budget(window='total')])
+        agent = Agent(_scripted_usage(), deps_type=type(None), capabilities=[guard, _StrayEngineName()])
+
+        with pytest.warns(SpendCompositionWarning, match='_StrayEngineName'):
+            await agent.run('hi')
+
     async def test_a_hooks_subclass_with_its_own_wrapper_is_reported(self):
         guard = SpendLimits[None](budgets=[Budget(window='total')])
         hooks = _HooksWithItsOwnWrapper(ordering=CapabilityOrdering(position='innermost'))
@@ -774,6 +801,19 @@ class TestCompositionWarning:
         guard = SpendLimits[None](budgets=[Budget(window='total')])
         agent = Agent(_scripted_usage(), deps_type=type(None), capabilities=[guard])
 
+        with pytest.warns(SpendCompositionWarning, match='_InnermostWithAWrapper'):
+            await agent.run('hi', capabilities=[_InnermostWithAWrapper()])
+
+    async def test_a_run_that_adds_one_later_is_still_reported(self):
+        """A safe first run must not mark every chain that follows it as read.
+
+        The report is deduplicated on the arrangement, not on having reported before, because
+        the same `SpendLimits` instance can be surrounded differently on each run.
+        """
+        guard = SpendLimits[None](budgets=[Budget(window='total')])
+        agent = Agent(_scripted_usage(), deps_type=type(None), capabilities=[guard])
+
+        await agent.run('hi')
         with pytest.warns(SpendCompositionWarning, match='_InnermostWithAWrapper'):
             await agent.run('hi', capabilities=[_InnermostWithAWrapper()])
 

@@ -21,19 +21,29 @@ from pydantic_ai.capabilities import AbstractCapability, CombinedCapability, Hoo
 from pydantic_ai_harness.spend._exceptions import SpendCompositionWarning
 
 
-def warn_about_inner_wrappers(root: AbstractCapability[Any] | None, capability: AbstractCapability[Any]) -> None:
+def warn_about_inner_wrappers(
+    root: AbstractCapability[Any] | None,
+    capability: AbstractCapability[Any],
+    reported: set[str],
+) -> None:
     """Warn when a capability in `root` wraps inside `capability`'s `wrap_model_request`.
 
-    Call this once per capability instance rather than once per request: the chain is
-    fixed for the run, and a per-request warning would report the same arrangement as
-    many times as the agent happens to call the model.
+    `reported` accumulates the arrangements already warned about and is read and written here,
+    so the same one reports once however many requests or runs it survives. Deduplicating on
+    the arrangement rather than on the first call is what lets a reused agent be read again:
+    `agent.run(capabilities=[...])` can put a different chain around the same capability
+    instance on every run, and a flag set by the first, safe chain would hide every later one.
     """
     inner = _inner_wrappers(root, capability)
     if not inner:
         return
+    listed = ', '.join(inner)
+    if listed in reported:
+        return
+    reported.add(listed)
     name = type(capability).__name__
     warnings.warn(
-        f'These capabilities are listed after `{name}`, so they wrap inside it: {", ".join(inner)}. '
+        f'These capabilities are listed after `{name}`, so they wrap inside it: {listed}. '
         'A response one of them rejects after awaiting it is billed by the provider and never counted. '
         f'List `{name}` last among the innermost capabilities to close that.',
         SpendCompositionWarning,
@@ -70,21 +80,30 @@ def _may_reject_a_billed_response(capability: AbstractCapability[Any]) -> bool:
       about whether one was, and the registry that would say is private. Core publishes
       `has_wrap_node_run` and `has_wrap_run_event_stream` but no equivalent for model
       requests; asked for in
-      [pydantic-ai#7165](https://github.com/pydantic/pydantic-ai/issues/7165). A subclass
+      [pydantic-ai#7177](https://github.com/pydantic/pydantic-ai/issues/7177). A subclass
       that overrides the method supplies its own and is still reported.
-    - A durable-execution capability, identified by the `engine_name` its base declares,
-      routes the request into an activity/step/task rather than rejecting what comes back,
-      and core requires its dispatch to be the innermost wrapper. Reordering is the one
-      thing a reader must not do here, so there would be nothing to act on. That
-      combination has its own, louder report: `SpendLimits` refuses the workflow clock and
-      names <https://github.com/pydantic/pydantic-ai-harness/issues/531>.
+    - A durable-execution capability routes the request into an activity/step/task rather
+      than rejecting what comes back, and core requires its dispatch to be the innermost
+      wrapper, so reordering is the one thing a reader must not do here and there would be
+      nothing to act on. That combination has its own, louder report: `SpendLimits` refuses
+      the workflow clock and names
+      <https://github.com/pydantic/pydantic-ai-harness/issues/531>. Recognized by both public
+      members `BaseDurabilityCapability` declares, `engine_name` and `in_durable_context`,
+      rather than by `isinstance` against that base: it lives in `pydantic_ai.durable_exec._base`,
+      and importing a private module to decide whether to warn would turn a later rename in
+      core into an `ImportError` on `import pydantic_ai_harness.spend`. Recognizing the engine
+      by name degrades into a warning instead, which is the failure this whole function is
+      built to prefer, and follows what `SpendLimits._now` already does for
+      `RestrictedWorkflowAccessError`. A public way to ask the question is the fourth item on
+      [pydantic-ai#7177](https://github.com/pydantic/pydantic-ai/issues/7177).
 
     A missed report is preferred over one on a correct arrangement, which the reader could
     only silence by changing correct code.
     """
-    if hasattr(type(capability), 'engine_name'):
+    capability_type = type(capability)
+    if hasattr(capability_type, 'engine_name') and hasattr(capability_type, 'in_durable_context'):
         return False
-    implementation = type(capability).wrap_model_request
+    implementation = capability_type.wrap_model_request
     return (
         implementation is not AbstractCapability.wrap_model_request and implementation is not Hooks.wrap_model_request
     )
