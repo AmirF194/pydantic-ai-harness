@@ -176,6 +176,12 @@ carry a `spec_<Name>` (or `short_spec_<Name>`) entry, and the properties of
 Every failure above is silent, so the generated schema is the only thing that
 answers the question.
 
+The two middle cases are silent because core swallows them: `_get_schema_target`
+catches the `NameError` and falls back, and pydantic's union handling drops a
+member it cannot schematize instead of raising. Proposed upstream in
+[pydantic-ai#7180](https://github.com/pydantic/pydantic-ai/issues/7180). Until
+that lands, generating the schema is the check.
+
 ### Policy Lives In The Pluggable Component
 
 When a capability takes a dependency behind a `Protocol` -- `PlanStore`,
