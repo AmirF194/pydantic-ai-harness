@@ -29,6 +29,7 @@ from pydantic_ai.messages import ModelResponse
 from pydantic_ai.tools import AgentDepsT, RunContext
 
 from pydantic_ai_harness.spend._budget import Budget, BudgetSpec, bucket, scope_key, store_key
+from pydantic_ai_harness.spend._composition import warn_about_inner_wrappers
 from pydantic_ai_harness.spend._exceptions import SpendLimitExceeded, UnpricedModelError, UnpricedModelWarning
 from pydantic_ai_harness.spend._snapshot import BudgetStatus, SpendSnapshot, Spent
 from pydantic_ai_harness.spend._store import InMemorySpendStore, SpendStore, utc_now
@@ -137,6 +138,13 @@ class SpendLimits(AbstractCapability[AgentDepsT]):
 
     Instance-level and never reset, matching the capability's own posture that state
     outlives a run: a per-run set would warn again on every run for the same model.
+    """
+
+    _checked_composition: bool = field(default=False, init=False, repr=False, compare=False)
+    """Whether the capability chain has been inspected for wrappers nested inside the accrual.
+
+    Instance-level like `_warned_unpriced`, so the arrangement reports once rather than once
+    per model request.
     """
 
     def __post_init__(self) -> None:
@@ -251,7 +259,18 @@ class SpendLimits(AbstractCapability[AgentDepsT]):
         ctx: RunContext[AgentDepsT],
         request_context: ModelRequestContext,
     ) -> ModelRequestContext:
-        """Refuse the request if any budget with a ceiling is already spent."""
+        """Refuse the request if any budget with a ceiling is already spent.
+
+        Also the first point at which the sorted capability chain is readable, so the
+        arrangement `get_ordering` cannot rule out is reported here. `for_agent` sees only
+        the capabilities the agent was constructed with, and `RunContext.root_capability`
+        is not yet populated when `for_run` runs, so neither covers a capability added
+        through `agent.run(capabilities=...)`. This still runs before the first billed
+        response.
+        """
+        if not self._checked_composition:
+            self._checked_composition = True
+            warn_about_inner_wrappers(ctx.root_capability, self)
         read: dict[str, Spent] = {}
         for budget, key in self._keyed(ctx):
             if not budget.enforces:

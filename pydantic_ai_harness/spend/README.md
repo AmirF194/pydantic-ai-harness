@@ -171,6 +171,10 @@ Wrapping also means a request the provider never saw is not charged for. `SkipMo
 
 What is left is siblings. Pydantic AI orders innermost capabilities against non-innermost ones only, and among themselves the one listed *later* nests further in. `TemporalDurability` and `InputGuardrail` also declare themselves innermost, so either of them listed after `SpendLimits` wraps inside it and can still reject a billed response before it is counted. List `SpendLimits` last among your innermost capabilities when that matters. Closing it outright needs a way to order innermost capabilities against each other, or the public composition-validation hook being decided in [pydantic-ai#5477](https://github.com/pydantic/pydantic-ai/issues/5477); tracked in [#534](https://github.com/pydantic/pydantic-ai-harness/issues/534).
 
+`SpendLimits` reports that arrangement rather than leaving it to be read here. On the first model request of a run it reads the sorted chain from `RunContext.root_capability` and warns once, with `SpendCompositionWarning`, naming the capabilities listed after it that bring a `wrap_model_request` of their own. A warning rather than a refusal, because the under-count is not certain: an `InputGuardrail(parallel=True)` that finishes before the provider does cancels the request instead, and there is nothing billed to count.
+
+Two kinds of capability are left out of that report, because it would land on an arrangement you could not correct. A `Hooks` is not named: it defines `wrap_model_request` whether or not a `model_request` hook was registered, and the registry that would say is private ([pydantic-ai#7165](https://github.com/pydantic/pydantic-ai/issues/7165)). Neither is a durable-execution capability, which routes the request into an activity rather than rejecting what comes back, and whose dispatch has to stay the innermost wrapper -- so reordering is the one correction not available there. What `SpendLimits` does not support under a durable engine is reported separately, and more loudly, below.
+
 **Durable execution.** `SpendLimits` is not supported inside a Temporal workflow.
 
 The capability hooks run in workflow code; only the model request itself is the activity. Temporal replays workflow code, so it replays the accrual with it, and a window ends up counting the same response more than once -- one `$1` model activity leaves `$2` in the store once the workflow replays. The day and month buckets have the same problem from the other side: they come from a wall clock the workflow sandbox restricts, and under time-skipping the workflow's day and the key's day drift apart.
@@ -226,8 +230,8 @@ The fields above are what `SpendLimits.from_spec` names in its signature, which 
 ## API
 
 `SpendLimits`, `Budget`, `SpendSnapshot`, `BudgetStatus`, `Spent`, `SpendStore`,
-`InMemorySpendStore`, `RedisSpendStore`, `SpendLimitExceeded`, and `UnpricedModelError` are
-exported from `pydantic_ai_harness.spend`. Signatures and defaults are rendered from the
+`InMemorySpendStore`, `RedisSpendStore`, `SpendLimitExceeded`, `UnpricedModelError`, and
+`SpendCompositionWarning` are exported from `pydantic_ai_harness.spend`. Signatures and defaults are rendered from the
 source on the [docs page](https://pydantic.dev/docs/ai/harness/spend/), which is the copy
 that cannot drift.
 

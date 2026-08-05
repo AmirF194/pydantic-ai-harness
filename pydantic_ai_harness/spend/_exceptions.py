@@ -34,6 +34,30 @@ class UnpricedModelWarning(UserWarning):
     """
 
 
+class SpendCompositionWarning(UserWarning):
+    """Warned once when another capability is composed so that it wraps inside the accrual.
+
+    Pydantic AI orders the `innermost` tier against non-innermost capabilities only.
+    Among themselves the one listed later nests further in, so a capability listed
+    after `SpendLimits` wraps inside it. Such a capability can await a response and
+    then raise, which sends the run to a fresh request while the rejected response --
+    generated, billed, and kept in history -- is never counted.
+
+    Whether that happens depends on the run. An `InputGuardrail(parallel=True)` that
+    finishes before the provider does cancels the request instead, and there is nothing
+    billed to count. So this reports how the capabilities are ordered, not an under-count
+    that has already happened. List `SpendLimits` last among the innermost capabilities
+    to remove it.
+
+    Silence it with::
+
+        import warnings
+        from pydantic_ai_harness.spend import SpendCompositionWarning
+
+        warnings.filterwarnings('ignore', category=SpendCompositionWarning)
+    """
+
+
 class UnpricedModelError(UserError):
     """Raised when `on_unpriced='raise'` and no price could be resolved for a response.
 

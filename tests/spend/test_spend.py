@@ -16,7 +16,13 @@ from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanE
 from opentelemetry.trace import NoOpTracer, Tracer
 from pydantic_ai import Agent
 from pydantic_ai.agent.spec import AgentSpec
-from pydantic_ai.capabilities import AbstractCapability, CapabilityOrdering, WrapModelRequestHandler
+from pydantic_ai.capabilities import (
+    AbstractCapability,
+    CapabilityOrdering,
+    CombinedCapability,
+    Hooks,
+    WrapModelRequestHandler,
+)
 from pydantic_ai.exceptions import ModelRetry, SkipModelRequest, UsageLimitExceeded, UserError
 from pydantic_ai.messages import ModelMessage, ModelResponse, TextPart, ToolCallPart, ToolReturnPart
 from pydantic_ai.models import ModelRequestContext, ModelRequestParameters
@@ -29,6 +35,7 @@ from pydantic_ai_harness.spend import (
     Budget,
     InMemorySpendStore,
     RedisSpendStore,
+    SpendCompositionWarning,
     SpendLimitExceeded,
     SpendLimits,
     SpendSnapshot,
@@ -68,6 +75,7 @@ def _run_ctx(
     deps: Any = None,
     trace_include_content: bool = False,
     tracer: Tracer | None = None,
+    root_capability: AbstractCapability[Any] | None = None,
 ) -> RunContext[Any]:
     return RunContext(
         deps=deps,
@@ -77,6 +85,7 @@ def _run_ctx(
         conversation_id=conversation_id,
         trace_include_content=trace_include_content,
         tracer=tracer if tracer is not None else NoOpTracer(),
+        root_capability=root_capability,
     )
 
 
@@ -481,6 +490,109 @@ class TestEnforcement:
             await agent.run('hi')
 
 
+class _RetryOnceInnermost(AbstractCapability[None]):
+    """Rejects the first response it has already awaited, from the innermost tier."""
+
+    seen: int = 0
+
+    def get_ordering(self) -> CapabilityOrdering:
+        return CapabilityOrdering(position='innermost')
+
+    async def wrap_model_request(
+        self,
+        ctx: RunContext[None],
+        *,
+        request_context: ModelRequestContext,
+        handler: WrapModelRequestHandler,
+    ) -> ModelResponse:
+        response = await handler(request_context)
+        self.seen += 1
+        if self.seen == 1:
+            raise ModelRetry('try again')
+        return response
+
+
+class _InnermostWithAWrapper(AbstractCapability[None]):
+    """Innermost with a `wrap_model_request` of its own, which is all the report is about."""
+
+    def get_ordering(self) -> CapabilityOrdering:
+        return CapabilityOrdering(position='innermost')
+
+    async def wrap_model_request(
+        self,
+        ctx: RunContext[None],
+        *,
+        request_context: ModelRequestContext,
+        handler: WrapModelRequestHandler,
+    ) -> ModelResponse:
+        return await handler(request_context)
+
+
+class _InnermostRejector(AbstractCapability[None]):
+    """Innermost, and rejects every response it has already awaited."""
+
+    def get_ordering(self) -> CapabilityOrdering:
+        return CapabilityOrdering(position='innermost')
+
+    async def wrap_model_request(
+        self,
+        ctx: RunContext[None],
+        *,
+        request_context: ModelRequestContext,
+        handler: WrapModelRequestHandler,
+    ) -> ModelResponse:
+        await handler(request_context)
+        raise RuntimeError('rejected after the provider had already been paid')
+
+
+class _InnermostWithoutAWrapper(AbstractCapability[None]):
+    """Innermost, like `ToolGuardrail`, but with no `wrap_model_request` of its own."""
+
+    def get_ordering(self) -> CapabilityOrdering:
+        return CapabilityOrdering(position='innermost')
+
+
+class _EngineDurability(AbstractCapability[None]):
+    """Stands in for a durable-execution capability, which core marks with `engine_name`."""
+
+    engine_name = 'Stand-in'
+
+    def get_ordering(self) -> CapabilityOrdering:
+        return CapabilityOrdering(position='innermost')
+
+    async def wrap_model_request(
+        self,
+        ctx: RunContext[None],
+        *,
+        request_context: ModelRequestContext,
+        handler: WrapModelRequestHandler,
+    ) -> ModelResponse:
+        return await handler(request_context)
+
+
+class _HooksWithItsOwnWrapper(Hooks[None]):
+    """A `Hooks` subclass that supplies the method instead of dispatching to a registry."""
+
+    async def wrap_model_request(
+        self,
+        ctx: RunContext[None],
+        *,
+        request_context: ModelRequestContext,
+        handler: WrapModelRequestHandler,
+    ) -> ModelResponse:
+        return await handler(request_context)
+
+
+async def _passthrough(
+    ctx: RunContext[Any],
+    /,
+    *,
+    request_context: ModelRequestContext,
+    handler: WrapModelRequestHandler,
+) -> ModelResponse:
+    return await handler(request_context)
+
+
 class TestOrdering:
     """Nothing may reject a response before it is counted."""
 
@@ -555,8 +667,126 @@ class TestOrdering:
         assert result.output == 'cached'
         assert (await guard.status())[0].spent == Spent()
 
+    async def test_an_innermost_capability_listed_after_leaves_a_billed_response_uncounted(self):
+        """Innermost members are not ordered among themselves, so the later one nests further in.
+
+        The provider bills both requests and the counter sees one. This is the arrangement
+        `get_ordering` cannot rule out, and the reason it reports itself.
+        """
+        guard = SpendLimits(budgets=[Budget(window='total')], price=lambda r: Decimal('1'))
+        agent = Agent(_scripted_usage(), deps_type=type(None), capabilities=[guard, _RetryOnceInnermost()])
+
+        with pytest.warns(SpendCompositionWarning):
+            result = await agent.run('hi')
+
+        assert result.usage.requests == 2
+        assert (await guard.status())[0].spent.requests == 1
+
+    async def test_listing_spend_limits_last_counts_every_billed_response(self):
+        """The documented fix: the rejecting capability wraps outside the accrual again."""
+        guard = SpendLimits(budgets=[Budget(window='total')], price=lambda r: Decimal('1'))
+        agent = Agent(_scripted_usage(), deps_type=type(None), capabilities=[_RetryOnceInnermost(), guard])
+
+        result = await agent.run('hi')
+
+        assert result.usage.requests == 2
+        assert (await guard.status())[0].spent.requests == 2
+
     def test_it_declares_innermost(self):
         assert SpendLimits[None]().get_ordering() == CapabilityOrdering(position='innermost')
+
+
+class TestCompositionWarning:
+    """The arrangement that can leave a billed response uncounted reports itself."""
+
+    async def test_it_names_the_nested_capability_and_the_fix(self):
+        guard = SpendLimits[None](budgets=[Budget(window='total')])
+        agent = Agent(_scripted_usage(), deps_type=type(None), capabilities=[guard, _InnermostRejector()])
+
+        with pytest.warns(SpendCompositionWarning, match=r'_InnermostRejector.*List `SpendLimits` last'):
+            with pytest.raises(RuntimeError):
+                await agent.run('hi')
+
+    async def test_it_reports_once_rather_than_once_per_request(self):
+        guard = SpendLimits[None](budgets=[Budget(window='total')])
+        agent = Agent(_scripted_usage(), deps_type=type(None), capabilities=[guard, _InnermostWithAWrapper()])
+
+        with warnings.catch_warnings(record=True) as reported:
+            warnings.simplefilter('always')
+            await agent.run('hi')
+            await agent.run('hi')
+
+        assert [str(w.message) for w in reported if w.category is SpendCompositionWarning] == [
+            'These capabilities are listed after `SpendLimits`, so they wrap inside it: _InnermostWithAWrapper. '
+            'A response one of them rejects after awaiting it is billed by the provider and never counted. '
+            'List `SpendLimits` last among the innermost capabilities to close that.'
+        ]
+
+    async def test_listing_spend_limits_last_reports_nothing(self):
+        guard = SpendLimits[None](budgets=[Budget(window='total')])
+        agent = Agent(_scripted_usage(), deps_type=type(None), capabilities=[_InnermostWithAWrapper(), guard])
+
+        await agent.run('hi')
+
+    async def test_a_capability_with_no_wrapper_of_its_own_is_not_reported(self):
+        """Nesting only matters for a capability that can reject the response on the way out."""
+        guard = SpendLimits[None](budgets=[Budget(window='total')])
+        agent = Agent(_scripted_usage(), deps_type=type(None), capabilities=[guard, _InnermostWithoutAWrapper()])
+
+        await agent.run('hi')
+
+    async def test_a_hooks_capability_is_not_reported(self):
+        """`Hooks` defines the method unconditionally, so its definition cannot answer the question.
+
+        The cost is a missed report for a `Hooks` that did register a `model_request` hook,
+        which is preferred over reporting one that did not: that arrangement is correct, and
+        the user could only silence the warning by changing correct code.
+        """
+        guard = SpendLimits[None](budgets=[Budget(window='total')])
+        hooks = Hooks[None](ordering=CapabilityOrdering(position='innermost'), model_request=_passthrough)
+        agent = Agent(_scripted_usage(), deps_type=type(None), capabilities=[guard, hooks])
+
+        await agent.run('hi')
+
+    async def test_a_durable_execution_capability_is_not_reported(self):
+        """It routes the request into a durable unit rather than rejecting what comes back.
+
+        Core also requires its dispatch to be the innermost wrapper, so listing `SpendLimits`
+        after it is the one correction a reader must not make. `tests/spend/test_temporal.py`
+        composes the real capability the same way. What `SpendLimits` does not support under a
+        durable engine is reported separately, by refusing the workflow clock.
+        """
+        guard = SpendLimits[None](budgets=[Budget(window='total')])
+        agent = Agent(_scripted_usage(), deps_type=type(None), capabilities=[guard, _EngineDurability()])
+
+        await agent.run('hi')
+
+    async def test_a_hooks_subclass_with_its_own_wrapper_is_reported(self):
+        guard = SpendLimits[None](budgets=[Budget(window='total')])
+        hooks = _HooksWithItsOwnWrapper(ordering=CapabilityOrdering(position='innermost'))
+        agent = Agent(_scripted_usage(), deps_type=type(None), capabilities=[guard, hooks])
+
+        with pytest.warns(SpendCompositionWarning, match='_HooksWithItsOwnWrapper'):
+            await agent.run('hi')
+
+    async def test_a_capability_added_for_one_run_is_reported(self):
+        """`agent.run(capabilities=...)` is why the chain is read per run rather than at binding."""
+        guard = SpendLimits[None](budgets=[Budget(window='total')])
+        agent = Agent(_scripted_usage(), deps_type=type(None), capabilities=[guard])
+
+        with pytest.warns(SpendCompositionWarning, match='_InnermostWithAWrapper'):
+            await agent.run('hi', capabilities=[_InnermostWithAWrapper()])
+
+    async def test_nothing_is_reported_without_a_capability_chain(self):
+        """`RunContext.root_capability` is unset outside a run, leaving nothing to compare against."""
+        await _gate(SpendLimits[None](budgets=[Budget(window='total')]))
+
+    async def test_nothing_is_reported_when_the_chain_does_not_list_it(self):
+        """A `SpendLimits` reached through a wrapper is not a member of the chain it would compare against."""
+        guard = SpendLimits[None](budgets=[Budget(window='total')])
+        ctx = _run_ctx(root_capability=CombinedCapability[None]([_InnermostWithAWrapper()]))
+
+        await _gate(guard, ctx=ctx)
 
 
 class TestPricing:
