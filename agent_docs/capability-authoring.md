@@ -162,16 +162,19 @@ Four ways a signature publishes nothing, all silent:
 so it costs nothing there, and it keeps a runtime-only field -- a callable, a
 live client, a store -- rejected *by name* rather than silently ignored: a spec
 that promises per-tenant scoping and does not deliver it is worse than one that
-refuses to load. `SpendLimits.from_spec` is the reference implementation;
-`ToolOutputLimits.from_spec` is the same shape for a capability whose main
-option has no spec form at all.
+refuses to load. `SpendLimits.from_spec` is the reference implementation.
 
 A capability that should not be configurable from a spec overrides
 `get_serialization_name` to return `None` instead (`SubAgents`, the guardrails,
 `DynamicWorkflow`), which removes it from the registry entirely. That is the
 sanctioned opt-out; there is no allowlist.
 
-`tests/test_capability_specs.py` checks all of this for every capability.
+Confirm it by generating the schema rather than by reading the signature back.
+`AgentSpec.model_json_schema_with_capabilities([YourCapability])['$defs']` has to
+carry a `spec_<Name>` (or `short_spec_<Name>`) entry, and the properties of
+`spec_params_<Name>` have to include `id`, `description` and `defer_loading`.
+Every failure above is silent, so the generated schema is the only thing that
+answers the question.
 
 ### Policy Lives In The Pluggable Component
 

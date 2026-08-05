@@ -101,10 +101,12 @@ README, or source code.
   establish state continuity across activity, process, or replay boundaries.
 - Relevant protocol-shaped output is snapshotted.
 - A new or changed capability publishes its configurable fields -- including
-  `id`, `description` and `defer_loading` -- to the `AgentSpec` schema.
-  `tests/test_capability_specs.py` checks this repo-wide; see
-  `capability-authoring.md` "The Read Signature Is The Published Schema" for the
-  four ways a signature ends up publishing nothing.
+  `id`, `description` and `defer_loading` -- to the `AgentSpec` schema. Check by
+  generating it:
+  `AgentSpec.model_json_schema_with_capabilities([C])['$defs']` carries
+  `spec_<Name>` with those properties. See `capability-authoring.md` "The Read
+  Signature Is The Published Schema" for the four ways a signature ends up
+  publishing nothing.
 - `make lint`, `make typecheck`, and `make test` pass before handoff.
 
 ## Docs
