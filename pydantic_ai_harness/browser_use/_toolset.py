@@ -135,7 +135,10 @@ def _narrator(sink: Callable[[str], None]) -> StepCallback:
     """Report each step's stated goal to `sink`, for `BrowserUse.progress`."""
 
     def narrate(browser_state_summary: BrowserStateSummary, output: AgentOutput, step_number: int) -> None:
-        goal = (output.next_goal or output.evaluation_previous_goal or '').strip()
+        # Stripped before the fallback, not after: a whitespace-only `next_goal` is truthy, so
+        # choosing first and stripping second would let it beat a real `evaluation_previous_goal`
+        # and then narrate nothing.
+        goal = (output.next_goal or '').strip() or (output.evaluation_previous_goal or '').strip()
         if goal:
             sink(f'  - {goal}')
 

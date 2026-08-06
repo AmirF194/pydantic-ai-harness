@@ -1328,6 +1328,18 @@ class TestProgress:
 
         assert reported == ['* task', '  - Read the plan table']
 
+    async def test_a_blank_next_goal_does_not_beat_the_evaluation(self, kill_calls: list[BrowserSession]) -> None:
+        """A whitespace-only `next_goal` is truthy, so it must not swallow the fallback."""
+        reported: list[str] = []
+        factory = _success_factory()
+
+        await BrowserUse[None](progress=reported.append, browser_agent=factory).get_toolset().browse_web('task')
+        on_step = factory.requests[0].on_step
+        assert on_step is not None
+        on_step(*_step(next_goal='   ', evaluation_previous_goal='Read the plan table'))
+
+        assert reported == ['* task', '  - Read the plan table']
+
     async def test_a_step_that_states_no_goal_reports_nothing(self, kill_calls: list[BrowserSession]) -> None:
         reported: list[str] = []
         factory = _success_factory()
