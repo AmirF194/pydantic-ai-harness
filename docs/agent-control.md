@@ -261,6 +261,10 @@ to understand costs more than the part that contains it:
 Every drop warns once per process, naming the offending value, because a config resolves on every
 single run and a per-run warning would bury the signal in its own repetition.
 
+Each instruction block is limited to 65,536 characters. An oversized bare `instructions` value drops
+that section; an oversized list entry drops only itself. Valid sibling entries and other config
+sections continue to apply.
+
 `''` is never accepted where a string carries meaning. Omission and `null` already mean "leave this to
 code", so an empty string is only ever a half-filled field -- and `"model": ""` is not "no model":
 Pydantic AI raises `Unknown model:` on every request the agent makes, and the config around it is

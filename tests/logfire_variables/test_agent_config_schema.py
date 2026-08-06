@@ -32,7 +32,7 @@ LOCKSTEP = (
     'schemas for the same agent.'
 )
 
-CANONICAL_SCHEMA_SHA256 = '5fcbbc940c4fdf22ef0a04cb62a5f97d9e4fadfd0dfd96047c564bdec64f2b41'
+CANONICAL_SCHEMA_SHA256 = '42ae0b34f0f478578316be162d2583d75963374f1c451e7fa93f8b50a92868ea'
 """SHA-256 of this schema's canonical JSON, pinned identically by the platform's `agent-config.test.ts`.
 
 Every other assertion in this module checks a property, and properties are exactly what let the two
@@ -115,8 +115,11 @@ def schema_errors(schema: dict[str, Any], value: Any, path: str = 'value') -> li
     # `bool` is an `int` subclass, so a numeric schema has to reject `True` explicitly.
     if not isinstance(value, expected_type) or (expected in ('integer', 'number') and isinstance(value, bool)):
         return [f'{path}: expected {expected}, got {type(value).__name__}']
-    if expected == 'string' and len(value) < schema.get('minLength', 0):
-        errors.append(f'{path}: shorter than minLength')
+    if expected == 'string':
+        if len(value) < schema.get('minLength', 0):
+            errors.append(f'{path}: shorter than minLength')
+        if len(value) > schema.get('maxLength', len(value)):
+            errors.append(f'{path}: longer than maxLength')
     elif expected == 'object':
         members: dict[str, Any] = value
         properties: dict[str, Any] = schema.get('properties', {})
@@ -213,6 +216,16 @@ def test_empty_strings_are_rejected_wherever_they_would_be_meaningless() -> None
     ]
     assert schema_errors(AGENT_CONFIG_JSON_SCHEMA, {'tool_definitions': [{'name': 't', 'new_name': ''}]}) == [
         'value.tool_definitions[0].new_name: shorter than minLength'
+    ]
+
+
+def test_oversized_instruction_text_is_rejected_at_write_time() -> None:
+    oversized = 'x' * 65_537
+    assert schema_errors(AGENT_CONFIG_JSON_SCHEMA, {'instructions': oversized}) == [
+        'value.instructions: matches none of the allowed types'
+    ]
+    assert schema_errors(AGENT_CONFIG_JSON_SCHEMA, {'instructions': ['kept', oversized]}) == [
+        'value.instructions: matches none of the allowed types'
     ]
 
 

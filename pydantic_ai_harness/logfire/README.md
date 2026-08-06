@@ -397,6 +397,10 @@ and `null` already mean "leave this to code", so an empty string is only ever a 
 `"model": ""` in particular is not "no model": Pydantic AI raises `Unknown model:` on every request the
 agent makes, and the config around it is valid, so nothing downstream would catch it.
 
+Each instruction block is limited to 65,536 characters. An oversized bare `instructions` value drops
+that section; an oversized list entry drops only itself. Both warn once per process, and valid sibling
+entries and other config sections continue to apply.
+
 ### Where your base prompt lives
 
 Instructions are a **composition point**, not a single field. Pydantic AI assembles them from every

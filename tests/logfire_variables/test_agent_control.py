@@ -403,6 +403,22 @@ def test_malformed_sections_degrade_independently(value: dict[str, Any], expecte
         assert AgentConfig.model_validate(value) == expected
 
 
+def test_oversized_bare_instructions_drop_the_section_and_keep_siblings() -> None:
+    oversized = 'x' * 65_537
+    with pytest.warns(UserWarning, match='65536-character limit') as caught:
+        assert AgentConfig.model_validate({'instructions': oversized, 'model': 'test'}) == AgentConfig(model='test')
+        AgentConfig.model_validate({'instructions': oversized, 'model': 'test'})
+    assert len(caught) == 1
+
+
+def test_oversized_instruction_entry_drops_itself_and_keeps_siblings() -> None:
+    value = {'instructions': ['kept', {'id': 'agent', 'instructions': 'x' * 65_537}], 'model': 'test'}
+    with pytest.warns(UserWarning, match='65536-character limit'):
+        assert AgentConfig.model_validate(value) == AgentConfig(
+            instructions=[InstructionBlock(instructions='kept')], model='test'
+        )
+
+
 def test_prebuilt_variable() -> None:
     variable = Variable(
         'agent__prebuilt',

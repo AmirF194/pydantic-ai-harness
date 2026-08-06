@@ -8,7 +8,18 @@ import warnings
 from collections.abc import Callable, Mapping
 from contextvars import ContextVar
 from dataclasses import dataclass, field, replace
-from typing import TYPE_CHECKING, Annotated, Any, ClassVar, Literal, TypeAlias, TypeVar, cast, get_args, get_origin
+from typing import (
+    TYPE_CHECKING,
+    Annotated,
+    Any,
+    ClassVar,
+    Literal,
+    TypeAlias,
+    TypeVar,
+    cast,
+    get_args,
+    get_origin,
+)
 
 import logfire
 from logfire.variables import Variable
@@ -37,6 +48,10 @@ if TYPE_CHECKING:
     from pydantic_ai.run import AgentRunResult
 
 _AGENT_VARIABLE_PREFIX = 'agent__'
+
+# 64 KiB of text is already roughly 16K tokens for typical English prose. It accommodates substantial
+# instructions while preventing one managed entry from adding megabytes to every model request.
+_MAX_MODEL_FACING_TEXT_LENGTH = 65_536
 
 _EntryT = TypeVar('_EntryT')
 
@@ -78,7 +93,15 @@ def _spawn_baseline_publish(variable: Variable[Any], example: str) -> None:
 
 
 def _publish_baseline(variable: Variable[Any], example: str) -> None:
-    """Update only the `example` on the provider's current complete variable definition."""
+    """Update only the `example` on the provider's current complete variable definition.
+
+    Read-modify-write, because the provider offers nothing narrower: `update_variable` PUTs the whole
+    definition to `/v1/variables/{name}/` and takes no revision or `If-Match` input, so an edit saved
+    in the Logfire UI between the read and the write is lost. The window is one HTTP round trip, the
+    publish runs at most once per process per variable, and it returns early when `example` already
+    matches -- but the race is real and cannot be closed from this side. Narrowing it needs a partial
+    write or a conditional one on the platform API: https://github.com/pydantic/pydantic-ai-harness/issues/565
+    """
     provider = variable.logfire_instance.config.get_variable_provider()
     try:
         config = provider.get_variable_config(variable.name)
@@ -242,6 +265,9 @@ every level: the stored JSON schema won't accept the write, and a value that rea
 anyway degrades that one field instead of the whole config.
 """
 
+InstructionText: TypeAlias = Annotated[str, Field(min_length=1, max_length=_MAX_MODEL_FACING_TEXT_LENGTH)]
+"""A non-empty instruction block bounded before it can become recurring model input."""
+
 
 class InstructionBlock(BaseModel):
     """One entry in `AgentConfig.instructions`: a block to add, or a patch on a block the agent assembles.
@@ -271,7 +297,7 @@ class InstructionBlock(BaseModel):
     single declared block. Blocks Pydantic AI cannot key -- a callable passed to `Agent(instructions=...)`,
     a toolset with no `id` of its own -- cannot be addressed at all.
     """
-    instructions: NonEmptyStr | None = None
+    instructions: InstructionText | None = None
     """The block's text, or `None` to drop the addressed block.
 
     `None` is how a block is disabled, which is why `''` is rejected rather than taken as a quiet way to
@@ -408,7 +434,7 @@ class AgentConfig(BaseModel):
 
     model_config = ConfigDict(protected_namespaces=())
 
-    instructions: NonEmptyStr | list[NonEmptyStr | InstructionBlock] | None = None
+    instructions: InstructionText | list[InstructionText | InstructionBlock] | None = None
     """Instruction blocks to add to -- or swap out of -- the ones the agent assembles in code.
 
     A capability contributes instructions, it cannot take them over: Pydantic AI appends every
@@ -461,8 +487,15 @@ class AgentConfig(BaseModel):
         field doesn't validate them a second time.
         """
         if isinstance(data, str):
-            if data:
+            if 0 < len(data) <= _MAX_MODEL_FACING_TEXT_LENGTH:
                 return data
+            if len(data) > _MAX_MODEL_FACING_TEXT_LENGTH:
+                _warn_dropped(
+                    f'Managed instructions section contains {len(data)} characters, exceeding the '
+                    f'{_MAX_MODEL_FACING_TEXT_LENGTH}-character limit; ignoring that section and keeping the rest '
+                    'of the managed config.'
+                )
+                return None
             _warn_dropped(
                 "Managed instructions section is invalid -- instructions=''; ignoring that section and keeping "
                 'the rest of the managed config.'
@@ -478,6 +511,18 @@ class AgentConfig(BaseModel):
             return data
         blocks: list[InstructionBlock] = []
         for entry in cast(list[Any], data):
+            text: object | None = entry if isinstance(entry, str) else None
+            if isinstance(entry, dict):
+                # Runtime narrowing cannot recover a dictionary's generic parameters from untyped JSON.
+                typed_entry = cast(dict[str, object], entry)
+                text = typed_entry.get('instructions')
+            if isinstance(text, str) and len(text) > _MAX_MODEL_FACING_TEXT_LENGTH:
+                _warn_dropped(
+                    f'Managed instruction entry contains {len(text)} characters, exceeding the '
+                    f'{_MAX_MODEL_FACING_TEXT_LENGTH}-character limit; ignoring that entry and keeping the rest '
+                    'of the managed config.'
+                )
+                continue
             try:
                 block = InstructionBlock.model_validate({'instructions': entry} if isinstance(entry, str) else entry)
             except ValidationError as error:
@@ -552,12 +597,12 @@ AGENT_CONFIG_JSON_SCHEMA: dict[str, Any] = {
                 'agent already sends under that key instead of adding one.'
             ),
             'anyOf': [
-                {'type': 'string', 'minLength': 1},
+                {'type': 'string', 'minLength': 1, 'maxLength': _MAX_MODEL_FACING_TEXT_LENGTH},
                 {
                     'type': 'array',
                     'items': {
                         'anyOf': [
-                            {'type': 'string', 'minLength': 1},
+                            {'type': 'string', 'minLength': 1, 'maxLength': _MAX_MODEL_FACING_TEXT_LENGTH},
                             {
                                 'type': 'object',
                                 'properties': {
@@ -571,7 +616,14 @@ AGENT_CONFIG_JSON_SCHEMA: dict[str, Any] = {
                                         ),
                                     },
                                     'instructions': {
-                                        'anyOf': [{'type': 'string', 'minLength': 1}, {'type': 'null'}],
+                                        'anyOf': [
+                                            {
+                                                'type': 'string',
+                                                'minLength': 1,
+                                                'maxLength': _MAX_MODEL_FACING_TEXT_LENGTH,
+                                            },
+                                            {'type': 'null'},
+                                        ],
                                         'description': 'The text to send, or null to drop the addressed block.',
                                     },
                                     'dynamic': {
@@ -904,7 +956,7 @@ class AgentControl(ManagedVariableCapability[AgentDepsT, AgentConfig]):
 
     Mutually exclusive with the `instructions` shorthand below.
     """
-    instructions: NonEmptyStr | list[NonEmptyStr | InstructionBlock] | None = None
+    instructions: InstructionText | list[InstructionText | InstructionBlock] | None = None
     """Code-side base prompt, exactly equivalent to `default=AgentConfig(instructions=...)`.
 
     The base prompt belongs here rather than on `Agent(instructions=...)`, which a published config
@@ -1182,7 +1234,7 @@ class AgentControl(ManagedVariableCapability[AgentDepsT, AgentConfig]):
             _warn_durable_write_skipped(self._variable)
             return
         own_instruction_id = f'capability:{self.id}'
-        instructions: list[NonEmptyStr | InstructionBlock] = [
+        instructions: list[InstructionText | InstructionBlock] = [
             InstructionBlock(id=part.id, instructions=part.content, dynamic=part.dynamic)
             for part in request_context.model_request_parameters.instruction_parts or []
             if part.content.strip() and part.id != own_instruction_id
