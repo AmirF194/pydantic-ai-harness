@@ -12,7 +12,7 @@ import asyncio
 import functools
 from collections.abc import AsyncIterator
 from pathlib import Path
-from typing import Any, Protocol, TypeVar, runtime_checkable
+from typing import Any, TypeVar
 from unittest.mock import MagicMock
 
 import pytest
@@ -58,11 +58,6 @@ async def _close_direct_toolsets(anyio_backend: str) -> AsyncIterator[None]:
 pytestmark = pytest.mark.anyio
 
 T = TypeVar('T')
-
-
-@runtime_checkable
-class _ToolVisibilityAccessor(Protocol):
-    def visibility_of(self, tool_name: str) -> object: ...
 
 
 @pytest.fixture
@@ -1261,14 +1256,12 @@ class TestCodeMode:
         assert 'run_code' in by_name
 
         # The deferred member tool stays hidden until loaded: not folded into `run_code`
-        # and not surfaced as a plain native tool. Since the declared/visibility split,
-        # `function_tools` retains hidden declarations, so hiddenness is read from the
-        # visibility accessor rather than from the name being absent.
-        request_parameters = model.last_model_request_parameters
-        if isinstance(request_parameters, _ToolVisibilityAccessor):
-            assert request_parameters.visibility_of('demo_tool') != 'visible'
-        else:  # pragma: no cover - only the `lowest-versions` floor lacks the accessor
-            assert 'demo_tool' not in by_name
+        # and not surfaced as a plain native tool. Assert on reveal state rather than on the
+        # name being absent from `function_tools` -- once pydantic-ai splits declaration from
+        # visibility, `function_tools` keeps the hidden declaration and only the reveal set
+        # distinguishes the two. `revealed_tool_names` means the same thing on both sides of
+        # that change, so this holds without version-sniffing.
+        assert 'demo_tool' not in model.last_model_request_parameters.revealed_tool_names
         run_code_desc = by_name['run_code'].description or ''
         assert 'demo_tool' not in run_code_desc
         assert 'load_capability' not in run_code_desc
