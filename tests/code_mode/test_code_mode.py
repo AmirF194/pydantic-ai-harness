@@ -1267,7 +1267,7 @@ class TestCodeMode:
         request_parameters = model.last_model_request_parameters
         if isinstance(request_parameters, _ToolVisibilityAccessor):
             assert request_parameters.visibility_of('demo_tool') != 'visible'
-        else:
+        else:  # pragma: no cover - only the `lowest-versions` floor lacks the accessor
             assert 'demo_tool' not in by_name
         run_code_desc = by_name['run_code'].description or ''
         assert 'demo_tool' not in run_code_desc
