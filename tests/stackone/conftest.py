@@ -41,12 +41,20 @@ def run_context() -> RunContext[None]:
     )
 
 
+def _fastmcp_server(name: str) -> FastMCP:
+    """Create a test FastMCP server after resolving its settings forward references."""
+    from mcp.server.fastmcp.server import FastMCP, Settings
+
+    # `pydantic-settings` 2.15 treats FastMCP's unresolved `lifespan` annotation as an error under this
+    # suite's warnings policy. Resolve it before the local test server reads its settings.
+    Settings.model_rebuild()
+    return FastMCP(name)
+
+
 @pytest.fixture
 def stackone_server() -> FastMCP:
     """In-process stand-in for StackOne's MCP endpoint in `individual` tool mode."""
-    from mcp.server.fastmcp import FastMCP
-
-    server = FastMCP('stackone-fake')
+    server = _fastmcp_server('stackone-fake')
 
     @server.tool()
     def bamboohr_list_employees(limit: int = 10) -> list[dict[str, str]]:
@@ -69,9 +77,7 @@ def stackone_server() -> FastMCP:
 @pytest.fixture
 def search_execute_server() -> FastMCP:
     """In-process stand-in for StackOne's MCP endpoint in `search_execute` tool mode."""
-    from mcp.server.fastmcp import FastMCP
-
-    server = FastMCP('stackone-fake-search')
+    server = _fastmcp_server('stackone-fake-search')
 
     @server.tool()
     def bamboohr_search_actions(query: str, top_k: int = 10) -> list[dict[str, str]]:
