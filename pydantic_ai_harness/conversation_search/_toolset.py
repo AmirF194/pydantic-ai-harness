@@ -20,6 +20,7 @@ from pydantic_ai import RunContext
 from pydantic_ai.messages import (
     ModelMessage,
     ModelRequest,
+    ModelRequestPart,
     SystemPromptPart,
     TextContent,
     TextPart,
@@ -166,6 +167,37 @@ def _user_prompt_text(part: UserPromptPart) -> str:
     return ' '.join(texts)
 
 
+def _format_request_part(part: ModelRequestPart, *, truncate: bool) -> str | None:
+    """Render one request part to a searchable line, or `None` for non-content parts."""
+    if isinstance(part, UserPromptPart):
+        content = _user_prompt_text(part)
+        if truncate and len(content) > 500:
+            content = content[:500] + '...'
+        return f'User: {content}'
+    if isinstance(part, SystemPromptPart):
+        content = part.content
+        # Defensive for sources that do not filter compaction artifacts;
+        # `SnapshotHistorySource` already excludes them from the corpus.
+        if content.startswith(SUMMARY_PREFIX):
+            return '[Compaction summary]'
+        if truncate:
+            content = content[:200]
+        return f'System: {content}'
+    if isinstance(part, ToolReturnPart):
+        content = str(part.content)
+        if truncate and len(content) > 500:
+            content = content[:500] + '...'
+        return f'Tool [{part.tool_name}]: {content}'
+    if part.part_kind == 'tool-availability-delta':
+        # Tool-list bookkeeping (pydantic-ai 2.27+), not conversation content; nothing
+        # to index. Matched by `part_kind`, not `isinstance`: the 2.22 floor lacks the class.
+        return None
+    # The only remaining `ModelRequestPart` is `RetryPromptPart`
+    # (`ToolSearchReturnPart`/`LoadCapabilityReturnPart` subclass `ToolReturnPart`).
+    # A retry or validation-error prompt is worth recalling, so index it in full.
+    return f'Retry [{part.tool_name}]: {part.content}'
+
+
 def _format_message(message: ModelMessage, *, truncate: bool) -> str:
     """Render one message to text.
 
@@ -176,31 +208,9 @@ def _format_message(message: ModelMessage, *, truncate: bool) -> str:
 
     if isinstance(message, ModelRequest):
         for part in message.parts:
-            if isinstance(part, UserPromptPart):
-                content = _user_prompt_text(part)
-                if truncate and len(content) > 500:
-                    content = content[:500] + '...'
-                lines.append(f'User: {content}')
-            elif isinstance(part, SystemPromptPart):
-                content = part.content
-                # Defensive for sources that do not filter compaction artifacts;
-                # `SnapshotHistorySource` already excludes them from the corpus.
-                if content.startswith(SUMMARY_PREFIX):
-                    lines.append('[Compaction summary]')
-                else:
-                    if truncate:
-                        content = content[:200]
-                    lines.append(f'System: {content}')
-            elif isinstance(part, ToolReturnPart):
-                content = str(part.content)
-                if truncate and len(content) > 500:
-                    content = content[:500] + '...'
-                lines.append(f'Tool [{part.tool_name}]: {content}')
-            else:
-                # The only remaining `ModelRequestPart` is `RetryPromptPart`
-                # (`ToolSearchReturnPart`/`LoadCapabilityReturnPart` subclass `ToolReturnPart`).
-                # A retry or validation-error prompt is worth recalling, so index it in full.
-                lines.append(f'Retry [{part.tool_name}]: {part.content}')
+            line = _format_request_part(part, truncate=truncate)
+            if line is not None:
+                lines.append(line)
     else:
         for part in message.parts:
             if isinstance(part, TextPart):

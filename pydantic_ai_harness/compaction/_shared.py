@@ -73,6 +73,11 @@ def _collect_text(messages: Sequence[ModelMessage]) -> list[str]:
                     segments.append(_user_prompt_text_for_counting(part))
                 elif isinstance(part, SystemPromptPart):
                     segments.append(part.content)
+                elif part.part_kind == 'tool-availability-delta':
+                    # Tool-list bookkeeping (pydantic-ai 2.27+): the tool names ride in the
+                    # request's tool definitions, which this estimator already leaves out.
+                    # Matched by `part_kind`, not `isinstance`: the 2.22 floor lacks the class.
+                    pass
                 else:
                     # Everything else a request can carry is a retry prompt or a tool return
                     # of some kind -- the tool-search and capability-load returns subclass

@@ -7,6 +7,7 @@ from collections.abc import Callable
 from typing import Any
 from unittest.mock import AsyncMock, patch
 
+import pydantic_ai.messages
 import pytest
 from opentelemetry.trace import NoOpTracer, Tracer
 from pydantic_ai import Agent
@@ -635,6 +636,26 @@ class TestTriggerBoundary:
         await capability.before_model_request(_ctx(), request_context)
 
         assert len(request_context.messages) < 6
+
+
+@pytest.mark.skipif(
+    not hasattr(pydantic_ai.messages, 'ToolAvailabilityDeltaPart'),
+    reason='pydantic-ai < 2.27 has no ToolAvailabilityDeltaPart',
+)
+def test_tool_availability_delta_adds_nothing_to_the_estimate():
+    """The part is tool-list bookkeeping: its names travel in the request's tool
+    definitions, which the estimator deliberately leaves out of the count."""
+    from pydantic_ai.messages import ToolAvailabilityDeltaPart
+
+    messages = _history(1)
+    first = messages[0]
+    assert isinstance(first, ModelRequest)
+    augmented: list[ModelMessage] = [
+        ModelRequest(parts=[*first.parts, ToolAvailabilityDeltaPart(tools_added=['secret_tool'])]),
+        *messages[1:],
+    ]
+
+    assert estimate_token_count(augmented) == estimate_token_count(messages)
 
 
 class TestStrategyWindowOverride:

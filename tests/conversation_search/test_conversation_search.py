@@ -12,6 +12,7 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
+import pydantic_ai.messages
 import pytest
 from pydantic_ai import Agent
 from pydantic_ai.messages import (
@@ -606,6 +607,29 @@ class TestSearchScope:
         assert 'Tool [readfile]' in rendered
         assert 'Retry [readfile]: please retry' in rendered  # RetryPromptPart is searchable
         assert '...' in rendered  # truncation applied to the long tool return / args
+
+    @pytest.mark.skipif(
+        not hasattr(pydantic_ai.messages, 'ToolAvailabilityDeltaPart'),
+        reason='pydantic-ai < 2.27 has no ToolAvailabilityDeltaPart',
+    )
+    async def test_tool_availability_delta_is_not_indexed(self) -> None:
+        """Tool-list bookkeeping is not conversation content: the delta contributes no
+        searchable line, and the parts around it still index normally."""
+        from pydantic_ai.messages import ToolAvailabilityDeltaPart
+
+        messages: list[ModelMessage] = [
+            ModelRequest(
+                parts=[
+                    UserPromptPart(content='mango question'),
+                    ToolAvailabilityDeltaPart(tools_added=['zzzrevealed']),
+                ]
+            ),
+            ModelResponse(parts=[TextPart(content='mango answer')]),
+        ]
+        source = _StubSource({'r1': messages})
+
+        assert 'No matches' in await _search(source, 'zzzrevealed')
+        assert 'mango question' in await _search(source, 'mango')
 
     async def test_user_and_text_parts_truncate_but_stay_searchable(self) -> None:
         long_user = 'pomegranate ' * 60 + 'USERTAIL'
