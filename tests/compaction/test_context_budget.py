@@ -645,12 +645,17 @@ def test_tool_availability_delta_adds_nothing_to_the_estimate():
     It is also the only `ModelRequestPart` without a `content` attribute, so before this
     was handled the estimator raised `AttributeError` on any history in which a deferred
     capability had loaded (#577).
+
+    Built with no arguments deliberately: the estimator rejects the part on its type and
+    never reads the names it carries, and the field holding them was renamed
+    (`added` -> `tools_added`) in pydantic-ai 2.26. Naming it here would pin the test to a
+    release later than the floor the runtime actually needs.
     """
     messages = _history(1)
     first = messages[0]
     assert isinstance(first, ModelRequest)
     augmented: list[ModelMessage] = [
-        ModelRequest(parts=[*first.parts, ToolAvailabilityDeltaPart(tools_added=['secret_tool'])]),
+        ModelRequest(parts=[*first.parts, ToolAvailabilityDeltaPart()]),
         *messages[1:],
     ]
 
