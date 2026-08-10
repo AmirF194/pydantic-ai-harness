@@ -125,12 +125,19 @@ async def _toolset(
         yield run_toolset
 
 
+def _background_timeouts(fake_e2b: FakeE2B) -> list[float | None]:
+    return [call.timeout for call in fake_e2b.sandboxes[0].commands.calls if call.background]
+
+
 class TestRunCommand:
-    async def test_stdout_stderr_nonzero_and_no_output(self, fake_e2b: FakeE2B) -> None:
+    async def test_combines_stdout_stderr_and_exit_code(self, fake_e2b: FakeE2B) -> None:
         fake_e2b.responder = lambda command, timeout: ('out\n', 'err\n', 2)
         async with _toolset() as tools:
             assert await tools.run_command('false') == ('[stdout]\nout\n[stderr]\nerr\n[exit code: 2]')
-            fake_e2b.responder = lambda command, timeout: ('', '', 0)
+
+    async def test_no_output(self, fake_e2b: FakeE2B) -> None:
+        fake_e2b.responder = lambda command, timeout: ('', '', 0)
+        async with _toolset() as tools:
             assert await tools.run_command('true') == '(no output)'
 
     async def test_timeout_is_reported_and_killed(self, fake_e2b: FakeE2B) -> None:
@@ -148,13 +155,21 @@ class TestRunCommand:
             result = await tools.run_command('flood', timeout_seconds=2)
         assert result == f'[stdout]\n{"A" * 20}\n[... output truncated to the first 20B ...]\n[timed out after 2s]'
 
-    async def test_timeout_rounds_and_clamps(self, fake_e2b: FakeE2B) -> None:
-        async with _toolset(sandbox_timeout=20, default_command_timeout=4.1) as tools:
+    async def test_omitted_timeout_falls_back_to_default_and_rounds_up(self, fake_e2b: FakeE2B) -> None:
+        async with _toolset(default_command_timeout=4.1) as tools:
             await tools.run_command('default')
+        assert _background_timeouts(fake_e2b) == [5]
+
+    async def test_fractional_timeout_rounds_up(self, fake_e2b: FakeE2B) -> None:
+        # A sub-second timeout must not floor to 0, which would mean "no timeout".
+        async with _toolset() as tools:
             await tools.run_command('fractional', timeout_seconds=0.2)
+        assert _background_timeouts(fake_e2b) == [1]
+
+    async def test_timeout_clamped_to_sandbox_timeout(self, fake_e2b: FakeE2B) -> None:
+        async with _toolset(sandbox_timeout=20) as tools:
             await tools.run_command('clamped', timeout_seconds=100)
-        timeouts = [call.timeout for call in fake_e2b.sandboxes[0].commands.calls if call.background]
-        assert timeouts == [5, 1, 20]
+        assert _background_timeouts(fake_e2b) == [20]
 
     async def test_owned_default_ceiling_tracks_longer_sandbox_lifetime(self, fake_e2b: FakeE2B) -> None:
         async with _toolset(sandbox_timeout=600) as tools:

@@ -21,6 +21,7 @@ from pydantic_ai_harness.e2b_sandbox import (
 
 from .fake_e2b import (
     AuthenticationException,
+    FakeCreateCall,
     FakeE2B,
     FakeEntryInfo,
     FakeFileType,
@@ -45,7 +46,7 @@ class TestLifecycle:
             assert session.mode == 'owned'
             assert session.workdir == '/workspace'
         assert fake_e2b.create_calls == [
-            fake_e2b.create_calls[0].__class__(
+            FakeCreateCall(
                 'python-data',
                 120,
                 {'task': 'test'},
@@ -227,6 +228,7 @@ class TestExec:
     @pytest.mark.skipif(sys.platform == 'win32', reason='E2B command capture requires POSIX process groups')
     async def test_timeout_wrapper_flushes_short_output_incrementally(self, fake_e2b: FakeE2B) -> None:
         fake_e2b.execute_capture_wrapper = True
+        fake_e2b.local_partial_expectations = {'stderr.partial': b'warning'}
         async with E2BSandboxSession() as session:
             result = await session.exec('printf warning >&2; sleep 30', timeout=1, max_output_bytes=100)
         assert result.stderr == 'warning'
@@ -234,18 +236,39 @@ class TestExec:
 
     async def test_success_and_bounded_tail(self, fake_e2b: FakeE2B) -> None:
         fake_e2b.responder = lambda command, timeout: ('A' * 20 + 'END', 'warning', 0)
-        async with E2BSandboxSession(workdir='/project') as session:
+        async with E2BSandboxSession() as session:
             result = await session.exec('echo hello', timeout=7, max_output_bytes=10)
-            command_call = fake_e2b.sandboxes[0].commands.calls[0]
-            assert command_call.cwd == '/project'
-            assert command_call.timeout == 7
         assert result.stdout == 'A' * 7 + 'END'
         assert result.stderr == 'warning'
         assert result.stdout_truncated is True
         assert result.stderr_truncated is False
         assert result.returncode == 0
+
+    async def test_exec_applies_workdir_and_timeout(self, fake_e2b: FakeE2B) -> None:
+        async with E2BSandboxSession(workdir='/project') as session:
+            result = await session.exec('true', timeout=7, max_output_bytes=10)
+        command_call = fake_e2b.sandboxes[0].commands.calls[0]
+        assert command_call.cwd == '/project'
+        assert command_call.timeout == 7
         assert result.applied_timeout == 7
-        assert fake_e2b.sandboxes[0].files.removed
+
+    async def test_exec_removes_its_temp_dir(self, fake_e2b: FakeE2B) -> None:
+        async with E2BSandboxSession() as session:
+            await session.exec('true', timeout=2, max_output_bytes=10)
+        files = fake_e2b.sandboxes[0].files
+        assert len(files.removed) == 1
+        temp_dir = files.removed[0]
+        assert temp_dir.startswith('/tmp/pydantic-ai-harness-')
+        assert not any(path.startswith(temp_dir) for path in files.files)
+
+    async def test_reads_are_streamed_with_an_idle_timeout(self, fake_e2b: FakeE2B) -> None:
+        # Every session read must use the SDK's bounded streaming format and carry the
+        # internal idle timeout, so a stalled envd stream cannot hang a tool call.
+        async with E2BSandboxSession() as session:
+            await session.exec('true', timeout=2, max_output_bytes=10)
+        files = fake_e2b.sandboxes[0].files
+        assert set(files.read_formats) == {'stream'}
+        assert set(files.read_stream_idle_timeouts) == {10}
 
     async def test_sdk_streams_are_redirected_and_discarded(self, fake_e2b: FakeE2B) -> None:
         fake_e2b.responder = lambda command, timeout: ('out', 'err', 9)
@@ -278,7 +301,6 @@ class TestExec:
         async with E2BSandboxSession() as session:
             with pytest.raises(E2BSandboxError, match=rf'{read_limit}-byte read limit'):
                 await session.exec('true', timeout=3, max_output_bytes=max_output_bytes)
-            assert set(fake_e2b.sandboxes[0].files.read_formats) == {'stream'}
 
     async def test_timeout_capture_file_is_read_with_a_bound(self, fake_e2b: FakeE2B) -> None:
         fake_e2b.wait_error = TimeoutException('deadline')
@@ -286,7 +308,15 @@ class TestExec:
         async with E2BSandboxSession() as session:
             with pytest.raises(E2BSandboxError, match='101-byte read limit'):
                 await session.exec('sleep 99', timeout=3, max_output_bytes=100)
-            assert set(fake_e2b.sandboxes[0].files.read_formats) == {'stream'}
+
+    async def test_cancel_during_exec_kills_command_and_cleans_up(self, fake_e2b: FakeE2B) -> None:
+        fake_e2b.wait_hangs = True
+        async with E2BSandboxSession() as session:
+            with anyio.move_on_after(0.1):
+                await session.exec('sleep 99', timeout=30, max_output_bytes=100)
+        sandbox = fake_e2b.sandboxes[0]
+        assert sandbox.commands.handles[0].killed is True
+        assert len(sandbox.files.removed) == 1
 
     async def test_timeout_kills_process_group_and_handle(self, fake_e2b: FakeE2B) -> None:
         fake_e2b.responder = lambda command, timeout: ('partial', '', 0)
@@ -405,6 +435,18 @@ class TestFiles:
                 ('src', True),
                 ('unknown', False),
             ]
+
+    async def test_relative_paths_resolve_against_workdir(self, fake_e2b: FakeE2B) -> None:
+        async with E2BSandboxSession(workdir='/project') as session:
+            await session.write_bytes('notes.txt', b'abc')
+        assert '/project/notes.txt' in fake_e2b.sandboxes[0].files.files
+
+    async def test_parent_segments_normalize_before_the_sandbox_sees_them(self, fake_e2b: FakeE2B) -> None:
+        # Not a security boundary (the model has a full shell); pinned so path handling
+        # cannot change silently.
+        async with E2BSandboxSession(workdir='/project') as session:
+            await session.write_bytes('../escaped.txt', b'abc')
+        assert '/escaped.txt' in fake_e2b.sandboxes[0].files.files
 
     async def test_stream_read_stops_over_limit(self, fake_e2b: FakeE2B) -> None:
         async with E2BSandboxSession() as session:

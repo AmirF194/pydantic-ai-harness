@@ -41,14 +41,19 @@ class TimeoutException(SandboxException):
 
 
 class CommandExitException(SandboxException):
-    """Fake non-zero command result."""
+    """Fake non-zero command result.
 
-    def __init__(self, stdout: str, stderr: str, exit_code: int) -> None:
-        self.stdout = stdout
+    Field order matches the real SDK's `CommandResult` dataclass (`stderr, stdout,
+    exit_code, error`, with `error` required), so positional construction cannot
+    silently swap streams relative to a real `e2b` install.
+    """
+
+    def __init__(self, stderr: str, stdout: str, exit_code: int, error: str | None) -> None:
         self.stderr = stderr
+        self.stdout = stdout
         self.exit_code = exit_code
-        self.error = f'exit status {exit_code}'
-        super().__init__(self.error)
+        self.error = error
+        super().__init__()
 
 
 @dataclass(frozen=True)
@@ -132,13 +137,16 @@ class FakeCommandHandle:
         self.killed = False
 
     async def wait(self) -> FakeCommandResult:
+        if self._control.wait_hangs:
+            await anyio.sleep_forever()
         if self._wait_error is not None:
             raise self._wait_error
         if self._result.exit_code:
             raise CommandExitException(
-                self._control.sdk_stdout,
                 self._control.sdk_stderr,
+                self._control.sdk_stdout,
                 self._result.exit_code,
+                f'exit status {self._result.exit_code}',
             )
         return self._result
 
@@ -173,10 +181,13 @@ class LocalCommandHandle(FakeCommandHandle):
         self._filesystem = filesystem
 
     async def wait(self) -> FakeCommandResult:
-        partial = self._local_dir / 'stderr.partial'
+        # Fire the deadline only after the wrapper has flushed the output the test
+        # expects; a real deadline fires on the clock, which a unit test cannot race.
         with anyio.fail_after(5):
-            while not partial.exists() or partial.read_bytes() != b'warning':
-                await anyio.sleep(0.01)
+            for name, expected in self._control.local_partial_expectations.items():
+                target = self._local_dir / name
+                while not target.exists() or target.read_bytes() != expected:
+                    await anyio.sleep(0.01)
         return await super().wait()
 
     async def kill(self) -> bool:
@@ -203,6 +214,7 @@ class FakeFilesystem:
         self.listings: dict[str, list[FakeEntryInfo]] = {}
         self.removed: list[str] = []
         self.read_formats: list[str] = []
+        self.read_stream_idle_timeouts: list[float | None] = []
 
     async def get_info(self, path: str) -> FakeEntryInfo:
         if self._control.info_error is not None:
@@ -219,8 +231,8 @@ class FakeFilesystem:
         *,
         stream_idle_timeout: float | None = None,
     ) -> FakeFileStream:
-        del stream_idle_timeout
         self.read_formats.append(format)
+        self.read_stream_idle_timeouts.append(stream_idle_timeout)
         if self._control.read_error is not None:
             raise self._control.read_error
         try:
@@ -437,11 +449,13 @@ class FakeE2B:
         self.info_error: Exception | None = None
         self.list_error: Exception | None = None
         self.remove_error: Exception | None = None
+        self.wait_hangs = False
         self.omit_capture = False
         self.omit_count = False
         self.invalid_count = False
         self.capture_overrides: dict[str, bytes] = {}
         self.execute_capture_wrapper = False
+        self.local_partial_expectations: dict[str, bytes] = {}
         self.sdk_stdout = ''
         self.sdk_stderr = ''
         self.file_chunk_size = 4
