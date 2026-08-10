@@ -14,13 +14,14 @@ import json
 import math
 import re
 from dataclasses import dataclass
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
 
 from pydantic_ai import RunContext
 from pydantic_ai.messages import (
     ModelMessage,
     ModelRequest,
     ModelRequestPart,
+    RetryPromptPart,
     SystemPromptPart,
     TextContent,
     TextPart,
@@ -31,6 +32,7 @@ from pydantic_ai.messages import (
 )
 from pydantic_ai.tools import AgentDepsT
 from pydantic_ai.toolsets import FunctionToolset
+from typing_extensions import assert_never
 
 from pydantic_ai_harness.conversation_search._source import SUMMARY_PREFIX, HistorySource
 
@@ -189,14 +191,22 @@ def _format_request_part(part: ModelRequestPart, *, truncate: bool) -> str | Non
         if truncate and len(content) > 500:
             content = content[:500] + '...'
         return f'Tool [{part.tool_name}]: {content}'
-    if isinstance(part, ToolAvailabilityDeltaPart):
-        # Tool-list bookkeeping, not conversation content, so there is nothing to index.
-        # Checked before the `RetryPromptPart` fallback below, which would raise on it.
+    if isinstance(part, RetryPromptPart):
+        # A retry or validation-error prompt is worth recalling, so index it in full.
+        return f'Retry [{part.tool_name}]: {part.content}'
+    # Tool-list bookkeeping rather than conversation, so there is no line to contribute.
+    # Redundant against the union as it stands today, but kept explicit so the fallthrough
+    # below stays a real branch at runtime rather than dead code.
+    if isinstance(part, ToolAvailabilityDeltaPart):  # pyright: ignore[reportUnnecessaryIsInstance]
         return None
-    # The only remaining `ModelRequestPart` is `RetryPromptPart`
-    # (`ToolSearchReturnPart`/`LoadCapabilityReturnPart` subclass `ToolReturnPart`).
-    # A retry or validation-error prompt is worth recalling, so index it in full.
-    return f'Retry [{part.tool_name}]: {part.content}'
+    # A part pydantic-ai added after this was written. Indexing it would mean guessing which
+    # of its fields read as conversation, and a search index is not worth failing a run over,
+    # so it contributes nothing. `assert_never` under `TYPE_CHECKING` keeps the chain
+    # exhaustive at type-check time -- a new upstream part fails `make typecheck` -- without
+    # crashing a user who upgrades pydantic-ai ahead of us.
+    if TYPE_CHECKING:
+        assert_never(part)
+    return None  # pragma: no cover - reachable only on a pydantic-ai release newer than this one
 
 
 def _format_message(message: ModelMessage, *, truncate: bool) -> str:

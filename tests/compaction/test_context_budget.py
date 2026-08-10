@@ -639,8 +639,11 @@ class TestTriggerBoundary:
 
 
 def test_tool_availability_delta_adds_nothing_to_the_estimate():
-    """The part is tool-list bookkeeping: its names travel in the request's tool
-    definitions, which the estimator deliberately leaves out of the count.
+    """The part itself carries no message text, so it adds nothing to the estimate.
+
+    This is a statement about the part, not about the reveal being free: the schemas of the
+    revealed tools do travel in the request, and this estimator counts no tool definitions at
+    all, so a mid-run reveal has a context cost it cannot see. That gap is tracked separately.
 
     It is also the only `ModelRequestPart` without a `content` attribute, so before this
     was handled the estimator raised `AttributeError` on any history in which a deferred
