@@ -28,8 +28,10 @@ classifiers = [
     'Typing :: Typed',
 ]
 dependencies = [
+    "genai-prices>=0.0.71",
     "httpx>=0.28.1",
-    "pydantic-ai-slim>=2.18.0",
+    # `CodeMode` reads `ModelRequestParameters.revealed_tool_names`, which lands in 2.22.0.
+    "pydantic-ai-slim>=2.22.0",
 ]
 
 [project.optional-dependencies]
@@ -63,11 +65,21 @@ acp = [
 exa = [
     "exa-py>=2.16.0",
 ]
+mongodb = [
+    "pymongo>=4.17.0",
+]
 skills = [
     "pyyaml>=6.0.2",
 ]
+browser-use = [
+    "browser-use>=0.13.6,<0.14 ; python_full_version >= '3.11'",
+]
 playwright = [
     "playwright>=1.61.0",
+]
+stackone = [
+    "fastmcp>=3.4.5,<4",
+    "pydantic-ai-slim[mcp]>=2.18.0",
 ]
 
 [project.urls]
@@ -92,6 +104,8 @@ dev = [
     "pydantic-ai-slim[spec]>=2.18.0",
     "pytest-examples>=0.0.18",
     "pytest-recording>=0.13.4",
+    "mongomock-motor>=0.0.36",
+    "redis>=6.0.0",
 ]
 lint = [
     'ruff>=0.14',
@@ -143,6 +157,11 @@ exclude = ['template', '.venv', 'mutants', '.agents', '.claude']
 # helpers are registered via decorators and never referenced by name (matches pydantic-ai).
 executionEnvironments = [
     { root = 'tests', reportPrivateUsage = false, reportUnusedFunction = false },
+    # `redis.asyncio.Redis` ships `py.typed` but leaves most of its command surface
+    # partially unknown (`from_url`, `ping`, `scan_iter`, `ttl`). Only the live-Redis
+    # tests touch the client directly -- `RedisSpendStore` itself goes through the
+    # `RedisClient` protocol and stays fully checked.
+    { root = 'integration_tests/redis', reportUnknownMemberType = false, reportUnknownVariableType = false, reportUnknownArgumentType = false },
 ]
 
 [tool.pytest.ini_options]
@@ -153,8 +172,22 @@ filterwarnings = [
     'error',
     # DBOS's run_sync triggers this on Python 3.12+ — not our code.
     'ignore:There is no current event loop:DeprecationWarning',
+    # browser-use's observability decorators call asyncio.iscoroutinefunction at
+    # import time, which Python 3.14+ deprecates — not our code.
+    "ignore:'asyncio.iscoroutinefunction' is deprecated:DeprecationWarning",
     # Experimental capabilities warn on import by design; assert it explicitly where it matters.
     'ignore::pydantic_ai_harness.experimental.HarnessExperimentalWarning',
+    # pydantic-settings 2.15 started warning about models whose annotations hold unresolved
+    # forward references, and `mcp`'s `FastMCP` settings model has one on `lifespan` (it refers
+    # to `FastMCP`, defined later in that module). Neither model is ours, and the field is not a
+    # settings source we read. Transitive, so it reaches the floor job first — `lowest-direct`
+    # pins our direct deps but still resolves pydantic-settings to latest.
+    #
+    # Matched on message rather than `ignore::pydantic_settings.exceptions.IncompleteFieldDefinitionWarning`:
+    # the class doesn't exist before 2.15, and a category filter naming a class pytest can't
+    # import fails collection outright — which would break every job resolving an older
+    # pydantic-settings, including the locked one.
+    "ignore:Field '.*' has an incomplete definition",
 ]
 anyio_mode = 'auto'
 

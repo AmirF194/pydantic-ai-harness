@@ -1,6 +1,6 @@
 .DEFAULT_GOAL := all
 
-.PHONY: .uv .prek install format lint typecheck test testcov integration-localstack all
+.PHONY: .uv .prek install format lint typecheck test testcov integration-localstack integration-mongodb integration-redis all
 
 .uv:
 	@uv --version || echo 'Please install uv: https://docs.astral.sh/uv/getting-started/installation/'
@@ -32,5 +32,15 @@ testcov:
 
 integration-localstack:
 	uv run pytest integration_tests/localstack/test_live_localstack.py
+
+# Needs a reachable mongod (`docker run -d -p 27017:27017 mongo:8`); without one
+# the tests skip. Set MONGODB_TEST_URL to point at a server elsewhere.
+integration-mongodb:
+	uv run pytest integration_tests/mongodb/test_live_mongodb.py
+
+# Needs a reachable Redis (`docker run -d -p 6379:6379 redis:8`); without one the
+# tests skip. Set REDIS_TEST_URL to point at a server elsewhere.
+integration-redis:
+	uv run pytest integration_tests/redis/test_live_redis.py
 
 all: format lint typecheck testcov
