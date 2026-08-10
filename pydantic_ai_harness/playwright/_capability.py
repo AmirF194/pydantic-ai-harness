@@ -207,7 +207,7 @@ class PlaywrightBrowser(AbstractCapability[AgentDepsT]):
     reason `from_spec` does not accept it.
     """
 
-    cdp_url: str | None = None
+    cdp_url: str | None = field(default=None, repr=False)
     """Attach to a Chromium already running at this Chrome DevTools Protocol endpoint.
 
     When set, the capability connects instead of launching, so no local Chromium

@@ -1343,12 +1343,21 @@ class TestPlaywrightBrowserHooks:
         assert browser.cdp_url is None
         assert browser.storage_state is None
 
-    def test_repr_omits_storage_state(self) -> None:
-        # `repr` reaches diagnostics and logs; session cookies must not ride along.
-        rendered = repr(PlaywrightBrowser[None](storage_state=_STORAGE_STATE, cdp_url='http://localhost:9222'))
+    def test_repr_omits_credential_bearing_fields(self) -> None:
+        # `repr` reaches diagnostics and logs. Session cookies must not ride along,
+        # and a managed-browser endpoint can carry an auth token in the URL.
+        rendered = repr(
+            PlaywrightBrowser[None](
+                storage_state=_STORAGE_STATE,
+                cdp_url='https://cloud.example.com/?token=s3cret',
+                allowed_domains=['example.com'],
+            )
+        )
         assert 'abc' not in rendered
         assert 'storage_state' not in rendered
-        assert 'http://localhost:9222' in rendered  # non-secret configuration still shows
+        assert 's3cret' not in rendered
+        assert 'cdp_url' not in rendered
+        assert "allowed_domains=['example.com']" in rendered  # non-secret configuration still shows
 
     def test_from_spec_refuses_storage_state(self) -> None:
         # Session credentials stay out of a spec: naming it fails loudly rather
