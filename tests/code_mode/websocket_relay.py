@@ -70,7 +70,7 @@ async def _serve_relay(host: str, port: int, monty_bin: str) -> None:  # pragma:
         await _bridge_connection(websocket, monty_bin)
 
     async with serve(handler, host, port, max_size=None) as server:
-        bound_host, bound_port = server.sockets[0].getsockname()[:2]
+        bound_host, bound_port = next(iter(server.sockets)).getsockname()[:2]
         print(f'ws://{bound_host}:{bound_port}', flush=True)
         await asyncio.get_running_loop().create_future()
 
