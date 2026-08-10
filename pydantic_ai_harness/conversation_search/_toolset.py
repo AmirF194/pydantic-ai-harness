@@ -24,6 +24,7 @@ from pydantic_ai.messages import (
     SystemPromptPart,
     TextContent,
     TextPart,
+    ToolAvailabilityDeltaPart,
     ToolCallPart,
     ToolReturnPart,
     UserPromptPart,
@@ -188,9 +189,9 @@ def _format_request_part(part: ModelRequestPart, *, truncate: bool) -> str | Non
         if truncate and len(content) > 500:
             content = content[:500] + '...'
         return f'Tool [{part.tool_name}]: {content}'
-    if part.part_kind == 'tool-availability-delta':
-        # Tool-list bookkeeping (pydantic-ai 2.27+), not conversation content; nothing
-        # to index. Matched by `part_kind`, not `isinstance`: the 2.22 floor lacks the class.
+    if isinstance(part, ToolAvailabilityDeltaPart):
+        # Tool-list bookkeeping, not conversation content, so there is nothing to index.
+        # Checked before the `RetryPromptPart` fallback below, which would raise on it.
         return None
     # The only remaining `ModelRequestPart` is `RetryPromptPart`
     # (`ToolSearchReturnPart`/`LoadCapabilityReturnPart` subclass `ToolReturnPart`).

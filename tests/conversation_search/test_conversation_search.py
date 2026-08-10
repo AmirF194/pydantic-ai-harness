@@ -12,7 +12,6 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
-import pydantic_ai.messages
 import pytest
 from pydantic_ai import Agent
 from pydantic_ai.messages import (
@@ -25,6 +24,7 @@ from pydantic_ai.messages import (
     TextContent,
     TextPart,
     ThinkingPart,
+    ToolAvailabilityDeltaPart,
     ToolCallPart,
     ToolReturnPart,
     UserPromptPart,
@@ -608,15 +608,9 @@ class TestSearchScope:
         assert 'Retry [readfile]: please retry' in rendered  # RetryPromptPart is searchable
         assert '...' in rendered  # truncation applied to the long tool return / args
 
-    @pytest.mark.skipif(
-        not hasattr(pydantic_ai.messages, 'ToolAvailabilityDeltaPart'),
-        reason='pydantic-ai < 2.27 has no ToolAvailabilityDeltaPart',
-    )
     async def test_tool_availability_delta_is_not_indexed(self) -> None:
         """Tool-list bookkeeping is not conversation content: the delta contributes no
         searchable line, and the parts around it still index normally."""
-        from pydantic_ai.messages import ToolAvailabilityDeltaPart
-
         messages: list[ModelMessage] = [
             ModelRequest(
                 parts=[

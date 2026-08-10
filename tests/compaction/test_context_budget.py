@@ -7,7 +7,6 @@ from collections.abc import Callable
 from typing import Any
 from unittest.mock import AsyncMock, patch
 
-import pydantic_ai.messages
 import pytest
 from opentelemetry.trace import NoOpTracer, Tracer
 from pydantic_ai import Agent
@@ -16,6 +15,7 @@ from pydantic_ai.messages import (
     ModelRequest,
     ModelResponse,
     TextPart,
+    ToolAvailabilityDeltaPart,
     ToolCallPart,
     ToolReturnPart,
     UserPromptPart,
@@ -638,15 +638,14 @@ class TestTriggerBoundary:
         assert len(request_context.messages) < 6
 
 
-@pytest.mark.skipif(
-    not hasattr(pydantic_ai.messages, 'ToolAvailabilityDeltaPart'),
-    reason='pydantic-ai < 2.27 has no ToolAvailabilityDeltaPart',
-)
 def test_tool_availability_delta_adds_nothing_to_the_estimate():
     """The part is tool-list bookkeeping: its names travel in the request's tool
-    definitions, which the estimator deliberately leaves out of the count."""
-    from pydantic_ai.messages import ToolAvailabilityDeltaPart
+    definitions, which the estimator deliberately leaves out of the count.
 
+    It is also the only `ModelRequestPart` without a `content` attribute, so before this
+    was handled the estimator raised `AttributeError` on any history in which a deferred
+    capability had loaded (#577).
+    """
     messages = _history(1)
     first = messages[0]
     assert isinstance(first, ModelRequest)
