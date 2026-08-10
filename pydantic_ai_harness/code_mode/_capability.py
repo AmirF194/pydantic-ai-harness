@@ -98,10 +98,12 @@ class CodeMode(AbstractCapability[AgentDepsT]):
 
     The URL may point to a relay or any server that bridges the WebSocket to a
     Monty worker. Mounts, `os_access`, prints, and tool calls are still serviced
-    by the host over the connection. Remote turns use the transport's 10-second
-    default deadline; it covers worker-side execution only (waiting on a host
-    tool call does not count), and exceeding it surfaces as a sandbox-crash
-    retry. WebSocket transport cannot run inside a Temporal workflow.
+    by the host over the connection. Plaintext `ws://` is only accepted for
+    loopback hosts; remote workers require `wss://`. Remote turns use the
+    transport's 10-second default deadline; it covers worker-side execution only
+    (waiting on a host tool call does not count), and exceeding it surfaces as a
+    sandbox-crash retry. WebSocket transport cannot run inside a Temporal
+    workflow.
     """
 
     dynamic_catalog: bool = False

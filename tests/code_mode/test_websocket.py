@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import shutil
+import socket
 import sys
 from collections.abc import AsyncIterator
 from pathlib import Path
@@ -11,7 +12,16 @@ from typing import Any
 
 import pytest
 from pydantic_ai import Agent
-from pydantic_ai.messages import ModelMessage, ModelRequest, ModelResponse, TextPart, ToolCallPart, ToolReturnPart
+from pydantic_ai.exceptions import UserError
+from pydantic_ai.messages import (
+    ModelMessage,
+    ModelRequest,
+    ModelResponse,
+    RetryPromptPart,
+    TextPart,
+    ToolCallPart,
+    ToolReturnPart,
+)
 from pydantic_ai.models.function import AgentInfo, FunctionModel
 from pydantic_monty import MountDir
 
@@ -126,3 +136,69 @@ async def test_code_mode_runs_over_websocket(
         {'output': 'remote tool result 5\n'},
         {'output': 'mounted data\n', 'result': 50},
     ]
+
+
+def _text_model(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+    return ModelResponse(parts=[TextPart('done')])
+
+
+@pytest.mark.parametrize(
+    'url',
+    ['ws://sandbox.example.com:8799/monty', 'ws://192.0.2.1:8799', 'ws:///monty'],
+)
+async def test_plaintext_remote_sandbox_url_rejected(url: str) -> None:
+    """`ws://` to a non-loopback host fails when the toolset enters, before any connection is dialed."""
+    agent: Agent[None, str] = Agent(
+        FunctionModel(_text_model),
+        capabilities=[CodeMode(monty_sandbox_url=url)],
+    )
+    with pytest.raises(UserError, match='wss://'):
+        await agent.run('never dials')
+
+
+@pytest.mark.parametrize(
+    'url',
+    ['ws://127.0.0.1:8799', 'ws://localhost:8799', 'ws://[::1]:8799', 'wss://sandbox.example.com/monty'],
+)
+async def test_loopback_or_tls_sandbox_url_accepted(url: str) -> None:
+    """Loopback `ws://` and any `wss://` URL pass validation; workers dial lazily, not at enter."""
+    agent: Agent[None, str] = Agent(FunctionModel(_text_model), capabilities=[CodeMode(monty_sandbox_url=url)])
+    result = await agent.run('no run_code call, so nothing dials')
+    assert result.output == 'done'
+
+
+async def test_dial_failure_redacts_sandbox_url() -> None:
+    """A failed dial's retry message must not leak the URL, which may carry credentials."""
+    with socket.socket() as probe:
+        probe.bind(('127.0.0.1', 0))
+        free_port = probe.getsockname()[1]
+    secret_url = f'ws://127.0.0.1:{free_port}/?token=hunter2'
+
+    def model(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        retries = [
+            part
+            for message in messages
+            if isinstance(message, ModelRequest)
+            for part in message.parts
+            if isinstance(part, RetryPromptPart)
+        ]
+        if not retries:
+            return ModelResponse(parts=[ToolCallPart('run_code', {'code': '1 + 1'})])
+        return ModelResponse(parts=[TextPart('done')])
+
+    agent: Agent[None, str] = Agent(FunctionModel(model), capabilities=[CodeMode(monty_sandbox_url=secret_url)])
+    result = await agent.run('dial a dead worker')
+
+    assert result.output == 'done'
+    retry_parts = [
+        part
+        for message in result.all_messages()
+        if isinstance(message, ModelRequest)
+        for part in message.parts
+        if isinstance(part, RetryPromptPart)
+    ]
+    assert retry_parts, 'expected the dial failure to surface as a retry'
+    content = str(retry_parts[0].content)
+    assert 'token=hunter2' not in content
+    assert secret_url not in content
+    assert '<monty_sandbox_url>' in content

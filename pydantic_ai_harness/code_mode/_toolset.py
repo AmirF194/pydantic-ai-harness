@@ -11,7 +11,9 @@ from collections import deque
 from collections.abc import AsyncGenerator, Awaitable, Callable, Coroutine, Sequence
 from contextlib import AsyncExitStack, ExitStack, asynccontextmanager
 from dataclasses import dataclass, field, replace
+from ipaddress import ip_address
 from typing import Annotated, Any
+from urllib.parse import urlsplit
 
 from pydantic import Field, TypeAdapter
 from pydantic_ai import AbstractToolset, RunContext, ToolDefinition, WrapperToolset
@@ -74,6 +76,31 @@ def _in_temporal_workflow() -> bool:
     except ImportError:
         return False
     return workflow.in_workflow()
+
+
+def _check_monty_sandbox_url(url: str) -> None:
+    """Reject plaintext `ws://` to non-loopback hosts.
+
+    The WebSocket frames carry tool dispatches, mount reads, and `os_access`
+    results, so a plaintext connection to a remote host would let an on-path
+    attacker read and forge them. `ws://` stays available for loopback -- a
+    local relay or a TLS-terminating sidecar on the same machine.
+    """
+    split = urlsplit(url)
+    if split.scheme != 'ws':
+        return
+    host = split.hostname or ''
+    if host == 'localhost':
+        return
+    try:
+        if ip_address(host).is_loopback:
+            return
+    except ValueError:
+        pass
+    raise UserError(
+        f'`CodeMode.monty_sandbox_url` uses plaintext `ws://` for remote host {host!r}. '
+        'Use `wss://`, or a loopback address for a local relay.'
+    )
 
 
 @dataclass
@@ -513,10 +540,12 @@ class CodeModeToolset(WrapperToolset[AgentDepsT]):
 
     The URL may point to a relay or any server that bridges the WebSocket to a
     Monty worker. Mounts, `os_access`, prints, and tool calls are still serviced
-    by the host over the connection. Remote turns use the transport's 10-second
-    default deadline; it covers worker-side execution only (waiting on a host
-    tool call does not count), and exceeding it surfaces as a sandbox-crash
-    retry. WebSocket transport cannot run inside a Temporal workflow.
+    by the host over the connection. Plaintext `ws://` is only accepted for
+    loopback hosts; remote workers require `wss://`. Remote turns use the
+    transport's 10-second default deadline; it covers worker-side execution only
+    (waiting on a host tool call does not count), and exceeding it surfaces as a
+    sandbox-crash retry. WebSocket transport cannot run inside a Temporal
+    workflow.
     """
 
     dynamic_catalog: bool = False
@@ -566,6 +595,8 @@ class CodeModeToolset(WrapperToolset[AgentDepsT]):
                 '`CodeMode.monty_sandbox_url` cannot be used inside a Temporal workflow because '
                 'Monty WebSocket transport requires async worker I/O.'
             )
+        if self.monty_sandbox_url is not None:
+            _check_monty_sandbox_url(self.monty_sandbox_url)
         run_state: _MontyRunState
         if in_temporal_workflow:
             run_state = _SyncMontyRunState()
@@ -579,11 +610,13 @@ class CodeModeToolset(WrapperToolset[AgentDepsT]):
         """Exit the wrapped toolset, then tear down the worker pool."""
         run_state = self._run_state
         assert run_state is not None
-        self._run_state = None
         try:
             return await self.wrapped.__aexit__(*args)
         finally:
+            # Detach only after a successful close, so a caller that retries teardown
+            # after a failed close can still reach the state.
             await run_state.close()
+            self._run_state = None
 
     async def get_instructions(
         self, ctx: RunContext[AgentDepsT]
@@ -921,6 +954,11 @@ class CodeModeToolset(WrapperToolset[AgentDepsT]):
             # record of what failed for both the model and the transcript.
             await run_state.reset()
             error_text = f'{type(e).__name__}: {e}'
+            if self.monty_sandbox_url is not None:
+                # Dial failures embed the configured URL, which may carry routing or auth
+                # credentials in its userinfo, path, or query; keep it out of the
+                # transcript-bound retry message.
+                error_text = error_text.replace(self.monty_sandbox_url, '<monty_sandbox_url>')
             raise ModelRetry(
                 'Code execution failed and the session was reset. Re-run any imports, recreate '
                 f'any state you need, and try again.\n{capture.prepend_to(error_text)}'

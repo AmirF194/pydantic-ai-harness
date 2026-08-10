@@ -203,7 +203,8 @@ agent = Agent(
 )
 ```
 
-The URL must use `ws://` or `wss://` and point to a server that bridges each WebSocket
+The URL must use `wss://` (plaintext `ws://` is only accepted for loopback hosts, e.g. a
+local relay or a TLS-terminating sidecar) and point to a server that bridges each WebSocket
 connection to one Monty worker -- Monty's `monty-server` is built for this, or any relay that
 forwards frames to a worker fits. The WebSocket side carries one binary Monty protocol frame per
 message. A relay backed by `monty subprocess` adds the worker's four-byte little-endian length
