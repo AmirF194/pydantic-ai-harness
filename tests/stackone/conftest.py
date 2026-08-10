@@ -45,8 +45,9 @@ def _fastmcp_server(name: str) -> FastMCP:
     """Create a test FastMCP server after resolving its settings forward references."""
     from mcp.server.fastmcp.server import FastMCP, Settings
 
-    # `pydantic-settings` 2.15 treats FastMCP's unresolved `lifespan` annotation as an error under this
-    # suite's warnings policy. Resolve it before the local test server reads its settings.
+    # The `mcp` SDK leaves the `lifespan` annotation on `Settings` as an unresolved forward reference,
+    # and `pydantic-settings` >= 2.15 warns about that at construction, which this suite's `error`
+    # warnings policy escalates. Drop the rebuild once `mcp` resolves the annotation itself.
     Settings.model_rebuild()
     return FastMCP(name)
 
