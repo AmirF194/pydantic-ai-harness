@@ -1255,13 +1255,13 @@ class TestCodeMode:
         assert 'load_capability' in by_name
         assert 'run_code' in by_name
 
-        # The deferred member tool stays out of `run_code` until loaded. How it stays
-        # hidden natively depends on the model's tool-search support: `TestModel` gained
-        # it in pydantic-ai 2.26, where the unrevealed tool is sent on the wire flagged
-        # `defer_loading=True` (present but unloaded); before that it is dropped from the
-        # request entirely, with a synthetic `search_tools` tool standing in.
-        if 'demo_tool' in by_name:  # pragma: lax no cover
-            assert by_name['demo_tool'].defer_loading
+        # The deferred member tool stays hidden until loaded: not folded into `run_code`
+        # and not surfaced as a plain native tool. Assert on reveal state rather than on the
+        # name being absent from `function_tools` -- once pydantic-ai splits declaration from
+        # visibility, `function_tools` keeps the hidden declaration and only the reveal set
+        # distinguishes the two. `revealed_tool_names` means the same thing on both sides of
+        # that change, so this holds without version-sniffing.
+        assert 'demo_tool' not in model.last_model_request_parameters.revealed_tool_names
         run_code_desc = by_name['run_code'].description or ''
         assert 'demo_tool' not in run_code_desc
         assert 'load_capability' not in run_code_desc
