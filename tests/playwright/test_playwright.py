@@ -16,6 +16,7 @@ from typing import Protocol
 import pytest
 from playwright._impl._errors import TargetClosedError
 from playwright.async_api import Error as PlaywrightError
+from playwright.async_api import StorageState
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 from pydantic_ai import Agent, AgentRunResult
 from pydantic_ai.capabilities import AbstractCapability
@@ -37,6 +38,8 @@ from pydantic_ai_harness.playwright import (
 )
 
 pytestmark = pytest.mark.anyio
+
+_STORAGE_STATE: StorageState = {'cookies': [{'name': 'session', 'value': 'abc', 'domain': 'example.com', 'path': '/'}]}
 
 _HISTORY_RESPONSE = object()
 
@@ -116,7 +119,7 @@ class _FakeRouteHandler(Protocol):
 
 class _FakeBrowserContext:
     def __init__(
-        self, page: _FakePage, *, storage_state: str | None = None, service_workers: str | None = None
+        self, page: _FakePage, *, storage_state: StorageState | None = None, service_workers: str | None = None
     ) -> None:
         self.page = page
         self.storage_state = storage_state
@@ -375,7 +378,7 @@ class _FakePlaywrightBrowser:
         self.contexts: list[_FakeBrowserContext] = []
 
     async def new_context(
-        self, *, storage_state: str | None = None, service_workers: str | None = None
+        self, *, storage_state: StorageState | None = None, service_workers: str | None = None
     ) -> _FakeBrowserContext:
         context = _FakeBrowserContext(self._page, storage_state=storage_state, service_workers=service_workers)
         self._page._context = context
@@ -404,6 +407,7 @@ class _FakeChromium:
         self._launch_error = launch_error
         self._close_error = close_error
         self.launched: list[bool] = []
+        self.connected: list[str] = []
         self.browser: _FakePlaywrightBrowser | None = None
 
     @property
@@ -414,6 +418,11 @@ class _FakeChromium:
         self.launched.append(headless)
         if self._launch_error is not None:
             raise self._launch_error
+        self.browser = _FakePlaywrightBrowser(self._page, close_error=self._close_error)
+        return self.browser
+
+    async def connect_over_cdp(self, endpoint_url: str) -> _FakePlaywrightBrowser:
+        self.connected.append(endpoint_url)
         self.browser = _FakePlaywrightBrowser(self._page, close_error=self._close_error)
         return self.browser
 
@@ -1315,7 +1324,7 @@ class TestPlaywrightBrowserHooks:
             max_content_tokens=100,
             timeout_ms=5000,
             auto_install_chromium=True,
-            storage_state='/tmp/state.json',
+            cdp_url='http://localhost:9222',
         )
         assert browser.headless is False
         assert browser.allowed_domains == ['x.com']
@@ -1324,14 +1333,21 @@ class TestPlaywrightBrowserHooks:
         assert browser.max_content_tokens == 100
         assert browser.timeout_ms == 5000
         assert browser.auto_install_chromium is True
-        assert browser.storage_state == '/tmp/state.json'
+        assert browser.cdp_url == 'http://localhost:9222'
 
     def test_from_spec_defaults_to_open_egress(self) -> None:
         browser = PlaywrightBrowser[None].from_spec()
         assert browser.allowed_domains is None
         assert browser.block_private_addresses is True
         assert browser.auto_install_chromium is False
+        assert browser.cdp_url is None
         assert browser.storage_state is None
+
+    def test_from_spec_refuses_storage_state(self) -> None:
+        # Session credentials stay out of a spec: naming it fails loudly rather
+        # than moving cookies into whatever stores the spec.
+        with pytest.raises(TypeError, match='storage_state'):
+            PlaywrightBrowser[None].from_spec(storage_state=_STORAGE_STATE)  # pyright: ignore[reportCallIssue]
 
 
 class TestDurabilityRejection:
@@ -1413,12 +1429,55 @@ class TestPlaywrightBrowserLifecycle:
         cm = _install_fake_driver(monkeypatch, page)
         agent = Agent(
             TestModel(call_tools=['screenshot']),
-            capabilities=[PlaywrightBrowser(storage_state='/tmp/session.json')],
+            capabilities=[PlaywrightBrowser(storage_state=_STORAGE_STATE)],
         )
         await agent.run('screenshot the page')
         browser = cm._driver.chromium.browser
         assert browser is not None
-        assert [c.storage_state for c in browser.contexts] == ['/tmp/session.json']
+        assert [c.storage_state for c in browser.contexts] == [_STORAGE_STATE]
+
+    async def test_cdp_url_attaches_instead_of_launching(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        page = _FakePage()
+        cm = _install_fake_driver(monkeypatch, page)
+        agent = Agent(
+            TestModel(call_tools=['screenshot']),
+            capabilities=[PlaywrightBrowser(cdp_url='http://localhost:9222')],
+        )
+        await agent.run('screenshot the page')
+        chromium = cm._driver.chromium
+        assert chromium.connected == ['http://localhost:9222']
+        assert chromium.launched == []
+        assert chromium.browser is not None and chromium.browser.closed is True
+
+    async def test_cdp_url_skips_the_missing_binary_check(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # Attaching needs no local Chromium, so an absent binary must not hide the
+        # tools or trigger the install hint.
+        page = _FakePage()
+        cm = _install_fake_driver(monkeypatch, page, executable_missing=True)
+        agent = Agent(
+            TestModel(call_tools=['screenshot']),
+            capabilities=[PlaywrightBrowser(cdp_url='http://localhost:9222', auto_install_chromium=True)],
+        )
+        await agent.run('screenshot the page')
+        chromium = cm._driver.chromium
+        assert chromium.connected == ['http://localhost:9222']
+        assert chromium.launched == []  # no local binary consulted, so no install hint and no download
+
+    async def test_cdp_url_context_still_applies_storage_state_and_guards(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        page = _FakePage()
+        cm = _install_fake_driver(monkeypatch, page)
+        agent = Agent(
+            TestModel(call_tools=['screenshot']),
+            capabilities=[PlaywrightBrowser(cdp_url='http://localhost:9222', storage_state=_STORAGE_STATE)],
+        )
+        await agent.run('screenshot the page')
+        browser = cm._driver.chromium.browser
+        assert browser is not None
+        assert [c.storage_state for c in browser.contexts] == [_STORAGE_STATE]
+        assert [c.service_workers for c in browser.contexts] == ['block']
+        assert page.context.routes == ['**/*']
 
     async def test_storage_state_defaults_to_none(self, monkeypatch: pytest.MonkeyPatch) -> None:
         page = _FakePage()

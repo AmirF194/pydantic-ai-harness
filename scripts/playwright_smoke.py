@@ -11,8 +11,8 @@ It exercises the public `PlaywrightBrowser` surface and checks four things:
 
 - lazy launch plus a real navigation to https://example.com (prints the title),
 - the allowlist bounce (a disallowed host returns an error result, not content),
-- a `storage_state` round-trip: a cookie saved by a real context is visible to
-  the agent after relaunching the capability with that state file,
+- a `storage_state` round-trip: a cookie captured from a real context is visible
+  to the agent after relaunching the capability with that state,
 - clean teardown: each scenario runs its own capability, whose `wrap_run` closes
   the browser when the run ends. After it prints `all checks passed`, confirm no
   Chromium lingered, e.g. `pgrep -fl chromium` shows nothing this script started.
@@ -21,10 +21,8 @@ It exercises the public `PlaywrightBrowser` surface and checks four things:
 from __future__ import annotations
 
 import asyncio
-import tempfile
-from pathlib import Path
 
-from playwright.async_api import async_playwright
+from playwright.async_api import StorageState, async_playwright
 from pydantic_ai import Agent
 from pydantic_ai.messages import (
     ModelMessage,
@@ -82,8 +80,8 @@ async def _check_allowlist_bounce() -> None:
     print('allowlist bounce ok')
 
 
-async def _write_storage_state(path: Path) -> None:
-    """Save a cookie into a Playwright storage state file via a real context."""
+async def _capture_storage_state() -> StorageState:
+    """Log a cookie into a real context and hand back its storage state."""
     async with async_playwright() as pw:
         chromium = await pw.chromium.launch(headless=True)
         try:
@@ -91,23 +89,20 @@ async def _write_storage_state(path: Path) -> None:
             page = await context.new_page()
             await page.goto('https://example.com')
             await page.evaluate(f"document.cookie = '{_COOKIE}; path=/'")
-            await context.storage_state(path=str(path))
+            return await context.storage_state()
         finally:
             await chromium.close()
 
 
 async def _check_storage_state_round_trip() -> None:
-    """A cookie saved to a state file is visible to the agent after relaunch."""
-    with tempfile.TemporaryDirectory() as tmp:
-        state_path = Path(tmp) / 'state.json'
-        await _write_storage_state(state_path)
-        browser = PlaywrightBrowser[object](storage_state=str(state_path))
-        _, cookies = await _run_tools(
-            browser,
-            [('navigate', {'url': 'https://example.com'}), ('execute_js', {'script': 'document.cookie'})],
-        )
-        assert _COOKIE in cookies, cookies
-        print('storage_state round-trip ok')
+    """A cookie captured from a real context is visible to the agent after relaunch."""
+    browser = PlaywrightBrowser[object](storage_state=await _capture_storage_state())
+    _, cookies = await _run_tools(
+        browser,
+        [('navigate', {'url': 'https://example.com'}), ('execute_js', {'script': 'document.cookie'})],
+    )
+    assert _COOKIE in cookies, cookies
+    print('storage_state round-trip ok')
 
 
 async def _main() -> None:

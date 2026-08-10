@@ -11,7 +11,7 @@ move through history, extract page text, run JavaScript, and screenshot. Reach
 for it when the lighter web tools fall short -- pages behind login or session
 cookies, JavaScript-rendered SPAs, and interactive multi-step flows. For
 query-based research prefer [Exa Search](exa-search.md); for a static URL prefer
-a web-fetch tool.
+a web-fetch tool. For an open-ended goal on a page layout you do not know in advance, [Browser Use](browser-use.md) delegates the whole task to an autonomous browser agent instead. The two are complementary: this capability gives the model typed, deterministic actions it drives itself, one tool call at a time.
 
 [Source](https://github.com/pydantic/pydantic-ai-harness/tree/main/pydantic_ai_harness/playwright/)
 
@@ -94,23 +94,75 @@ not raised to abort the agent run.
 | `max_content_tokens` | `4000` | Approximate token budget for every textual tool result. |
 | `timeout_ms` | `30000` | Default Playwright navigation/action timeout. |
 | `auto_install_chromium` | `False` | Fetch Chromium automatically when the binary is missing. |
-| `storage_state` | `None` | Path to a Playwright storage-state JSON file (cookies + localStorage) loaded at launch; see [Authenticated sites](#authenticated-sites). |
+| `storage_state` | `None` | Playwright storage state (cookies + localStorage) loaded at launch; see [Authenticated sites](#authenticated-sites). |
+| `cdp_url` | `None` | Attach to a Chromium already running at this CDP endpoint instead of launching one; see [Attaching to a running browser](#attaching-to-a-running-browser). |
 
 ## Authenticated sites
 
-Pass `storage_state` to start the browser already logged in. It is the path to a
-Playwright [storage state](https://playwright.dev/python/docs/auth) JSON file
-(cookies plus localStorage) loaded into the browser context at launch, so the
-first navigation is already authenticated.
+Pass `storage_state` to start the browser already logged in. It is a Playwright
+[storage state](https://playwright.dev/python/docs/auth) object -- cookies plus
+localStorage -- loaded into the browser context at launch, so the first
+navigation is already authenticated.
 
-Produce the file once by logging in by hand, either with the Playwright CLI:
+Capture it once, in your own code, by logging in with a visible browser:
 
-```bash
-playwright codegen https://example.com --save-storage=auth.json
+```python
+from playwright.async_api import async_playwright
+
+
+async def capture_state() -> object:
+    async with async_playwright() as pw:
+        browser = await pw.chromium.launch(headless=False)
+        context = await browser.new_context()
+        page = await context.new_page()
+        await page.goto('https://example.com/login')
+        # log in by hand in the window that opened
+        state = await context.storage_state()
+        await browser.close()
+        return state
 ```
 
-or from your own script with `context.storage_state(path='auth.json')`. Then
-point the capability at it:
+`playwright codegen https://example.com --save-storage=auth.json` writes the same
+structure to a file, which you load with `json.loads(Path('auth.json').read_text())`.
+Either way, hand the object to the capability:
+
+```python
+from pydantic_ai import Agent
+from pydantic_ai_harness.playwright import PlaywrightBrowser
+
+state = ...  # captured above
+
+agent = Agent(
+    'anthropic:claude-sonnet-4-6',
+    capabilities=[
+        PlaywrightBrowser(storage_state=state, allowed_domains=['example.com']),
+    ],
+)
+```
+
+The option takes an object rather than a path because agents commonly run in
+shared environments where the local filesystem is not somewhere to put anything
+durable: where the state lives is your decision, not the capability's. For the
+same reason `PlaywrightBrowser.from_spec` does not accept `storage_state` --
+a spec would carry the cookies into whatever stores it. Set it on the
+constructed capability instead.
+
+The capability runs headless by default and does not drive the login flow
+itself: you capture the state out of band. The usual pattern is to log in once
+with a visible browser, then reuse the state for headless runs.
+
+Treat the state as credential material: it can impersonate the account. Keep it
+out of source control and out of logs, store it with restrictive permissions if
+you do persist it, and discard it when the session expires. This mirrors
+Playwright's own [auth-guide](https://playwright.dev/python/docs/auth) warning.
+Prefer a minimal-scope state (log in to only the target site when capturing it)
+over reusing a full browser profile.
+
+## Attaching to a running browser
+
+Set `cdp_url` to connect to a Chromium that is already running at a
+[Chrome DevTools Protocol](https://playwright.dev/python/docs/api/class-browsertype#browser-type-connect-over-cdp)
+endpoint instead of launching one:
 
 ```python
 from pydantic_ai import Agent
@@ -118,26 +170,22 @@ from pydantic_ai_harness.playwright import PlaywrightBrowser
 
 agent = Agent(
     'anthropic:claude-sonnet-4-6',
-    capabilities=[
-        PlaywrightBrowser(storage_state='auth.json', allowed_domains=['example.com']),
-    ],
+    capabilities=[PlaywrightBrowser(cdp_url='http://localhost:9222')],
 )
 ```
 
-The capability runs headless by default and does not drive the login flow
-itself: you produce the state file out of band. The usual pattern is to log in
-once with a visible browser (`playwright codegen`, or your own Playwright
-script) to write the file, then reuse it for headless runs.
+No local Chromium binary is involved, so the install hint and
+`auto_install_chromium` do not apply. This is what managed-browser providers and
+benchmark harnesses expect: they start a browser and hand you its endpoint.
 
-Treat the state file as credential material: it can impersonate the account.
-gitignore it, never commit it, store it with restrictive permissions, and delete
-it when the session expires. This mirrors Playwright's own
-[auth-guide](https://playwright.dev/python/docs/auth) warning. Prefer a
-minimal-scope file (log in to only the target site when producing it) over
-sharing a full browser profile. Attaching the agent to your real running Chrome
-(the browser-extension or connect-to-Chrome approach) is the higher-risk
-alternative: it exposes every session that browser is logged into, so prefer the
-scoped state file.
+The run still gets its own browser context, so `storage_state`, the domain
+allowlist, and the private-address block apply exactly as they do for a launched
+browser, and the agent does not inherit the sessions already open in that
+Chrome. Pointing `cdp_url` at your personal everyday browser is still the
+higher-risk choice -- that process holds every account you are logged into, and
+anything the agent can reach through it is reachable in one prompt injection.
+Prefer a browser started for the agent, with a scoped `storage_state`. Provider
+endpoints sometimes embed an auth token in the URL; treat those as secrets.
 
 ## Lifecycle
 

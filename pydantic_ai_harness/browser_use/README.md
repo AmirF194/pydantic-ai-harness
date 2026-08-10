@@ -21,6 +21,9 @@ a browser on first run when none is found locally.
 
 ## The problem
 
+[`PlaywrightBrowser`](../playwright/) is that low-level surface in this repo, and
+the two capabilities are complementary rather than alternatives.
+
 Low-level browser tools (goto, click a selector, extract text) work well when
 the flow is known: the host model decides every action, which is cheap and
 deterministic. On an unknown page layout or a fuzzy goal ("find the price of

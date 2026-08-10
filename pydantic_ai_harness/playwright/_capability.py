@@ -37,6 +37,7 @@ if TYPE_CHECKING:
     from playwright.async_api import Playwright as PlaywrightDriver
     from playwright.async_api import Request as PlaywrightRequest
     from playwright.async_api import Route as PlaywrightRoute
+    from playwright.async_api import StorageState
     from pydantic_ai.agent import AbstractAgent
 
 _CHROMIUM_MISSING_MESSAGE = (
@@ -137,7 +138,8 @@ class PlaywrightBrowser(AbstractCapability[AgentDepsT]):
     tool pay no Playwright cost. When the Chromium binary is missing the tools are
     hidden from the model and calling one raises with a `playwright install
     chromium` hint; set `auto_install_chromium=True` to fetch it automatically
-    instead.
+    instead. Set `cdp_url` to attach to a Chromium that is already running
+    (managed-browser providers, benchmark harnesses) rather than launching one.
 
     Durable execution (e.g. `TemporalDurability`) is not supported: durability
     replays tool calls as activities and a live Chromium page cannot survive
@@ -186,14 +188,33 @@ class PlaywrightBrowser(AbstractCapability[AgentDepsT]):
     clear install hint. Set `True` to opt into the automatic download instead.
     """
 
-    storage_state: str | None = None
-    """Path to a Playwright storage state JSON file (cookies, localStorage).
+    storage_state: StorageState | None = None
+    """Playwright storage state (cookies, localStorage) loaded into the browser context at launch.
 
-    Produced by `context.storage_state(path=...)` or
-    `playwright codegen --save-storage`, and loaded into the browser context at
-    launch so the agent starts with that session. The file is credential
-    material -- treat it as a secret: never commit it, and delete it when the
-    session expires.
+    Obtain it in your own code -- `await context.storage_state()`, or
+    `json.loads(Path('auth.json').read_text())` for a file written by
+    `playwright codegen --save-storage` -- so the login runs where you control
+    it and the credentials never have to reach wherever the agent runs. This is
+    session material equivalent to the account: keep it out of source control
+    and out of logs, and discard it when the session expires.
+
+    An object rather than a path so the capability never assumes a filesystem it
+    can read: agents often run where the local disk is neither durable nor
+    writable, so where the state lives stays the caller's decision. For the same
+    reason `from_spec` does not accept it.
+    """
+
+    cdp_url: str | None = None
+    """Attach to a Chromium already running at this Chrome DevTools Protocol endpoint.
+
+    When set, the capability connects instead of launching, so no local Chromium
+    binary is needed and `auto_install_chromium` does not apply. Used for
+    managed-browser providers and benchmark harnesses that hand the agent a
+    browser. A new browser context is still created for the run, so
+    `storage_state` and the egress guards apply as they do for a launched
+    browser, and the run does not inherit the sessions already open in that
+    Chrome. Provider endpoints sometimes carry an auth token in the URL; treat
+    those as secrets.
     """
 
     _state: PlaywrightBrowserState = field(default_factory=PlaywrightBrowserState, init=False, repr=False)
@@ -337,7 +358,9 @@ class PlaywrightBrowser(AbstractCapability[AgentDepsT]):
             nonlocal entered
             pw = await pw_cm.__aenter__()
             entered = True
-            if not os.path.exists(pw.chromium.executable_path):
+            if self.cdp_url is not None:
+                browser = await pw.chromium.connect_over_cdp(self.cdp_url)
+            elif not os.path.exists(pw.chromium.executable_path):
                 # Binary genuinely absent: raise a clear install hint, or fetch it
                 # when opted in. A launch failure with the binary present (sandbox,
                 # missing system libs, no display) is left to surface as its own
@@ -398,12 +421,14 @@ class PlaywrightBrowser(AbstractCapability[AgentDepsT]):
         max_content_tokens: int = DEFAULT_MAX_CONTENT_TOKENS,
         timeout_ms: int = DEFAULT_TIMEOUT_MS,
         auto_install_chromium: bool = False,
-        storage_state: str | None = None,
+        cdp_url: str | None = None,
     ) -> PlaywrightBrowser[AgentDepsT]:
         """Construct the capability from serializable spec options (all fields are plain scalars/lists).
 
-        `storage_state` is a path string, which is spec-safe: the secret lives in
-        the referenced file, not in the spec.
+        A spec carries connection configuration, not session credentials:
+        `storage_state` is deliberately absent, so a spec naming it raises rather
+        than moving cookies into whatever stores the spec. Set it on the
+        constructed capability instead.
         """
         return cls(
             headless=headless,
@@ -413,5 +438,5 @@ class PlaywrightBrowser(AbstractCapability[AgentDepsT]):
             max_content_tokens=max_content_tokens,
             timeout_ms=timeout_ms,
             auto_install_chromium=auto_install_chromium,
-            storage_state=storage_state,
+            cdp_url=cdp_url,
         )

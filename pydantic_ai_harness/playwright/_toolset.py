@@ -6,11 +6,13 @@ vendor's schedule and that the mocked tests do not exercise. Re-verify against t
 installed package and the linked sources before changing version, selector, or
 teardown handling; bump the date when a fact still holds, update code and date
 together when it changed. Pinned in the `[playwright]` extra as
-`playwright>=1.61.0` (pyproject.toml); all facts verified against 1.61.0.
+`playwright>=1.61.0` (pyproject.toml). Every fact below was verified against
+1.61.0, and the signature-checkable ones re-verified against 1.62.0 on 2026-08-10.
 
 - `page.aria_snapshot(mode='ai')` returns an agent-oriented tree whose nodes carry
-  `[ref=eN]` handles. `mode` accepts `Literal['ai', 'default']` in 1.61.0; the
-  `ref` attributes have shipped since Playwright 1.52. Verified 2026-07-24.
+  `[ref=eN]` handles. `mode` accepts `Literal['ai', 'default'] | None` through
+  1.62.0; the `ref` attributes have shipped since Playwright 1.52. Verified
+  2026-08-10.
   Source: <https://playwright.dev/python/docs/aria-snapshots>. Re-check:
   `inspect.signature(playwright.async_api.Page.aria_snapshot)` still offers 'ai'.
 - The `aria-ref=eN` handles from that snapshot are resolvable by the `aria-ref=`
@@ -20,13 +22,15 @@ together when it changed. Pinned in the `[playwright]` extra as
   `snapshot` ref back into `click` against a live page, or grep the installed
   driver bundle for `aria-ref`.
 - `browser.new_context(service_workers='block')` disables page service workers;
-  the option is `Literal['allow', 'block'] | None` in 1.61.0. Verified 2026-07-24.
+  the option is `Literal['allow', 'block'] | None` through 1.62.0. Verified
+  2026-08-10.
   Source: <https://playwright.dev/python/docs/api/class-browsercontext>
   (`serviceWorkers` option). Re-check: inspect the `service_workers` parameter of
   `Browser.new_context`.
-- `TargetClosedError` is not re-exported from `playwright.async_api` in 1.61.0; it
-  lives at `playwright._impl._errors`. A driver-raised instance only carries
-  `.name`, so `isinstance` is the reliable discriminator. Verified 2026-07-24.
+- `TargetClosedError` is not re-exported from `playwright.async_api` through
+  1.62.0; it lives at `playwright._impl._errors`. A driver-raised instance only
+  carries `.name`, so `isinstance` is the reliable discriminator. Verified
+  2026-08-10.
   Source: <https://github.com/microsoft/playwright-python> (async_api `__init__`).
   Re-check: `hasattr(playwright.async_api, 'TargetClosedError')` (expect `False`);
   if it becomes `True`, switch to the public import.
