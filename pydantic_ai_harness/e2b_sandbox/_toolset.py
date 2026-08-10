@@ -16,7 +16,6 @@ from pydantic_ai.toolsets import AbstractToolset, FunctionToolset
 from typing_extensions import Self
 
 from pydantic_ai_harness.e2b_sandbox._session import (
-    DEFAULT_SANDBOX_TIMEOUT,
     E2BSandboxError,
     E2BSandboxSession,
     E2BSandboxTerminalError,
@@ -147,12 +146,9 @@ class E2BSandboxToolset(FunctionToolset[AgentDepsT]):
         if timeout_seconds is not None and (not math.isfinite(timeout_seconds) or timeout_seconds <= 0):
             raise ModelRetry(f'timeout_seconds must be greater than 0, got {timeout_seconds}.')
         requested = timeout_seconds if timeout_seconds is not None else self._default_command_timeout
-        reused = self._external_session is not None or self._sandbox_id is not None
-        ceiling = (
-            self._max_command_timeout
-            if self._max_command_timeout is not None
-            else (DEFAULT_SANDBOX_TIMEOUT if reused else self._sandbox_timeout)
-        )
+        # In reuse modes capability validation pins `sandbox_timeout` to its default, so
+        # this is the documented 300s ceiling there and the sandbox lifetime when owned.
+        ceiling = self._max_command_timeout if self._max_command_timeout is not None else self._sandbox_timeout
         return min(max(1, math.ceil(requested)), ceiling)
 
     def _truncate_stream(self, text: str, already_truncated: bool, *, direction: Literal['head', 'tail']) -> str:
@@ -171,6 +167,8 @@ class E2BSandboxToolset(FunctionToolset[AgentDepsT]):
         timeout_seconds: float | None = None,
     ) -> str:
         """Run a Bash command in the sandbox and return bounded output.
+
+        A non-zero exit is reported in the output, not raised, so the model can react to it.
 
         Args:
             command: The Bash command to run.

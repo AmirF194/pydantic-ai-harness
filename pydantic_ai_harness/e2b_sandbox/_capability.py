@@ -27,28 +27,35 @@ if TYPE_CHECKING:
     from pydantic_ai.agent.abstract import AbstractAgent
 
 _DEFAULT_MAX_READ_BYTES = 5 * 1024 * 1024
-_DURABILITY_BASE = ('pydantic_ai.durable_exec._base', 'BaseDurabilityCapability')
 
 _OWNED_INSTRUCTIONS = (
     'You have an E2B sandbox: an isolated, ephemeral cloud computer. Use `run_command` to run '
     'Bash commands, and `read_file` / `write_file` / `list_directory` to manage files. '
-    'A command times out after {default_timeout}s unless you pass `timeout_seconds` '
-    '(up to {max_timeout}s). The sandbox is reset between runs, so persist anything important elsewhere.'
+    'Commands run through Bash, so pipes and redirection work. A command times out after '
+    '{default_timeout}s unless you pass `timeout_seconds` (up to {max_timeout}s). The sandbox '
+    'is reset between runs, so persist anything important elsewhere.'
 )
 
 _REUSED_INSTRUCTIONS = (
     'You have an E2B sandbox: an isolated cloud computer. Use `run_command` to run Bash commands, '
-    'and `read_file` / `write_file` / `list_directory` to manage files. A command times out after '
-    '{default_timeout}s unless you pass `timeout_seconds` (up to {max_timeout}s). This sandbox '
-    'persists across runs, so files from earlier runs can still be present.'
+    'and `read_file` / `write_file` / `list_directory` to manage files. Commands run through Bash, '
+    'so pipes and redirection work. A command times out after {default_timeout}s unless you pass '
+    '`timeout_seconds` (up to {max_timeout}s). This sandbox persists across runs, so files from '
+    'earlier runs can still be present.'
 )
 
 
 def _durability_engines(capabilities: Iterable[AbstractCapability[Any]]) -> set[str]:
-    """Name the durable execution engines among `capabilities` (e.g. Temporal, DBOS)."""
+    """Name the durable execution engines among `capabilities` (e.g. Temporal, DBOS).
+
+    Durability capabilities are the `innermost` ordering tier by definition (see
+    `AbstractCapability.get_ordering`), so the public ordering declaration identifies
+    them without importing any engine.
+    """
     engines: set[str] = set()
     for capability in capabilities:
-        if any((base.__module__, base.__name__) == _DURABILITY_BASE for base in type(capability).__mro__):
+        ordering = capability.get_ordering()
+        if ordering is not None and ordering.position == 'innermost':
             engines.add(type(capability).__name__.removesuffix('Durability'))
     return engines
 
@@ -82,7 +89,13 @@ class E2BSandbox(AbstractCapability[AgentDepsT]):
     """E2B template name or id for newly created sandboxes. None uses E2B's default."""
 
     sandbox_id: str | None = None
-    """Attach to an existing sandbox instead of creating one. It will not be killed."""
+    """Attach to an existing sandbox by id instead of creating one. Attached sandboxes are not killed.
+
+    Use this to reuse a sandbox created elsewhere (e.g. via the E2B dashboard or SDK). The
+    settings that only apply when creating a sandbox (`template`, `sandbox_timeout`, `env`,
+    `metadata`, `allow_internet_access`) cannot be combined with `sandbox_id`. Unlike
+    creation settings, `workdir` still applies: E2B sets it per command, not at creation.
+    """
 
     session: E2BSandboxSession | None = None
     """Use a caller-owned, already-open session without opening or closing it."""
@@ -106,16 +119,41 @@ class E2BSandbox(AbstractCapability[AgentDepsT]):
     """Default maximum runtime in seconds for one command."""
 
     max_command_timeout: int | None = None
-    """Hard per-command ceiling. Reused sandboxes default to 300 seconds."""
+    """Hard ceiling in seconds for any single `run_command`, including a model-supplied
+    `timeout_seconds`. None falls back to `sandbox_timeout`.
+
+    An owned command cannot outlive `sandbox_timeout` anyway, so the default ceiling is
+    exact for owned sandboxes. For an attached or injected sandbox the fallback is pinned
+    to the default (300s), because the capability does not know the real lifetime of a
+    sandbox it did not create. So every command there is capped at 300s unless you set
+    `max_command_timeout` to the value the sandbox actually allows.
+    """
 
     max_output_bytes: int = DEFAULT_MAX_BYTES
-    """Maximum stdout, stderr, or file-read payload retained in UTF-8 bytes."""
+    """Maximum payload retained per command stream or file read, measured in UTF-8 bytes.
+
+    For commands the cap applies to stdout and stderr separately, both inside the sandbox
+    (each capture file retains at most this many bytes) and in the tool output, so a large
+    stderr cannot crowd out stdout. Labels, truncation notes, continuation offsets,
+    timeouts, and exit codes add a small amount beyond this payload limit. Whichever of
+    `max_output_bytes` and `max_output_lines` is reached first wins.
+    """
 
     max_output_lines: int = DEFAULT_MAX_LINES
-    """Maximum payload lines returned by each command stream or file tool."""
+    """Maximum payload lines retained per command stream or file read, alongside `max_output_bytes`.
+
+    A second cap so many short lines cannot pile up under the byte budget. Whichever cap is
+    reached first wins. Labels and truncation or status notes can add lines beyond this
+    payload limit.
+    """
 
     max_read_bytes: int = _DEFAULT_MAX_READ_BYTES
-    """Maximum file size streamed into client memory by `read_file`."""
+    """Largest file `read_file` will read whole; larger files are refused with a hint to use shell tools.
+
+    The tool checks E2B file metadata first and then streams at most this many bytes plus
+    one into client memory, so a file that grows after the metadata check still cannot
+    create an unbounded client buffer.
+    """
 
     instructions: str | None = None
     """Model instructions. None uses mode-aware defaults; an empty string disables them."""
@@ -135,7 +173,7 @@ class E2BSandbox(AbstractCapability[AgentDepsT]):
             if conflicts:
                 raise ValueError(
                     f'{", ".join(conflicts)} cannot be combined with `session`, which already owns '
-                    'the sandbox and its configuration.'
+                    'the sandbox and its configuration.' + self._command_ceiling_hint(conflicts)
                 )
             return
 
@@ -145,14 +183,20 @@ class E2BSandbox(AbstractCapability[AgentDepsT]):
                 raise ValueError(
                     f'{", ".join(conflicts)} only apply when creating a sandbox, but `sandbox_id` attaches '
                     'to an existing one. Remove them, or drop `sandbox_id` to create a sandbox.'
+                    + self._command_ceiling_hint(conflicts)
                 )
             return
 
+        # Owned mode: a command cannot outlive the sandbox, so a ceiling above the sandbox
+        # lifetime is a dead value. In attach/injected modes a higher ceiling is the
+        # documented escape hatch for sandboxes whose real lifetime exceeds the pinned
+        # default, so no check there.
         ceiling = self.max_command_timeout
         if ceiling is not None and ceiling > self.sandbox_timeout:
             raise ValueError(
                 f'max_command_timeout ({ceiling}) cannot exceed sandbox_timeout '
-                f'({self.sandbox_timeout}) for an owned sandbox.'
+                f'({self.sandbox_timeout}) for an owned sandbox: the sandbox is reaped '
+                'before such a command could finish. Raise sandbox_timeout instead.'
             )
 
     def for_agent(self, agent: AbstractAgent[AgentDepsT, Any]) -> Self:
@@ -196,6 +240,17 @@ class E2BSandbox(AbstractCapability[AgentDepsT]):
         if self.instructions is not None and type(self.instructions) is not str:
             raise ValueError(f'instructions must be a string or None, got {self.instructions!r}.')
 
+    def _command_ceiling_hint(self, rejected: list[str]) -> str:
+        """Redirect a rejected `sandbox_timeout` to the setting that works in reuse modes.
+
+        `sandbox_timeout` is the natural-but-wrong reach for "let commands run longer" on a
+        reused sandbox (it only sizes an owned sandbox's lifetime). The per-command ceiling
+        there is `max_command_timeout`, so point the user at it instead of just rejecting.
+        """
+        if 'sandbox_timeout' not in rejected:
+            return ''
+        return ' To raise the per-command timeout ceiling on a reused sandbox, set `max_command_timeout`.'
+
     def _non_default_creation_settings(self) -> list[str]:
         return [
             name
@@ -221,11 +276,9 @@ class E2BSandbox(AbstractCapability[AgentDepsT]):
             return self.instructions or None
         reused = self.sandbox_id is not None or self.session is not None
         template = _REUSED_INSTRUCTIONS if reused else _OWNED_INSTRUCTIONS
-        ceiling = (
-            self.max_command_timeout
-            if self.max_command_timeout is not None
-            else (DEFAULT_SANDBOX_TIMEOUT if reused else self.sandbox_timeout)
-        )
+        # In reuse modes validation pins `sandbox_timeout` to its default, so this is the
+        # documented 300s ceiling there and the exact sandbox lifetime when owned.
+        ceiling = self.max_command_timeout if self.max_command_timeout is not None else self.sandbox_timeout
         default_timeout = min(max(1, math.ceil(self.default_command_timeout)), ceiling)
         return template.format(default_timeout=default_timeout, max_timeout=ceiling)
 

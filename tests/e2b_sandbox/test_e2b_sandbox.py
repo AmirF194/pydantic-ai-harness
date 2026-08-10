@@ -13,7 +13,7 @@ from opentelemetry.sdk.trace.export import SimpleSpanProcessor
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 from opentelemetry.trace import NoOpTracer, Tracer
 from pydantic_ai import Agent, RunContext
-from pydantic_ai.capabilities import AbstractCapability, Capability
+from pydantic_ai.capabilities import AbstractCapability, Capability, CapabilityOrdering
 from pydantic_ai.exceptions import ModelRetry, UserError
 from pydantic_ai.messages import ModelMessage, ModelResponse, TextPart, ToolCallPart, ToolReturnPart
 from pydantic_ai.models.function import AgentInfo, FunctionModel
@@ -41,14 +41,15 @@ from .fake_e2b import (
 )
 
 
-class BaseDurabilityCapability(AbstractCapability[Any]):
-    """Match the stable base-class identity without importing Prefect."""
+class PrefectDurability(AbstractCapability[Any]):
+    """Dependency-free representative of Prefect's concrete wrapper.
 
-    __module__ = 'pydantic_ai.durable_exec._base'
+    Durability capabilities declare the `innermost` ordering tier; that public
+    declaration is what `E2BSandbox` detects, so no engine import is needed.
+    """
 
-
-class PrefectDurability(BaseDurabilityCapability):
-    """Dependency-free representative of Prefect's concrete wrapper."""
+    def get_ordering(self) -> CapabilityOrdering:
+        return CapabilityOrdering(position='innermost')
 
 
 @runtime_checkable
@@ -234,7 +235,7 @@ class TestFiles:
                 await tools.read_file('/large')
             fake_e2b.sandboxes[0].files.stat_sizes['/growing'] = 5
             fake_e2b.sandboxes[0].files.files['/growing'] = b'123456'
-            with pytest.raises(ModelRetry, match='grew beyond'):
+            with pytest.raises(ModelRetry, match='exceeds the 5-byte read limit'):
                 await tools.read_file('/growing')
 
     @pytest.mark.parametrize(

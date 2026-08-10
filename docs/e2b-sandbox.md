@@ -80,7 +80,10 @@ agent = Agent(
 ```
 
 Without Pydantic AI instrumentation, capability-managed sessions use the run's
-no-op tracer and the added operation spans have negligible overhead.
+no-op tracer and the added operation spans have negligible overhead. A directly
+constructed `E2BSandboxSession` instead defaults to the global OpenTelemetry
+tracer, so its lifecycle spans reach any globally configured provider; pass
+`tracer=` to override that.
 
 ## Lifecycle
 

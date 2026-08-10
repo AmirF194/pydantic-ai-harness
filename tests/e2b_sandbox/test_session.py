@@ -409,7 +409,7 @@ class TestFiles:
     async def test_stream_read_stops_over_limit(self, fake_e2b: FakeE2B) -> None:
         async with E2BSandboxSession() as session:
             fake_e2b.sandboxes[0].files.files['/big'] = b'abcdefgh'
-            with pytest.raises(E2BSandboxError, match='grew beyond'):
+            with pytest.raises(E2BSandboxError, match='exceeds the 5-byte read limit'):
                 await session.read_bytes('/big', max_bytes=5)
 
     async def test_invalid_stream_limit(self, fake_e2b: FakeE2B) -> None:

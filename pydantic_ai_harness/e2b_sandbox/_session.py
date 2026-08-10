@@ -190,7 +190,7 @@ class _E2BSandboxReadTooLargeError(E2BSandboxError):
     def __init__(self, *, size_bytes: int, max_bytes: int) -> None:
         self.size_bytes = size_bytes
         self.max_bytes = max_bytes
-        super().__init__(f'File grew beyond the {max_bytes}-byte read limit.')
+        super().__init__(f'File exceeds the {max_bytes}-byte read limit.')
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -202,11 +202,16 @@ class E2BSandboxExecResult:
 
     stderr: str
     """Retained stderr: the bounded tail, or the bounded prefix when `timed_out` is set."""
+
     returncode: int
+    """The command's exit status. A timed-out command reports the synthetic 124 (as `timeout(1)` does)."""
+
     stdout_truncated: bool = False
     stderr_truncated: bool = False
     timed_out: bool = False
-    applied_timeout: int | None = None
+
+    applied_timeout: int
+    """The timeout in seconds that was enforced for this command."""
 
 
 def _capture_wrapper(temp_dir: str, max_output_bytes: int) -> str:
