@@ -242,6 +242,19 @@ def blocked_navigation_reason(url: str, allowed_domains: list[str] | None, block
     return None
 
 
+def refused_in_every_frame(url: str, block_private_addresses: bool) -> bool:
+    """Whether `url` must be refused in any frame, not just the top-level document.
+
+    The private-address block is absolute: `snapshot()` reads the ARIA tree of
+    cross-origin child frames, so letting a subframe load
+    `http://169.254.169.254/` would hand the model the very response body the
+    block exists to withhold. The allowlist stays top-level, where a page's own
+    third-party frames (identity providers, payment steps) keep working.
+    """
+    host = _url_host(url)
+    return block_private_addresses and host is not None and is_blocked_address(host)
+
+
 def _truncate(text: str, max_chars: int) -> str:
     """Cap tool output at `max_chars`, keeping the head where the substance sits."""
     if len(text) <= max_chars:

@@ -216,14 +216,20 @@ re-checks the resulting URL and bounces to `about:blank` so disallowed content
 never reaches the model. Service workers are blocked in the browser context so
 their traffic cannot slip past the route guard.
 
+The two policies differ in how far down the frame tree they reach. The
+allowlist governs top-level navigation only, so a page's own third-party frames
+(identity providers, payment steps) still load. The private-address block
+applies to **every** frame, because `snapshot()` reads the ARIA tree of
+cross-origin child frames, and a subframe pointed at `169.254.169.254` would
+otherwise hand the model the response body the block exists to withhold.
+
 Neither policy is a general security boundary. Microsoft's own playwright-mcp
-disclaims its origin filter the same way. Both govern page navigation
-(top-level document requests), not requests initiated by in-page JavaScript
-(`fetch`/XHR via `execute_js`); the private-address block matches IP literals
-and `localhost` names, not hostnames that resolve to private addresses (DNS
-rebinding); and WebSocket connections are not covered. Constraining in-page
-requests and resolution-based blocking are tracked in
-[#415](https://github.com/pydantic/pydantic-ai-harness/issues/415).
+disclaims its origin filter the same way. Both govern navigation, not requests
+initiated by in-page JavaScript (`fetch`/XHR via `execute_js`); the
+private-address block matches IP literals and `localhost` names, not hostnames
+that resolve to private addresses (DNS rebinding); and WebSocket connections are
+not covered. Constraining in-page requests and resolution-based blocking are
+tracked in [#415](https://github.com/pydantic/pydantic-ai-harness/issues/415).
 
 For untrusted-input scenarios, run the browser in a container or VM with an
 egress firewall, or front it with a proxy, and pair it with the harness's

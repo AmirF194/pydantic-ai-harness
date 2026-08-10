@@ -1343,6 +1343,13 @@ class TestPlaywrightBrowserHooks:
         assert browser.cdp_url is None
         assert browser.storage_state is None
 
+    def test_repr_omits_storage_state(self) -> None:
+        # `repr` reaches diagnostics and logs; session cookies must not ride along.
+        rendered = repr(PlaywrightBrowser[None](storage_state=_STORAGE_STATE, cdp_url='http://localhost:9222'))
+        assert 'abc' not in rendered
+        assert 'storage_state' not in rendered
+        assert 'http://localhost:9222' in rendered  # non-secret configuration still shows
+
     def test_from_spec_refuses_storage_state(self) -> None:
         # Session credentials stay out of a spec: naming it fails loudly rather
         # than moving cookies into whatever stores the spec.
@@ -1602,6 +1609,50 @@ class TestPlaywrightBrowserLifecycle:
         )
         assert popup_before_frame_creation.aborted is True
         assert popup_before_frame_creation.continued is False
+
+    async def test_route_guard_blocks_private_addresses_in_subframes(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # `snapshot()` reads the ARIA tree of cross-origin child frames (verified
+        # against real Chromium), so a private-IP subframe would hand the model
+        # the response body the block exists to withhold.
+        page = _FakePage()
+        _install_fake_driver(monkeypatch, page)
+        agent = Agent(
+            TestModel(call_tools=['screenshot']), capabilities=[PlaywrightBrowser(allowed_domains=['example.com'])]
+        )
+        await agent.run('screenshot the page')
+
+        host_page = _FakeRequestPage()
+        subframe = _FakeFrame(host_page)  # not `host_page.main_frame`
+
+        metadata = await page.context.dispatch(
+            _FakeRequest('http://169.254.169.254/latest/meta-data/', navigation=True, frame=subframe)
+        )
+        assert metadata.aborted is True
+        assert metadata.continued is False
+
+        # The allowlist stays top-level: a page's own third-party frames (identity
+        # providers, payment steps) still load.
+        third_party = await page.context.dispatch(
+            _FakeRequest('https://evil.com/embed', navigation=True, frame=subframe)
+        )
+        assert third_party.aborted is False
+        assert third_party.continued is True
+
+    async def test_route_guard_subframe_block_honors_opt_out(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        page = _FakePage()
+        _install_fake_driver(monkeypatch, page)
+        agent = Agent(
+            TestModel(call_tools=['screenshot']),
+            capabilities=[PlaywrightBrowser(allowed_domains=['example.com'], block_private_addresses=False)],
+        )
+        await agent.run('screenshot the page')
+
+        host_page = _FakeRequestPage()
+        local = await page.context.dispatch(
+            _FakeRequest('http://127.0.0.1:8080/panel', navigation=True, frame=_FakeFrame(host_page))
+        )
+        assert local.aborted is False
+        assert local.continued is True
 
     async def test_popup_is_closed_without_navigating_main_page(self, monkeypatch: pytest.MonkeyPatch) -> None:
         popup = _FakePage(url='https://example.com/popup')

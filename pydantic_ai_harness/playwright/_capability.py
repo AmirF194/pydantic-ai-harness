@@ -27,6 +27,7 @@ from pydantic_ai_harness.playwright._toolset import (
     PlaywrightError,
     async_playwright,
     blocked_navigation_reason,
+    refused_in_every_frame,
 )
 
 if TYPE_CHECKING:
@@ -126,8 +127,10 @@ class PlaywrightBrowser(AbstractCapability[AgentDepsT]):
     navigation to an allowlist. Independently, `block_private_addresses=True`
     (the default) refuses navigation to private, loopback, link-local, and other
     reserved IP literals (for example `169.254.169.254`, `127.0.0.1`, or
-    `localhost`), even under open egress. Both policies govern page navigation
-    (top-level document requests), not requests made by in-page JavaScript
+    `localhost`), even under open egress -- and unlike the allowlist, which
+    governs top-level navigation only, the private-address block applies to every
+    frame, since `snapshot` reads cross-origin child frames. Both policies govern
+    navigation, not requests made by in-page JavaScript
     (`fetch`/XHR via `execute_js`), and the private-address block matches IP
     literals rather than resolving hostnames; those gaps are tracked in
     https://github.com/pydantic/pydantic-ai-harness/issues/415. Set
@@ -188,7 +191,7 @@ class PlaywrightBrowser(AbstractCapability[AgentDepsT]):
     clear install hint. Set `True` to opt into the automatic download instead.
     """
 
-    storage_state: StorageState | None = None
+    storage_state: StorageState | None = field(default=None, repr=False)
     """Playwright storage state (cookies, localStorage) loaded into the browser context at launch.
 
     Obtain it in your own code -- `await context.storage_state()`, or
@@ -317,6 +320,9 @@ class PlaywrightBrowser(AbstractCapability[AgentDepsT]):
         permitted = blocked_navigation_reason(request.url, self.allowed_domains, self.block_private_addresses) is None
         if not request.is_navigation_request() or permitted:
             await route.continue_()
+            return
+        if refused_in_every_frame(request.url, self.block_private_addresses):
+            await route.abort()
             return
         try:
             frame = request.frame
