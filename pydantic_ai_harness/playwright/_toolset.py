@@ -66,6 +66,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Literal, Protocol, TypeVar
 from urllib.parse import urlparse
 
+import idna
 from pydantic_ai.messages import BinaryContent, ToolReturn
 from pydantic_ai.tools import AgentDepsT
 from pydantic_ai.toolsets import FunctionToolset
@@ -169,17 +170,23 @@ class _Page(Protocol):
 def _to_idna(host: str) -> str:
     """Return `host` in its ASCII/IDNA form so Unicode and `xn--` spellings compare equal.
 
-    A host that cannot be IDNA-encoded (over-long or empty labels, IP literals)
-    falls back to the input unchanged, so IPv4/IPv6 literals are left alone. The
-    trailing dot of a fully-qualified spelling is dropped first: it names the DNS
-    root rather than a label, and `encode('idna')` rejects the empty label it
-    produces, which would otherwise deny `example.com.` against an `example.com`
-    allowlist entry.
+    Encoding goes through the `idna` package under UTS46 non-transitional rules,
+    which is what Chromium applies. The stdlib `'idna'` codec implements the older
+    IDNA-2003 mapping and disagrees on the deviation characters (`ß`, `ς`, ZWJ,
+    ZWNJ): it renders `faß.de` as `fass.de` where the browser connects to
+    `xn--fa-hia.de`, so an allowlist entry and the request it is meant to permit
+    would never match.
+
+    A host that cannot be encoded (over-long or empty labels, IP literals) falls
+    back to the input unchanged, so IPv4/IPv6 literals are left alone. The trailing
+    dot of a fully-qualified spelling is dropped first: it names the DNS root rather
+    than a label, and encoding rejects the empty label it produces, which would
+    otherwise deny `example.com.` against an `example.com` allowlist entry.
     """
     host = host.rstrip('.')
     try:
-        return host.encode('idna').decode('ascii')
-    except UnicodeError:
+        return idna.encode(host, uts46=True, transitional=False).decode('ascii')
+    except (idna.IDNAError, UnicodeError):
         return host
 
 
@@ -325,6 +332,26 @@ class NavigationPolicy:
         if self.block_private_addresses:
             domains += ' (private/internal addresses blocked)'
         return domains
+
+
+def _without_endpoint_credentials(message: str, cdp_url: str) -> str:
+    """Replace the CDP endpoint in `message` with a form carrying no credentials.
+
+    A failure to attach reaches the model as a tool result, and Playwright quotes
+    the endpoint it tried, call log included. Managed-browser providers routinely
+    put a token in that URL's query string or path, so only the scheme, host and
+    port survive -- enough to see which endpoint was unreachable, which the driver
+    reports separately anyway.
+    """
+    try:
+        parsed = urlparse(cdp_url)
+    except ValueError:  # pragma: no cover -- an unparsable endpoint cannot be redacted piecemeal
+        return message.replace(cdp_url, '<cdp_url>')
+    host = parsed.hostname or ''
+    if parsed.port is not None:
+        host = f'{host}:{parsed.port}'
+    safe = f'{parsed.scheme}://{host}' if parsed.scheme else host
+    return message.replace(cdp_url, safe)
 
 
 def _truncate(text: str, max_chars: int) -> str:
@@ -475,7 +502,10 @@ class PlaywrightBrowserSession:
         since a first-run browser fetch legitimately outlasts an action timeout.
         """
         if self._cdp_url is not None:
-            return await pw.chromium.connect_over_cdp(self._cdp_url, timeout=self._launch_timeout_ms)
+            try:
+                return await pw.chromium.connect_over_cdp(self._cdp_url, timeout=self._launch_timeout_ms)
+            except PlaywrightError as exc:
+                raise PlaywrightError(_without_endpoint_credentials(str(exc), self._cdp_url)) from exc
         if os.path.exists(pw.chromium.executable_path):
             return await pw.chromium.launch(headless=self._headless, timeout=self._launch_timeout_ms)
         # Binary genuinely absent: raise a clear install hint, or fetch it when

@@ -615,6 +615,20 @@ class TestPlaywrightBrowserTools:
         assert await toolset.click('button#go') == "Clicked 'button#go'. URL: about:blank\n\nHello body"
         assert 'no host' not in await toolset.execute_js('1 + 1')
 
+    def test_idna_matching_follows_chromium_not_the_stdlib_codec(self) -> None:
+        # The stdlib 'idna' codec maps the deviation characters the IDNA-2003 way
+        # ('faß.de' -> 'fass.de'), where Chromium connects to 'xn--fa-hia.de'. An
+        # allowlist that disagrees with the browser blocks the host it means to allow.
+        assert toolset_module.check_allowed_domain('https://faß.de/', ['faß.de']) is True
+        assert toolset_module.check_allowed_domain('https://xn--fa-hia.de/', ['faß.de']) is True
+        assert toolset_module.check_allowed_domain('https://faß.de/', ['fass.de']) is False
+
+    def test_undecodable_host_falls_back_to_the_original(self) -> None:
+        # An over-long label cannot be encoded; the comparison still has to return a
+        # verdict rather than raise, and an unencodable host matches nothing.
+        assert toolset_module.check_allowed_domain(f'https://{"a" * 64}.example.com/', ['example.com']) is True
+        assert toolset_module.check_allowed_domain('https://example.com/', [f'{"a" * 64}.com']) is False
+
     async def test_navigate_allows_trailing_dot_spelling_of_an_allowlisted_host(self) -> None:
         # The trailing dot names the DNS root, so the absolute spelling is the same host.
         page = _FakePage()
@@ -1887,13 +1901,41 @@ class TestPlaywrightBrowserLifecycle:
         # A dead cdp_url endpoint is a browser failure like any other: the model
         # gets a result it can act on instead of the run being aborted under it.
         page = _FakePage()
-        _install_fake_driver(monkeypatch, page, launch_error=TargetClosedError())
+        _install_fake_driver(monkeypatch, page, launch_error=PlaywrightError('connect ECONNREFUSED 127.0.0.1:9222'))
         agent = Agent(
             TestModel(call_tools=['screenshot']),
             capabilities=[PlaywrightBrowser(cdp_url='http://127.0.0.1:9222')],
         )
         result = await agent.run('screenshot the page')
-        assert 'closed unexpectedly' in str(result.all_messages())
+        assert 'Error: screenshot failed: connect ECONNREFUSED' in str(result.all_messages())
+
+    async def test_attach_failure_does_not_report_the_endpoint_credentials(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Managed-browser providers put a token in the cdp_url, and Playwright quotes
+        # the endpoint it tried. That message now reaches the model, so it must not
+        # carry the token; the host and port stay, since they name what was unreachable.
+        page = _FakePage()
+        endpoint = 'http://127.0.0.1:59999/?token=SUPERSECRET'
+        _install_fake_driver(
+            monkeypatch, page, launch_error=PlaywrightError(f'connect ECONNREFUSED, retrieving url from {endpoint}')
+        )
+        agent = Agent(TestModel(call_tools=['screenshot']), capabilities=[PlaywrightBrowser(cdp_url=endpoint)])
+        result = await agent.run('screenshot the page')
+        rendered = str(result.all_messages())
+        assert 'SUPERSECRET' not in rendered
+        assert 'token=' not in rendered
+        assert 'http://127.0.0.1:59999' in rendered
+
+    async def test_attach_failure_redacts_an_endpoint_without_a_scheme_or_port(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        page = _FakePage()
+        endpoint = 'browserless.example.com/session/SUPERSECRET'
+        _install_fake_driver(monkeypatch, page, launch_error=PlaywrightError(f'cannot reach {endpoint}'))
+        agent = Agent(TestModel(call_tools=['screenshot']), capabilities=[PlaywrightBrowser(cdp_url=endpoint)])
+        result = await agent.run('screenshot the page')
+        assert 'SUPERSECRET' not in str(result.all_messages())
 
     async def test_launch_failure_with_binary_present_surfaces_own_error(self, monkeypatch: pytest.MonkeyPatch) -> None:
         installs: list[bool] = []

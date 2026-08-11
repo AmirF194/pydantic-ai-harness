@@ -235,7 +235,9 @@ should reach a local app or an internal dashboard.
 
 With `allowed_domains=None` (the default) the agent can reach any public URL.
 **When the agent may act on untrusted input, set `allowed_domains` to an
-explicit allowlist.** Each entry matches its exact host and any subdomain. The
+explicit allowlist.** Each entry matches its exact host and any subdomain,
+compared in the ASCII form Chromium itself uses, so an internationalized host
+and its `xn--` spelling get the same verdict. The
 two policies are independent: an allowlisted private address is still refused
 until you opt out of `block_private_addresses`. Both are enforced at two
 layers: a network route guard aborts disallowed requests before they leave
