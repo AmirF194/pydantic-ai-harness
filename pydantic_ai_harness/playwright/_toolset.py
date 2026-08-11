@@ -417,9 +417,15 @@ class PlaywrightBrowserToolset(FunctionToolset[AgentDepsT]):
             raise PlaywrightTimeoutError(f'Timeout {timeout_ms}ms exceeded.') from exc
 
     def _timeout_error(self, timeout_ms: int | None) -> str | None:
-        """Return a bounded error when a per-call timeout override is negative, else `None`."""
-        if timeout_ms is not None and timeout_ms < 0:
-            return self._truncate_output('Error: timeout_ms must be greater than or equal to 0.')
+        """Return a bounded error when a per-call timeout override is not positive, else `None`.
+
+        `0` means "no deadline" to both Playwright and `_await_with_timeout`, so it
+        stays available to the developer as the capability default but is refused as
+        a per-call override: the model chooses that argument, and an injected page
+        could otherwise ask for an unbounded call that never returns.
+        """
+        if timeout_ms is not None and timeout_ms <= 0:
+            return self._truncate_output('Error: timeout_ms must be greater than 0.')
         return None
 
     def _oversized_screenshot_error(self, png: bytes) -> str | None:
@@ -456,6 +462,7 @@ class PlaywrightBrowserToolset(FunctionToolset[AgentDepsT]):
         Args:
             url: Full URL to navigate to (e.g. `https://example.com`).
             timeout_ms: Override the default action timeout for this call, in milliseconds.
+                Must be greater than 0.
 
         Returns:
             The page URL, title, and visible text. When `screenshot_on_navigate`
@@ -495,6 +502,7 @@ class PlaywrightBrowserToolset(FunctionToolset[AgentDepsT]):
                 from `snapshot` (the most reliable way to target an element), or
                 pixel coordinates as `'x,y'` (e.g. `'450,300'`).
             timeout_ms: Override the default action timeout for this call, in milliseconds.
+                Must be greater than 0.
 
         Returns:
             The page's visible text after the click.
@@ -533,6 +541,7 @@ class PlaywrightBrowserToolset(FunctionToolset[AgentDepsT]):
                 handle from `snapshot`.
             text: Text to type into the field.
             timeout_ms: Override the default action timeout for this call, in milliseconds.
+                Must be greater than 0.
 
         Returns:
             The page's visible text after typing.
@@ -555,6 +564,7 @@ class PlaywrightBrowserToolset(FunctionToolset[AgentDepsT]):
             full_page: Capture the full scrollable page when `True`, else the
                 current viewport.
             timeout_ms: Override the default action timeout for this call, in milliseconds.
+                Must be greater than 0.
 
         Returns:
             A short note with the page URL, and the PNG as image content so
@@ -582,6 +592,7 @@ class PlaywrightBrowserToolset(FunctionToolset[AgentDepsT]):
         Args:
             selector: CSS selector to read. Omit for the full page's visible text.
             timeout_ms: Override the default action timeout for this call, in milliseconds.
+                Must be greater than 0.
 
         Returns:
             The element's text, or the full page's visible text when no selector
@@ -613,6 +624,7 @@ class PlaywrightBrowserToolset(FunctionToolset[AgentDepsT]):
             x: Optional x coordinate to scroll from (paired with `y`).
             y: Optional y coordinate to scroll from (paired with `x`).
             timeout_ms: Override the default action timeout for this call, in milliseconds.
+                Must be greater than 0.
 
         Returns:
             The page's visible text after scrolling.
@@ -648,6 +660,7 @@ class PlaywrightBrowserToolset(FunctionToolset[AgentDepsT]):
 
         Args:
             timeout_ms: Override the default action timeout for this call, in milliseconds.
+                Must be greater than 0.
 
         Returns:
             The previous page's visible text.
@@ -674,6 +687,7 @@ class PlaywrightBrowserToolset(FunctionToolset[AgentDepsT]):
 
         Args:
             timeout_ms: Override the default action timeout for this call, in milliseconds.
+                Must be greater than 0.
 
         Returns:
             The next page's visible text.
@@ -701,6 +715,7 @@ class PlaywrightBrowserToolset(FunctionToolset[AgentDepsT]):
         Args:
             script: JavaScript expression to evaluate, e.g. `document.title`.
             timeout_ms: Override the default action timeout for this call, in milliseconds.
+                Must be greater than 0.
 
         Returns:
             A string result as-is, objects/arrays as JSON, `null`/`undefined` as
@@ -745,6 +760,7 @@ class PlaywrightBrowserToolset(FunctionToolset[AgentDepsT]):
             selector: CSS selector (or an `aria-ref=` handle) to wait for.
             text: Visible text to wait for, matched with Playwright's text engine.
             timeout_ms: Override the default action timeout for this call, in milliseconds.
+                Must be greater than 0.
 
         Returns:
             A short confirmation followed by the page's visible text, or a bounded
@@ -780,6 +796,7 @@ class PlaywrightBrowserToolset(FunctionToolset[AgentDepsT]):
 
         Args:
             timeout_ms: Override the default action timeout for this call, in milliseconds.
+                Must be greater than 0.
 
         Returns:
             The accessibility tree (truncated to the token budget), or a bounded

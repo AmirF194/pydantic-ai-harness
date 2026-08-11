@@ -60,7 +60,9 @@ manages the Chromium lifecycle for the run.
 | `execute_js` | `(script, timeout_ms=None)` | the JavaScript result (string as-is, objects as JSON, `null` as `undefined`) |
 
 Every page action accepts an optional `timeout_ms` to override the capability's
-default `timeout_ms` for that one call.
+default `timeout_ms` for that one call. An override has to be greater than 0:
+`0` disables the deadline entirely, which stays available as the capability
+default but not as an argument the model picks.
 
 `snapshot` returns the page's accessibility tree, the low-cost structured way for
 the model to read the page and obtain `aria-ref=eN` handles. Targeting an element
@@ -92,7 +94,7 @@ not raised to abort the agent run.
 | `block_private_addresses` | `True` | Refuse navigation to private, loopback, link-local, and other reserved IP literals (see [Egress](#egress-and-ssrf)). |
 | `screenshot_on_navigate` | `False` | Attach a screenshot to every `navigate` result. |
 | `max_content_tokens` | `4000` | Approximate token budget for every textual tool result. |
-| `timeout_ms` | `30000` | Default Playwright navigation/action timeout. |
+| `timeout_ms` | `30000` | Default Playwright navigation/action timeout. `0` disables it. |
 | `auto_install_chromium` | `False` | Fetch Chromium automatically when the binary is missing. |
 | `storage_state` | `None` | Playwright storage state (cookies + localStorage) loaded at launch; see [Authenticated sites](#authenticated-sites). |
 | `cdp_url` | `None` | Attach to a Chromium already running at this CDP endpoint instead of launching one; see [Attaching to a running browser](#attaching-to-a-running-browser). |

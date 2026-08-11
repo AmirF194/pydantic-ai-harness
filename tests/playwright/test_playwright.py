@@ -454,6 +454,7 @@ def _toolset(
     block_private_addresses: bool = True,
     screenshot_on_navigate: bool = False,
     max_content_tokens: int = DEFAULT_MAX_CONTENT_TOKENS,
+    timeout_ms: int = DEFAULT_TIMEOUT_MS,
 ) -> PlaywrightBrowserToolset[None]:
     """Build a toolset whose active page is the given double."""
     state = PlaywrightBrowserState()
@@ -464,6 +465,7 @@ def _toolset(
         block_private_addresses=block_private_addresses,
         screenshot_on_navigate=screenshot_on_navigate,
         max_content_tokens=max_content_tokens,
+        timeout_ms=timeout_ms,
     )
 
 
@@ -991,7 +993,7 @@ class TestPlaywrightErrorHandling:
         assert result == 'Error: go_forward failed: history unavailable'
 
 
-_NEGATIVE_TIMEOUT_CALLS: list[Callable[[PlaywrightBrowserToolset[None]], Awaitable[object]]] = [
+_NON_POSITIVE_TIMEOUT_CALLS: list[Callable[[PlaywrightBrowserToolset[None]], Awaitable[object]]] = [
     lambda t: t.navigate('https://example.com/', timeout_ms=-1),
     lambda t: t.click('button', timeout_ms=-1),
     lambda t: t.type_text('input', 'x', timeout_ms=-1),
@@ -1018,8 +1020,8 @@ class TestPerCallTimeout:
             'screenshot': 1111,
         }
 
-    async def test_zero_timeout_disables_title_deadline(self) -> None:
-        result = await _toolset(_FakePage()).navigate('https://example.com/', timeout_ms=0)
+    async def test_zero_capability_default_disables_title_deadline(self) -> None:
+        result = await _toolset(_FakePage(), timeout_ms=0).navigate('https://example.com/')
         assert isinstance(result, str)
         assert result.startswith('URL:')
 
@@ -1083,12 +1085,18 @@ class TestPerCallTimeout:
         await _toolset(page).click('button#go')
         assert page.timeouts['click'] == DEFAULT_TIMEOUT_MS
 
-    @pytest.mark.parametrize('call', _NEGATIVE_TIMEOUT_CALLS)
-    async def test_negative_override_returns_bounded_error(
+    @pytest.mark.parametrize('call', _NON_POSITIVE_TIMEOUT_CALLS)
+    async def test_non_positive_override_returns_bounded_error(
         self, call: Callable[[PlaywrightBrowserToolset[None]], Awaitable[object]]
     ) -> None:
         result = await call(_toolset(_FakePage()))
-        assert result == 'Error: timeout_ms must be greater than or equal to 0.'
+        assert result == 'Error: timeout_ms must be greater than 0.'
+
+    async def test_zero_override_cannot_disable_the_deadline(self) -> None:
+        # 0 means "no deadline" to Playwright, so the model-chosen override refuses it
+        # even though the developer-set capability default may use it.
+        result = await _toolset(_HangingEvaluatePage()).execute_js('new Promise(() => {})', timeout_ms=0)
+        assert result == 'Error: timeout_ms must be greater than 0.'
 
 
 class TestWaitFor:
