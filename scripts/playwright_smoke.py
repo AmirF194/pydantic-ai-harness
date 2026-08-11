@@ -7,10 +7,13 @@ it after installing the browser binary to verify the real integration end to end
     playwright install chromium
     uv run python scripts/playwright_smoke.py
 
-It exercises the public `PlaywrightBrowser` surface and checks five things:
+It exercises the public `PlaywrightBrowser` surface and checks six things:
 
 - lazy launch plus a real navigation to https://example.com (prints the title),
 - the allowlist bounce (a disallowed host returns an error result, not content),
+- the private-address block against a real local server, including the decimal
+  spelling of an IP (which only Chromium's canonicalization resolves) and an
+  in-page `fetch`, each with an opt-out control proving the server is reachable,
 - a `storage_state` round-trip: a cookie captured from a real context is visible
   to the agent after relaunching the capability with that state,
 - attaching over `cdp_url` to a browser that already holds a session: the run gets
@@ -41,6 +44,7 @@ from pydantic_ai.models.function import AgentInfo, FunctionModel
 from pydantic_ai_harness.playwright import PlaywrightBrowser
 
 _COOKIE = 'smoke_session=abc123'
+_SECRET = 'private-address-smoke-secret'
 
 
 async def _run_tools(browser: PlaywrightBrowser[object], calls: list[tuple[str, dict[str, object]]]) -> list[str]:
@@ -83,6 +87,57 @@ async def _check_allowlist_bounce() -> None:
     (result,) = await _run_tools(browser, [('navigate', {'url': 'https://www.iana.org/'})])
     assert 'not in allowed_domains' in result, result
     print('allowlist bounce ok')
+
+
+async def _serve_secret() -> tuple[asyncio.Server, int]:
+    """Serve a fixed body over HTTP on a loopback port, so a leak is observable."""
+
+    async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        await reader.readline()
+        body = _SECRET.encode()
+        writer.write(
+            b'HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n'
+            b'Access-Control-Allow-Origin: *\r\n'
+            b'Content-Length: ' + str(len(body)).encode() + b'\r\n\r\n' + body
+        )
+        await writer.drain()
+        writer.close()
+
+    server = await asyncio.start_server(handle, '127.0.0.1', 0)
+    return server, server.sockets[0].getsockname()[1]
+
+
+async def _check_private_address_block() -> None:
+    """The block must survive both an exotic IP spelling and an in-page fetch.
+
+    Neither is decided by the pre-check: `2130706433` is not parseable as an
+    address until Chromium canonicalizes it, and a `fetch` never goes through
+    `navigate` at all. Both therefore rest on the route guard, and the mocked
+    suite feeds that guard already-canonical URLs. Each assertion is paired with
+    a `block_private_addresses=False` control, so a server that simply failed to
+    start could not pass the check by accident.
+    """
+    server, port = await _serve_secret()
+    async with server:
+        decimal_url = f'http://2130706433:{port}/'
+        fetch = f"fetch('http://127.0.0.1:{port}/').then(r => r.text())"
+
+        (blocked_nav,) = await _run_tools(PlaywrightBrowser[object](), [('navigate', {'url': decimal_url})])
+        assert _SECRET not in blocked_nav, blocked_nav
+        (open_nav,) = await _run_tools(
+            PlaywrightBrowser[object](block_private_addresses=False), [('navigate', {'url': decimal_url})]
+        )
+        assert _SECRET in open_nav, f'control failed, server unreachable: {open_nav}'
+        print('decimal-IP navigation blocked ok (control reached the server)')
+
+        (blocked_fetch,) = await _run_tools(PlaywrightBrowser[object](), [('execute_js', {'script': fetch})])
+        assert _SECRET not in blocked_fetch, blocked_fetch
+        open_fetch = await _run_tools(
+            PlaywrightBrowser[object](block_private_addresses=False),
+            [('navigate', {'url': f'http://127.0.0.1:{port}/'}), ('execute_js', {'script': fetch})],
+        )
+        assert _SECRET in open_fetch[-1], f'control failed, fetch never reached the server: {open_fetch}'
+        print('in-page fetch to a private address blocked ok (control reached the server)')
 
 
 async def _capture_storage_state() -> StorageState:
@@ -155,6 +210,7 @@ async def _main() -> None:
     """Run every smoke scenario in sequence."""
     await _check_navigate()
     await _check_allowlist_bounce()
+    await _check_private_address_block()
     await _check_storage_state_round_trip()
     await _check_cdp_attach()
     print('all checks passed')
