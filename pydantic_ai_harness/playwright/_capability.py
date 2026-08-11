@@ -7,9 +7,6 @@ recorded in the `_toolset` module docstring.
 
 from __future__ import annotations
 
-import asyncio
-import os
-import sys
 from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING
 
@@ -22,30 +19,16 @@ from pydantic_ai.tools import AgentDepsT, ToolDefinition
 from pydantic_ai_harness.playwright._toolset import (
     DEFAULT_MAX_CONTENT_TOKENS,
     DEFAULT_TIMEOUT_MS,
-    PlaywrightBrowserState,
+    NavigationPolicy,
+    PlaywrightBrowserSession,
     PlaywrightBrowserToolset,
-    PlaywrightError,
-    async_playwright,
-    blocked_navigation_reason,
-    refused_in_every_frame,
 )
 
 if TYPE_CHECKING:
     from collections.abc import Callable
 
-    from playwright.async_api import Browser as PlaywrightBrowserHandle
-    from playwright.async_api import Page as PlaywrightPage
-    from playwright.async_api import Playwright as PlaywrightDriver
-    from playwright.async_api import Request as PlaywrightRequest
-    from playwright.async_api import Route as PlaywrightRoute
     from playwright.async_api import StorageState
     from pydantic_ai.agent import AbstractAgent
-
-_CHROMIUM_MISSING_MESSAGE = (
-    'Chromium is not installed. Run `playwright install chromium` (on a fresh Linux or CI image use '
-    '`playwright install --with-deps chromium` to also install the required system libraries) and restart '
-    'the agent to enable browser tools.'
-)
 
 _INSTRUCTIONS = """\
 You have a real web browser powered by Playwright. Use it for pages the lighter tools cannot handle:
@@ -65,34 +48,6 @@ only for visual checks (charts, layout).
 Textual tool results are truncated to roughly {max_content_tokens} tokens; use `get_text` with a CSS
 selector to read a specific section of a large page. The browser is single-tab. Allowed domains: {allowed_domains}.
 """
-
-
-async def _auto_install_chromium() -> str | None:
-    """Run `playwright install chromium` in this interpreter; `None` on success, else the installer output.
-
-    Only invoked when `auto_install_chromium=True` and the binary is missing. It
-    shells out to a subprocess and downloads a browser, so it runs outside the
-    mocked test surface. On failure the merged stdout/stderr is returned so the
-    launch path can surface why the install failed instead of the generic hint.
-    """
-    proc = await asyncio.create_subprocess_exec(
-        sys.executable,
-        '-m',
-        'playwright',
-        'install',
-        'chromium',
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.STDOUT,
-    )
-    try:
-        stdout, _ = await proc.communicate()
-    except asyncio.CancelledError:
-        proc.terminate()
-        await proc.wait()
-        raise
-    if proc.returncode == 0:
-        return None
-    return stdout.decode(errors='replace')
 
 
 @dataclass
@@ -220,16 +175,25 @@ class PlaywrightBrowser(AbstractCapability[AgentDepsT]):
     those as secrets.
     """
 
-    _state: PlaywrightBrowserState = field(default_factory=PlaywrightBrowserState, init=False, repr=False)
+    _session: PlaywrightBrowserSession = field(init=False, repr=False)
     _toolset: PlaywrightBrowserToolset[AgentDepsT] = field(init=False, repr=False)
-    _browser: PlaywrightBrowserHandle | None = field(default=None, init=False, repr=False)
-    _popup_tasks: set[asyncio.Task[None]] = field(default_factory=set[asyncio.Task[None]], init=False, repr=False)
+    _policy: NavigationPolicy = field(init=False, repr=False)
 
     def __post_init__(self) -> None:
+        self._policy = NavigationPolicy(
+            allowed_domains=self.allowed_domains, block_private_addresses=self.block_private_addresses
+        )
+        self._session = PlaywrightBrowserSession(
+            policy=self._policy,
+            headless=self.headless,
+            storage_state=self.storage_state,
+            cdp_url=self.cdp_url,
+            auto_install_chromium=self.auto_install_chromium,
+            launch_timeout_ms=self.timeout_ms,
+        )
         self._toolset = PlaywrightBrowserToolset[AgentDepsT](
-            state=self._state,
-            allowed_domains=self.allowed_domains,
-            block_private_addresses=self.block_private_addresses,
+            session=self._session,
+            policy=self._policy,
             screenshot_on_navigate=self.screenshot_on_navigate,
             max_content_tokens=self.max_content_tokens,
             timeout_ms=self.timeout_ms,
@@ -273,17 +237,11 @@ class PlaywrightBrowser(AbstractCapability[AgentDepsT]):
         """When-to-use guidance for the browser, suppressed while a launch error is set."""
 
         def _instructions(ctx: RunContext[AgentDepsT]) -> str | None:
-            if self._state.launch_error is not None:
+            if self._session.launch_error is not None:
                 return None
-            if self.allowed_domains is None:
-                domains = 'all'
-            elif self.allowed_domains:
-                domains = ', '.join(self.allowed_domains)
-            else:
-                domains = 'none'
-            if self.block_private_addresses:
-                domains += ' (private/internal addresses blocked)'
-            return _INSTRUCTIONS.format(max_content_tokens=self.max_content_tokens, allowed_domains=domains)
+            return _INSTRUCTIONS.format(
+                max_content_tokens=self.max_content_tokens, allowed_domains=self._policy.describe()
+            )
 
         return _instructions
 
@@ -294,136 +252,18 @@ class PlaywrightBrowser(AbstractCapability[AgentDepsT]):
         (e.g. a different `navigate`) is left untouched.
         """
         toolset_id = self._toolset.id
-        if self._state.launch_error is not None:
+        if self._session.launch_error is not None:
             return [td for td in tool_defs if td.toolset_id != toolset_id]
         return tool_defs
 
-    async def _install_and_retry(self, pw: PlaywrightDriver) -> PlaywrightBrowserHandle | None:
-        """Fetch Chromium and relaunch once.
-
-        Returns the browser on success. On install failure it records a launch
-        error carrying a bounded tail of the installer output (so the failure is
-        diagnosable) and returns `None`.
-        """
-        install_output = await _auto_install_chromium()
-        if install_output is None:
-            return await pw.chromium.launch(headless=self.headless)  # pragma: no cover
-        self._state.launch_error = f'{_CHROMIUM_MISSING_MESSAGE}\nAuto-install failed:\n{install_output[-300:]}'
-        return None
-
-    async def _route_guard(self, route: PlaywrightRoute, request: PlaywrightRequest) -> None:
-        """Network-layer egress policy: abort what the configuration refuses, pass the rest.
-
-        The two policies have different reach. The private-address block covers
-        every request of every resource type in every frame, because a page can
-        read a subresource it fetched itself and hand the body to the model. The
-        allowlist covers top-level navigation only, so a permitted page keeps its
-        own CDN assets, identity-provider frames, and payment steps.
-        """
-        if refused_in_every_frame(request.url, self.block_private_addresses):
-            await route.abort()
-            return
-        permitted = blocked_navigation_reason(request.url, self.allowed_domains, self.block_private_addresses) is None
-        if not request.is_navigation_request() or permitted:
-            await route.continue_()
-            return
-        try:
-            frame = request.frame
-        except PlaywrightError:
-            await route.abort()
-            return
-        if frame == frame.page.main_frame:
-            await route.abort()
-            return
-        await route.continue_()
-
-    async def _handle_popup(self, popup: PlaywrightPage) -> None:
-        """Keep the browser single-tab by closing popup pages."""
-        await popup.close()
-
-    def _popup_done(self, task: asyncio.Task[None]) -> None:
-        """Release a finished popup task and retrieve any close error."""
-        self._popup_tasks.discard(task)
-        if not task.cancelled():
-            task.exception()
-
-    def _on_popup(self, popup: PlaywrightPage) -> None:
-        """Schedule popup handling, keeping a strong task reference until it finishes."""
-        task = asyncio.create_task(self._handle_popup(popup))
-        self._popup_tasks.add(task)
-        task.add_done_callback(self._popup_done)
-
     async def wrap_run(self, ctx: RunContext[AgentDepsT], *, handler: WrapRunHandler) -> AgentRunResult[AgentDepsT]:
-        """Install a lazy Chromium launcher and guarantee cleanup when the run ends.
+        """Hold the run's browser session open, and release it however the run ends.
 
-        Playwright and Chromium start only on the first browser-tool call. A
-        `finally` block closes the browser and exits the Playwright driver whether
-        the run returns, raises, or is cancelled.
+        Chromium starts on the first browser-tool call, not here, so a run that
+        never browses never launches one.
         """
-        pw_cm = async_playwright()
-        entered = False
-
-        async def _launch() -> None:
-            nonlocal entered
-            pw = await pw_cm.__aenter__()
-            entered = True
-            if self.cdp_url is not None:
-                browser = await pw.chromium.connect_over_cdp(self.cdp_url)
-            elif not os.path.exists(pw.chromium.executable_path):
-                # Binary genuinely absent: raise a clear install hint, or fetch it
-                # when opted in. A launch failure with the binary present (sandbox,
-                # missing system libs, no display) is left to surface as its own
-                # error rather than being masked as "Chromium is not installed".
-                browser = await self._install_and_retry(pw) if self.auto_install_chromium else None
-                if browser is None:  # pragma: no branch
-                    if self._state.launch_error is None:
-                        self._state.launch_error = _CHROMIUM_MISSING_MESSAGE
-                    return
-            else:
-                browser = await pw.chromium.launch(headless=self.headless)
-            self._browser = browser
-            # Service workers can issue requests that context routes never see, so
-            # they are blocked to keep all traffic on the routable path. Downloads are
-            # refused because no tool exposes them: accepting them only lets a page
-            # write to the host's temporary storage for the length of the run.
-            context = await browser.new_context(
-                storage_state=self.storage_state,
-                service_workers='block',
-                accept_downloads=False,
-            )
-            page = await context.new_page()
-            if self.allowed_domains is not None or self.block_private_addresses:
-                await context.route('**/*', self._route_guard)
-            page.on('popup', self._on_popup)
-            self._state.page = page
-
-        self._state.lazy_launcher = _launch
-        try:
+        async with self._session:
             return await handler()
-        finally:
-            self._state.lazy_launcher = None
-            if self._popup_tasks:
-                for task in self._popup_tasks:
-                    task.cancel()
-                await asyncio.gather(*self._popup_tasks, return_exceptions=True)
-                self._popup_tasks.clear()
-            run_failed = sys.exc_info()[0] is not None
-            try:
-                browser = self._browser
-                if browser is not None:
-                    self._state.page = None
-                    self._browser = None
-                    try:
-                        await browser.close()
-                    finally:
-                        await pw_cm.__aexit__(None, None, None)
-                elif entered:
-                    await pw_cm.__aexit__(None, None, None)
-            except Exception:
-                # A teardown error must not mask the run's real exception. When the
-                # run already failed, drop the close/exit error; otherwise surface it.
-                if not run_failed:
-                    raise
 
     @classmethod
     def from_spec(

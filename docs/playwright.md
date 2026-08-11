@@ -103,7 +103,7 @@ not raised to abort the agent run.
 | `block_private_addresses` | `True` | Refuse navigation to private, loopback, link-local, and other reserved IP literals (see [Egress](#egress-and-ssrf)). |
 | `screenshot_on_navigate` | `False` | Attach a screenshot to every `navigate` result. |
 | `max_content_tokens` | `4000` | Approximate token budget for every textual tool result. |
-| `timeout_ms` | `30000` | Default Playwright navigation/action timeout. `0` disables it. |
+| `timeout_ms` | `30000` | Default Playwright navigation/action timeout, and the deadline for starting or attaching to the browser. `0` disables both. |
 | `auto_install_chromium` | `False` | Fetch Chromium automatically when the binary is missing. |
 | `storage_state` | `None` | Playwright storage state (cookies + localStorage) loaded at launch; see [Authenticated sites](#authenticated-sites). |
 | `cdp_url` | `None` | Attach to a Chromium already running at this CDP endpoint instead of launching one; see [Attaching to a running browser](#attaching-to-a-running-browser). |
@@ -204,6 +204,22 @@ Chromium starts lazily on the first browser-tool call and is closed when the run
 ends -- on success, error, or cancellation. Runs that never call a browser tool
 pay no Playwright cost (no subprocess, no window). Each agent run gets its own
 page and browser, so concurrent `agent.run()` calls never share a tab.
+
+That lifecycle lives in `PlaywrightBrowserSession`, which the capability creates
+per run. It is exported for the case where you want the same guarded browser
+without an agent around it -- the allowlist, the private-address block, the
+service-worker block, and the single-tab behavior all come with it:
+
+```python
+from pydantic_ai_harness.playwright import PlaywrightBrowserSession
+
+async with PlaywrightBrowserSession() as session:
+    page = await session.ensure_page()  # Chromium starts here, not on entry
+    await page.goto('https://example.com')
+```
+
+`PlaywrightBrowserToolset` is exported on the same basis: pass it a session to
+get the eleven tools without the capability's hooks.
 
 ## Limitations
 

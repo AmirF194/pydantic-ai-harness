@@ -27,13 +27,12 @@ from pydantic_ai.models.test import TestModel
 from pydantic_ai.tools import RunContext, ToolDefinition
 from pydantic_ai.usage import RunUsage
 
-import pydantic_ai_harness.playwright._capability as capability_module
 import pydantic_ai_harness.playwright._toolset as toolset_module
 from pydantic_ai_harness.playwright import (
     DEFAULT_MAX_CONTENT_TOKENS,
     DEFAULT_TIMEOUT_MS,
     PlaywrightBrowser,
-    PlaywrightBrowserState,
+    PlaywrightBrowserSession,
     PlaywrightBrowserToolset,
 )
 
@@ -427,21 +426,26 @@ class _FakeChromium:
         self._close_error = close_error
         self.launched: list[bool] = []
         self.connected: list[str] = []
+        self.launch_timeouts: list[int] = []
         self.browser: _FakePlaywrightBrowser | None = None
 
     @property
     def executable_path(self) -> str:
         return self._executable_path
 
-    async def launch(self, *, headless: bool) -> _FakePlaywrightBrowser:
+    async def launch(self, *, headless: bool, timeout: int | None = None) -> _FakePlaywrightBrowser:
         self.launched.append(headless)
+        self.launch_timeouts.append(timeout if timeout is not None else -1)
         if self._launch_error is not None:
             raise self._launch_error
         self.browser = _FakePlaywrightBrowser(self._page, close_error=self._close_error)
         return self.browser
 
-    async def connect_over_cdp(self, endpoint_url: str) -> _FakePlaywrightBrowser:
+    async def connect_over_cdp(self, endpoint_url: str, *, timeout: int | None = None) -> _FakePlaywrightBrowser:
         self.connected.append(endpoint_url)
+        self.launch_timeouts.append(timeout if timeout is not None else -1)
+        if self._launch_error is not None:
+            raise self._launch_error
         self.browser = _FakePlaywrightBrowser(self._page, close_error=self._close_error)
         return self.browser
 
@@ -453,6 +457,7 @@ class _FakeDriver:
 
 class _FakeDriverCM:
     def __init__(self, driver: _FakeDriver) -> None:
+        self.driver = driver
         self._driver = driver
         self.entered = False
         self.exited = False
@@ -466,6 +471,19 @@ class _FakeDriverCM:
         return False
 
 
+class _ScriptedSession(PlaywrightBrowserSession):
+    """A session whose launch is scripted, to drive the locking without a real Chromium."""
+
+    def __init__(self, on_launch: Callable[[_ScriptedSession], Awaitable[None]]) -> None:
+        super().__init__()
+        self._on_launch = on_launch
+        self.launches = 0
+
+    async def _launch(self) -> None:
+        self.launches += 1
+        await self._on_launch(self)
+
+
 def _toolset(
     page: _FakePage,
     *,
@@ -476,12 +494,13 @@ def _toolset(
     timeout_ms: int = DEFAULT_TIMEOUT_MS,
 ) -> PlaywrightBrowserToolset[None]:
     """Build a toolset whose active page is the given double."""
-    state = PlaywrightBrowserState()
-    state.page = page
+    session = PlaywrightBrowserSession()
+    session.page = page
     return PlaywrightBrowserToolset[None](
-        state=state,
-        allowed_domains=allowed_domains,
-        block_private_addresses=block_private_addresses,
+        session=session,
+        policy=toolset_module.NavigationPolicy(
+            allowed_domains=allowed_domains, block_private_addresses=block_private_addresses
+        ),
         screenshot_on_navigate=screenshot_on_navigate,
         max_content_tokens=max_content_tokens,
         timeout_ms=timeout_ms,
@@ -505,7 +524,7 @@ def _install_fake_driver(
         page, executable_missing=executable_missing, launch_error=launch_error, close_error=close_error
     )
     cm = _FakeDriverCM(_FakeDriver(chromium))
-    monkeypatch.setattr(capability_module, 'async_playwright', lambda: cm)
+    monkeypatch.setattr(toolset_module, 'async_playwright', lambda: cm)
     return cm
 
 
@@ -1070,6 +1089,12 @@ class TestPlaywrightErrorHandling:
         assert result == 'Error: go_forward failed: history unavailable'
 
 
+_BAD_DEADLINE_AND_BAD_ARGUMENT_CALLS: list[Callable[[PlaywrightBrowserToolset[None]], Awaitable[object]]] = [
+    lambda t: t.navigate('mailto:a@b.com', timeout_ms=-1),
+    lambda t: t.scroll('sideways', timeout_ms=-1),
+    lambda t: t.wait_for(timeout_ms=-1),
+]
+
 _NON_POSITIVE_TIMEOUT_CALLS: list[Callable[[PlaywrightBrowserToolset[None]], Awaitable[object]]] = [
     lambda t: t.navigate('https://example.com/', timeout_ms=-1),
     lambda t: t.click('button', timeout_ms=-1),
@@ -1178,6 +1203,15 @@ class TestPerCallTimeout:
         result = await call(_toolset(_FakePage()))
         assert result == 'Error: timeout_ms must be greater than 0.'
 
+    @pytest.mark.parametrize('call', _BAD_DEADLINE_AND_BAD_ARGUMENT_CALLS, ids=['navigate', 'scroll', 'wait_for'])
+    async def test_bad_deadline_outranks_a_bad_argument(
+        self, call: Callable[[PlaywrightBrowserToolset[None]], Awaitable[object]]
+    ) -> None:
+        # These three refuse their argument before acquiring a page, but the deadline
+        # is still checked first, so the reported error does not depend on the order
+        # the two problems happen to be noticed in.
+        assert await call(_toolset(_FakePage())) == 'Error: timeout_ms must be greater than 0.'
+
     async def test_zero_override_cannot_disable_the_deadline(self) -> None:
         # 0 means "no deadline" to Playwright, so the model-chosen override refuses it
         # even though the developer-set capability default may use it.
@@ -1246,76 +1280,64 @@ class TestSnapshot:
 # --- State / ensure_page ----------------------------------------------------
 
 
-class TestPlaywrightBrowserState:
+class TestPlaywrightBrowserSession:
     def test_toolset_validates_max_content_tokens(self) -> None:
-        state = PlaywrightBrowserState()
+        session = PlaywrightBrowserSession()
         with pytest.raises(ValueError, match='^max_content_tokens must be greater than or equal to 0$'):
-            PlaywrightBrowserToolset[None](state=state, max_content_tokens=-1)
-        PlaywrightBrowserToolset[None](state=state, max_content_tokens=0)
+            PlaywrightBrowserToolset[None](session=session, max_content_tokens=-1)
+        PlaywrightBrowserToolset[None](session=session, max_content_tokens=0)
 
     def test_toolset_validates_timeout_ms(self) -> None:
-        state = PlaywrightBrowserState()
+        session = PlaywrightBrowserSession()
         with pytest.raises(ValueError, match='^timeout_ms must be greater than or equal to 0$'):
-            PlaywrightBrowserToolset[None](state=state, timeout_ms=-1)
-        PlaywrightBrowserToolset[None](state=state, timeout_ms=0)  # 0 = no deadline, accepted
+            PlaywrightBrowserToolset[None](session=session, timeout_ms=-1)
+        PlaywrightBrowserToolset[None](session=session, timeout_ms=0)  # 0 = no deadline, accepted
 
     async def test_tool_raises_when_wrap_run_not_active(self) -> None:
-        toolset = PlaywrightBrowserToolset[None](state=PlaywrightBrowserState())
+        toolset = PlaywrightBrowserToolset[None](session=PlaywrightBrowserSession())
         with pytest.raises(RuntimeError, match='PlaywrightBrowser is not running'):
             await toolset.screenshot()
 
     async def test_tool_raises_on_launch_error(self) -> None:
-        state = PlaywrightBrowserState()
-        state.launch_error = 'Chromium is not installed.'
-        toolset = PlaywrightBrowserToolset[None](state=state)
+        session = PlaywrightBrowserSession()
+        session.launch_error = 'Chromium is not installed.'
+        toolset = PlaywrightBrowserToolset[None](session=session)
         with pytest.raises(RuntimeError, match='Chromium is not installed'):
             await toolset.screenshot()
 
     async def test_concurrent_ensure_page_launches_once(self) -> None:
         # Two tool calls that race before the page exists must launch Chromium once.
-        state = PlaywrightBrowserState()
-        launches: list[int] = []
-
-        async def _launch() -> None:
-            launches.append(1)
+        async def _launch(session: _ScriptedSession) -> None:
             await asyncio.sleep(0)  # yield so the second caller blocks on the lock
-            state.page = _FakePage()
+            session.page = _FakePage()
 
-        state.lazy_launcher = _launch
-        first, second = await asyncio.gather(state.ensure_page(), state.ensure_page())
-        assert launches == [1]
+        async with _ScriptedSession(_launch) as session:
+            first, second = await asyncio.gather(session.ensure_page(), session.ensure_page())
+        assert session.launches == 1
         assert first is second
 
     async def test_combined_operation_and_launch_lock_launches_once(self) -> None:
         # Two first tool calls contend both the toolset operation lock and the
         # lazy-launch lock. The operation lock is outer and the launch lock inner,
         # so the launch runs once and both calls observe the same page state.
-        state = PlaywrightBrowserState()
-        launches: list[int] = []
-
-        async def _launch() -> None:
-            launches.append(1)
+        async def _launch(session: _ScriptedSession) -> None:
             await asyncio.sleep(0)
-            state.page = _FakePage(body='shared body')
+            session.page = _FakePage(body='shared body')
 
-        state.lazy_launcher = _launch
-        toolset = PlaywrightBrowserToolset[None](state=state)
-        first, second = await asyncio.gather(toolset.get_text(), toolset.get_text())
-        assert launches == [1]
+        async with _ScriptedSession(_launch) as session:
+            toolset = PlaywrightBrowserToolset[None](session=session)
+            first, second = await asyncio.gather(toolset.get_text(), toolset.get_text())
+        assert session.launches == 1
         assert first == second == 'shared body'
 
     async def test_concurrent_ensure_page_failed_launch_raises_once(self) -> None:
-        state = PlaywrightBrowserState()
-        launches: list[int] = []
-
-        async def _launch() -> None:
-            launches.append(1)
+        async def _launch(session: _ScriptedSession) -> None:
             await asyncio.sleep(0)
-            state.launch_error = 'Chromium is not installed.'
+            session.launch_error = 'Chromium is not installed.'
 
-        state.lazy_launcher = _launch
-        results = await asyncio.gather(state.ensure_page(), state.ensure_page(), return_exceptions=True)
-        assert launches == [1]  # second caller sees the error, does not relaunch
+        async with _ScriptedSession(_launch) as session:
+            results = await asyncio.gather(session.ensure_page(), session.ensure_page(), return_exceptions=True)
+        assert session.launches == 1  # second caller sees the error, does not relaunch
         assert all(isinstance(r, RuntimeError) for r in results)
 
 
@@ -1363,7 +1385,7 @@ class TestPlaywrightBrowserHooks:
 
     def test_get_instructions_suppressed_on_launch_error(self) -> None:
         browser = PlaywrightBrowser[None]()
-        browser._state.launch_error = 'boom'
+        browser._session.launch_error = 'boom'
         assert browser.get_instructions()(_ctx()) is None
 
     async def test_prepare_tools_preserves_upstream_unapproved_kind(self) -> None:
@@ -1381,7 +1403,7 @@ class TestPlaywrightBrowserHooks:
 
     async def test_prepare_tools_hides_tools_on_launch_error(self) -> None:
         browser = PlaywrightBrowser[None]()
-        browser._state.launch_error = 'boom'
+        browser._session.launch_error = 'boom'
         defs = [
             ToolDefinition(
                 name='navigate', parameters_json_schema={'type': 'object'}, kind='function', toolset_id='playwright'
@@ -1399,15 +1421,15 @@ class TestPlaywrightBrowserHooks:
         )
         browser = PlaywrightBrowser[None]()
         assert (await browser.prepare_tools(_ctx(), [foreign]))[0].kind == 'unapproved'
-        browser._state.launch_error = 'boom'
+        browser._session.launch_error = 'boom'
         assert [td.name for td in await browser.prepare_tools(_ctx(), [foreign])] == ['navigate']
 
     async def test_for_run_isolates_state(self) -> None:
         browser = PlaywrightBrowser[None]()
         first = await browser.for_run(_ctx())
         second = await browser.for_run(_ctx())
-        assert first._state is not second._state
-        assert first._state is not browser._state
+        assert first._session is not second._session
+        assert first._session is not browser._session
 
     def test_from_spec_round_trips_fields(self) -> None:
         browser = PlaywrightBrowser[None].from_spec(
@@ -1502,14 +1524,14 @@ class TestChromiumAutoInstall:
     ) -> None:
         process = _FakeInstallerProcess(returncode=returncode, output=output)
         _install_fake_installer_process(monkeypatch, process)
-        assert await capability_module._auto_install_chromium() == expected
+        assert await toolset_module._auto_install_chromium() == expected
         assert process.terminated is False
         assert process.waited is False
 
     async def test_cancellation_terminates_and_waits_for_installer(self, monkeypatch: pytest.MonkeyPatch) -> None:
         process = _FakeInstallerProcess(returncode=-15, output=b'', hang=True)
         _install_fake_installer_process(monkeypatch, process)
-        task = asyncio.create_task(capability_module._auto_install_chromium())
+        task = asyncio.create_task(toolset_module._auto_install_chromium())
         await process.communicate_started.wait()
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
@@ -1812,16 +1834,16 @@ class TestPlaywrightBrowserLifecycle:
         agent = Agent(TestModel(call_tools=['screenshot']), capabilities=[browser])
         await agent.run('screenshot the page')
         assert popup.closed is True
-        assert browser._popup_tasks == set()
+        assert browser._session._popup_tasks == set()
 
     async def test_cancelled_popup_task_is_discarded(self) -> None:
         browser = PlaywrightBrowser[None]()
         task = asyncio.create_task(asyncio.sleep(1))
-        browser._popup_tasks.add(task)
+        browser._session._popup_tasks.add(task)
         task.cancel()
         await asyncio.gather(task, return_exceptions=True)
-        browser._popup_done(task)
-        assert browser._popup_tasks == set()
+        browser._session._popup_done(task)
+        assert browser._session._popup_tasks == set()
 
     async def test_run_without_browser_tool_skips_launch(self, monkeypatch: pytest.MonkeyPatch) -> None:
         page = _FakePage()
@@ -1840,6 +1862,39 @@ class TestPlaywrightBrowserLifecycle:
         assert cm._driver.chromium.launched == []  # never attempted launch on a missing binary
         assert cm.exited is True  # Playwright driver still cleaned up
 
+    async def test_launch_is_bounded_by_the_configured_timeout(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # Starting or attaching to a browser is the one step no per-call timeout_ms
+        # reaches, so it takes the capability's deadline rather than none at all.
+        page = _FakePage()
+        cm = _install_fake_driver(monkeypatch, page)
+        agent = Agent(TestModel(call_tools=['screenshot']), capabilities=[PlaywrightBrowser(timeout_ms=4200)])
+        await agent.run('screenshot the page')
+        assert cm.driver.chromium.launch_timeouts == [4200]
+
+    async def test_cdp_attach_is_bounded_by_the_configured_timeout(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        page = _FakePage()
+        cm = _install_fake_driver(monkeypatch, page)
+        agent = Agent(
+            TestModel(call_tools=['screenshot']),
+            capabilities=[PlaywrightBrowser(cdp_url='http://127.0.0.1:9222', timeout_ms=4300)],
+        )
+        await agent.run('screenshot the page')
+        assert cm.driver.chromium.launch_timeouts == [4300]
+
+    async def test_browser_error_while_attaching_returns_a_bounded_result(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # A dead cdp_url endpoint is a browser failure like any other: the model
+        # gets a result it can act on instead of the run being aborted under it.
+        page = _FakePage()
+        _install_fake_driver(monkeypatch, page, launch_error=TargetClosedError())
+        agent = Agent(
+            TestModel(call_tools=['screenshot']),
+            capabilities=[PlaywrightBrowser(cdp_url='http://127.0.0.1:9222')],
+        )
+        result = await agent.run('screenshot the page')
+        assert 'closed unexpectedly' in str(result.all_messages())
+
     async def test_launch_failure_with_binary_present_surfaces_own_error(self, monkeypatch: pytest.MonkeyPatch) -> None:
         installs: list[bool] = []
 
@@ -1847,7 +1902,7 @@ class TestPlaywrightBrowserLifecycle:
             installs.append(True)
             return None
 
-        monkeypatch.setattr(capability_module, '_auto_install_chromium', _spy_install)
+        monkeypatch.setattr(toolset_module, '_auto_install_chromium', _spy_install)
         page = _FakePage()
         cm = _install_fake_driver(monkeypatch, page, launch_error=RuntimeError('sandbox denied'))
         # auto_install_chromium=True proves a real launch failure does not trigger a download.
@@ -1866,7 +1921,7 @@ class TestPlaywrightBrowserLifecycle:
         async def _fake_install() -> str | None:
             return 'download error: HTTP 403 forbidden'
 
-        monkeypatch.setattr(capability_module, '_auto_install_chromium', _fake_install)
+        monkeypatch.setattr(toolset_module, '_auto_install_chromium', _fake_install)
         agent = Agent(
             TestModel(call_tools=['screenshot']), capabilities=[PlaywrightBrowser(auto_install_chromium=True)]
         )
@@ -1893,7 +1948,7 @@ class TestPlaywrightBrowserLifecycle:
             pass
 
         async def _handler() -> AgentRunResult[None]:
-            await browser._state.ensure_page()
+            await browser._session.ensure_page()
             raise _RunFailure('run failed')
 
         # The run's own exception wins; the close error raised during teardown is dropped.
@@ -1913,11 +1968,11 @@ class TestPlaywrightBrowserLifecycle:
 
         monkeypatch.setattr(PlaywrightBrowser, 'for_run', _same_instance)
         pending = asyncio.ensure_future(asyncio.sleep(3600))
-        browser._popup_tasks.add(pending)
+        browser._session._popup_tasks.add(pending)
         agent = Agent(TestModel(call_tools=['screenshot']), capabilities=[browser])
         await agent.run('screenshot the page')
         assert pending.cancelled()
-        assert browser._popup_tasks == set()
+        assert browser._session._popup_tasks == set()
 
 
 # --- Package surface --------------------------------------------------------
@@ -1928,4 +1983,4 @@ def test_public_exports() -> None:
     assert DEFAULT_TIMEOUT_MS == 30_000
     assert issubclass(PlaywrightBrowser, object)
     assert PlaywrightBrowserToolset is not None
-    assert PlaywrightBrowserState is not None
+    assert PlaywrightBrowserSession is not None

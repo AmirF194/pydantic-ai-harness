@@ -59,14 +59,17 @@ from __future__ import annotations
 import asyncio
 import ipaddress
 import json
-from contextlib import asynccontextmanager
-from dataclasses import dataclass, field
+import os
+import sys
+from contextlib import AbstractAsyncContextManager
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Literal, Protocol, TypeVar
 from urllib.parse import urlparse
 
 from pydantic_ai.messages import BinaryContent, ToolReturn
 from pydantic_ai.tools import AgentDepsT
 from pydantic_ai.toolsets import FunctionToolset
+from typing_extensions import Self
 
 try:
     # Import-time gate (mirrors `pydantic_ai_harness.exa._toolset`): importing the
@@ -89,7 +92,14 @@ except ImportError as _import_error:  # pragma: no cover
     ) from _import_error
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncGenerator, Awaitable, Callable
+    from collections.abc import Awaitable, Callable
+
+    from playwright.async_api import Browser as PlaywrightBrowserHandle
+    from playwright.async_api import Page as PlaywrightPage
+    from playwright.async_api import Playwright as PlaywrightDriver
+    from playwright.async_api import Request as PlaywrightRequest
+    from playwright.async_api import Route as PlaywrightRoute
+    from playwright.async_api import StorageState
 
 _T = TypeVar('_T')
 
@@ -278,6 +288,45 @@ def refused_in_every_frame(url: str, block_private_addresses: bool) -> bool:
     return block_private_addresses and host is not None and is_blocked_address(host)
 
 
+@dataclass(frozen=True)
+class NavigationPolicy:
+    """What the agent is allowed to reach, and how to say so to the model.
+
+    The two axes are independent and deny wins: an allowlisted private address is
+    still refused until `block_private_addresses` is turned off. Holding them
+    together keeps enforcement and description from drifting apart -- the failure
+    mode being that the instructions promise the model a reach the guards do not
+    grant.
+    """
+
+    allowed_domains: list[str] | None = None
+    block_private_addresses: bool = True
+
+    def blocked_reason(self, url: str) -> str | None:
+        """Why navigating to `url` is denied, or `None` when it is permitted."""
+        return blocked_navigation_reason(url, self.allowed_domains, self.block_private_addresses)
+
+    def refused_in_every_frame(self, url: str) -> bool:
+        """Whether `url` must be refused in any frame and for any resource type."""
+        return refused_in_every_frame(url, self.block_private_addresses)
+
+    def enforced(self) -> bool:
+        """Whether either axis restricts anything, i.e. whether a route guard is worth installing."""
+        return self.allowed_domains is not None or self.block_private_addresses
+
+    def describe(self) -> str:
+        """The reach, phrased for the model's instructions."""
+        if self.allowed_domains is None:
+            domains = 'all'
+        elif self.allowed_domains:
+            domains = ', '.join(self.allowed_domains)
+        else:
+            domains = 'none'
+        if self.block_private_addresses:
+            domains += ' (private/internal addresses blocked)'
+        return domains
+
+
 def _truncate(text: str, max_chars: int) -> str:
     """Cap tool output at `max_chars`, keeping the head where the substance sits."""
     if len(text) <= max_chars:
@@ -288,52 +337,250 @@ def _truncate(text: str, max_chars: int) -> str:
     return f'{text[: max_chars - len(marker)]}{marker}'
 
 
-@dataclass
-class PlaywrightBrowserState:
-    """Per-run browser handles shared between `PlaywrightBrowser` and `PlaywrightBrowserToolset`.
+_CHROMIUM_MISSING_MESSAGE = (
+    'Chromium is not installed. Run `playwright install chromium` (on a fresh Linux or CI image use '
+    '`playwright install --with-deps chromium` to also install the required system libraries) and restart '
+    'the agent to enable browser tools.'
+)
 
-    `PlaywrightBrowser.wrap_run` installs `lazy_launcher`; the first browser-tool
-    call triggers it through `ensure_page`, so Chromium starts only when a tool
-    is actually used. Each agent run gets a fresh instance (via
-    `PlaywrightBrowser.for_run`), so concurrent runs never share a page.
+
+async def _auto_install_chromium() -> str | None:
+    """Run `playwright install chromium` in this interpreter; `None` on success, else the installer output.
+
+    Only invoked when `auto_install_chromium=True` and the binary is missing. It
+    shells out to a subprocess and downloads a browser, so it runs outside the
+    mocked test surface. On failure the merged stdout/stderr is returned so the
+    launch path can surface why the install failed instead of the generic hint.
+    """
+    proc = await asyncio.create_subprocess_exec(
+        sys.executable,
+        '-m',
+        'playwright',
+        'install',
+        'chromium',
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.STDOUT,
+    )
+    try:
+        stdout, _ = await proc.communicate()
+    except asyncio.CancelledError:
+        proc.terminate()
+        await proc.wait()
+        raise
+    if proc.returncode == 0:
+        return None
+    return stdout.decode(errors='replace')
+
+
+class PlaywrightBrowserSession:
+    """One agent run's Chromium: how a page is obtained, guarded, and released.
+
+    Entering the session arms it; nothing starts until `ensure_page` is first
+    awaited, so a run that never calls a browser tool never launches a browser.
+    Exiting closes whatever was started, in the order that a half-built session
+    still tears down cleanly.
+
+    `PlaywrightBrowser` creates one per run (via `for_run`), so concurrent runs
+    never share a page. It can also be driven directly:
+
+    ```python
+    async with PlaywrightBrowserSession(policy=NavigationPolicy()) as session:
+        page = await session.ensure_page()
+    ```
     """
 
-    page: _Page | None = None
-    """Active page, or `None` before the browser is launched."""
-
-    launch_error: str | None = None
-    """Set when a launch attempt failed (e.g. the Chromium binary is missing)."""
-
-    lazy_launcher: Callable[[], Awaitable[None]] | None = field(default=None, init=False, repr=False)
-    """Async launcher installed by `PlaywrightBrowser.wrap_run`; populates `page` on first use."""
-
-    _launch_lock: asyncio.Lock = field(default_factory=asyncio.Lock, init=False, repr=False)
-    """Serializes the lazy launch so concurrent first tool calls launch Chromium once."""
+    def __init__(
+        self,
+        *,
+        policy: NavigationPolicy | None = None,
+        headless: bool = True,
+        storage_state: StorageState | None = None,
+        cdp_url: str | None = None,
+        auto_install_chromium: bool = False,
+        launch_timeout_ms: int = DEFAULT_TIMEOUT_MS,
+    ) -> None:
+        self._policy = policy if policy is not None else NavigationPolicy()
+        self._headless = headless
+        self._storage_state = storage_state
+        self._cdp_url = cdp_url
+        self._auto_install_chromium = auto_install_chromium
+        self._launch_timeout_ms = launch_timeout_ms
+        self.page: _Page | None = None
+        """Active page, or `None` before the browser is launched."""
+        self.launch_error: str | None = None
+        """Set when a launch attempt failed (e.g. the Chromium binary is missing)."""
+        self._driver_cm: AbstractAsyncContextManager[PlaywrightDriver] | None = None
+        self._driver_entered = False
+        self._browser: PlaywrightBrowserHandle | None = None
+        self._popup_tasks: set[asyncio.Task[None]] = set()
+        self._launch_lock = asyncio.Lock()
 
     async def ensure_page(self) -> _Page:
         """Return the active page, launching Chromium lazily on the first call.
 
         Tool calls in one model response run concurrently, so the launch is
-        serialized: the first caller runs `lazy_launcher` under the lock and the
-        rest observe the populated `page` (or the launch error) instead of
-        launching a second Chromium.
+        serialized: the first caller runs it under the lock and the rest observe
+        the populated `page` (or the launch error) instead of launching a second
+        Chromium.
         """
         if self.launch_error is not None:
             raise RuntimeError(self.launch_error)
         if self.page is None:
             async with self._launch_lock:
                 if self.page is None and self.launch_error is None:
-                    if self.lazy_launcher is None:
+                    if self._driver_cm is None:
                         raise RuntimeError(
                             'PlaywrightBrowser is not running: PlaywrightBrowser.wrap_run must be active before any '
                             'browser tool.'
                         )
-                    await self.lazy_launcher()
+                    await self._launch()
             if self.launch_error is not None:
                 raise RuntimeError(self.launch_error)
             if self.page is None:
                 raise RuntimeError('Browser failed to launch.')  # pragma: no cover
         return self.page
+
+    async def _launch(self) -> None:
+        """Start the driver and Chromium, then open the guarded page."""
+        assert self._driver_cm is not None
+        pw = await self._driver_cm.__aenter__()
+        self._driver_entered = True
+        browser = await self._connect(pw)
+        if browser is None:
+            return
+        # Assigned before the context and page are built, so teardown closes Chromium
+        # even when a later setup step raises.
+        self._browser = browser
+        # Service workers can issue requests that context routes never see, so they
+        # are blocked to keep all traffic on the routable path. Downloads are refused
+        # because no tool exposes them: accepting them only lets a page write to the
+        # host's temporary storage for the length of the run.
+        context = await browser.new_context(
+            storage_state=self._storage_state,
+            service_workers='block',
+            accept_downloads=False,
+        )
+        page = await context.new_page()
+        if self._policy.enforced():
+            await context.route('**/*', self._route_guard)
+        page.on('popup', self._on_popup)
+        self.page = page
+
+    async def _connect(self, pw: PlaywrightDriver) -> PlaywrightBrowserHandle | None:
+        """Attach to or start a browser, or record why none is available.
+
+        Both paths are bounded by `launch_timeout_ms`: a `cdp_url` pointing at an
+        unresponsive endpoint would otherwise hold the operation lock with no
+        deadline at all. The auto-install download is deliberately left unbounded,
+        since a first-run browser fetch legitimately outlasts an action timeout.
+        """
+        if self._cdp_url is not None:
+            return await pw.chromium.connect_over_cdp(self._cdp_url, timeout=self._launch_timeout_ms)
+        if os.path.exists(pw.chromium.executable_path):
+            return await pw.chromium.launch(headless=self._headless, timeout=self._launch_timeout_ms)
+        # Binary genuinely absent: raise a clear install hint, or fetch it when
+        # opted in. A launch failure with the binary present (sandbox, missing
+        # system libs, no display) is left to surface as its own error rather than
+        # being masked as "Chromium is not installed".
+        browser = await self._install_and_retry(pw) if self._auto_install_chromium else None
+        if browser is None:  # pragma: no branch
+            if self.launch_error is None:
+                self.launch_error = _CHROMIUM_MISSING_MESSAGE
+        return browser
+
+    async def _install_and_retry(self, pw: PlaywrightDriver) -> PlaywrightBrowserHandle | None:
+        """Fetch Chromium and relaunch once.
+
+        Returns the browser on success. On install failure it records a launch
+        error carrying a bounded tail of the installer output (so the failure is
+        diagnosable) and returns `None`.
+        """
+        install_output = await _auto_install_chromium()
+        if install_output is None:
+            return await pw.chromium.launch(  # pragma: no cover
+                headless=self._headless, timeout=self._launch_timeout_ms
+            )
+        self.launch_error = f'{_CHROMIUM_MISSING_MESSAGE}\nAuto-install failed:\n{install_output[-300:]}'
+        return None
+
+    async def _route_guard(self, route: PlaywrightRoute, request: PlaywrightRequest) -> None:
+        """Network-layer egress policy: abort what the configuration refuses, pass the rest.
+
+        The two policies have different reach. The private-address block covers
+        every request of every resource type in every frame, because a page can
+        read a subresource it fetched itself and hand the body to the model. The
+        allowlist covers top-level navigation only, so a permitted page keeps its
+        own CDN assets, identity-provider frames, and payment steps.
+        """
+        if self._policy.refused_in_every_frame(request.url):
+            await route.abort()
+            return
+        permitted = self._policy.blocked_reason(request.url) is None
+        if not request.is_navigation_request() or permitted:
+            await route.continue_()
+            return
+        try:
+            frame = request.frame
+        except PlaywrightError:
+            await route.abort()
+            return
+        if frame == frame.page.main_frame:
+            await route.abort()
+            return
+        await route.continue_()
+
+    async def _handle_popup(self, popup: PlaywrightPage) -> None:
+        """Keep the browser single-tab by closing popup pages."""
+        await popup.close()
+
+    def _popup_done(self, task: asyncio.Task[None]) -> None:
+        """Release a finished popup task and retrieve any close error."""
+        self._popup_tasks.discard(task)
+        if not task.cancelled():
+            task.exception()
+
+    def _on_popup(self, popup: PlaywrightPage) -> None:
+        """Schedule popup handling, keeping a strong task reference until it finishes."""
+        task = asyncio.create_task(self._handle_popup(popup))
+        self._popup_tasks.add(task)
+        task.add_done_callback(self._popup_done)
+
+    async def __aenter__(self) -> Self:
+        """Arm the session. Cheap by design: no driver and no browser start here."""
+        self._driver_cm = async_playwright()
+        return self
+
+    async def __aexit__(self, exc_type: type[BaseException] | None, *_: object) -> None:
+        """Release everything the session started, without masking the run's own failure.
+
+        Popup handlers are cancelled first so none outlives the browser they act
+        on. A `close()` failure still exits the driver, and when the run is
+        already unwinding the teardown error is dropped: the exception the caller
+        is carrying is the one worth reporting.
+        """
+        driver_cm = self._driver_cm
+        self._driver_cm = None
+        if self._popup_tasks:
+            for task in self._popup_tasks:
+                task.cancel()
+            await asyncio.gather(*self._popup_tasks, return_exceptions=True)
+            self._popup_tasks.clear()
+        if driver_cm is None:  # pragma: no cover
+            return
+        try:
+            browser = self._browser
+            if browser is not None:
+                self.page = None
+                self._browser = None
+                try:
+                    await browser.close()
+                finally:
+                    await driver_cm.__aexit__(None, None, None)
+            elif self._driver_entered:
+                await driver_cm.__aexit__(None, None, None)
+        except Exception:
+            if exc_type is None:
+                raise
 
 
 class PlaywrightBrowserToolset(FunctionToolset[AgentDepsT]):
@@ -354,9 +601,8 @@ class PlaywrightBrowserToolset(FunctionToolset[AgentDepsT]):
     def __init__(
         self,
         *,
-        state: PlaywrightBrowserState,
-        allowed_domains: list[str] | None = None,
-        block_private_addresses: bool = True,
+        session: PlaywrightBrowserSession,
+        policy: NavigationPolicy | None = None,
         screenshot_on_navigate: bool = False,
         max_content_tokens: int = DEFAULT_MAX_CONTENT_TOKENS,
         timeout_ms: int = DEFAULT_TIMEOUT_MS,
@@ -366,9 +612,8 @@ class PlaywrightBrowserToolset(FunctionToolset[AgentDepsT]):
         if timeout_ms < 0:
             raise ValueError('timeout_ms must be greater than or equal to 0')
         super().__init__(id='playwright')
-        self._state = state
-        self._allowed_domains = allowed_domains
-        self._block_private_addresses = block_private_addresses
+        self._session = session
+        self._policy = policy if policy is not None else NavigationPolicy()
         self._screenshot_on_navigate = screenshot_on_navigate
         self._max_content_tokens = max_content_tokens
         self._timeout_ms = timeout_ms
@@ -385,15 +630,14 @@ class PlaywrightBrowserToolset(FunctionToolset[AgentDepsT]):
         self.add_function(self.wait_for, name='wait_for')
         self.add_function(self.snapshot, name='snapshot')
 
-    @asynccontextmanager
-    async def _serialize_operation(self) -> AsyncGenerator[None]:
-        """Prevent concurrent tools from interleaving reads and writes on the shared page."""
-        async with self._operation_lock:
-            yield
+    async def _page_text(self, page: _Page, timeout_ms: int | None = None) -> str:
+        """Return `page`'s visible text, truncated to the token budget.
 
-    async def _page_text(self, timeout_ms: int | None = None) -> str:
-        """Return the current page's visible text, truncated to the token budget."""
-        page = await self._state.ensure_page()
+        The page is passed in rather than re-acquired: every caller already holds
+        the one it just acted on, and re-entering `ensure_page` here would be a
+        second path into the launch machinery, raising `RuntimeError` where the
+        callers only guard against `PlaywrightError`.
+        """
         text = await page.inner_text('body', timeout=timeout_ms)
         return self._truncate_output(text)
 
@@ -490,12 +734,63 @@ class PlaywrightBrowserToolset(FunctionToolset[AgentDepsT]):
         The bounce runs under the caller's resolved `timeout` so a short
         per-call `timeout_ms` is not silently replaced by Playwright's default.
         """
-        reason = blocked_navigation_reason(page.url, self._allowed_domains, self._block_private_addresses)
+        reason = self._policy.blocked_reason(page.url)
         if reason is None:
             return None
         blocked = page.url
         await page.goto(_BLANK_PAGE, timeout=timeout)
         return self._truncate_output(f'Error: {action} reached a {reason}: {blocked}')
+
+    async def _in_operation(
+        self, action: str, timeout_ms: int | None, body: Callable[[_Page, int], Awaitable[_T]]
+    ) -> _T | str:
+        """Run `body` as one complete operation on the shared page.
+
+        Every tool needs the same five things in the same order: exclusive use of
+        the page, a per-call deadline that is either absent or positive, the page
+        itself (launching Chromium on the first call), the resolved deadline, and
+        a Playwright failure turned into a result the model can read instead of an
+        exception that ends the run.
+
+        Acquiring the page is inside the guarded region: starting or attaching to
+        a browser can fail the same way an action can (a `cdp_url` whose endpoint
+        is gone, most realistically), and the model can act on that only if it
+        arrives as a result rather than as an exception that ends the run.
+
+        An argument check that must not launch a browser belongs in the tool,
+        before this call -- see `_refuse`.
+        """
+        async with self._operation_lock:
+            if (error := self._timeout_error(timeout_ms)) is not None:
+                return error
+            timeout = self._resolve_timeout(timeout_ms)
+            try:
+                page = await self._session.ensure_page()
+                return await body(page, timeout)
+            except PlaywrightError as exc:
+                return self._truncate_output(self._playwright_error(action, exc, timeout))
+
+    async def _refuse(self, timeout_ms: int | None, message: str) -> str:
+        """Return a bounded refusal without acquiring a page.
+
+        A rejected argument must not start a browser, so these refusals happen
+        before `_in_operation`. The deadline is still validated first, so a call
+        that is wrong in both ways reports the same error either way.
+        """
+        async with self._operation_lock:
+            if (error := self._timeout_error(timeout_ms)) is not None:
+                return error
+            return self._truncate_output(message)
+
+    async def _settle(self, page: _Page, action: str, timeout: int) -> str | None:
+        """Let the navigation finish, then re-check where it landed.
+
+        The order is the point: the policy has to see the settled URL, because
+        reading it before the load completes checks the page the action started
+        from. Returns the bounced error, or `None` when the result is permitted.
+        """
+        await page.wait_for_load_state('domcontentloaded', timeout=timeout)
+        return await self._enforce_navigation_policy(page, action, timeout)
 
     async def navigate(self, url: str, timeout_ms: int | None = None) -> str | ToolReturn[str]:
         """Navigate to a URL and return the page's title and visible text.
@@ -509,31 +804,26 @@ class PlaywrightBrowserToolset(FunctionToolset[AgentDepsT]):
             The page URL, title, and visible text. When `screenshot_on_navigate`
             is set, a screenshot is attached as image content for vision models.
         """
-        async with self._serialize_operation():
-            if (error := self._timeout_error(timeout_ms)) is not None:
-                return error
-            reason = blocked_navigation_reason(url, self._allowed_domains, self._block_private_addresses)
-            if reason is not None:
-                return self._truncate_output(f'Error: {reason}: {url}')
-            page = await self._state.ensure_page()
-            timeout = self._resolve_timeout(timeout_ms)
-            try:
-                await page.goto(url, timeout=timeout)
-                await page.wait_for_load_state('domcontentloaded', timeout=timeout)
-                blocked = await self._enforce_navigation_policy(page, 'navigate', timeout)
-                if blocked is not None:
-                    return blocked
-                title = await self._await_with_timeout(page.title(), timeout)
-                text = await self._page_text(timeout)
-                result = self._truncate_output(f'URL: {page.url}\nTitle: {title}\n\n{text}')
-                if not self._screenshot_on_navigate:
-                    return result
-                png = await page.screenshot(timeout=timeout)
-                if (oversized := self._oversized_screenshot_error(png)) is not None:
-                    return self._truncate_output_keeping(result, oversized)
-                return ToolReturn(result, content=[BinaryContent(data=png, media_type='image/png')])
-            except PlaywrightError as exc:
-                return self._truncate_output(self._playwright_error('navigate', exc, timeout))
+        reason = self._policy.blocked_reason(url)
+        if reason is not None:
+            # Refused before `_in_operation`, so a disallowed URL never launches Chromium.
+            return await self._refuse(timeout_ms, f'Error: {reason}: {url}')
+
+        async def _navigate(page: _Page, timeout: int) -> str | ToolReturn[str]:
+            await page.goto(url, timeout=timeout)
+            if (blocked := await self._settle(page, 'navigate', timeout)) is not None:
+                return blocked
+            title = await self._await_with_timeout(page.title(), timeout)
+            text = await self._page_text(page, timeout)
+            result = self._truncate_output(f'URL: {page.url}\nTitle: {title}\n\n{text}')
+            if not self._screenshot_on_navigate:
+                return result
+            png = await page.screenshot(timeout=timeout)
+            if (oversized := self._oversized_screenshot_error(png)) is not None:
+                return self._truncate_output_keeping(result, oversized)
+            return ToolReturn(result, content=[BinaryContent(data=png, media_type='image/png')])
+
+        return await self._in_operation('navigate', timeout_ms, _navigate)
 
     async def click(self, selector: str, timeout_ms: int | None = None) -> str:
         """Click an element on the current page.
@@ -548,31 +838,25 @@ class PlaywrightBrowserToolset(FunctionToolset[AgentDepsT]):
         Returns:
             The page's visible text after the click.
         """
-        async with self._serialize_operation():
-            if (error := self._timeout_error(timeout_ms)) is not None:
-                return error
-            page = await self._state.ensure_page()
-            parts = selector.split(',', 1)
-            coordinates: tuple[int, int] | None = None
-            if len(parts) == 2:
-                try:
-                    coordinates = (int(parts[0]), int(parts[1]))
-                except ValueError:
-                    pass
-            timeout = self._resolve_timeout(timeout_ms)
+        parts = selector.split(',', 1)
+        coordinates: tuple[int, int] | None = None
+        if len(parts) == 2:
             try:
-                if coordinates is not None:
-                    await page.mouse.click(*coordinates)
-                else:
-                    await page.click(selector, timeout=timeout)
-                await page.wait_for_load_state('domcontentloaded', timeout=timeout)
-                blocked = await self._enforce_navigation_policy(page, 'click', timeout)
-                if blocked is not None:
-                    return blocked
-                text = await self._page_text(timeout)
-                return self._truncate_output(f"Clicked '{selector}'. URL: {page.url}\n\n{text}")
-            except PlaywrightError as exc:
-                return self._truncate_output(self._playwright_error('click', exc, timeout))
+                coordinates = (int(parts[0]), int(parts[1]))
+            except ValueError:
+                pass
+
+        async def _click(page: _Page, timeout: int) -> str:
+            if coordinates is not None:
+                await page.mouse.click(*coordinates)
+            else:
+                await page.click(selector, timeout=timeout)
+            if (blocked := await self._settle(page, 'click', timeout)) is not None:
+                return blocked
+            text = await self._page_text(page, timeout)
+            return self._truncate_output(f"Clicked '{selector}'. URL: {page.url}\n\n{text}")
+
+        return await self._in_operation('click', timeout_ms, _click)
 
     async def type_text(self, selector: str, text: str, timeout_ms: int | None = None) -> str:
         """Type text into an input field, replacing any existing value.
@@ -587,16 +871,12 @@ class PlaywrightBrowserToolset(FunctionToolset[AgentDepsT]):
         Returns:
             The page's visible text after typing.
         """
-        async with self._serialize_operation():
-            if (error := self._timeout_error(timeout_ms)) is not None:
-                return error
-            page = await self._state.ensure_page()
-            timeout = self._resolve_timeout(timeout_ms)
-            try:
-                await page.fill(selector, text, timeout=timeout)
-                return self._truncate_output(f"Typed into '{selector}'.\n\n{await self._page_text(timeout)}")
-            except PlaywrightError as exc:
-                return self._truncate_output(self._playwright_error('type_text', exc, timeout))
+
+        async def _type_text(page: _Page, timeout: int) -> str:
+            await page.fill(selector, text, timeout=timeout)
+            return self._truncate_output(f"Typed into '{selector}'.\n\n{await self._page_text(page, timeout)}")
+
+        return await self._in_operation('type_text', timeout_ms, _type_text)
 
     async def screenshot(self, full_page: bool = False, timeout_ms: int | None = None) -> str | ToolReturn[str]:
         """Capture a screenshot of the current page.
@@ -611,21 +891,17 @@ class PlaywrightBrowserToolset(FunctionToolset[AgentDepsT]):
             A short note with the page URL, and the PNG as image content so
             vision models can see it.
         """
-        async with self._serialize_operation():
-            if (error := self._timeout_error(timeout_ms)) is not None:
-                return error
-            page = await self._state.ensure_page()
-            timeout = self._resolve_timeout(timeout_ms)
-            try:
-                png = await page.screenshot(full_page=full_page, timeout=timeout)
-            except PlaywrightError as exc:
-                return self._truncate_output(self._playwright_error('screenshot', exc, timeout))
+
+        async def _screenshot(page: _Page, timeout: int) -> str | ToolReturn[str]:
+            png = await page.screenshot(full_page=full_page, timeout=timeout)
             if (oversized := self._oversized_screenshot_error(png)) is not None:
                 return self._truncate_output(oversized)
             return ToolReturn(
                 self._truncate_output(f'Screenshot captured. URL: {page.url}'),
                 content=[BinaryContent(data=png, media_type='image/png')],
             )
+
+        return await self._in_operation('screenshot', timeout_ms, _screenshot)
 
     async def get_text(self, selector: str | None = None, timeout_ms: int | None = None) -> str:
         """Extract text from the page or a specific element.
@@ -639,21 +915,19 @@ class PlaywrightBrowserToolset(FunctionToolset[AgentDepsT]):
             The element's text, or the full page's visible text when no selector
             is given.
         """
-        async with self._serialize_operation():
-            if (error := self._timeout_error(timeout_ms)) is not None:
-                return error
-            page = await self._state.ensure_page()
-            timeout = self._resolve_timeout(timeout_ms)
-            if selector:
-                try:
-                    text = await page.inner_text(selector, timeout=timeout)
-                except Exception as exc:
-                    return self._truncate_output(f"Error getting text from '{selector}': {exc}")
-                return self._truncate_output(text)
+
+        async def _get_text(page: _Page, timeout: int) -> str:
+            if not selector:
+                return await self._page_text(page, timeout)
             try:
-                return await self._page_text(timeout)
-            except PlaywrightError as exc:
-                return self._truncate_output(self._playwright_error('get_text', exc, timeout))
+                text = await page.inner_text(selector, timeout=timeout)
+            except Exception as exc:
+                # Named after the selector rather than the action: which selector failed
+                # is the part the model needs to act on.
+                return self._truncate_output(f"Error getting text from '{selector}': {exc}")
+            return self._truncate_output(text)
+
+        return await self._in_operation('get_text', timeout_ms, _get_text)
 
     async def scroll(
         self, direction: str, x: int | None = None, y: int | None = None, timeout_ms: int | None = None
@@ -670,31 +944,27 @@ class PlaywrightBrowserToolset(FunctionToolset[AgentDepsT]):
         Returns:
             The page's visible text after scrolling.
         """
-        async with self._serialize_operation():
-            if (error := self._timeout_error(timeout_ms)) is not None:
-                return error
-            deltas: dict[str, tuple[int, int]] = {
-                'up': (0, -300),
-                'down': (0, 300),
-                'left': (-300, 0),
-                'right': (300, 0),
-            }
-            delta = deltas.get(direction.lower())
-            if delta is None:
-                return self._truncate_output(f'Error: invalid direction {direction!r}; use up/down/left/right')
-            page = await self._state.ensure_page()
-            timeout = self._resolve_timeout(timeout_ms)
-            try:
-                if x is not None and y is not None:
-                    await page.mouse.move(x, y)
-                    await page.mouse.wheel(*delta)
-                else:
-                    # `evaluate` has no `timeout` parameter and hangs if the page's
-                    # main thread is blocked, so it is bounded externally.
-                    await self._await_with_timeout(page.evaluate(f'window.scrollBy({delta[0]}, {delta[1]})'), timeout)
-                return self._truncate_output(f'Scrolled {direction}.\n\n{await self._page_text(timeout)}')
-            except PlaywrightError as exc:
-                return self._truncate_output(self._playwright_error('scroll', exc, timeout))
+        deltas: dict[str, tuple[int, int]] = {
+            'up': (0, -300),
+            'down': (0, 300),
+            'left': (-300, 0),
+            'right': (300, 0),
+        }
+        delta = deltas.get(direction.lower())
+        if delta is None:
+            return await self._refuse(timeout_ms, f'Error: invalid direction {direction!r}; use up/down/left/right')
+
+        async def _scroll(page: _Page, timeout: int) -> str:
+            if x is not None and y is not None:
+                await page.mouse.move(x, y)
+                await page.mouse.wheel(*delta)
+            else:
+                # `evaluate` has no `timeout` parameter and hangs if the page's
+                # main thread is blocked, so it is bounded externally.
+                await self._await_with_timeout(page.evaluate(f'window.scrollBy({delta[0]}, {delta[1]})'), timeout)
+            return self._truncate_output(f'Scrolled {direction}.\n\n{await self._page_text(page, timeout)}')
+
+        return await self._in_operation('scroll', timeout_ms, _scroll)
 
     async def go_back(self, timeout_ms: int | None = None) -> str:
         """Navigate back in the browser history.
@@ -706,22 +976,16 @@ class PlaywrightBrowserToolset(FunctionToolset[AgentDepsT]):
         Returns:
             The previous page's visible text.
         """
-        async with self._serialize_operation():
-            if (error := self._timeout_error(timeout_ms)) is not None:
-                return error
-            page = await self._state.ensure_page()
-            timeout = self._resolve_timeout(timeout_ms)
-            try:
-                response = await page.go_back(timeout=timeout)
-                if response is None:
-                    return self._truncate_output('No previous page in browser history.')
-                await page.wait_for_load_state('domcontentloaded', timeout=timeout)
-                blocked = await self._enforce_navigation_policy(page, 'go_back', timeout)
-                if blocked is not None:
-                    return blocked
-                return self._truncate_output(f'Went back. URL: {page.url}\n\n{await self._page_text(timeout)}')
-            except PlaywrightError as exc:
-                return self._truncate_output(self._playwright_error('go_back', exc, timeout))
+
+        async def _go_back(page: _Page, timeout: int) -> str:
+            response = await page.go_back(timeout=timeout)
+            if response is None:
+                return self._truncate_output('No previous page in browser history.')
+            if (blocked := await self._settle(page, 'go_back', timeout)) is not None:
+                return blocked
+            return self._truncate_output(f'Went back. URL: {page.url}\n\n{await self._page_text(page, timeout)}')
+
+        return await self._in_operation('go_back', timeout_ms, _go_back)
 
     async def go_forward(self, timeout_ms: int | None = None) -> str:
         """Navigate forward in the browser history.
@@ -733,22 +997,16 @@ class PlaywrightBrowserToolset(FunctionToolset[AgentDepsT]):
         Returns:
             The next page's visible text.
         """
-        async with self._serialize_operation():
-            if (error := self._timeout_error(timeout_ms)) is not None:
-                return error
-            page = await self._state.ensure_page()
-            timeout = self._resolve_timeout(timeout_ms)
-            try:
-                response = await page.go_forward(timeout=timeout)
-                if response is None:
-                    return self._truncate_output('No next page in browser history.')
-                await page.wait_for_load_state('domcontentloaded', timeout=timeout)
-                blocked = await self._enforce_navigation_policy(page, 'go_forward', timeout)
-                if blocked is not None:
-                    return blocked
-                return self._truncate_output(f'Went forward. URL: {page.url}\n\n{await self._page_text(timeout)}')
-            except PlaywrightError as exc:
-                return self._truncate_output(self._playwright_error('go_forward', exc, timeout))
+
+        async def _go_forward(page: _Page, timeout: int) -> str:
+            response = await page.go_forward(timeout=timeout)
+            if response is None:
+                return self._truncate_output('No next page in browser history.')
+            if (blocked := await self._settle(page, 'go_forward', timeout)) is not None:
+                return blocked
+            return self._truncate_output(f'Went forward. URL: {page.url}\n\n{await self._page_text(page, timeout)}')
+
+        return await self._in_operation('go_forward', timeout_ms, _go_forward)
 
     async def execute_js(self, script: str, timeout_ms: int | None = None) -> str:
         """Evaluate a JavaScript expression and return its result.
@@ -762,30 +1020,21 @@ class PlaywrightBrowserToolset(FunctionToolset[AgentDepsT]):
             A string result as-is, objects/arrays as JSON, `null`/`undefined` as
             `'undefined'`, or `JS error: ...` when evaluation raises.
         """
-        async with self._serialize_operation():
-            if (error := self._timeout_error(timeout_ms)) is not None:
-                return error
-            page = await self._state.ensure_page()
-            timeout = self._resolve_timeout(timeout_ms)
+
+        async def _execute_js(page: _Page, timeout: int) -> str:
             try:
                 # `evaluate` waits for a returned promise and has no `timeout`
                 # parameter, so a never-resolving promise (or a blocked main
                 # thread) would hold the operation lock forever without the
                 # external deadline.
                 result = await self._await_with_timeout(page.evaluate(script), timeout)
-            except (PlaywrightTimeoutError, TargetClosedError) as exc:
-                # A broader `except PlaywrightError` would catch script exceptions too,
-                # which `evaluate` also raises; these two are the browser failing.
-                return self._truncate_output(self._playwright_error('execute_js', exc, timeout))
+            except (PlaywrightTimeoutError, TargetClosedError):
+                # `evaluate` raises for script exceptions too, so the browser's own
+                # failures are picked out by type and left to the operation's mapper.
+                raise
             except Exception as exc:
                 return self._truncate_output(f'JS error: {exc}')
-            try:
-                # Guarded separately from `evaluate`: the bounce this may perform is a
-                # navigation, and its failure is a browser error rather than a script one.
-                blocked = await self._enforce_navigation_policy(page, 'execute_js', timeout)
-            except PlaywrightError as exc:
-                return self._truncate_output(self._playwright_error('execute_js', exc, timeout))
-            if blocked is not None:
+            if (blocked := await self._enforce_navigation_policy(page, 'execute_js', timeout)) is not None:
                 return blocked
             if result is None:
                 return self._truncate_output('undefined')
@@ -795,6 +1044,8 @@ class PlaywrightBrowserToolset(FunctionToolset[AgentDepsT]):
                 return self._truncate_output(json.dumps(result, default=str))
             except TypeError:  # pragma: no cover
                 return self._truncate_output(str(result))
+
+        return await self._in_operation('execute_js', timeout_ms, _execute_js)
 
     async def wait_for(
         self, selector: str | None = None, text: str | None = None, timeout_ms: int | None = None
@@ -814,25 +1065,21 @@ class PlaywrightBrowserToolset(FunctionToolset[AgentDepsT]):
             A short confirmation followed by the page's visible text, or a bounded
             error string when neither/both arguments are given or the wait times out.
         """
-        async with self._serialize_operation():
-            if (error := self._timeout_error(timeout_ms)) is not None:
-                return error
-            invalid = 'Error: wait_for requires exactly one of selector or text.'
-            if text is not None:
-                if selector is not None:
-                    return self._truncate_output(invalid)
-                query = f'text={text}'
-            elif selector is not None:
-                query = selector
-            else:
-                return self._truncate_output(invalid)
-            page = await self._state.ensure_page()
-            timeout = self._resolve_timeout(timeout_ms)
-            try:
-                await page.wait_for_selector(query, timeout=timeout)
-                return self._truncate_output(f"Found '{query}'.\n\n{await self._page_text(timeout)}")
-            except PlaywrightError as exc:
-                return self._truncate_output(self._playwright_error('wait_for', exc, timeout))
+        invalid = 'Error: wait_for requires exactly one of selector or text.'
+        if text is not None:
+            if selector is not None:
+                return await self._refuse(timeout_ms, invalid)
+            query = f'text={text}'
+        elif selector is not None:
+            query = selector
+        else:
+            return await self._refuse(timeout_ms, invalid)
+
+        async def _wait_for(page: _Page, timeout: int) -> str:
+            await page.wait_for_selector(query, timeout=timeout)
+            return self._truncate_output(f"Found '{query}'.\n\n{await self._page_text(page, timeout)}")
+
+        return await self._in_operation('wait_for', timeout_ms, _wait_for)
 
     async def snapshot(self, timeout_ms: int | None = None) -> str:
         """Return the page's accessibility tree with `aria-ref` handles for targeting.
@@ -850,13 +1097,8 @@ class PlaywrightBrowserToolset(FunctionToolset[AgentDepsT]):
             The accessibility tree (truncated to the token budget), or a bounded
             error string when the snapshot fails.
         """
-        async with self._serialize_operation():
-            if (error := self._timeout_error(timeout_ms)) is not None:
-                return error
-            page = await self._state.ensure_page()
-            timeout = self._resolve_timeout(timeout_ms)
-            try:
-                tree = await page.aria_snapshot(mode='ai', timeout=timeout)
-            except PlaywrightError as exc:
-                return self._truncate_output(self._playwright_error('snapshot', exc, timeout))
-            return self._truncate_output(tree)
+
+        async def _snapshot(page: _Page, timeout: int) -> str:
+            return self._truncate_output(await page.aria_snapshot(mode='ai', timeout=timeout))
+
+        return await self._in_operation('snapshot', timeout_ms, _snapshot)
