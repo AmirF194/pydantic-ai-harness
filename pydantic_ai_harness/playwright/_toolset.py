@@ -345,12 +345,15 @@ def _without_endpoint_credentials(message: str, cdp_url: str) -> str:
     """
     try:
         parsed = urlparse(cdp_url)
-    except ValueError:  # pragma: no cover -- an unparsable endpoint cannot be redacted piecemeal
+        host = parsed.hostname or ''
+        # `.port` parses lazily and raises on a non-numeric port, so it has to be
+        # read inside the guard: this runs while an error is already being built.
+        if parsed.port is not None:
+            host = f'{host}:{parsed.port}'
+        scheme = parsed.scheme
+    except ValueError:
         return message.replace(cdp_url, '<cdp_url>')
-    host = parsed.hostname or ''
-    if parsed.port is not None:
-        host = f'{host}:{parsed.port}'
-    safe = f'{parsed.scheme}://{host}' if parsed.scheme else host
+    safe = f'{scheme}://{host}' if scheme else host
     return message.replace(cdp_url, safe)
 
 

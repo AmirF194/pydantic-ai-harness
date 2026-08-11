@@ -1937,6 +1937,20 @@ class TestPlaywrightBrowserLifecycle:
         result = await agent.run('screenshot the page')
         assert 'SUPERSECRET' not in str(result.all_messages())
 
+    async def test_attach_failure_redacts_an_endpoint_with_an_invalid_port(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # A non-numeric port makes urlparse raise when the port is read, which would
+        # otherwise replace the redacted error with an unhandled one.
+        page = _FakePage()
+        endpoint = 'http://host:bad/session/SUPERSECRET'
+        _install_fake_driver(monkeypatch, page, launch_error=PlaywrightError(f'cannot reach {endpoint}'))
+        agent = Agent(TestModel(call_tools=['screenshot']), capabilities=[PlaywrightBrowser(cdp_url=endpoint)])
+        result = await agent.run('screenshot the page')
+        rendered = str(result.all_messages())
+        assert 'SUPERSECRET' not in rendered
+        assert '<cdp_url>' in rendered
+
     async def test_launch_failure_with_binary_present_surfaces_own_error(self, monkeypatch: pytest.MonkeyPatch) -> None:
         installs: list[bool] = []
 
