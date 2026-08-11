@@ -151,11 +151,15 @@ agent = Agent(
 
 ### What counts toward the fraction
 
-The estimator counts every part that is sent: prompts, system prompts, tool calls and their
-results, retry prompts, extended-thinking blocks, provider-side tool results, and the
-instructions, once. It is a ~4-characters-per-token approximation, not a tokenizer; pass
-`tokenizer=` to any strategy to measure with the real one. `FilePart` is not counted -- its
-payload is binary, and its length in characters would mean nothing.
+With a usage anchor, everything the provider billed for the anchored request counts -- including
+tool definitions and `FilePart` payloads, which no character estimate can see. For the messages
+after the anchor (and for whole histories with no reported usage), the estimator counts every part
+that is sent: prompts, system prompts, tool calls and their results, retry prompts,
+extended-thinking blocks, provider-side tool results, and the instructions, once (or again after
+the anchor only when they changed since it). That estimated portion is a ~4-characters-per-token
+approximation, not a tokenizer; pass `tokenizer=` to any strategy to measure with the real one.
+`FilePart` is not counted there -- its payload is binary, and its length in characters would mean
+nothing.
 
 **If you already set an absolute `max_tokens`, re-check it.** The estimator used to count only user
 and system prompts, tool returns, response text, and tool calls. `ThinkingPart` / `CompactionPart`

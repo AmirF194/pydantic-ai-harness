@@ -205,15 +205,23 @@ def estimate_context_tokens(
     A history rewritten *after* the anchor's request went out (a compaction strategy editing
     older messages mid-cycle) is overestimated, because the anchor still describes the
     pre-rewrite request; the next real response re-anchors it. `TieredCompaction` compensates
-    inside its escalation loop by scaling its anchored baseline by the heuristic shrink.
-    Compacting slightly early is the cheap failure mode; the heuristic's multi-x underestimate
-    on dense content, which lets the history blow the context window, is the expensive one.
+    inside its escalation loop by subtracting each tier's estimated reclaim from its anchored
+    baseline. Compacting slightly early is the cheap failure mode; the heuristic's multi-x
+    underestimate on dense content, which lets the history blow the context window, is the
+    expensive one.
     """
     for index in range(len(messages) - 1, -1, -1):
         message = messages[index]
         if isinstance(message, ModelResponse) and message.usage.input_tokens:
             anchored = message.usage.input_tokens + message.usage.output_tokens
             segments = _collect_message_text(messages[index + 1 :])
+            # The anchor paid for the instructions in force when its request was made. When the
+            # latest instructions differ (dynamic instructions, or a persisted history resumed
+            # under a new prompt), the new set is absent from both the anchor and the message
+            # text, so count it; when unchanged, counting it would double what the anchor holds.
+            current_instructions = _instructions_text(messages)
+            if current_instructions != _instructions_text(messages[: index + 1]):
+                segments = [*segments, *current_instructions]
             if tokenizer is not None:
                 return anchored + sum(tokenizer(s) for s in segments)
             return anchored + sum(len(s) for s in segments) // _CHARS_PER_TOKEN

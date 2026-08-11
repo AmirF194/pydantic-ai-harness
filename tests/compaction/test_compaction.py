@@ -213,12 +213,21 @@ class TestEstimateContextTokens:
         msgs: list[ModelMessage] = [_user('x' * 40), _assistant('y' * 40)]
         assert estimate_context_tokens(msgs) == estimate_token_count(msgs) > 0
 
-    def test_suffix_does_not_recount_instructions(self):
+    def test_suffix_does_not_recount_unchanged_instructions(self):
         # Instructions travelled inside the anchor's input_tokens; counting the copy carried
         # by a later request would double them.
+        request_before = ModelRequest(parts=[UserPromptPart(content='q')], instructions='i' * 4_000)
         request_after = ModelRequest(parts=[UserPromptPart(content='a' * 40)], instructions='i' * 4_000)
-        msgs: list[ModelMessage] = [_assistant_with_usage('short', 50_000, 500), request_after]
+        msgs: list[ModelMessage] = [request_before, _assistant_with_usage('short', 50_000, 500), request_after]
         assert estimate_context_tokens(msgs) == 50_500 + 10
+
+    def test_instructions_changed_after_the_anchor_are_counted(self):
+        # The anchor paid for the old instructions only; a new set (dynamic instructions, or a
+        # resumed history under a new prompt) must be added to the estimate.
+        request_before = ModelRequest(parts=[UserPromptPart(content='q')], instructions='old')
+        request_after = ModelRequest(parts=[UserPromptPart(content='a' * 40)], instructions='i' * 4_000)
+        msgs: list[ModelMessage] = [request_before, _assistant_with_usage('short', 50_000, 500), request_after]
+        assert estimate_context_tokens(msgs) == 50_500 + 10 + 1_000
 
     def test_tokenizer_applies_to_the_suffix(self):
         msgs: list[ModelMessage] = [
@@ -1882,21 +1891,37 @@ class TestTieredCompaction:
         assert len(result.messages) == 1
 
     @pytest.mark.anyio
-    async def test_escalation_scales_anchored_baseline_by_tier_reclaim(self):
+    async def test_escalation_subtracts_tier_reclaim_from_anchored_baseline(self):
         # The anchor predates any tier rewrite, so re-anchoring would show no reclaim and
-        # always escalate to the last tier. Scaling by the heuristic shrink must register
-        # t1's reclaim (101K -> ~50.5K <= 60K target) and never reach t2.
+        # always escalate to the last tier. Subtracting the removed text's estimate must
+        # register t1's reclaim (14K -> 12K <= 13K target) and never reach t2.
         calls: list[str] = []
         t1 = _RecordingTier('t1', calls, drop=6)
         t2 = _RecordingTier('t2', calls)
-        cap = TieredCompaction(tiers=[t1, t2], target_tokens=60_000)
-        messages: list[ModelMessage] = [_assistant_with_usage('', 100_000, 0)] + [
+        cap = TieredCompaction(tiers=[t1, t2], target_tokens=13_000, tokenizer=len)
+        messages: list[ModelMessage] = [_assistant_with_usage('', 10_000, 0)] + [
             _tool_return('search', f'tc{i}', 'z' * 400) for i in range(10)
         ]
         rc = _make_request_context(messages)
         result = await cap.before_model_request(_make_ctx(), rc)
         assert calls == ['t1']
         assert len(result.messages) == 5
+
+    @pytest.mark.anyio
+    async def test_escalation_never_counts_fixed_overhead_as_reclaimed(self):
+        # 100K of the baseline is anchored overhead (tool definitions, instructions) that no
+        # tier can touch. Halving the 4K of message text must leave the estimate at ~102K,
+        # not the ~52K a proportional rescale would claim, so escalation continues to t2.
+        calls: list[str] = []
+        t1 = _RecordingTier('t1', calls, drop=6)
+        t2 = _RecordingTier('t2', calls)
+        cap = TieredCompaction(tiers=[t1, t2], target_tokens=60_000, tokenizer=len)
+        messages: list[ModelMessage] = [_assistant_with_usage('', 100_000, 0)] + [
+            _tool_return('search', f'tc{i}', 'z' * 400) for i in range(10)
+        ]
+        rc = _make_request_context(messages)
+        await cap.before_model_request(_make_ctx(), rc)
+        assert calls == ['t1', 't2']
 
     @pytest.mark.anyio
     async def test_full_escalation(self):

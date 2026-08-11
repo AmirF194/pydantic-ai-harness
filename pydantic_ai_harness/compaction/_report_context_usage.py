@@ -25,10 +25,13 @@ class ContextUsage:
     used_tokens: int
     """Estimated tokens in the message history about to be sent.
 
-    Counted by `estimate_token_count`: every message part that is sent, plus the most recent
-    `ModelRequest.instructions` once. Tool schemas are outside the count, so a gauge built on
-    this reads lower than what the provider bills. Tool-schema accounting is tracked separately
-    in pydantic/pydantic-ai-harness#100.
+    Counted by `estimate_context_tokens`: the provider-reported usage of the most recent model
+    response (tool schemas included) plus an estimate of the messages added since. Histories
+    with no reported usage fall back to `estimate_token_count`, whose character heuristic
+    cannot see tool schemas (pydantic/pydantic-ai-harness#100) and so reads lower than what the
+    provider bills. When a compactor registered *before* this capability rewrote messages older
+    than the anchor this same cycle, the reading stays at the pre-compaction size until the
+    next response re-anchors it.
     """
 
     window_tokens: int

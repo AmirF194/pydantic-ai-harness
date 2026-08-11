@@ -32,7 +32,7 @@ An agent that runs for many turns accumulates history: tool outputs, file reads,
 
 ## Triggers
 
-Every size-based strategy triggers on `max_messages`, `max_tokens` (estimated), or `max_fraction`. Token counts use a ~4-chars-per-token heuristic by default; pass a `tokenizer` callable (for example `tiktoken`) for accuracy. `DeduplicateFileReads` runs on every request when no trigger is set (it is cheap and near-lossless). `TieredCompaction` triggers and stops on a single `target_tokens` / `target_fraction` budget. `ClampOversizedMessages` triggers per *part* (`max_part_tokens` / `max_part_chars`), not on the whole history -- the failure it targets is one oversized part, not a large total.
+Every size-based strategy triggers on `max_messages`, `max_tokens` (estimated), or `max_fraction`. Token counts anchor on the provider-reported usage of the most recent model response when one is available (its `input_tokens` measured the whole request that produced it, tool definitions included); only the messages added since are estimated, with a ~4-chars-per-token heuristic by default -- pass a `tokenizer` callable (for example `tiktoken`) to sharpen it. Histories with no reported usage fall back to the heuristic throughout. `DeduplicateFileReads` runs on every request when no trigger is set (it is cheap and near-lossless). `TieredCompaction` triggers and stops on a single `target_tokens` / `target_fraction` budget. `ClampOversizedMessages` triggers per *part* (`max_part_tokens` / `max_part_chars`), not on the whole history -- the failure it targets is one oversized part, not a large total.
 
 ### `max_fraction`: one setting for every model
 

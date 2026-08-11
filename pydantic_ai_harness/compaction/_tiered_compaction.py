@@ -143,8 +143,11 @@ class TieredCompaction(AbstractCapability[AgentDepsT]):
         """Apply tiers in order until the history fits *target* or tiers run out."""
         original = messages
         # The usage anchor describes the request as it was sent, so a tier's rewrite of older
-        # messages is invisible to re-anchoring; scale the anchored baseline by the heuristic
-        # shrink instead, so tier reclaim registers against real-token accounting.
+        # messages is invisible to re-anchoring. Subtract the estimated tokens of the text a
+        # tier removed from the anchored baseline instead: the reclaim is measured only on
+        # message text, so the baseline's fixed overhead (tool definitions, instructions) is
+        # never treated as compacted away. On content the estimator undercounts, this
+        # understates the reclaim and escalates a tier early -- the cheap direction.
         baseline = estimate_context_tokens(messages, self.tokenizer)
         heuristic_baseline = estimate_token_count(messages, self.tokenizer)
         estimate = baseline
@@ -154,8 +157,8 @@ class TieredCompaction(AbstractCapability[AgentDepsT]):
             messages = await tier.compact(messages, ctx)
             # Before the next stop decision, so escalation measures the history it would return.
             messages = reinject_pinned(original, messages)
-            heuristic_now = estimate_token_count(messages, self.tokenizer)
-            estimate = baseline * heuristic_now // heuristic_baseline if heuristic_baseline else heuristic_now
+            reclaimed = heuristic_baseline - estimate_token_count(messages, self.tokenizer)
+            estimate = max(baseline - reclaimed, 0)
         return messages
 
     async def compact(
