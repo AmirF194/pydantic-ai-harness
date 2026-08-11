@@ -14,10 +14,15 @@ self-healing), and the tool returns a text result.
 
 [Source](https://github.com/pydantic/pydantic-ai-harness/tree/main/pydantic_ai_harness/browser_use/)
 
-## The problem
+!!! note "Which browser capability?"
+    This page covers the browser-use integration: one `browse_web` tool that
+    hands a goal to an autonomous agent. To have the host model drive the
+    browser itself with typed actions -- navigate, click, type, screenshot --
+    see [Playwright Browser](playwright.md). Give an agent one or the other:
+    each capability runs its own browser, so a session opened by one is not
+    visible to the other.
 
-[Playwright Browser](playwright.md) is that low-level surface in this repo, and
-the two capabilities are complementary rather than alternatives.
+## The problem
 
 Low-level browser tools (goto, click a selector, extract text) work well when
 the flow is known: the host model decides every action, which is cheap and

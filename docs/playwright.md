@@ -7,13 +7,22 @@ description: Give a Pydantic AI agent a real, stateful Chromium browser via asyn
 
 `PlaywrightBrowser` gives an agent a real, stateful Chromium browser via async
 [Playwright](https://playwright.dev/python/): navigate, click, type, scroll,
-move through history, extract page text, run JavaScript, and screenshot. Reach
-for it when the lighter web tools fall short -- pages behind login or session
-cookies, JavaScript-rendered SPAs, and interactive multi-step flows. For
-query-based research prefer [Exa Search](exa-search.md); for a static URL prefer
-a web-fetch tool. For an open-ended goal on a page layout you do not know in advance, [Browser Use](browser-use.md) delegates the whole task to an autonomous browser agent instead. The two are complementary: this capability gives the model typed, deterministic actions it drives itself, one tool call at a time.
+move through history, extract page text, run JavaScript, and screenshot.
+
+Reach for it when the lighter web tools fall short. A web search tool answers a
+research question without loading a page, and a web-fetch tool handles a known
+static URL. This capability covers what neither can reach: pages behind login or session cookies,
+JavaScript-rendered SPAs, and interactive multi-step flows.
 
 [Source](https://github.com/pydantic/pydantic-ai-harness/tree/main/pydantic_ai_harness/playwright/)
+
+!!! note "Which browser capability?"
+    This page covers driving the browser from the host model: typed,
+    deterministic actions, one tool call at a time. To hand an open-ended goal
+    to an autonomous agent that drives the browser for you, see
+    [Browser Use](browser-use.md). Give an agent one or the other: each
+    capability runs its own browser, so a session opened by one is not visible
+    to the other.
 
 ## Installation
 

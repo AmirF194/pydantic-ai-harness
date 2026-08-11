@@ -1129,6 +1129,15 @@ class TestPerCallTimeout:
         await toolset.scroll('down', timeout_ms=1234)
         assert page.timeouts['inner_text'] == 1234
 
+    async def test_override_bounds_the_disallowed_navigation_bounce(self) -> None:
+        # The bounce to about:blank is itself a navigation, so it must run under the
+        # caller's deadline rather than Playwright's 30-second default.
+        page = _FakePage(url='https://evil.com/landing')
+        toolset = _toolset(page, allowed_domains=['example.com'])
+        await toolset.click('a.external', timeout_ms=4321)
+        assert page.goto_calls == ['about:blank']
+        assert page.timeouts['goto'] == 4321
+
     async def test_none_falls_back_to_capability_default(self) -> None:
         page = _FakePage()
         await _toolset(page).click('button#go')

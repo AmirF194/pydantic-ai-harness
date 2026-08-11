@@ -458,7 +458,7 @@ class PlaywrightBrowserToolset(FunctionToolset[AgentDepsT]):
             'capture the viewport (full_page=False) or scroll and capture sections instead.'
         )
 
-    async def _enforce_navigation_policy(self, page: _Page, action: str) -> str | None:
+    async def _enforce_navigation_policy(self, page: _Page, action: str, timeout: int) -> str | None:
         """After an action, bounce to `about:blank` if the page left the permitted set.
 
         Navigation can happen through clicks, `execute_js` setting
@@ -469,12 +469,15 @@ class PlaywrightBrowserToolset(FunctionToolset[AgentDepsT]):
         model. The network-level route guard installed by
         `PlaywrightBrowser.wrap_run` is the primary boundary; this is the second
         layer.
+
+        The bounce runs under the caller's resolved `timeout` so a short
+        per-call `timeout_ms` is not silently replaced by Playwright's default.
         """
         reason = blocked_navigation_reason(page.url, self._allowed_domains, self._block_private_addresses)
         if reason is None:
             return None
         blocked = page.url
-        await page.goto('about:blank')
+        await page.goto('about:blank', timeout=timeout)
         return self._truncate_output(f'Error: {action} reached a {reason}: {blocked}')
 
     async def navigate(self, url: str, timeout_ms: int | None = None) -> str | ToolReturn[str]:
@@ -500,7 +503,7 @@ class PlaywrightBrowserToolset(FunctionToolset[AgentDepsT]):
             try:
                 await page.goto(url, timeout=timeout)
                 await page.wait_for_load_state('domcontentloaded', timeout=timeout)
-                blocked = await self._enforce_navigation_policy(page, 'navigate')
+                blocked = await self._enforce_navigation_policy(page, 'navigate', timeout)
                 if blocked is not None:
                     return blocked
                 title = await self._await_with_timeout(page.title(), timeout)
@@ -546,7 +549,7 @@ class PlaywrightBrowserToolset(FunctionToolset[AgentDepsT]):
                 else:
                     await page.click(selector, timeout=timeout)
                 await page.wait_for_load_state('domcontentloaded', timeout=timeout)
-                blocked = await self._enforce_navigation_policy(page, 'click')
+                blocked = await self._enforce_navigation_policy(page, 'click', timeout)
                 if blocked is not None:
                     return blocked
                 text = await self._page_text(timeout)
@@ -696,7 +699,7 @@ class PlaywrightBrowserToolset(FunctionToolset[AgentDepsT]):
                 if response is None:
                     return self._truncate_output('No previous page in browser history.')
                 await page.wait_for_load_state('domcontentloaded', timeout=timeout)
-                blocked = await self._enforce_navigation_policy(page, 'go_back')
+                blocked = await self._enforce_navigation_policy(page, 'go_back', timeout)
                 if blocked is not None:
                     return blocked
                 return self._truncate_output(f'Went back. URL: {page.url}\n\n{await self._page_text(timeout)}')
@@ -723,7 +726,7 @@ class PlaywrightBrowserToolset(FunctionToolset[AgentDepsT]):
                 if response is None:
                     return self._truncate_output('No next page in browser history.')
                 await page.wait_for_load_state('domcontentloaded', timeout=timeout)
-                blocked = await self._enforce_navigation_policy(page, 'go_forward')
+                blocked = await self._enforce_navigation_policy(page, 'go_forward', timeout)
                 if blocked is not None:
                     return blocked
                 return self._truncate_output(f'Went forward. URL: {page.url}\n\n{await self._page_text(timeout)}')
@@ -760,7 +763,7 @@ class PlaywrightBrowserToolset(FunctionToolset[AgentDepsT]):
             try:
                 # Guarded separately from `evaluate`: the bounce this may perform is a
                 # navigation, and its failure is a browser error rather than a script one.
-                blocked = await self._enforce_navigation_policy(page, 'execute_js')
+                blocked = await self._enforce_navigation_policy(page, 'execute_js', timeout)
             except PlaywrightError as exc:
                 return self._truncate_output(self._playwright_error('execute_js', exc, timeout))
             if blocked is not None:

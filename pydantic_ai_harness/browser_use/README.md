@@ -9,6 +9,14 @@ the tool returns a text result.
 
 [Source](https://github.com/pydantic/pydantic-ai-harness/tree/main/pydantic_ai_harness/browser_use/)
 
+> [!NOTE]
+> This README covers the browser-use integration: one `browse_web` tool that
+> hands a goal to an autonomous agent. To have the host model drive the browser
+> itself with typed actions -- navigate, click, type, screenshot -- see
+> [`PlaywrightBrowser`](../playwright/). Give an agent one or the other: each
+> capability runs its own browser, so a session opened by one is not visible to
+> the other.
+
 ## Installation
 
 ```bash
@@ -20,9 +28,6 @@ supports 3.10). browser-use talks to Chromium directly over CDP and downloads
 a browser on first run when none is found locally.
 
 ## The problem
-
-[`PlaywrightBrowser`](../playwright/) is that low-level surface in this repo, and
-the two capabilities are complementary rather than alternatives.
 
 Low-level browser tools (goto, click a selector, extract text) work well when
 the flow is known: the host model decides every action, which is cheap and
