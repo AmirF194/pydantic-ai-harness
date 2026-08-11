@@ -222,26 +222,29 @@ With `allowed_domains=None` (the default) the agent can reach any public URL.
 explicit allowlist.** Each entry matches its exact host and any subdomain. The
 two policies are independent: an allowlisted private address is still refused
 until you opt out of `block_private_addresses`. Both are enforced at two
-layers: a network route guard aborts disallowed top-level navigations (covering
-clicks, `execute_js`, and history moves, not just `navigate`), and each tool
-re-checks the resulting URL and bounces to `about:blank` so disallowed content
-never reaches the model. Service workers are blocked in the browser context so
+layers: a network route guard aborts disallowed requests before they leave
+(covering clicks, `execute_js`, and history moves, not just `navigate`), and
+each tool re-checks the resulting URL and bounces to `about:blank` so disallowed
+content never reaches the model. Service workers are blocked in the browser context so
 their traffic cannot slip past the route guard.
 
-The two policies differ in how far down the frame tree they reach. The
-allowlist governs top-level navigation only, so a page's own third-party frames
-(identity providers, payment steps) still load. The private-address block
-applies to **every** frame, because `snapshot()` reads the ARIA tree of
-cross-origin child frames, and a subframe pointed at `169.254.169.254` would
-otherwise hand the model the response body the block exists to withhold.
+The two policies differ in how far they reach. The allowlist governs top-level
+navigation only, so a page's own subresources and third-party frames (identity
+providers, payment steps) still load. The private-address block applies to
+**every** frame and **every** resource type, including a `fetch` or XHR issued
+by `execute_js`. Both channels end at the model: `snapshot()` reads the ARIA
+tree of cross-origin child frames, and a page can read back a subresource it
+fetched itself, so either would otherwise hand over the response body the block
+exists to withhold.
 
 Neither policy is a general security boundary. Microsoft's own playwright-mcp
-disclaims its origin filter the same way. Both govern navigation, not requests
-initiated by in-page JavaScript (`fetch`/XHR via `execute_js`); the
-private-address block matches IP literals and `localhost` names, not hostnames
-that resolve to private addresses (DNS rebinding); and WebSocket connections are
-not covered. Constraining in-page requests and resolution-based blocking are
-tracked in [#415](https://github.com/pydantic/pydantic-ai-harness/issues/415).
+disclaims its origin filter the same way. The allowlist governs navigation, not
+requests initiated by in-page JavaScript (`fetch`/XHR via `execute_js`); both
+policies match IP literals and `localhost` names, not hostnames that resolve to
+private addresses (DNS rebinding); and the route guard does not see WebSocket
+connections. Constraining in-page requests against the allowlist and
+resolution-based blocking are tracked in
+[#415](https://github.com/pydantic/pydantic-ai-harness/issues/415).
 
 For untrusted-input scenarios, run the browser in a container or VM with an
 egress firewall, or front it with a proxy, and pair it with the harness's

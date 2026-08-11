@@ -102,6 +102,9 @@ DEFAULT_TIMEOUT_MS: int = 30_000
 _CHARS_PER_TOKEN = 4
 """Characters-per-token estimate used to turn a token budget into a character cap."""
 
+_BLANK_PAGE = 'about:blank'
+"""The blank page a context starts on, and where a disallowed navigation is sent."""
+
 _MAX_SCREENSHOT_BYTES = 5_000_000
 """Largest screenshot PNG returned as image content.
 
@@ -157,8 +160,13 @@ def _to_idna(host: str) -> str:
     """Return `host` in its ASCII/IDNA form so Unicode and `xn--` spellings compare equal.
 
     A host that cannot be IDNA-encoded (over-long or empty labels, IP literals)
-    falls back to the input unchanged, so IPv4/IPv6 literals are left alone.
+    falls back to the input unchanged, so IPv4/IPv6 literals are left alone. The
+    trailing dot of a fully-qualified spelling is dropped first: it names the DNS
+    root rather than a label, and `encode('idna')` rejects the empty label it
+    produces, which would otherwise deny `example.com.` against an `example.com`
+    allowlist entry.
     """
+    host = host.rstrip('.')
     try:
         return host.encode('idna').decode('ascii')
     except UnicodeError:
@@ -239,9 +247,18 @@ def blocked_navigation_reason(url: str, allowed_domains: list[str] | None, block
     open egress still cannot reach `http://169.254.169.254/`. The returned phrase
     names which policy denied the URL, so the model and logs can tell an
     allowlist miss from a private-address block.
+
+    `about:blank` is permitted: it is the state a context starts in and the target
+    this module bounces to, so denying it would refuse every tool call made before
+    the first navigation. Every other hostless URL (`file:`, `mailto:`, `data:`)
+    stays denied, under a phrase that does not blame an allowlist that may not exist.
     """
+    if url == _BLANK_PAGE:
+        return None
     host = _url_host(url)
-    if host is None or not check_allowed_domain(url, allowed_domains):
+    if host is None:
+        return 'URL with no host'
+    if not check_allowed_domain(url, allowed_domains):
         return 'domain not in allowed_domains'
     if block_private_addresses and is_blocked_address(host):
         return 'blocked private or link-local address'
@@ -477,7 +494,7 @@ class PlaywrightBrowserToolset(FunctionToolset[AgentDepsT]):
         if reason is None:
             return None
         blocked = page.url
-        await page.goto('about:blank', timeout=timeout)
+        await page.goto(_BLANK_PAGE, timeout=timeout)
         return self._truncate_output(f'Error: {action} reached a {reason}: {blocked}')
 
     async def navigate(self, url: str, timeout_ms: int | None = None) -> str | ToolReturn[str]:
@@ -756,7 +773,9 @@ class PlaywrightBrowserToolset(FunctionToolset[AgentDepsT]):
                 # thread) would hold the operation lock forever without the
                 # external deadline.
                 result = await self._await_with_timeout(page.evaluate(script), timeout)
-            except PlaywrightTimeoutError as exc:
+            except (PlaywrightTimeoutError, TargetClosedError) as exc:
+                # A broader `except PlaywrightError` would catch script exceptions too,
+                # which `evaluate` also raises; these two are the browser failing.
                 return self._truncate_output(self._playwright_error('execute_js', exc, timeout))
             except Exception as exc:
                 return self._truncate_output(f'JS error: {exc}')

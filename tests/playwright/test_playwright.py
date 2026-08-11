@@ -579,13 +579,30 @@ class TestPlaywrightBrowserTools:
         assert isinstance(result, str) and result.startswith('URL:')
         assert page.goto_calls == ['http://[::1]:8080/']
 
-    @pytest.mark.parametrize('url', ['mailto:a@b.com', 'about:blank'])
+    @pytest.mark.parametrize('url', ['mailto:a@b.com', 'file:///etc/passwd', 'data:text/html,<h1>x'])
     async def test_navigate_rejects_url_without_host(self, url: str) -> None:
         page = _FakePage()
         toolset = _toolset(page)
         result = await toolset.navigate(url)
-        assert result == f'Error: domain not in allowed_domains: {url}'
+        # The phrase does not name the allowlist: this toolset has none.
+        assert result == f'Error: URL with no host: {url}'
         assert page.goto_calls == []
+
+    async def test_fresh_page_is_usable_before_the_first_navigation(self) -> None:
+        # A context opens on about:blank, which is also where a disallowed navigation
+        # is sent. Denying it refused every tool call made before the first navigate.
+        page = _FakePage(url='about:blank')
+        toolset = _toolset(page)
+        assert await toolset.click('button#go') == "Clicked 'button#go'. URL: about:blank\n\nHello body"
+        assert 'no host' not in await toolset.execute_js('1 + 1')
+
+    async def test_navigate_allows_trailing_dot_spelling_of_an_allowlisted_host(self) -> None:
+        # The trailing dot names the DNS root, so the absolute spelling is the same host.
+        page = _FakePage()
+        toolset = _toolset(page, allowed_domains=['example.com'])
+        assert isinstance(await toolset.navigate('https://example.com./'), str)
+        assert isinstance(await toolset.navigate('https://sub.example.com./'), str)
+        assert page.goto_calls == ['https://example.com./', 'https://sub.example.com./']
 
     async def test_navigate_rejects_trailing_dot_host_for_blank_allowlist_entry(self) -> None:
         page = _FakePage()
@@ -599,14 +616,14 @@ class TestPlaywrightBrowserTools:
         page = _FakePage()
         toolset = _toolset(page)
         result = await toolset.navigate('https://[::1')
-        assert result == 'Error: domain not in allowed_domains: https://[::1'
+        assert result == 'Error: URL with no host: https://[::1'
         assert page.goto_calls == []
 
     async def test_navigate_rejects_backslash_url_without_opening_page(self) -> None:
         page = _FakePage()
         url = r'https://evil.com\@example.com/'
         result = await _toolset(page, allowed_domains=['example.com']).navigate(url)
-        assert result == f'Error: domain not in allowed_domains: {url}'
+        assert result == f'Error: URL with no host: {url}'
         assert page.goto_calls == []
 
     async def test_navigate_attaches_screenshot_when_configured(self) -> None:
@@ -884,6 +901,15 @@ class TestPlaywrightBrowserTools:
         toolset = _toolset(_FakePage(evaluate_raises=ValueError('boom')))
         assert await toolset.execute_js('bad(') == 'JS error: boom'
 
+    async def test_execute_js_closed_target_is_a_browser_error_not_a_script_error(self) -> None:
+        # `evaluate` raises for script exceptions too, so the closed target is picked
+        # out by type; 'JS error: ...' would hide the signal that the browser is gone.
+        toolset = _toolset(_FakePage(evaluate_raises=TargetClosedError()))
+        assert await toolset.execute_js('document.title') == (
+            'Error: execute_js failed: the browser or page was closed unexpectedly. '
+            'Browser tools may be unavailable for the rest of this run.'
+        )
+
     async def test_execute_js_bounces_off_disallowed_domain(self) -> None:
         page = _FakePage(url='https://evil.com/', evaluate_result='x')
         toolset = _toolset(page, allowed_domains=['example.com'])
@@ -944,7 +970,9 @@ class TestPrivateAddressBlocking:
         assert reason('http://127.0.0.1/', ['example.com'], True) == 'domain not in allowed_domains'
         # ...but an allowlisted private address is still blocked (deny over allow).
         assert reason('http://127.0.0.1/', ['127.0.0.1'], True) == 'blocked private or link-local address'
-        assert reason('about:blank', None, True) == 'domain not in allowed_domains'
+        # about:blank is the context's own starting state, not a destination to deny.
+        assert reason('about:blank', None, True) is None
+        assert reason('file:///etc/passwd', None, True) == 'URL with no host'
 
     async def test_navigate_blocks_private_address_under_open_egress(self) -> None:
         page = _FakePage()
@@ -1723,6 +1751,26 @@ class TestPlaywrightBrowserLifecycle:
         )
         assert third_party.aborted is False
         assert third_party.continued is True
+
+    async def test_route_guard_blocks_private_addresses_for_subresources(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # `execute_js` can run `fetch('http://169.254.169.254/...')` and return the
+        # body, so the private-address block has to reach requests that are not
+        # navigations. The allowlist deliberately does not: aborting subresources
+        # would strip an allowed page of its own assets.
+        page = _FakePage()
+        _install_fake_driver(monkeypatch, page)
+        agent = Agent(TestModel(call_tools=['screenshot']), capabilities=[PlaywrightBrowser()])
+        await agent.run('screenshot the page')
+
+        metadata = await page.context.dispatch(
+            _FakeRequest(
+                'http://169.254.169.254/latest/meta-data/iam/security-credentials/',
+                navigation=False,
+                frame_error=PlaywrightError('frame must not be accessed'),
+            )
+        )
+        assert metadata.aborted is True
+        assert metadata.continued is False
 
     async def test_route_guard_subframe_block_honors_opt_out(self, monkeypatch: pytest.MonkeyPatch) -> None:
         page = _FakePage()

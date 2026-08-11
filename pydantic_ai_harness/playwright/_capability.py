@@ -311,18 +311,21 @@ class PlaywrightBrowser(AbstractCapability[AgentDepsT]):
         self._state.launch_error = f'{_CHROMIUM_MISSING_MESSAGE}\nAuto-install failed:\n{install_output[-300:]}'
         return None
 
-    async def _route_guard(self, route: PlaywrightRoute, request: PlaywrightRequest) -> None:  # pragma: no cover
-        """Network-layer navigation policy: abort disallowed top-level navigations, pass the rest.
+    async def _route_guard(self, route: PlaywrightRoute, request: PlaywrightRequest) -> None:
+        """Network-layer egress policy: abort what the configuration refuses, pass the rest.
 
-        Applies both the allowlist and the private-address block. Runs only as a
-        real Playwright route callback, so it is outside the mocked test surface.
+        The two policies have different reach. The private-address block covers
+        every request of every resource type in every frame, because a page can
+        read a subresource it fetched itself and hand the body to the model. The
+        allowlist covers top-level navigation only, so a permitted page keeps its
+        own CDN assets, identity-provider frames, and payment steps.
         """
+        if refused_in_every_frame(request.url, self.block_private_addresses):
+            await route.abort()
+            return
         permitted = blocked_navigation_reason(request.url, self.allowed_domains, self.block_private_addresses) is None
         if not request.is_navigation_request() or permitted:
             await route.continue_()
-            return
-        if refused_in_every_frame(request.url, self.block_private_addresses):
-            await route.abort()
             return
         try:
             frame = request.frame
