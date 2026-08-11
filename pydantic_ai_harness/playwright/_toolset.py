@@ -27,6 +27,12 @@ together when it changed. Pinned in the `[playwright]` extra as
   Source: <https://playwright.dev/python/docs/api/class-browsercontext>
   (`serviceWorkers` option). Re-check: inspect the `service_workers` parameter of
   `Browser.new_context`.
+- `new_context` accepts downloads by default; `accept_downloads=False` refuses
+  them, so a page cannot write attachments to the host's temporary storage.
+  Verified 2026-08-11 (parameter documented as "Defaults to `true` where all the
+  downloads are accepted"). Source:
+  <https://playwright.dev/python/docs/api/class-browser#browser-new-context>.
+  Re-check: `inspect.getdoc(Browser.new_context)` still states that default.
 - `TargetClosedError` is not re-exported from `playwright.async_api` through
   1.62.0; it lives at `playwright._impl._errors`. A driver-raised instance only
   carries `.name`, so `isinstance` is the reliable discriminator. Verified
@@ -736,7 +742,12 @@ class PlaywrightBrowserToolset(FunctionToolset[AgentDepsT]):
                 return self._truncate_output(self._playwright_error('execute_js', exc, timeout))
             except Exception as exc:
                 return self._truncate_output(f'JS error: {exc}')
-            blocked = await self._enforce_navigation_policy(page, 'execute_js')
+            try:
+                # Guarded separately from `evaluate`: the bounce this may perform is a
+                # navigation, and its failure is a browser error rather than a script one.
+                blocked = await self._enforce_navigation_policy(page, 'execute_js')
+            except PlaywrightError as exc:
+                return self._truncate_output(self._playwright_error('execute_js', exc, timeout))
             if blocked is not None:
                 return blocked
             if result is None:

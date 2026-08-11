@@ -380,8 +380,14 @@ class PlaywrightBrowser(AbstractCapability[AgentDepsT]):
                 browser = await pw.chromium.launch(headless=self.headless)
             self._browser = browser
             # Service workers can issue requests that context routes never see, so
-            # they are blocked to keep all traffic on the routable path.
-            context = await browser.new_context(storage_state=self.storage_state, service_workers='block')
+            # they are blocked to keep all traffic on the routable path. Downloads are
+            # refused because no tool exposes them: accepting them only lets a page
+            # write to the host's temporary storage for the length of the run.
+            context = await browser.new_context(
+                storage_state=self.storage_state,
+                service_workers='block',
+                accept_downloads=False,
+            )
             page = await context.new_page()
             if self.allowed_domains is not None or self.block_private_addresses:
                 await context.route('**/*', self._route_guard)

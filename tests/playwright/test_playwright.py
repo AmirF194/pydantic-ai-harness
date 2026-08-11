@@ -119,11 +119,17 @@ class _FakeRouteHandler(Protocol):
 
 class _FakeBrowserContext:
     def __init__(
-        self, page: _FakePage, *, storage_state: StorageState | None = None, service_workers: str | None = None
+        self,
+        page: _FakePage,
+        *,
+        storage_state: StorageState | None = None,
+        service_workers: str | None = None,
+        accept_downloads: bool | None = None,
     ) -> None:
         self.page = page
         self.storage_state = storage_state
         self.service_workers = service_workers
+        self.accept_downloads = accept_downloads
         self.routes: list[str] = []
         self.route_handler: _FakeRouteHandler | None = None
 
@@ -156,6 +162,7 @@ class _FakePage:
         screenshot_bytes: bytes = b'PNG-BYTES',
         close_error: Exception | None = None,
         goto_error: PlaywrightError | None = None,
+        bounce_error: PlaywrightError | None = None,
         click_error: PlaywrightError | None = None,
         fill_error: PlaywrightError | None = None,
         inner_text_error: PlaywrightError | None = None,
@@ -179,6 +186,7 @@ class _FakePage:
         self._screenshot_bytes = screenshot_bytes
         self._close_error = close_error
         self._goto_error = goto_error
+        self._bounce_error = bounce_error
         self._click_error = click_error
         self._fill_error = fill_error
         self._inner_text_error = inner_text_error
@@ -216,6 +224,8 @@ class _FakePage:
         self.timeouts['goto'] = timeout
         if self._goto_error is not None and url != 'about:blank':
             raise self._goto_error
+        if self._bounce_error is not None and url == 'about:blank':
+            raise self._bounce_error
         # A configured redirect lands the page on a different host than requested,
         # modelling a 3xx to a disallowed domain (but never for the bounce itself).
         self._url = self._redirect_to if self._redirect_to is not None and url != 'about:blank' else url
@@ -378,9 +388,18 @@ class _FakePlaywrightBrowser:
         self.contexts: list[_FakeBrowserContext] = []
 
     async def new_context(
-        self, *, storage_state: StorageState | None = None, service_workers: str | None = None
+        self,
+        *,
+        storage_state: StorageState | None = None,
+        service_workers: str | None = None,
+        accept_downloads: bool | None = None,
     ) -> _FakeBrowserContext:
-        context = _FakeBrowserContext(self._page, storage_state=storage_state, service_workers=service_workers)
+        context = _FakeBrowserContext(
+            self._page,
+            storage_state=storage_state,
+            service_workers=service_workers,
+            accept_downloads=accept_downloads,
+        )
         self._page._context = context
         self.contexts.append(context)
         return context
@@ -851,6 +870,17 @@ class TestPlaywrightBrowserTools:
         toolset = _toolset(page, allowed_domains=['example.com'])
         result = await toolset.execute_js('location.href="https://evil.com"')
         assert result == 'Error: execute_js reached a domain not in allowed_domains: https://evil.com/'
+
+    async def test_execute_js_bounce_failure_returns_bounded_error(self) -> None:
+        # The bounce is a navigation, so its failure is mapped like any other browser
+        # error instead of escaping the tool and aborting the run.
+        page = _FakePage(url='https://evil.com/', evaluate_result='x', bounce_error=TargetClosedError())
+        toolset = _toolset(page, allowed_domains=['example.com'])
+        result = await toolset.execute_js('location.href="https://evil.com"')
+        assert result == (
+            'Error: execute_js failed: the browser or page was closed unexpectedly. '
+            'Browser tools may be unavailable for the rest of this run.'
+        )
 
 
 _BLOCKED_ADDRESS_HOSTS = [
@@ -1522,6 +1552,17 @@ class TestPlaywrightBrowserLifecycle:
         # Service-worker traffic bypasses context routes, so workers are blocked
         # to keep the route guard authoritative for all requests.
         assert [c.service_workers for c in browser.contexts] == ['block']
+
+    async def test_context_refuses_downloads(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        page = _FakePage()
+        cm = _install_fake_driver(monkeypatch, page)
+        agent = Agent(TestModel(call_tools=['screenshot']), capabilities=[PlaywrightBrowser()])
+        await agent.run('screenshot the page')
+        browser = cm._driver.chromium.browser
+        assert browser is not None
+        # No tool exposes downloads, so accepting them would only let a page write
+        # to the host's temporary storage.
+        assert [c.accept_downloads for c in browser.contexts] == [False]
 
     async def test_no_route_guard_when_open_egress_and_private_opt_out(self, monkeypatch: pytest.MonkeyPatch) -> None:
         page = _FakePage()
