@@ -7,12 +7,15 @@ it after installing the browser binary to verify the real integration end to end
     playwright install chromium
     uv run python scripts/playwright_smoke.py
 
-It exercises the public `PlaywrightBrowser` surface and checks four things:
+It exercises the public `PlaywrightBrowser` surface and checks five things:
 
 - lazy launch plus a real navigation to https://example.com (prints the title),
 - the allowlist bounce (a disallowed host returns an error result, not content),
 - a `storage_state` round-trip: a cookie captured from a real context is visible
   to the agent after relaunching the capability with that state,
+- attaching over `cdp_url` to a browser that already holds a session: the run gets
+  its own context (the existing cookie is not visible), the allowlist still bounces,
+  and the host browser's own page survives teardown,
 - clean teardown: each scenario runs its own capability, whose `wrap_run` closes
   the browser when the run ends. After it prints `all checks passed`, confirm no
   Chromium lingered, e.g. `pgrep -fl chromium` shows nothing this script started.
@@ -21,6 +24,8 @@ It exercises the public `PlaywrightBrowser` surface and checks four things:
 from __future__ import annotations
 
 import asyncio
+import socket
+from tempfile import TemporaryDirectory
 
 from playwright.async_api import StorageState, async_playwright
 from pydantic_ai import Agent
@@ -105,11 +110,53 @@ async def _check_storage_state_round_trip() -> None:
     print('storage_state round-trip ok')
 
 
+async def _check_cdp_attach() -> None:
+    """Attaching over CDP gets a fresh context, not the sessions already open there.
+
+    The mocked suite cannot answer this: it turns on whether a real Chrome honours
+    `Target.createBrowserContext` for a browser Playwright did not launch. A cookie
+    is logged into the attached browser's own default context, then the capability
+    attaches and reads `document.cookie` on the same origin. The allowlist is
+    checked in the same run, since the route guard is installed on the context the
+    capability creates rather than on the browser it connected to.
+    """
+    with socket.socket() as probe:
+        probe.bind(('127.0.0.1', 0))
+        port = probe.getsockname()[1]
+    with TemporaryDirectory() as user_data_dir:
+        async with async_playwright() as pw:
+            default_context = await pw.chromium.launch_persistent_context(
+                user_data_dir, headless=True, args=[f'--remote-debugging-port={port}']
+            )
+            try:
+                page = await default_context.new_page()
+                await page.goto('https://example.com')
+                await page.evaluate(f"document.cookie = '{_COOKIE}; path=/'")
+                assert _COOKIE in await page.evaluate('document.cookie')
+
+                browser = PlaywrightBrowser[object](cdp_url=f'http://127.0.0.1:{port}', allowed_domains=['example.com'])
+                _, cookies, bounced = await _run_tools(
+                    browser,
+                    [
+                        ('navigate', {'url': 'https://example.com'}),
+                        ('execute_js', {'script': 'document.cookie'}),
+                        ('navigate', {'url': 'https://www.iana.org/'}),
+                    ],
+                )
+                assert _COOKIE not in cookies, f'attached run inherited the default context session: {cookies}'
+                assert 'not in allowed_domains' in bounced, bounced
+                assert not default_context.pages[0].is_closed(), 'teardown closed a page it did not create'
+            finally:
+                await default_context.close()
+    print('cdp attach ok -- isolated context, allowlist enforced, host browser left open')
+
+
 async def _main() -> None:
     """Run every smoke scenario in sequence."""
     await _check_navigate()
     await _check_allowlist_bounce()
     await _check_storage_state_round_trip()
+    await _check_cdp_attach()
     print('all checks passed')
 
 
