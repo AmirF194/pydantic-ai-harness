@@ -18,6 +18,7 @@ from pydantic_ai_harness.compaction._shared import (
     SupportsFocus,
     compact_with_span,
     context_for_request,
+    estimate_context_tokens,
     estimate_token_count,
     resolve_token_trigger,
     validate_token_trigger,
@@ -141,12 +142,20 @@ class TieredCompaction(AbstractCapability[AgentDepsT]):
     ) -> list[ModelMessage]:
         """Apply tiers in order until the history fits *target* or tiers run out."""
         original = messages
+        # The usage anchor describes the request as it was sent, so a tier's rewrite of older
+        # messages is invisible to re-anchoring; scale the anchored baseline by the heuristic
+        # shrink instead, so tier reclaim registers against real-token accounting.
+        baseline = estimate_context_tokens(messages, self.tokenizer)
+        heuristic_baseline = estimate_token_count(messages, self.tokenizer)
+        estimate = baseline
         for tier in self.tiers:
-            if estimate_token_count(messages, self.tokenizer) <= target:
+            if estimate <= target:
                 break
             messages = await tier.compact(messages, ctx)
             # Before the next stop decision, so escalation measures the history it would return.
             messages = reinject_pinned(original, messages)
+            heuristic_now = estimate_token_count(messages, self.tokenizer)
+            estimate = baseline * heuristic_now // heuristic_baseline if heuristic_baseline else heuristic_now
         return messages
 
     async def compact(
@@ -170,7 +179,7 @@ class TieredCompaction(AbstractCapability[AgentDepsT]):
         request_ctx = context_for_request(ctx, request_context)
         # Resolved once, so the gate and the escalation loop cannot disagree about the target.
         target = self._target(request_ctx.model)
-        if estimate_token_count(messages, self.tokenizer) <= target:
+        if estimate_context_tokens(messages, self.tokenizer) <= target:
             return request_context
         request_context.messages = await compact_with_span(
             request_ctx,

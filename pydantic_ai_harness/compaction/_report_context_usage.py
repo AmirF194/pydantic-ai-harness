@@ -12,7 +12,7 @@ from pydantic_ai.messages import ModelMessage
 from pydantic_ai.tools import RunContext
 
 from pydantic_ai_harness.compaction._context_window import DEFAULT_CONTEXT_WINDOW, resolve_context_window
-from pydantic_ai_harness.compaction._shared import estimate_token_count
+from pydantic_ai_harness.compaction._shared import estimate_context_tokens
 
 if TYPE_CHECKING:
     from pydantic_ai.models import ModelRequestContext
@@ -101,7 +101,7 @@ class ReportContextUsage(AbstractCapability[AgentDepsT]):
     def _measure(self, request_context: ModelRequestContext) -> ContextUsage:
         """Build a reading for the request as it stands."""
         messages: list[ModelMessage] = list(request_context.messages)
-        used = estimate_token_count(messages, self.tokenizer)
+        used = estimate_context_tokens(messages, self.tokenizer)
         if self.context_window is not None:
             return ContextUsage(used_tokens=used, window_tokens=self.context_window, resolved=True)
         # Resolved from the request's model rather than the run's: a capability may replace

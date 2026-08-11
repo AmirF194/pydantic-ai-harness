@@ -54,8 +54,8 @@ _CHARS_PER_TOKEN = 4
 """Rough approximation: ~4 characters per token on average."""
 
 
-def _collect_text(messages: Sequence[ModelMessage]) -> list[str]:
-    """Collect all text segments from a sequence of messages.
+def _collect_message_text(messages: Sequence[ModelMessage]) -> list[str]:
+    """Collect all text segments from a sequence of messages, excluding instructions.
 
     Every part that carries text the provider is sent counts, including the ones a run only
     grows under load: a retry prompt, an extended-thinking block, the result of a
@@ -119,6 +119,12 @@ def _collect_text(messages: Sequence[ModelMessage]) -> list[str]:
                 elif isinstance(part, NativeToolReturnPart):
                     segments.append(part.tool_name)
                     segments.append(str(part.content))
+    return segments
+
+
+def _collect_text(messages: Sequence[ModelMessage]) -> list[str]:
+    """Collect all text segments from a sequence of messages, instructions included."""
+    segments = _collect_message_text(messages)
     segments.extend(_instructions_text(messages))
     return segments
 
@@ -177,6 +183,43 @@ def estimate_token_count(
     return sum(len(s) for s in segments) // _CHARS_PER_TOKEN
 
 
+def estimate_context_tokens(
+    messages: Sequence[ModelMessage],
+    tokenizer: Callable[[str], int] | None = None,
+) -> int:
+    """Best-available token count for the request this history would produce.
+
+    Anchors on the most recent `ModelResponse` carrying provider-reported usage: its
+    `input_tokens` measured everything the provider was actually sent for that request --
+    instructions, tool definitions, and every prior message -- and its `output_tokens` measured
+    the response's own parts, so their sum is ground truth for the history up to and including
+    that response. Only the messages after the anchor are estimated with the character
+    heuristic (or *tokenizer*), without re-counting instructions, which the anchor already
+    covers. This is what makes the estimate robust where the pure heuristic is not: token-dense
+    content (minified JSON, base64, non-Latin scripts) and the tool definitions the heuristic
+    cannot see at all are both inside the provider's number.
+
+    Falls back to `estimate_token_count` when no response carries usage: a fresh history, or
+    test models that report none.
+
+    A history rewritten *after* the anchor's request went out (a compaction strategy editing
+    older messages mid-cycle) is overestimated, because the anchor still describes the
+    pre-rewrite request; the next real response re-anchors it. `TieredCompaction` compensates
+    inside its escalation loop by scaling its anchored baseline by the heuristic shrink.
+    Compacting slightly early is the cheap failure mode; the heuristic's multi-x underestimate
+    on dense content, which lets the history blow the context window, is the expensive one.
+    """
+    for index in range(len(messages) - 1, -1, -1):
+        message = messages[index]
+        if isinstance(message, ModelResponse) and message.usage.input_tokens:
+            anchored = message.usage.input_tokens + message.usage.output_tokens
+            segments = _collect_message_text(messages[index + 1 :])
+            if tokenizer is not None:
+                return anchored + sum(tokenizer(s) for s in segments)
+            return anchored + sum(len(s) for s in segments) // _CHARS_PER_TOKEN
+    return estimate_token_count(messages, tokenizer)
+
+
 def exceeds(
     messages: Sequence[ModelMessage],
     max_messages: int | None,
@@ -186,7 +229,7 @@ def exceeds(
     """Return True if *messages* exceeds either configured size threshold."""
     if max_messages is not None and len(messages) > max_messages:
         return True
-    if max_tokens is not None and estimate_token_count(messages, tokenizer) > max_tokens:
+    if max_tokens is not None and estimate_context_tokens(messages, tokenizer) > max_tokens:
         return True
     return False
 

@@ -35,8 +35,14 @@ provider rejects an orphaned pair. The zero-LLM strategies never call a model.
 ## Triggers
 
 Every size-based strategy triggers on `max_messages`, `max_tokens` (estimated), or `max_fraction`.
-Token counts use a ~4-chars-per-token heuristic by default; pass a `tokenizer` callable (e.g.
-`tiktoken`) for accuracy. `DeduplicateFileReads` runs on every request when no trigger is set (it is
+Token counts anchor on the provider-reported usage of the most recent model response when one is
+available: its `input_tokens` measured the whole request that produced it (instructions, tool
+definitions, every prior message), so only the messages added since are estimated. The estimate for
+those, and the fallback when no response carries usage yet, is a ~4-chars-per-token heuristic; pass
+a `tokenizer` callable (e.g. `tiktoken`) to sharpen it. The anchor is what keeps triggers honest on
+token-dense content -- minified JSON or base64 tokenizes at ~1-2 chars per token, which the
+heuristic underestimates severely enough for a history to blow the context window without any
+trigger firing. `DeduplicateFileReads` runs on every request when no trigger is set (it is
 cheap and near-lossless). `TieredCompaction` triggers and stops on a single `target_tokens` /
 `target_fraction` budget. `ClampOversizedMessages` triggers per *part* (`max_part_tokens` /
 `max_part_chars`), not on the whole history -- the failure it targets is one oversized part, not a
