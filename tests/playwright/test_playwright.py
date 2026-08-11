@@ -753,6 +753,25 @@ class TestPlaywrightBrowserTools:
         assert result.startswith('URL: https://example.com/')
         assert 'Error: screenshot is' in result
 
+    async def test_navigate_keeps_the_oversized_note_when_page_text_fills_the_budget(self) -> None:
+        # The page result is already budgeted, so the note has to be given room
+        # rather than appended: re-truncating a full result would drop it and
+        # leave ordinary page text with no sign the screenshot went missing.
+        png = b'x' * (toolset_module._MAX_SCREENSHOT_BYTES + 1)
+        page = _FakePage(body='b' * 5_000, screenshot_bytes=png)
+        toolset = _toolset(page, screenshot_on_navigate=True, max_content_tokens=100)
+        result = await toolset.navigate('https://example.com/')
+        assert isinstance(result, str)
+        assert result.startswith('URL: https://example.com/')
+        assert 'Error: screenshot is' in result
+        assert len(result) <= 100 * 4
+
+    async def test_oversized_note_takes_the_whole_budget_when_it_cannot_fit(self) -> None:
+        png = b'x' * (toolset_module._MAX_SCREENSHOT_BYTES + 1)
+        toolset = _toolset(_FakePage(screenshot_bytes=png), screenshot_on_navigate=True, max_content_tokens=5)
+        result = await toolset.navigate('https://example.com/')
+        assert result == 'Error: screenshot is'
+
     async def test_get_text_with_selector(self) -> None:
         toolset = _toolset(_FakePage())
         assert await toolset.get_text('h1') == 'text:h1'

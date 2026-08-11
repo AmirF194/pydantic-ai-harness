@@ -384,6 +384,21 @@ class PlaywrightBrowserToolset(FunctionToolset[AgentDepsT]):
         """Apply the configured token budget to a model-facing textual result."""
         return _truncate(text, self._max_content_tokens * _CHARS_PER_TOKEN)
 
+    def _truncate_output_keeping(self, text: str, note: str) -> str:
+        """Bound `text` and `note` together, giving `note` its room first.
+
+        Appending to an already-budgeted string and re-truncating drops the
+        appended part, which is the opposite of what a note reporting a dropped
+        result should do. A note too large for the budget on its own wins the
+        whole budget: it carries why the result is missing.
+        """
+        budget = self._max_content_tokens * _CHARS_PER_TOKEN
+        separator = '\n\n'
+        room = budget - len(note) - len(separator)
+        if room <= 0:
+            return _truncate(note, budget)
+        return f'{_truncate(text, room)}{separator}{note}'
+
     def _playwright_error(self, action: str, exc: PlaywrightError, timeout_ms: int) -> str:
         """Map a Playwright error to a bounded, model-actionable string.
 
@@ -495,7 +510,7 @@ class PlaywrightBrowserToolset(FunctionToolset[AgentDepsT]):
                     return result
                 png = await page.screenshot(timeout=timeout)
                 if (oversized := self._oversized_screenshot_error(png)) is not None:
-                    return self._truncate_output(f'{result}\n\n{oversized}')
+                    return self._truncate_output_keeping(result, oversized)
                 return ToolReturn(result, content=[BinaryContent(data=png, media_type='image/png')])
             except PlaywrightError as exc:
                 return self._truncate_output(self._playwright_error('navigate', exc, timeout))
