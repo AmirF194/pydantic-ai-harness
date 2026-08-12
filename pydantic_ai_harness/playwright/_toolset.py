@@ -106,6 +106,7 @@ import json
 import os
 import re
 import sys
+import warnings
 from collections import deque
 from contextlib import AbstractAsyncContextManager
 from dataclasses import dataclass, replace
@@ -606,6 +607,25 @@ def _truncate(text: str, max_chars: int) -> str:
     return f'{text[: max_chars - len(marker)]}{marker}'
 
 
+class BrowserUnavailableError(RuntimeError):
+    """No browser could be started for this run.
+
+    Raised by `PlaywrightBrowserSession.ensure_page` and turned into a tool result
+    by the toolset, rather than ending the run: installing a browser is something
+    an agent with a shell can do once it is told what is missing.
+    """
+
+
+class BrowserUnavailableWarning(UserWarning):
+    """A browser could not be started, warned once where the process can see it.
+
+    The model learns this from the tool result and a trace shows the failed
+    operation, but a developer watching a terminal sees neither. Filter it with
+    `warnings.simplefilter('ignore', BrowserUnavailableWarning)` when the miss is
+    expected.
+    """
+
+
 _CHROMIUM_MISSING_MESSAGE = (
     'Chromium is not installed. Run `playwright install chromium` (on a fresh Linux or CI image use '
     '`playwright install --with-deps chromium` to also install the required system libraries) and restart '
@@ -906,22 +926,31 @@ class PlaywrightBrowserSession:
         serialized: the first caller runs it under the lock and the rest observe
         the populated `page` (or the launch error) instead of launching a second
         Chromium.
+
+        A launch that fails raises `BrowserUnavailableError`, which the tools turn
+        into a result rather than an exception. The recorded failure is cleared
+        once it has been reported, so a later call tries again: an agent that just
+        installed the browser gets one, instead of a session that refuses for the
+        rest of the run.
         """
         if self.launch_error is not None:
-            raise RuntimeError(self.launch_error)
+            raise BrowserUnavailableError(self.launch_error)
         if self.page is None:
             async with self._launch_lock:
                 if self.page is None and self.launch_error is None:
                     if self._driver_cm is None:
+                        # Not a `BrowserUnavailableError`: nothing the model does can
+                        # fix a capability that was never started, so this one ends
+                        # the run rather than becoming a tool result.
                         raise RuntimeError(
                             'PlaywrightBrowser is not running: PlaywrightBrowser.wrap_run must be active before any '
                             'browser tool.'
                         )
                     await self._launch()
             if self.launch_error is not None:
-                raise RuntimeError(self.launch_error)
+                raise BrowserUnavailableError(self.launch_error)
             if self.page is None:
-                raise RuntimeError('Browser failed to launch.')  # pragma: no cover
+                raise BrowserUnavailableError('Browser failed to launch.')  # pragma: no cover
         return self.page
 
     async def _launch(self) -> None:
@@ -985,6 +1014,9 @@ class PlaywrightBrowserSession:
         if browser is None:  # pragma: no branch
             if self.launch_error is None:
                 self.launch_error = _CHROMIUM_MISSING_MESSAGE
+            # The model hears about this through the tool result and a trace shows
+            # the failed operation. Neither reaches a developer reading a terminal.
+            warnings.warn(self.launch_error, BrowserUnavailableWarning, stacklevel=2)
         return browser
 
     async def _install_and_retry(self, pw: PlaywrightDriver) -> PlaywrightBrowserHandle | None:
@@ -1476,9 +1508,9 @@ class PlaywrightBrowserToolset(FunctionToolset[AgentDepsT]):
         into a result the model can read instead of an exception that ends the run.
 
         Acquiring the page is inside the guarded region: starting or attaching to
-        a browser can fail the same way an action can (a `cdp_url` whose endpoint
-        is gone, most realistically), and the model can act on that only if it
-        arrives as a result rather than as an exception that ends the run.
+        a browser can fail the same way an action can -- an endpoint that is gone,
+        a browser that was never installed -- and the model can act on either only
+        if it arrives as a result rather than as an exception that ends the run.
 
         `governed_by_navigation` names which deadline a failure is reported
         against, so a navigation timeout is not described with the action budget.
@@ -1506,6 +1538,11 @@ class PlaywrightBrowserToolset(FunctionToolset[AgentDepsT]):
                     return await body(page, deadlines)
                 except PlaywrightError as exc:
                     return self._error(self._playwright_error(action, exc, reported))
+                except BrowserUnavailableError as exc:
+                    # Forgotten once reported, so the next call launches again rather
+                    # than refusing on a failure the agent may already have fixed.
+                    self._session.launch_error = None
+                    return self._error(str(exc))
                 except BaseException:
                     span.set_attribute('browser.outcome', 'error')
                     raise

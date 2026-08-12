@@ -28,7 +28,7 @@ from pydantic_ai import Agent, AgentRunResult
 from pydantic_ai.capabilities import AbstractCapability
 from pydantic_ai.capabilities.abstract import CapabilityOrdering
 from pydantic_ai.exceptions import UserError
-from pydantic_ai.messages import BinaryContent, ToolReturn
+from pydantic_ai.messages import BinaryContent, ToolReturn, ToolReturnPart
 from pydantic_ai.models.instrumented import InstrumentationSettings, InstrumentedModel
 from pydantic_ai.models.test import TestModel
 from pydantic_ai.tools import RunContext, ToolDefinition
@@ -40,6 +40,8 @@ from pydantic_ai_harness.playwright import (
     DEFAULT_MAX_CONTENT_TOKENS,
     DEFAULT_NAVIGATION_TIMEOUT_MS,
     BrowserEvent,
+    BrowserUnavailableError,
+    BrowserUnavailableWarning,
     PlaywrightBrowser,
     PlaywrightBrowserSession,
     PlaywrightBrowserToolset,
@@ -734,6 +736,16 @@ def _toolset(
         max_content_tokens=max_content_tokens,
         action_timeout_ms=action_timeout_ms,
         navigation_timeout_ms=navigation_timeout_ms,
+    )
+
+
+def _tool_results(result: AgentRunResult[object]) -> str:
+    """Every tool result of a finished run, joined, for asserting what the model was told."""
+    return '\n'.join(
+        str(part.content)
+        for message in result.all_messages()
+        for part in message.parts
+        if isinstance(part, ToolReturnPart)
     )
 
 
@@ -1562,12 +1574,13 @@ class TestPlaywrightBrowserSession:
         with pytest.raises(RuntimeError, match='PlaywrightBrowser is not running'):
             await toolset.screenshot()
 
-    async def test_tool_raises_on_launch_error(self) -> None:
+    async def test_tool_reports_a_launch_error_instead_of_raising(self) -> None:
         session = PlaywrightBrowserSession()
         session.launch_error = 'Chromium is not installed.'
         toolset = PlaywrightBrowserToolset[None](session=session)
-        with pytest.raises(RuntimeError, match='Chromium is not installed'):
-            await toolset.screenshot()
+        assert await toolset.screenshot() == 'Chromium is not installed.'
+        # Forgotten once reported, so a call after the agent fixes it tries again.
+        assert session.launch_error is None
 
     async def test_concurrent_ensure_page_launches_once(self) -> None:
         # Two tool calls that race before the page exists must launch Chromium once.
@@ -1649,11 +1662,6 @@ class TestPlaywrightBrowserHooks:
         assert 'private/internal addresses blocked' not in text
         assert 'Allowed domains: all' in text
 
-    def test_get_instructions_suppressed_on_launch_error(self) -> None:
-        browser = PlaywrightBrowser[None]()
-        browser._session.launch_error = 'boom'
-        assert browser.get_instructions()(_ctx()) is None
-
     async def test_prepare_tools_preserves_upstream_unapproved_kind(self) -> None:
         browser = PlaywrightBrowser[None]()
         defs = [
@@ -1667,7 +1675,9 @@ class TestPlaywrightBrowserHooks:
         assert by_name['navigate'].kind == 'unapproved'
         assert by_name['other'].kind == 'function'
 
-    async def test_prepare_tools_hides_tools_on_launch_error(self) -> None:
+    async def test_the_browser_tools_stay_offered_when_no_browser_started(self) -> None:
+        # The model is told what is missing and can install it, which it cannot do
+        # if the tools disappear the moment a launch fails.
         browser = PlaywrightBrowser[None]()
         browser._session.launch_error = 'boom'
         defs = [
@@ -1677,7 +1687,7 @@ class TestPlaywrightBrowserHooks:
             ToolDefinition(name='other', parameters_json_schema={'type': 'object'}, kind='function', toolset_id='misc'),
         ]
         result = await browser.prepare_tools(_ctx(), defs)
-        assert [td.name for td in result] == ['other']
+        assert [td.name for td in result] == ['navigate', 'other']
 
     async def test_prepare_tools_ignores_same_named_foreign_tool(self) -> None:
         # A `navigate` from another toolset must be left untouched (not re-approved,
@@ -1687,8 +1697,6 @@ class TestPlaywrightBrowserHooks:
         )
         browser = PlaywrightBrowser[None]()
         assert (await browser.prepare_tools(_ctx(), [foreign]))[0].kind == 'unapproved'
-        browser._session.launch_error = 'boom'
-        assert [td.name for td in await browser.prepare_tools(_ctx(), [foreign])] == ['navigate']
 
     async def test_for_run_isolates_state(self) -> None:
         browser = PlaywrightBrowser[None]()
@@ -2124,14 +2132,17 @@ class TestPlaywrightBrowserLifecycle:
         assert cm.entered is False
         assert cm.exited is False
 
-    async def test_missing_binary_raises_install_hint(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    async def test_missing_binary_returns_the_install_hint_and_the_run_continues(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         page = _FakePage()
         cm = _install_fake_driver(monkeypatch, page, executable_missing=True)
         agent = Agent(TestModel(call_tools=['screenshot']), capabilities=[PlaywrightBrowser()])
-        with pytest.raises(RuntimeError, match='playwright install chromium'):
-            await agent.run('screenshot the page')
+        with pytest.warns(toolset_module.BrowserUnavailableWarning, match='playwright install chromium'):
+            result = await agent.run('screenshot the page')
         assert cm._driver.chromium.launched == []  # never attempted launch on a missing binary
         assert cm.exited is True  # Playwright driver still cleaned up
+        assert 'playwright install chromium' in _tool_results(result)
 
     async def test_launch_is_bounded_by_the_configured_timeout(self, monkeypatch: pytest.MonkeyPatch) -> None:
         # Starting or attaching to a browser is the one step no per-call timeout_ms
@@ -2242,9 +2253,10 @@ class TestPlaywrightBrowserLifecycle:
         )
         # A failed auto-install carries the installer output tail so it is diagnosable,
         # not just the generic missing-binary hint.
-        with pytest.raises(RuntimeError, match='HTTP 403 forbidden') as exc_info:
-            await agent.run('screenshot the page')
-        assert 'Chromium is not installed' in str(exc_info.value)
+        with pytest.warns(toolset_module.BrowserUnavailableWarning, match='HTTP 403 forbidden') as warned:
+            result = await agent.run('screenshot the page')
+        assert 'Chromium is not installed' in str(warned[0].message)
+        assert 'HTTP 403 forbidden' in _tool_results(result)
 
     async def test_close_error_still_exits_driver(self, monkeypatch: pytest.MonkeyPatch) -> None:
         page = _FakePage()
@@ -2301,6 +2313,8 @@ def test_public_exports() -> None:
     assert issubclass(PlaywrightBrowser, object)
     assert PlaywrightBrowserToolset is not None
     assert PlaywrightBrowserSession is not None
+    assert issubclass(BrowserUnavailableError, RuntimeError)
+    assert issubclass(BrowserUnavailableWarning, UserWarning)
 
 
 # --- Embedded frames --------------------------------------------------------
@@ -2847,12 +2861,13 @@ class TestSpanOutcome:
         assert span.attributes is not None and span.attributes['browser.outcome'] == 'error'
 
     async def test_an_escaping_exception_marks_the_span_failed(self) -> None:
+        # A capability that was never started is a wiring bug: it still ends the run,
+        # unlike a browser that could not be launched.
         session = PlaywrightBrowserSession()
-        session.launch_error = 'Chromium is not installed.'
         tracer, exporter = _recording_tracer()
         session.tracer = tracer
         toolset = PlaywrightBrowserToolset[None](session=session)
-        with pytest.raises(RuntimeError):
+        with pytest.raises(RuntimeError, match='PlaywrightBrowser is not running'):
             await toolset.snapshot()
         (span,) = exporter.get_finished_spans()
         assert span.attributes is not None and span.attributes['browser.outcome'] == 'error'
@@ -3156,7 +3171,10 @@ class TestReviewFollowUps:
         session = PlaywrightBrowserSession()
         _install_fake_driver(monkeypatch, page, executable_missing=True)
         async with session:
-            with pytest.raises(RuntimeError, match='Chromium is not installed'):
+            with (
+                pytest.warns(toolset_module.BrowserUnavailableWarning),
+                pytest.raises(toolset_module.BrowserUnavailableError, match='Chromium is not installed'),
+            ):
                 await session.ensure_page()
         # The binary is there the second time: the recorded failure described the
         # previous use and must not refuse this one before it tries.
@@ -3181,6 +3199,20 @@ class TestReviewFollowUps:
         assert await _toolset(page, session=session).console_messages() == (
             '[info] console log: see http://example.com/ then mail me@example.com'
         )
+
+    async def test_a_browser_installed_mid_run_is_used_by_the_next_call(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        page = _FakePage()
+        chromium = _FakeChromium(page, executable_missing=True)
+        cm = _FakeDriverCM(_FakeDriver(chromium))
+        monkeypatch.setattr(toolset_module, 'async_playwright', lambda: cm)
+        session = PlaywrightBrowserSession()
+        async with session:
+            toolset = PlaywrightBrowserToolset[None](session=session)
+            with pytest.warns(BrowserUnavailableWarning):
+                assert 'playwright install chromium' in await toolset.get_text()
+            # What an agent with a shell does between the two calls.
+            chromium._executable_path = sys.executable
+            assert await toolset.get_text() == 'Hello body'
 
     async def test_a_callback_url_is_redacted_wherever_a_tool_reports_it(self) -> None:
         landing = 'https://example.com/cb?code=secret&state=xyz'

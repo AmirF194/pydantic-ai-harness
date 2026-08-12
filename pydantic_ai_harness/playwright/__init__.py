@@ -6,6 +6,8 @@ from pydantic_ai_harness.playwright._toolset import (
     DEFAULT_MAX_CONTENT_TOKENS,
     DEFAULT_NAVIGATION_TIMEOUT_MS,
     BrowserEvent,
+    BrowserUnavailableError,
+    BrowserUnavailableWarning,
     PlaywrightBrowserSession,
     PlaywrightBrowserToolset,
 )
@@ -15,6 +17,8 @@ __all__ = [
     'DEFAULT_MAX_CONTENT_TOKENS',
     'DEFAULT_NAVIGATION_TIMEOUT_MS',
     'BrowserEvent',
+    'BrowserUnavailableError',
+    'BrowserUnavailableWarning',
     'PlaywrightBrowser',
     'PlaywrightBrowserSession',
     'PlaywrightBrowserToolset',

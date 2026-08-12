@@ -34,9 +34,13 @@ pip install 'pydantic-ai-harness[playwright]'
 playwright install chromium
 ```
 
-If the Chromium binary is missing at runtime, the first browser tool call fails
-the run with a `playwright install chromium` hint. Set
-`auto_install_chromium=True` to fetch the binary automatically on the first miss.
+If the Chromium binary is missing at runtime, the browser tool returns the
+`playwright install chromium` hint as its result rather than ending the run, so
+an agent that can run a shell can install the browser and carry on; the failure
+is not remembered, so the next call launches. The process also gets a
+`BrowserUnavailableWarning`, since a developer watching a terminal sees neither
+the tool result nor the trace. Set `auto_install_chromium=True` to fetch the
+binary automatically on the first miss instead.
 
 ## Usage
 

@@ -14,7 +14,7 @@ from pydantic_ai import AgentRunResult, RunContext
 from pydantic_ai.capabilities import AbstractCapability, WrapRunHandler
 from pydantic_ai.durable_exec._base import BaseDurabilityCapability  # pyright: ignore[reportPrivateUsage]
 from pydantic_ai.exceptions import UserError
-from pydantic_ai.tools import AgentDepsT, ToolDefinition
+from pydantic_ai.tools import AgentDepsT
 
 from pydantic_ai_harness.playwright._toolset import (
     DEFAULT_ACTION_TIMEOUT_MS,
@@ -113,10 +113,11 @@ class PlaywrightBrowser(AbstractCapability[AgentDepsT]):
 
     Chromium starts lazily on the first browser-tool call and is closed when the
     run ends (on success, error, or cancellation); runs that never call a browser
-    tool pay no Playwright cost. When the Chromium binary is missing the tools are
-    hidden from the model and calling one raises with a `playwright install
-    chromium` hint; set `auto_install_chromium=True` to fetch it automatically
-    instead. Set `cdp_url` to attach to a Chromium that is already running
+    tool pay no Playwright cost. When no browser can be started the tool returns a
+    `playwright install chromium` hint instead of ending the run, so an agent that
+    can run a shell can install it and carry on, and the process gets a
+    `BrowserUnavailableWarning` for the developer who is not reading tool results.
+    Set `auto_install_chromium=True` to fetch the binary automatically instead. Set `cdp_url` to attach to a Chromium that is already running
     (managed-browser providers, benchmark harnesses) rather than launching one.
 
     Every browser operation runs inside an OpenTelemetry span, and what the page
@@ -188,8 +189,9 @@ class PlaywrightBrowser(AbstractCapability[AgentDepsT]):
     """Fetch the Chromium binary via `playwright install chromium` on the first miss.
 
     Off by default: a library should not download a browser as a side effect. When
-    the binary is missing the browser tools are hidden and calling one raises a
-    clear install hint. Set `True` to opt into the automatic download instead.
+    the binary is missing the browser tool returns a clear install hint, which an
+    agent that can run a shell can act on. Set `True` to opt into the automatic
+    download instead.
     """
 
     storage_state: StorageState | None = field(default=None, repr=False)
@@ -281,27 +283,14 @@ class PlaywrightBrowser(AbstractCapability[AgentDepsT]):
         return self._toolset
 
     def get_instructions(self) -> Callable[[RunContext[AgentDepsT]], str | None]:
-        """When-to-use guidance for the browser, suppressed while a launch error is set."""
+        """When-to-use guidance for the browser."""
 
         def _instructions(ctx: RunContext[AgentDepsT]) -> str | None:
-            if self._session.launch_error is not None:
-                return None
             return _INSTRUCTIONS.format(
                 max_content_tokens=self.max_content_tokens, allowed_domains=self._policy.describe()
             )
 
         return _instructions
-
-    async def prepare_tools(self, ctx: RunContext[AgentDepsT], tool_defs: list[ToolDefinition]) -> list[ToolDefinition]:
-        """Hide the browser tools when Chromium is unavailable.
-
-        Tools are matched by `toolset_id` so a same-named tool from another toolset
-        (e.g. a different `navigate`) is left untouched.
-        """
-        toolset_id = self._toolset.id
-        if self._session.launch_error is not None:
-            return [td for td in tool_defs if td.toolset_id != toolset_id]
-        return tool_defs
 
     async def wrap_run(self, ctx: RunContext[AgentDepsT], *, handler: WrapRunHandler) -> AgentRunResult[AgentDepsT]:
         """Hold the run's browser session open, and release it however the run ends.
