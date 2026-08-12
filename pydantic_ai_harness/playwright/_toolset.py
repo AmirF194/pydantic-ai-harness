@@ -422,15 +422,52 @@ class NavigationPolicy:
         return domains
 
 
-def _without_userinfo(url: str) -> str:
-    """Return `url` with any `user:password@` credentials removed.
+_CREDENTIAL_PARAMETERS = (
+    'access_token',
+    'api_key',
+    'apikey',
+    'auth',
+    'awsaccesskeyid',
+    'code',
+    'id_token',
+    'key',
+    'password',
+    'pwd',
+    'refresh_token',
+    'secret',
+    'session',
+    'sig',
+    'signature',
+    'token',
+    'x-amz-signature',
+    'x-goog-signature',
+)
+"""Query and fragment parameters whose values are treated as credentials.
 
-    Recorded URLs reach an OpenTelemetry backend, where userinfo is replayable
-    credential material; the OTel HTTP conventions ask for it to be stripped from
-    `url.full`. A regex rather than a parse-and-rebuild so a URL Chromium accepted
-    but `urlsplit` rejects is still cleaned rather than raising.
+Names rather than whole query strings: which endpoint a page called is what makes
+a recorded request useful, and the OTel HTTP conventions redact known-sensitive
+parameters rather than dropping the query. The list covers the OAuth grant and
+the signed-URL parameters of the major clouds.
+"""
+
+_USERINFO = re.compile(r'^([a-zA-Z][\w+.\-]*://)[^/?#@]*@')
+
+_CREDENTIAL_VALUE = re.compile(
+    r'(?i)([?&#](?:' + '|'.join(_CREDENTIAL_PARAMETERS) + r')=)[^&#]*',
+)
+
+
+def _without_credentials(url: str) -> str:
+    """Return `url` with userinfo removed and credential parameter values redacted.
+
+    Recorded URLs reach the model and an OpenTelemetry backend, where a bearer
+    token, an OAuth code, or a signed-URL signature is replayable by anyone who
+    can read them. Regexes rather than a parse-and-rebuild, so a URL Chromium
+    accepted but `urlsplit` rejects is still cleaned rather than raising. The
+    scheme, host, path, and the names of every parameter survive: they are what
+    identifies the request the model is looking for.
     """
-    return re.sub(r'^([a-zA-Z][\w+.\-]*://)[^/?#@]*@', r'\1', url)
+    return _CREDENTIAL_VALUE.sub(r'\1REDACTED', _USERINFO.sub(r'\1', url))
 
 
 def _without_endpoint_credentials(message: str, cdp_url: str) -> str:
@@ -658,12 +695,11 @@ class PlaywrightBrowserSession:
     def record(self, event: BrowserEvent) -> None:
         """Log a browser event and attach it to the operation that was running.
 
-        The URL is stripped of credentials here, at the one point every event
-        passes through, so neither the tool output nor the exported span carries
-        them.
+        Credentials are removed here, at the one point every event passes
+        through, so neither the tool output nor the exported span carries them.
         """
         if event.url is not None:
-            event = replace(event, url=_without_userinfo(event.url))
+            event = replace(event, url=_without_credentials(event.url))
         self.events.append(event)
         span = self.operation_span
         if span is not None and span.is_recording():
@@ -1157,7 +1193,7 @@ class PlaywrightBrowserToolset(FunctionToolset[AgentDepsT]):
                 finally:
                     self._session.operation_span = None
                 span.set_attribute('browser.outcome', 'ok')
-                span.set_attribute('url.full', _without_userinfo(page.url))
+                span.set_attribute('url.full', _without_credentials(page.url))
                 return result
 
     async def _refuse(self, timeout_ms: int | None, message: str) -> str:

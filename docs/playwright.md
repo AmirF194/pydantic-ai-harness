@@ -277,7 +277,10 @@ between tool calls.
   else.
 - The agent can read the same log through `console_messages` and
   `network_requests`, which is often how it recovers from a page that renders
-  from an API rather than from HTML.
+  from an API rather than from HTML. Recorded URLs keep their host, path and
+  parameter names but lose `user:password@` credentials and the values of
+  credential-bearing parameters (`token`, `code`, `signature`, and the rest),
+  since those reach both the model and the telemetry backend.
 - A wait that seems to hang is usually an action timeout. `action_timeout_ms`
   defaults to 5s so the failure arrives quickly; lower it further while
   debugging, and read the timeout value in the error string to tell a slow page

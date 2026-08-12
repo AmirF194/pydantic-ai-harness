@@ -2568,8 +2568,25 @@ class TestCredentialsStayOutOfTelemetry:
         assert span.attributes is not None
         assert span.attributes['url.full'] == 'https://example.com/dashboard'
 
+    async def test_credential_parameters_are_redacted_by_name(self) -> None:
+        page = _FakePage()
+        session = PlaywrightBrowserSession()
+        session.page = page
+        session._on_response(_FakeResponse(url='https://example.com/dl?id=7&token=secret&sig=abc'))
+        # The endpoint and the parameter names survive -- they are what makes a
+        # recorded request findable -- and only the credential values go.
+        assert await _toolset(page, session=session).network_requests() == (
+            '[info] response GET 200 https://example.com/dl?id=7&token=REDACTED&sig=REDACTED'
+        )
+
+    def test_credentials_go_from_the_fragment_too(self) -> None:
+        # An OAuth implicit grant returns its token in the fragment.
+        assert toolset_module._without_credentials('https://app.example.com/cb#access_token=abc&state=x') == (
+            'https://app.example.com/cb#access_token=REDACTED&state=x'
+        )
+
     def test_a_url_urlsplit_rejects_is_still_cleaned(self) -> None:
         # Chromium accepts hosts the stdlib parser raises on, so the strip cannot
         # depend on parsing succeeding.
-        assert toolset_module._without_userinfo('http://user:pw@[::1/x') == 'http://[::1/x'
-        assert toolset_module._without_userinfo('https://example.com/a@b') == 'https://example.com/a@b'
+        assert toolset_module._without_credentials('http://user:pw@[::1/x') == 'http://[::1/x'
+        assert toolset_module._without_credentials('https://example.com/a@b') == 'https://example.com/a@b'
