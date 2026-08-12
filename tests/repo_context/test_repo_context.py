@@ -198,7 +198,8 @@ class TestToolset:
             TestModel(call_tools=['inventory_agent_context']),
             capabilities=[RepoContext[object](workspace_dir=tmp_path)],
         )
-        result = await agent.run('go')
+        async with LocalSandbox(root=tmp_path) as backend:
+            result = await agent.run('go', sandbox=backend)
         assert 'inventory_agent_context' in result.output
 
 

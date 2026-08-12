@@ -214,7 +214,8 @@ class TestThroughAgent:
             return ModelResponse(parts=[TextPart('done')])
 
         agent = Agent(FunctionModel(call_then_finish), capabilities=[PydanticAIDocs(local_docs_path=tmp_path)])
-        result = await agent.run('go')
+        async with LocalSandbox(root=tmp_path) as backend:
+            result = await agent.run('go', sandbox=backend)
 
         assert result.output == 'done'
         returns = [

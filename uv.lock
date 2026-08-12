@@ -3523,8 +3523,8 @@ lint = [
 
 [[package]]
 name = "pydantic-ai-slim"
-version = "2.23.1.dev39+aacd404d"
-source = { git = "https://github.com/pydantic/pydantic-ai.git?subdirectory=pydantic_ai_slim&branch=sandbox-concept#aacd404d0ce50559cc2ac242403e6d06ea11e9b7" }
+version = "2.27.2.dev58+b4510f7a"
+source = { git = "https://github.com/pydantic/pydantic-ai.git?subdirectory=pydantic_ai_slim&branch=sandbox-concept#b4510f7a67209bc0595785f6bc9641b335466e80" }
 dependencies = [
     { name = "anyio", version = "4.12.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
     { name = "anyio", version = "4.13.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
@@ -3798,8 +3798,8 @@ wheels = [
 
 [[package]]
 name = "pydantic-graph"
-version = "2.23.1.dev39+aacd404d"
-source = { git = "https://github.com/pydantic/pydantic-ai.git?subdirectory=pydantic_graph&branch=sandbox-concept#aacd404d0ce50559cc2ac242403e6d06ea11e9b7" }
+version = "2.27.2.dev58+b4510f7a"
+source = { git = "https://github.com/pydantic/pydantic-ai.git?subdirectory=pydantic_graph&branch=sandbox-concept#b4510f7a67209bc0595785f6bc9641b335466e80" }
 dependencies = [
     { name = "anyio", version = "4.12.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
     { name = "anyio", version = "4.13.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
