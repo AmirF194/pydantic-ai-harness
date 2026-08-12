@@ -10,10 +10,14 @@ from __future__ import annotations
 
 import asyncio
 import sys
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Sequence
 from typing import Protocol
 
 import pytest
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
+from opentelemetry.trace import Tracer
 from playwright._impl._errors import TargetClosedError
 from playwright.async_api import Error as PlaywrightError
 from playwright.async_api import StorageState
@@ -23,14 +27,17 @@ from pydantic_ai.capabilities import AbstractCapability
 from pydantic_ai.capabilities.abstract import CapabilityOrdering
 from pydantic_ai.exceptions import UserError
 from pydantic_ai.messages import BinaryContent, ToolReturn
+from pydantic_ai.models.instrumented import InstrumentationSettings, InstrumentedModel
 from pydantic_ai.models.test import TestModel
 from pydantic_ai.tools import RunContext, ToolDefinition
 from pydantic_ai.usage import RunUsage
 
 import pydantic_ai_harness.playwright._toolset as toolset_module
 from pydantic_ai_harness.playwright import (
+    DEFAULT_ACTION_TIMEOUT_MS,
     DEFAULT_MAX_CONTENT_TOKENS,
-    DEFAULT_TIMEOUT_MS,
+    DEFAULT_NAVIGATION_TIMEOUT_MS,
+    BrowserEvent,
     PlaywrightBrowser,
     PlaywrightBrowserSession,
     PlaywrightBrowserToolset,
@@ -63,6 +70,73 @@ class _FakeMouse:
 
     async def wheel(self, delta_x: float, delta_y: float) -> None:
         self.calls.append(('wheel', int(delta_x), int(delta_y)))
+
+
+class _FakeKeyboard:
+    def __init__(self) -> None:
+        self.pressed: list[str] = []
+
+    async def press(self, key: str) -> None:
+        self.pressed.append(key)
+
+
+class _FakeFrameContent:
+    """A child frame whose text page-level reads cannot see."""
+
+    def __init__(
+        self,
+        *,
+        url: str = 'https://embed.example.com/',
+        text: str = 'Embedded schedule',
+        inner_text_error: PlaywrightError | None = None,
+        wait_for_error: PlaywrightError | None = None,
+        wait_delay: float = 0.0,
+    ) -> None:
+        self.url = url
+        self._text = text
+        self._inner_text_error = inner_text_error
+        self._wait_for_error = wait_for_error
+        self._wait_delay = wait_delay
+
+    async def inner_text(self, selector: str, *, timeout: float | None = None) -> str:
+        if self._inner_text_error is not None:
+            raise self._inner_text_error
+        return self._text
+
+    async def wait_for_selector(self, selector: str, *, timeout: float | None = None) -> object:
+        if self._wait_delay:
+            await asyncio.sleep(self._wait_delay)
+        if self._wait_for_error is not None:
+            raise self._wait_for_error
+        return None
+
+
+class _HangingFrame(_FakeFrameContent):
+    """A frame whose text read never returns, to drive the sweep budget."""
+
+    async def inner_text(self, selector: str, *, timeout: float | None = None) -> str:
+        await asyncio.Event().wait()
+        return ''  # pragma: no cover -- unreachable; the wait is cancelled
+
+
+class _FakeConsoleMessage:
+    def __init__(self, type: str, text: str) -> None:
+        self.type = type
+        self.text = text
+
+
+class _FakeNetworkRequest:
+    def __init__(self, *, url: str, method: str = 'GET', failure: str | None = None) -> None:
+        self.url = url
+        self.method = method
+        self.failure = failure
+
+
+class _FakeResponse:
+    def __init__(self, *, url: str, status: int = 200, method: str = 'GET') -> None:
+        self.url = url
+        self.status = status
+        self.request = _FakeNetworkRequest(url=url, method=method)
 
 
 class _FakeRoute:
@@ -171,6 +245,9 @@ class _FakePage:
         go_back_result: object | None = _HISTORY_RESPONSE,
         go_forward_result: object | None = _HISTORY_RESPONSE,
         wait_for_error: PlaywrightError | None = None,
+        hover_error: PlaywrightError | None = None,
+        press_error: PlaywrightError | None = None,
+        select_option_error: PlaywrightError | None = None,
         aria_snapshot_tree: str = '- heading "Example" [ref=e1]\n- button "Go" [ref=e2]',
         aria_snapshot_error: PlaywrightError | None = None,
     ) -> None:
@@ -195,16 +272,25 @@ class _FakePage:
         self._go_back_result = go_back_result
         self._go_forward_result = go_forward_result
         self._wait_for_error = wait_for_error
+        self._hover_error = hover_error
+        self._press_error = press_error
+        self._select_option_error = select_option_error
         self._aria_snapshot_tree = aria_snapshot_tree
         self._aria_snapshot_error = aria_snapshot_error
         self._context: _FakeBrowserContext | None = None
         self._popup_on_screenshot: _FakePage | None = None
         self.mouse = _FakeMouse()
+        self.keyboard = _FakeKeyboard()
+        self.frames: list[_FakePage | _FakeFrameContent] = [self]
         self.timeouts: dict[str, float | None] = {}
         self.goto_calls: list[str] = []
         self.load_states: list[str] = []
         self.filled: list[tuple[str, str]] = []
         self.clicked: list[str] = []
+        self.pressed: list[tuple[str, str]] = []
+        self.hovered: list[str] = []
+        self.selected: list[tuple[str, list[str]]] = []
+        self.handlers: dict[str, list[Callable[[object], None]]] = {}
         self.popup_events: list[str] = []
         self.popup_handlers: list[Callable[[_FakePage], None]] = []
         self.closed = False
@@ -303,9 +389,35 @@ class _FakePage:
         if self._close_error is not None:
             raise self._close_error
 
-    def on(self, event: str, handler: Callable[[_FakePage], None]) -> None:
-        self.popup_events.append(event)
-        self.popup_handlers.append(handler)
+    async def hover(self, selector: str, *, timeout: float | None = None) -> None:
+        self.timeouts['hover'] = timeout
+        if self._hover_error is not None:
+            raise self._hover_error
+        self.hovered.append(selector)
+
+    async def press(self, selector: str, key: str, *, timeout: float | None = None) -> None:
+        self.timeouts['press'] = timeout
+        if self._press_error is not None:
+            raise self._press_error
+        self.pressed.append((selector, key))
+
+    async def select_option(self, selector: str, value: Sequence[str], *, timeout: float | None = None) -> list[str]:
+        self.timeouts['select_option'] = timeout
+        if self._select_option_error is not None:
+            raise self._select_option_error
+        self.selected.append((selector, list(value)))
+        return list(value)
+
+    def on(self, event: str, handler: Callable[[object], None]) -> None:
+        self.handlers.setdefault(event, []).append(handler)
+        if event == 'popup':
+            self.popup_events.append(event)
+            self.popup_handlers.append(handler)
+
+    def emit(self, event: str, payload: object) -> None:
+        """Deliver a page event the way Playwright's receive loop would."""
+        for handler in self.handlers.get(event, []):
+            handler(payload)
 
 
 class _ControlledNavigationPage(_FakePage):
@@ -491,10 +603,12 @@ def _toolset(
     block_private_addresses: bool = True,
     screenshot_on_navigate: bool = False,
     max_content_tokens: int = DEFAULT_MAX_CONTENT_TOKENS,
-    timeout_ms: int = DEFAULT_TIMEOUT_MS,
+    action_timeout_ms: int = DEFAULT_ACTION_TIMEOUT_MS,
+    navigation_timeout_ms: int = DEFAULT_NAVIGATION_TIMEOUT_MS,
+    session: PlaywrightBrowserSession | None = None,
 ) -> PlaywrightBrowserToolset[None]:
     """Build a toolset whose active page is the given double."""
-    session = PlaywrightBrowserSession()
+    session = session if session is not None else PlaywrightBrowserSession()
     session.page = page
     return PlaywrightBrowserToolset[None](
         session=session,
@@ -503,7 +617,8 @@ def _toolset(
         ),
         screenshot_on_navigate=screenshot_on_navigate,
         max_content_tokens=max_content_tokens,
-        timeout_ms=timeout_ms,
+        action_timeout_ms=action_timeout_ms,
+        navigation_timeout_ms=navigation_timeout_ms,
     )
 
 
@@ -840,8 +955,9 @@ class TestPlaywrightBrowserTools:
         toolset = _toolset(_FakePage(inner_text_error=PlaywrightTimeoutError('body timed out')))
         result = await toolset.get_text()
         assert result == (
-            'Error: get_text timed out after 30000ms. The element may not exist or the page may be slow; '
-            'try a different selector, or navigate again.'
+            'Error: get_text timed out after 5000ms. The element may not exist or the page may be slow; '
+            'try a different selector, or navigate again. '
+            'Content inside an iframe needs an `aria-ref=` handle from `snapshot`, not a CSS selector.'
         )
 
     async def test_get_text_full_page(self) -> None:
@@ -1051,11 +1167,13 @@ class TestPrivateAddressBlocking:
 
 class TestPlaywrightErrorHandling:
     async def test_navigate_timeout_returns_bounded_error(self) -> None:
-        page = _FakePage(goto_error=PlaywrightTimeoutError('Timeout 30000ms exceeded.'))
+        page = _FakePage(goto_error=PlaywrightTimeoutError('Timeout 60000ms exceeded.'))
         result = await _toolset(page).navigate('https://example.com/')
+        # A navigation failure reports the navigation budget, not the shorter action one.
         assert result == (
-            'Error: navigate timed out after 30000ms. The element may not exist or the page may be slow; '
-            'try a different selector, or navigate again.'
+            'Error: navigate timed out after 60000ms. The element may not exist or the page may be slow; '
+            'try a different selector, or navigate again. '
+            'Content inside an iframe needs an `aria-ref=` handle from `snapshot`, not a CSS selector.'
         )
 
     async def test_navigate_preserves_net_error_code(self) -> None:
@@ -1072,12 +1190,12 @@ class TestPlaywrightErrorHandling:
     async def test_click_timeout_returns_bounded_error(self) -> None:
         page = _FakePage(click_error=PlaywrightTimeoutError('Timeout 30000ms exceeded.'))
         result = await _toolset(page).click('button#missing')
-        assert result.startswith('Error: click timed out after 30000ms.')
+        assert result.startswith('Error: click timed out after 5000ms.')
 
     async def test_type_text_timeout_returns_bounded_error(self) -> None:
         page = _FakePage(fill_error=PlaywrightTimeoutError('Timeout 30000ms exceeded.'))
         result = await _toolset(page).type_text('input#missing', 'hi')
-        assert result.startswith('Error: type_text timed out after 30000ms.')
+        assert result.startswith('Error: type_text timed out after 5000ms.')
 
     async def test_scroll_playwright_error_returns_error_string(self) -> None:
         page = _FakePage(evaluate_raises=PlaywrightError('scroll blew up'))
@@ -1137,7 +1255,9 @@ class TestPerCallTimeout:
         }
 
     async def test_zero_capability_default_disables_title_deadline(self) -> None:
-        result = await _toolset(_FakePage(), timeout_ms=0).navigate('https://example.com/')
+        result = await _toolset(_FakePage(), action_timeout_ms=0, navigation_timeout_ms=0).navigate(
+            'https://example.com/'
+        )
         assert isinstance(result, str)
         assert result.startswith('URL:')
 
@@ -1147,7 +1267,8 @@ class TestPerCallTimeout:
         result = await _toolset(_HangingTitlePage()).navigate('https://example.com/', timeout_ms=1)
         assert result == (
             'Error: navigate timed out after 1ms. The element may not exist or the page may be slow; '
-            'try a different selector, or navigate again.'
+            'try a different selector, or navigate again. '
+            'Content inside an iframe needs an `aria-ref=` handle from `snapshot`, not a CSS selector.'
         )
 
     async def test_execute_js_bounds_unresolved_promise(self) -> None:
@@ -1208,7 +1329,7 @@ class TestPerCallTimeout:
     async def test_none_falls_back_to_capability_default(self) -> None:
         page = _FakePage()
         await _toolset(page).click('button#go')
-        assert page.timeouts['click'] == DEFAULT_TIMEOUT_MS
+        assert page.timeouts['click'] == DEFAULT_ACTION_TIMEOUT_MS
 
     @pytest.mark.parametrize('call', _NON_POSITIVE_TIMEOUT_CALLS)
     async def test_non_positive_override_returns_bounded_error(
@@ -1264,8 +1385,9 @@ class TestWaitFor:
         page = _FakePage(wait_for_error=PlaywrightTimeoutError('Timeout 30000ms exceeded.'))
         result = await _toolset(page).wait_for(selector='.never')
         assert result == (
-            'Error: wait_for timed out after 30000ms. The element may not exist or the page may be slow; '
-            'try a different selector, or navigate again.'
+            'Error: wait_for timed out after 5000ms. The element may not exist or the page may be slow; '
+            'try a different selector, or navigate again. '
+            'Content inside an iframe needs an `aria-ref=` handle from `snapshot`, not a CSS selector.'
         )
 
 
@@ -1301,11 +1423,14 @@ class TestPlaywrightBrowserSession:
             PlaywrightBrowserToolset[None](session=session, max_content_tokens=-1)
         PlaywrightBrowserToolset[None](session=session, max_content_tokens=0)
 
-    def test_toolset_validates_timeout_ms(self) -> None:
+    def test_toolset_validates_timeouts(self) -> None:
         session = PlaywrightBrowserSession()
-        with pytest.raises(ValueError, match='^timeout_ms must be greater than or equal to 0$'):
-            PlaywrightBrowserToolset[None](session=session, timeout_ms=-1)
-        PlaywrightBrowserToolset[None](session=session, timeout_ms=0)  # 0 = no deadline, accepted
+        with pytest.raises(ValueError, match='^action_timeout_ms must be greater than or equal to 0$'):
+            PlaywrightBrowserToolset[None](session=session, action_timeout_ms=-1)
+        with pytest.raises(ValueError, match='^navigation_timeout_ms must be greater than or equal to 0$'):
+            PlaywrightBrowserToolset[None](session=session, navigation_timeout_ms=-1)
+        # 0 = no deadline, accepted as a developer-set default
+        PlaywrightBrowserToolset[None](session=session, action_timeout_ms=0, navigation_timeout_ms=0)
 
     async def test_tool_raises_when_wrap_run_not_active(self) -> None:
         toolset = PlaywrightBrowserToolset[None](session=PlaywrightBrowserSession())
@@ -1364,10 +1489,12 @@ class TestPlaywrightBrowserHooks:
             PlaywrightBrowser[None](max_content_tokens=-1)
         PlaywrightBrowser[None](max_content_tokens=0)
 
-    def test_capability_validates_timeout_ms(self) -> None:
-        with pytest.raises(ValueError, match='^timeout_ms must be greater than or equal to 0$'):
-            PlaywrightBrowser[None](timeout_ms=-1)
-        PlaywrightBrowser[None](timeout_ms=0)
+    def test_capability_validates_timeouts(self) -> None:
+        with pytest.raises(ValueError, match='^action_timeout_ms must be greater than or equal to 0$'):
+            PlaywrightBrowser[None](action_timeout_ms=-1)
+        with pytest.raises(ValueError, match='^navigation_timeout_ms must be greater than or equal to 0$'):
+            PlaywrightBrowser[None](navigation_timeout_ms=-1)
+        PlaywrightBrowser[None](action_timeout_ms=0, navigation_timeout_ms=0)
 
     def test_get_instructions_reports_allowlist(self) -> None:
         instructions = PlaywrightBrowser[None](allowed_domains=['a.com', 'b.com']).get_instructions()
@@ -1452,7 +1579,8 @@ class TestPlaywrightBrowserHooks:
             block_private_addresses=False,
             screenshot_on_navigate=True,
             max_content_tokens=100,
-            timeout_ms=5000,
+            action_timeout_ms=1500,
+            navigation_timeout_ms=5000,
             auto_install_chromium=True,
             cdp_url='http://localhost:9222',
         )
@@ -1461,7 +1589,8 @@ class TestPlaywrightBrowserHooks:
         assert browser.block_private_addresses is False
         assert browser.screenshot_on_navigate is True
         assert browser.max_content_tokens == 100
-        assert browser.timeout_ms == 5000
+        assert browser.action_timeout_ms == 1500
+        assert browser.navigation_timeout_ms == 5000
         assert browser.auto_install_chromium is True
         assert browser.cdp_url == 'http://localhost:9222'
 
@@ -1881,7 +2010,9 @@ class TestPlaywrightBrowserLifecycle:
         # reaches, so it takes the capability's deadline rather than none at all.
         page = _FakePage()
         cm = _install_fake_driver(monkeypatch, page)
-        agent = Agent(TestModel(call_tools=['screenshot']), capabilities=[PlaywrightBrowser(timeout_ms=4200)])
+        agent = Agent(
+            TestModel(call_tools=['screenshot']), capabilities=[PlaywrightBrowser(navigation_timeout_ms=4200)]
+        )
         await agent.run('screenshot the page')
         assert cm.driver.chromium.launch_timeouts == [4200]
 
@@ -1890,7 +2021,7 @@ class TestPlaywrightBrowserLifecycle:
         cm = _install_fake_driver(monkeypatch, page)
         agent = Agent(
             TestModel(call_tools=['screenshot']),
-            capabilities=[PlaywrightBrowser(cdp_url='http://127.0.0.1:9222', timeout_ms=4300)],
+            capabilities=[PlaywrightBrowser(cdp_url='http://127.0.0.1:9222', navigation_timeout_ms=4300)],
         )
         await agent.run('screenshot the page')
         assert cm.driver.chromium.launch_timeouts == [4300]
@@ -2036,7 +2167,319 @@ class TestPlaywrightBrowserLifecycle:
 
 def test_public_exports() -> None:
     assert DEFAULT_MAX_CONTENT_TOKENS == 4000
-    assert DEFAULT_TIMEOUT_MS == 30_000
+    assert DEFAULT_ACTION_TIMEOUT_MS == 5_000
+    assert DEFAULT_NAVIGATION_TIMEOUT_MS == 60_000
+    assert BrowserEvent is not None
     assert issubclass(PlaywrightBrowser, object)
     assert PlaywrightBrowserToolset is not None
     assert PlaywrightBrowserSession is not None
+
+
+# --- Embedded frames --------------------------------------------------------
+
+
+class TestEmbeddedFrames:
+    """Content inside an iframe: page-level reads stop at the frame boundary."""
+
+    async def test_page_text_includes_child_frame_text(self) -> None:
+        page = _FakePage(body='Conference')
+        page.frames.append(_FakeFrameContent(text='Deep dive on agents'))
+        result = await _toolset(page).get_text()
+        assert result == 'Conference\n\n[frame https://embed.example.com/]\nDeep dive on agents'
+
+    async def test_navigate_reports_embedded_content(self) -> None:
+        page = _FakePage(body='Conference')
+        page.frames.append(_FakeFrameContent(text='Deep dive on agents'))
+        result = await _toolset(page).navigate('https://example.com/')
+        assert isinstance(result, str)
+        assert 'Deep dive on agents' in result
+
+    async def test_blank_frame_is_left_out(self) -> None:
+        page = _FakePage(body='Conference')
+        page.frames.append(_FakeFrameContent(text='   \n '))
+        assert await _toolset(page).get_text() == 'Conference'
+
+    async def test_unreadable_frame_does_not_fail_the_read(self) -> None:
+        # A frame can detach mid-read; a missing embed must not turn a successful
+        # action into an error.
+        page = _FakePage(body='Conference')
+        page.frames.append(_FakeFrameContent(inner_text_error=PlaywrightError('frame detached')))
+        page.frames.append(_FakeFrameContent(url='https://ok.example.com/', text='visible embed'))
+        result = await _toolset(page).get_text()
+        assert result == 'Conference\n\n[frame https://ok.example.com/]\nvisible embed'
+
+    async def test_frame_sweep_is_bounded(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # One unresponsive frame must not consume the action's deadline: whatever
+        # was collected before the sweep budget ran out is kept.
+        monkeypatch.setattr(toolset_module, '_FRAME_TEXT_BUDGET_MS', 10)
+        page = _FakePage(body='Conference')
+        page.frames.append(_HangingFrame())
+        assert await _toolset(page).get_text() == 'Conference'
+
+    async def test_wait_for_matches_inside_a_frame(self) -> None:
+        page = _FakePage(body='Conference', wait_for_error=PlaywrightTimeoutError('Timeout 5000ms exceeded.'))
+        page.frames.append(_FakeFrameContent(text='late content'))
+        result = await _toolset(page).wait_for(text='late content')
+        assert result.startswith("Found 'text=late content'.")
+
+    async def test_wait_for_reports_the_timeout_when_no_frame_matches(self) -> None:
+        page = _FakePage(wait_for_error=PlaywrightTimeoutError('Timeout 5000ms exceeded.'))
+        page.frames.append(
+            _FakeFrameContent(wait_for_error=PlaywrightTimeoutError('Timeout 5000ms exceeded.'), wait_delay=0.01)
+        )
+        result = await _toolset(page).wait_for(selector='.missing')
+        assert result.startswith('Error: wait_for timed out after 5000ms.')
+
+    async def test_slower_waits_are_cancelled_once_one_matches(self) -> None:
+        page = _FakePage(body='Conference')
+        slow = _FakeFrameContent(wait_delay=5)
+        page.frames.append(slow)
+        # The main-frame wait resolves immediately; the pending frame wait is
+        # cancelled rather than left running past the tool call.
+        assert (await _toolset(page).wait_for(selector='.ready')).startswith("Found '.ready'.")
+
+
+# --- Keyboard, dropdowns, hover ---------------------------------------------
+
+
+class TestInteractionTools:
+    async def test_press_key_without_selector_uses_the_keyboard(self) -> None:
+        page = _FakePage(body='results')
+        result = await _toolset(page).press_key('Enter')
+        assert page.keyboard.pressed == ['Enter']
+        assert result == "Pressed 'Enter'.\n\nresults"
+
+    async def test_press_key_with_selector_focuses_the_element(self) -> None:
+        page = _FakePage(body='results')
+        await _toolset(page).press_key('Enter', selector='input#q')
+        assert page.pressed == [('input#q', 'Enter')]
+
+    async def test_press_key_settles_navigation_and_enforces_policy(self) -> None:
+        page = _FakePage(url='https://evil.com/landing')
+        result = await _toolset(page, allowed_domains=['example.com']).press_key('Enter')
+        assert result == 'Error: press_key reached a domain not in allowed_domains: https://evil.com/landing'
+
+    async def test_press_key_error_is_bounded(self) -> None:
+        page = _FakePage(press_error=PlaywrightTimeoutError('Timeout 5000ms exceeded.'))
+        result = await _toolset(page).press_key('Enter', selector='input#q')
+        assert result.startswith('Error: press_key timed out after 5000ms.')
+
+    async def test_select_option_reports_what_was_selected(self) -> None:
+        page = _FakePage(body='filtered')
+        result = await _toolset(page).select_option('select#track', ['ai'])
+        assert page.selected == [('select#track', ['ai'])]
+        assert result == "Selected ['ai'] in 'select#track'.\n\nfiltered"
+
+    async def test_select_option_enforces_policy_after_the_change(self) -> None:
+        page = _FakePage(url='http://169.254.169.254/')
+        result = await _toolset(page).select_option('select#track', ['ai'])
+        assert result == (
+            'Error: select_option reached a blocked private or link-local address: http://169.254.169.254/'
+        )
+
+    async def test_select_option_error_is_bounded(self) -> None:
+        page = _FakePage(select_option_error=PlaywrightError('strict mode violation'))
+        result = await _toolset(page).select_option('select#track', ['ai'])
+        assert result == 'Error: select_option failed: strict mode violation'
+
+    async def test_hover_returns_the_revealed_page(self) -> None:
+        page = _FakePage(body='menu open')
+        result = await _toolset(page).hover('nav .menu')
+        assert page.hovered == ['nav .menu']
+        assert result == "Hovered 'nav .menu'.\n\nmenu open"
+
+    async def test_hover_error_is_bounded(self) -> None:
+        page = _FakePage(hover_error=PlaywrightTimeoutError('Timeout 5000ms exceeded.'))
+        result = await _toolset(page).hover('nav .menu')
+        assert result.startswith('Error: hover timed out after 5000ms.')
+
+
+# --- Browser events and tracing ---------------------------------------------
+
+
+def _recording_tracer() -> tuple[Tracer, InMemorySpanExporter]:
+    exporter = InMemorySpanExporter()
+    provider = TracerProvider()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    return provider.get_tracer('test'), exporter
+
+
+class TestBrowserEvents:
+    """What the page did between tool calls: console, network, refusals, popups."""
+
+    def _session(self, page: _FakePage) -> PlaywrightBrowserSession:
+        session = PlaywrightBrowserSession()
+        session.page = page
+        return session
+
+    async def test_console_messages_carry_the_page_severity(self) -> None:
+        page = _FakePage()
+        session = self._session(page)
+        toolset = _toolset(page, session=session)
+        for message in (
+            _FakeConsoleMessage('log', 'starting'),
+            _FakeConsoleMessage('warning', 'deprecated call'),
+            _FakeConsoleMessage('error', 'boom'),
+        ):
+            session._on_console(message)
+        session._on_page_error(RuntimeError('uncaught TypeError'))
+        assert await toolset.console_messages() == (
+            '[info] console log: starting\n'
+            '[warning] console warning: deprecated call\n'
+            '[error] console error: boom\n'
+            '[error] page_error uncaught TypeError'
+        )
+        assert await toolset.console_messages(errors_only=True) == (
+            '[error] console error: boom\n[error] page_error uncaught TypeError'
+        )
+
+    async def test_network_requests_report_status_and_filter_by_url(self) -> None:
+        page = _FakePage()
+        session = self._session(page)
+        toolset = _toolset(page, session=session)
+        session._on_response(_FakeResponse(url='https://example.com/api/sessions', status=200))
+        session._on_response(_FakeResponse(url='https://example.com/missing', status=404))
+        session._on_request_failed(
+            _FakeNetworkRequest(url='https://cdn.example.com/app.js', failure='net::ERR_CONNECTION_REFUSED')
+        )
+        assert await toolset.network_requests() == (
+            '[info] response GET 200 https://example.com/api/sessions\n'
+            '[error] response GET 404 https://example.com/missing\n'
+            '[error] request_failed GET https://cdn.example.com/app.js net::ERR_CONNECTION_REFUSED'
+        )
+        assert await toolset.network_requests(url_contains='/api/') == (
+            '[info] response GET 200 https://example.com/api/sessions'
+        )
+
+    async def test_request_failed_without_a_reason_still_records(self) -> None:
+        page = _FakePage()
+        session = self._session(page)
+        session._on_request_failed(_FakeNetworkRequest(url='https://example.com/x', failure=None))
+        assert await _toolset(page, session=session).network_requests() == (
+            '[error] request_failed GET https://example.com/x failed'
+        )
+
+    async def test_guard_abort_is_recorded_once_with_its_reason(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        page = _FakePage()
+        _install_fake_driver(monkeypatch, page)
+        session = PlaywrightBrowserSession(policy=toolset_module.NavigationPolicy(allowed_domains=['example.com']))
+        async with session:
+            await session.ensure_page()
+            request_page = _FakeRequestPage()
+            await page.context.dispatch(
+                _FakeRequest('https://evil.com/', navigation=True, frame=request_page.main_frame)
+            )
+            # Chromium reports the abort as a failed request too; the guard's entry
+            # already names the reason, so the bare failure is dropped.
+            session._on_request_failed(_FakeNetworkRequest(url='https://evil.com/', failure='net::ERR_FAILED'))
+        assert [event.describe() for event in session.events] == [
+            '[warning] request_blocked https://evil.com/ domain not in allowed_domains'
+        ]
+
+    async def test_closed_popup_is_recorded(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        page = _FakePage()
+        _install_fake_driver(monkeypatch, page)
+        session = PlaywrightBrowserSession()
+        async with session:
+            await session.ensure_page()
+            page.emit('popup', _FakePage(url='https://example.com/popup'))
+            await asyncio.sleep(0)
+        assert [event.describe() for event in session.events] == [
+            '[warning] popup_closed https://example.com/popup popup closed'
+        ]
+
+    async def test_empty_log_reports_that_rather_than_nothing(self) -> None:
+        toolset = _toolset(_FakePage())
+        assert await toolset.console_messages() == 'No console messages recorded.'
+        assert await toolset.network_requests() == 'No network requests recorded.'
+
+    async def test_operation_span_carries_the_action_and_page_events(self) -> None:
+        page = _FakePage()
+        session = self._session(page)
+        tracer, exporter = _recording_tracer()
+        session.tracer = tracer
+        toolset = _toolset(page, session=session)
+
+        class _EmittingPage(_FakePage):
+            async def inner_text(self, selector: str, *, timeout: float | None = None) -> str:
+                session._on_console(_FakeConsoleMessage('error', 'boom'))
+                return await super().inner_text(selector, timeout=timeout)
+
+        session.page = _EmittingPage()
+        await toolset.get_text()
+        (span,) = exporter.get_finished_spans()
+        assert span.name == 'browser get_text'
+        assert span.attributes is not None
+        assert span.attributes['browser.action'] == 'get_text'
+        assert span.attributes['browser.timeout_ms'] == DEFAULT_ACTION_TIMEOUT_MS
+        assert span.attributes['browser.outcome'] == 'ok'
+        assert span.attributes['url.full'] == 'https://example.com/'
+        (event,) = span.events
+        assert event.name == 'browser.console'
+        assert event.attributes is not None
+        assert event.attributes['browser.event.message'] == 'error: boom'
+
+    async def test_network_event_attributes_follow_otel_conventions(self) -> None:
+        page = _FakePage()
+        session = self._session(page)
+        tracer, exporter = _recording_tracer()
+        session.tracer = tracer
+        toolset = _toolset(page, session=session)
+
+        class _RequestingPage(_FakePage):
+            async def inner_text(self, selector: str, *, timeout: float | None = None) -> str:
+                session._on_response(_FakeResponse(url='https://example.com/api', status=503, method='POST'))
+                return await super().inner_text(selector, timeout=timeout)
+
+        session.page = _RequestingPage()
+        await toolset.get_text()
+        (span,) = exporter.get_finished_spans()
+        (event,) = span.events
+        assert event.name == 'browser.response'
+        assert event.attributes is not None
+        assert event.attributes['url.full'] == 'https://example.com/api'
+        assert event.attributes['http.request.method'] == 'POST'
+        assert event.attributes['http.response.status_code'] == 503
+        # A response carries no message, so no empty attribute is emitted for one.
+        assert 'browser.event.message' not in event.attributes
+
+    async def test_failed_operation_is_marked_on_the_span(self) -> None:
+        page = _FakePage(click_error=PlaywrightTimeoutError('Timeout 5000ms exceeded.'))
+        session = self._session(page)
+        tracer, exporter = _recording_tracer()
+        session.tracer = tracer
+        await _toolset(page, session=session).click('button#go')
+        (span,) = exporter.get_finished_spans()
+        assert span.attributes is not None
+        assert span.attributes['browser.outcome'] == 'error'
+        assert 'url.full' not in span.attributes
+
+    async def test_events_outside_an_operation_are_still_logged(self) -> None:
+        page = _FakePage()
+        session = self._session(page)
+        session._on_console(_FakeConsoleMessage('log', 'between tool calls'))
+        assert [event.kind for event in session.events] == ['console']
+
+    async def test_the_log_is_bounded(self) -> None:
+        page = _FakePage()
+        session = self._session(page)
+        for index in range(toolset_module._EVENT_LOG_LIMIT + 10):
+            session._on_console(_FakeConsoleMessage('log', str(index)))
+        assert len(session.events) == toolset_module._EVENT_LOG_LIMIT
+
+    async def test_a_run_reports_browser_spans_to_the_agents_instrumentation(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # The capability adopts the run's tracer, so browser spans land wherever the
+        # agent's instrumentation settings send its tool calls.
+        page = _FakePage()
+        _install_fake_driver(monkeypatch, page)
+        exporter = InMemorySpanExporter()
+        provider = TracerProvider()
+        provider.add_span_processor(SimpleSpanProcessor(exporter))
+        model = InstrumentedModel(
+            TestModel(call_tools=['screenshot']), InstrumentationSettings(tracer_provider=provider)
+        )
+        agent = Agent(model, capabilities=[PlaywrightBrowser()])
+        await agent.run('screenshot the page')
+        assert 'browser screenshot' in [span.name for span in exporter.get_finished_spans()]

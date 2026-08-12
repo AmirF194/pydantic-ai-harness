@@ -7,7 +7,7 @@ it after installing the browser binary to verify the real integration end to end
     playwright install chromium
     uv run python scripts/playwright_smoke.py
 
-It exercises the public `PlaywrightBrowser` surface and checks six things:
+It exercises the public `PlaywrightBrowser` surface and checks eight things:
 
 - lazy launch plus a real navigation to https://example.com (prints the title),
 - the allowlist bounce (a disallowed host returns an error result, not content),
@@ -16,6 +16,12 @@ It exercises the public `PlaywrightBrowser` surface and checks six things:
   in-page `fetch`, each with an opt-out control proving the server is reachable,
 - a `storage_state` round-trip: a cookie captured from a real context is visible
   to the agent after relaunching the capability with that state,
+- embedded content: text inside a real cross-origin iframe reaches the model, a
+  `snapshot` ref from that frame clicks inside it, and `wait_for` matches content
+  that appears there,
+- the browser event log: console output and a failed request land in
+  `console_messages` / `network_requests` (a refused request is checked in the
+  private-address scenario, where the guard is what refuses it),
 - attaching over `cdp_url` to a browser that already holds a session: the run gets
   its own context (the existing cookie is not visible), the allowlist still bounces,
   and the host browser's own page survives teardown,
@@ -47,7 +53,11 @@ _COOKIE = 'smoke_session=abc123'
 _SECRET = 'private-address-smoke-secret'
 
 
-async def _run_tools(browser: PlaywrightBrowser[object], calls: list[tuple[str, dict[str, object]]]) -> list[str]:
+async def _run_tools(
+    browser: PlaywrightBrowser[object],
+    calls: list[tuple[str, dict[str, object]]],
+    resolve_ref: tuple[str, int] | None = None,
+) -> list[str]:
     """Drive a fixed sequence of tool calls through one agent run, in order.
 
     Emitting one scripted `ToolCallPart` per model turn keeps every call in the
@@ -57,6 +67,18 @@ async def _run_tools(browser: PlaywrightBrowser[object], calls: list[tuple[str, 
     results: list[str] = []
     index = 0
 
+    def _with_ref(args: dict[str, object]) -> dict[str, object]:
+        """Substitute `aria-ref=REF` with the ref of the named node in the last snapshot.
+
+        A ref is only knowable at run time, so the scripted call carries a
+        placeholder and the ref is read out of the snapshot that preceded it.
+        """
+        if resolve_ref is None or args.get('selector') != 'aria-ref=REF':
+            return args
+        label, snapshot_index = resolve_ref
+        line = next(line for line in results[snapshot_index].splitlines() if label in line and '[ref=' in line)
+        return {**args, 'selector': f'aria-ref={line.split("[ref=")[1].split("]")[0]}'}
+
     async def model(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
         nonlocal index
         for part in messages[-1].parts:
@@ -65,7 +87,7 @@ async def _run_tools(browser: PlaywrightBrowser[object], calls: list[tuple[str, 
         if index < len(calls):
             name, args = calls[index]
             index += 1
-            return ModelResponse(parts=[ToolCallPart(tool_name=name, args=args)])
+            return ModelResponse(parts=[ToolCallPart(tool_name=name, args=_with_ref(args))])
         return ModelResponse(parts=[TextPart('done')])
 
     agent = Agent(FunctionModel(model), capabilities=[browser])
@@ -122,8 +144,13 @@ async def _check_private_address_block() -> None:
         decimal_url = f'http://2130706433:{port}/'
         fetch = f"fetch('http://127.0.0.1:{port}/').then(r => r.text())"
 
-        (blocked_nav,) = await _run_tools(PlaywrightBrowser[object](), [('navigate', {'url': decimal_url})])
+        blocked_nav, refusals = await _run_tools(
+            PlaywrightBrowser[object](), [('navigate', {'url': decimal_url}), ('network_requests', {})]
+        )
         assert _SECRET not in blocked_nav, blocked_nav
+        # The refusal is the route guard's, so it carries the reason rather than
+        # arriving as a bare network failure.
+        assert 'request_blocked' in refusals and 'private or link-local' in refusals, refusals
         (open_nav,) = await _run_tools(
             PlaywrightBrowser[object](block_private_addresses=False), [('navigate', {'url': decimal_url})]
         )
@@ -206,12 +233,87 @@ async def _check_cdp_attach() -> None:
     print('cdp attach ok -- isolated context, allowlist enforced, host browser left open')
 
 
+async def _serve_html(body: bytes) -> tuple[asyncio.Server, int]:
+    """Serve a fixed HTML body over HTTP on a loopback port."""
+
+    async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        await reader.readline()
+        writer.write(
+            b'HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n'
+            b'Content-Length: ' + str(len(body)).encode() + b'\r\n\r\n' + body
+        )
+        await writer.drain()
+        writer.close()
+
+    server = await asyncio.start_server(handle, '127.0.0.1', 0)
+    return server, server.sockets[0].getsockname()[1]
+
+
+_INNER_FRAME = (
+    b'<html><body><h1>Inner schedule</h1>'
+    b'<button id="more">Show more</button>'
+    b'<div id="late" style="display:none">LATE-CONTENT</div>'
+    b"<script>document.getElementById('more').onclick = () => "
+    b"{ document.getElementById('late').style.display = 'block' }</script>"
+    b'</body></html>'
+)
+
+
+async def _check_embedded_frame() -> None:
+    """Content inside a real iframe: readable, clickable by ref, waitable."""
+    inner, inner_port = await _serve_html(_INNER_FRAME)
+    outer, outer_port = await _serve_html(
+        f'<html><body><h1>Conference</h1><iframe src="http://127.0.0.1:{inner_port}/" '
+        f'width="600" height="400"></iframe></body></html>'.encode()
+    )
+    async with inner, outer:
+        browser = PlaywrightBrowser[object](block_private_addresses=False)
+        page_text, snapshot, _, waited = await _run_tools(
+            browser,
+            [
+                ('navigate', {'url': f'http://127.0.0.1:{outer_port}/'}),
+                ('snapshot', {}),
+                ('click', {'selector': 'aria-ref=REF'}),
+                ('wait_for', {'text': 'LATE-CONTENT', 'timeout_ms': 3000}),
+            ],
+            resolve_ref=('Show more', 1),
+        )
+        assert 'Inner schedule' in page_text, f'iframe text missing from the page read: {page_text}'
+        assert 'f1e' in snapshot, f'snapshot carries no frame-scoped refs: {snapshot}'
+        assert 'timed out' not in waited, waited
+    print('embedded frame ok -- read, clicked by ref, and waited inside the iframe')
+
+
+async def _check_browser_event_log() -> None:
+    """Console output, a failed request, and a refused request all reach the tools."""
+    server, port = await _serve_html(
+        b'<html><body><script>console.error("page boom");'
+        b'fetch("http://127.0.0.1:1/never").catch(() => {});'
+        b'</script></body></html>'
+    )
+    async with server:
+        browser = PlaywrightBrowser[object](block_private_addresses=False, allowed_domains=['127.0.0.1'])
+        _, console, network = await _run_tools(
+            browser,
+            [
+                ('navigate', {'url': f'http://127.0.0.1:{port}/'}),
+                ('console_messages', {'errors_only': True}),
+                ('network_requests', {}),
+            ],
+        )
+        assert 'page boom' in console, console
+        assert '127.0.0.1:1/never' in network, network
+    print('browser event log ok -- console error and failed request recorded')
+
+
 async def _main() -> None:
     """Run every smoke scenario in sequence."""
     await _check_navigate()
     await _check_allowlist_bounce()
     await _check_private_address_block()
     await _check_storage_state_round_trip()
+    await _check_embedded_frame()
+    await _check_browser_event_log()
     await _check_cdp_attach()
     print('all checks passed')
 

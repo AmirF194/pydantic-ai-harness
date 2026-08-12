@@ -17,8 +17,9 @@ from pydantic_ai.exceptions import UserError
 from pydantic_ai.tools import AgentDepsT, ToolDefinition
 
 from pydantic_ai_harness.playwright._toolset import (
+    DEFAULT_ACTION_TIMEOUT_MS,
     DEFAULT_MAX_CONTENT_TOKENS,
-    DEFAULT_TIMEOUT_MS,
+    DEFAULT_NAVIGATION_TIMEOUT_MS,
     NavigationPolicy,
     PlaywrightBrowserSession,
     PlaywrightBrowserToolset,
@@ -36,16 +37,26 @@ pages behind login or session cookies, JavaScript-heavy SPAs, interactive multi-
 filling forms), and dynamically loaded content. For looking up information or reading a static, public
 URL, prefer web search or web fetch.
 
-Tools: `navigate(url)`, `snapshot()`, `click(selector)` (CSS selector, 'x,y' pixel coordinates, or an
-`aria-ref=` handle from `snapshot`), `type_text(selector, text)`, `wait_for(selector?, text?)`,
-`screenshot(full_page?)`, `get_text(selector?)`, `scroll(direction)`, `go_back()`, `go_forward()`,
-`execute_js(script)`. Every page action takes an optional `timeout_ms` override.
+Read: `navigate(url)`, `snapshot()`, `get_text(selector?)`, `screenshot(full_page?)`.
+Act: `click(selector)` (CSS selector, 'x,y' pixel coordinates, or an `aria-ref=` handle from
+`snapshot`), `type_text(selector, text)`, `press_key(key, selector?)`, `select_option(selector, values)`,
+`hover(selector)`, `scroll(direction)`, `wait_for(selector?, text?)`, `go_back()`, `go_forward()`,
+`execute_js(script)`.
+Inspect: `console_messages(errors_only?)`, `network_requests(url_contains?)`.
+Every page action takes an optional `timeout_ms` override.
 
 Prefer `snapshot` to read the page structure and obtain `aria-ref` handles, then target elements by
-`aria-ref=` for reliable clicks. Use `wait_for` for content that loads after an action, and `screenshot`
-only for visual checks (charts, layout).
+`aria-ref=` for reliable clicks. `type_text` fills a field but does not submit: use `press_key('Enter')`
+for a search box or form. Use `wait_for` for content that loads after an action, and `screenshot` only
+for visual checks (charts, layout).
 
-Textual tool results are truncated to roughly {max_content_tokens} tokens; use `get_text` with a CSS
+When page text looks empty or is missing what you expect, the content is probably inside an iframe
+(embedded schedules, checkout steps, chat widgets). Call `snapshot`: refs inside an embed look like
+`f1e4` and work with `click`, `type_text`, `hover` and `get_text`, while a CSS selector does not reach
+there. If a page renders from an API, `network_requests` finds the request holding the data, which is
+often easier to read than the DOM.
+
+Textual tool results are truncated to roughly {max_content_tokens} tokens; use `get_text` with a
 selector to read a specific section of a large page. The browser is single-tab. Allowed domains: {allowed_domains}.
 """
 
@@ -54,8 +65,9 @@ selector to read a specific section of a large page. The browser is single-tab. 
 class PlaywrightBrowser(AbstractCapability[AgentDepsT]):
     """A real, stateful Chromium browser for an agent, via async Playwright.
 
-    Adds eleven tools -- navigate, snapshot, click, type_text, wait_for,
-    screenshot, get_text, scroll, go_back, go_forward, execute_js -- backed by one
+    Adds sixteen tools -- navigate, snapshot, click, type_text, press_key,
+    select_option, hover, wait_for, screenshot, get_text, scroll, go_back,
+    go_forward, execute_js, console_messages, network_requests -- backed by one
     Chromium page that persists across tool calls within a run. Reach for it when
     the lighter web tools fall short: pages behind login/session cookies,
     JavaScript-rendered SPAs, and interactive multi-step flows. For query-based
@@ -99,6 +111,11 @@ class PlaywrightBrowser(AbstractCapability[AgentDepsT]):
     instead. Set `cdp_url` to attach to a Chromium that is already running
     (managed-browser providers, benchmark harnesses) rather than launching one.
 
+    Every browser operation runs inside an OpenTelemetry span, and what the page
+    did during it (console output, responses, requests the egress policy refused,
+    popups closed) is attached to that span as span events and readable by the
+    agent through `console_messages` and `network_requests`.
+
     Durable execution (e.g. `TemporalDurability`) is not supported: durability
     replays tool calls as activities and a live Chromium page cannot survive
     replay or worker restart, so combining both on one agent raises `UserError`
@@ -135,8 +152,17 @@ class PlaywrightBrowser(AbstractCapability[AgentDepsT]):
     max_content_tokens: int = DEFAULT_MAX_CONTENT_TOKENS
     """Approximate token budget for textual tool results."""
 
-    timeout_ms: int = DEFAULT_TIMEOUT_MS
-    """Default Playwright navigation/action timeout in milliseconds."""
+    action_timeout_ms: int = DEFAULT_ACTION_TIMEOUT_MS
+    """Default deadline for element actions (click, type, read, wait), in milliseconds.
+
+    Shorter than the navigation budget on purpose. An action that misses is
+    normally a selector matching nothing, and a long deadline makes that look
+    like a hung agent rather than a fast failure the model can react to. Raise it
+    for pages whose elements appear slowly.
+    """
+
+    navigation_timeout_ms: int = DEFAULT_NAVIGATION_TIMEOUT_MS
+    """Default deadline for navigation and load settling, and for starting or attaching to the browser, in milliseconds."""
 
     auto_install_chromium: bool = False
     """Fetch the Chromium binary via `playwright install chromium` on the first miss.
@@ -189,14 +215,15 @@ class PlaywrightBrowser(AbstractCapability[AgentDepsT]):
             storage_state=self.storage_state,
             cdp_url=self.cdp_url,
             auto_install_chromium=self.auto_install_chromium,
-            launch_timeout_ms=self.timeout_ms,
+            launch_timeout_ms=self.navigation_timeout_ms,
         )
         self._toolset = PlaywrightBrowserToolset[AgentDepsT](
             session=self._session,
             policy=self._policy,
             screenshot_on_navigate=self.screenshot_on_navigate,
             max_content_tokens=self.max_content_tokens,
-            timeout_ms=self.timeout_ms,
+            action_timeout_ms=self.action_timeout_ms,
+            navigation_timeout_ms=self.navigation_timeout_ms,
         )
 
     def for_agent(self, agent: AbstractAgent[AgentDepsT, object]) -> AbstractCapability[AgentDepsT]:
@@ -230,7 +257,7 @@ class PlaywrightBrowser(AbstractCapability[AgentDepsT]):
         return replace(self)
 
     def get_toolset(self) -> PlaywrightBrowserToolset[AgentDepsT]:
-        """Provide the eleven browser tools."""
+        """Provide the sixteen browser tools."""
         return self._toolset
 
     def get_instructions(self) -> Callable[[RunContext[AgentDepsT]], str | None]:
@@ -260,8 +287,11 @@ class PlaywrightBrowser(AbstractCapability[AgentDepsT]):
         """Hold the run's browser session open, and release it however the run ends.
 
         Chromium starts on the first browser-tool call, not here, so a run that
-        never browses never launches one.
+        never browses never launches one. The run's tracer is adopted here so
+        browser spans follow the agent's instrumentation settings rather than a
+        tracer of this module's choosing.
         """
+        self._session.tracer = ctx.tracer
         async with self._session:
             return await handler()
 
@@ -274,7 +304,8 @@ class PlaywrightBrowser(AbstractCapability[AgentDepsT]):
         block_private_addresses: bool = True,
         screenshot_on_navigate: bool = False,
         max_content_tokens: int = DEFAULT_MAX_CONTENT_TOKENS,
-        timeout_ms: int = DEFAULT_TIMEOUT_MS,
+        action_timeout_ms: int = DEFAULT_ACTION_TIMEOUT_MS,
+        navigation_timeout_ms: int = DEFAULT_NAVIGATION_TIMEOUT_MS,
         auto_install_chromium: bool = False,
         cdp_url: str | None = None,
     ) -> PlaywrightBrowser[AgentDepsT]:
@@ -291,7 +322,8 @@ class PlaywrightBrowser(AbstractCapability[AgentDepsT]):
             block_private_addresses=block_private_addresses,
             screenshot_on_navigate=screenshot_on_navigate,
             max_content_tokens=max_content_tokens,
-            timeout_ms=timeout_ms,
+            action_timeout_ms=action_timeout_ms,
+            navigation_timeout_ms=navigation_timeout_ms,
             auto_install_chromium=auto_install_chromium,
             cdp_url=cdp_url,
         )

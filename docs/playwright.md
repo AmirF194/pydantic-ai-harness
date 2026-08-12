@@ -59,26 +59,42 @@ manages the Chromium lifecycle for the run.
 | `navigate` | `(url, timeout_ms=None)` | page URL, title, and visible text (truncated) |
 | `snapshot` | `(timeout_ms=None)` | the accessibility tree with `aria-ref` handles (truncated) |
 | `click` | `(selector, timeout_ms=None)` | page text after the click; `selector` is a CSS selector, an `aria-ref=` handle, or `'x,y'` pixel coordinates |
-| `type_text` | `(selector, text, timeout_ms=None)` | page text after typing (replaces the field value) |
-| `wait_for` | `(selector=None, text=None, timeout_ms=None)` | page text once the element/text appears; pass exactly one of `selector`/`text` |
+| `type_text` | `(selector, text, timeout_ms=None)` | page text after typing (replaces the field value, does not submit) |
+| `press_key` | `(key, selector=None, timeout_ms=None)` | page text after the key press; `key` is a Playwright key name (`Enter`, `Escape`, `Tab`, `Control+a`) |
+| `select_option` | `(selector, values, timeout_ms=None)` | page text after choosing options in a `<select>` |
+| `hover` | `(selector, timeout_ms=None)` | page text after hovering, revealing hover-only menus |
+| `wait_for` | `(selector=None, text=None, timeout_ms=None)` | page text once the element/text appears, in the page or any frame; pass exactly one of `selector`/`text` |
 | `screenshot` | `(full_page=False, timeout_ms=None)` | a note with the page URL, plus the PNG as image content |
 | `get_text` | `(selector=None, timeout_ms=None)` | the element's text, or the full page's visible text |
 | `scroll` | `(direction, x=None, y=None, timeout_ms=None)` | page text after scrolling; `direction` is up/down/left/right |
 | `go_back` | `(timeout_ms=None)` | the previous page's text |
 | `go_forward` | `(timeout_ms=None)` | the next page's text |
 | `execute_js` | `(script, timeout_ms=None)` | the JavaScript result (string as-is, objects as JSON, `null` as `undefined`) |
+| `console_messages` | `(errors_only=False)` | console output and uncaught script errors, oldest first |
+| `network_requests` | `(url_contains=None)` | requests the page made with their status, including ones the egress policy refused |
 
-Every page action accepts an optional `timeout_ms` to override the capability's
-default `timeout_ms` for that one call. An override has to be greater than 0:
-`0` disables the deadline entirely, which stays available as the capability
-default but not as an argument the model picks.
+Every page action accepts an optional `timeout_ms` to override both defaults for
+that one call. An override has to be greater than 0: `0` disables the deadline
+entirely, which stays available as a capability default but not as an argument
+the model picks.
+
+Two defaults rather than one, because the two failures differ. An action that
+misses (`click`, `get_text`, `wait_for`) is normally a selector matching nothing,
+and `action_timeout_ms` (5s) turns that into a fast, readable failure instead of
+a wait long enough to read as a hung agent. A page load legitimately takes
+longer, so navigation, load settling, and starting or attaching to the browser
+use `navigation_timeout_ms` (60s).
 
 `snapshot` returns the page's accessibility tree, the low-cost structured way for
 the model to read the page and obtain `aria-ref=eN` handles. Targeting an element
 by its `aria-ref=` handle (passed to `click` or `type_text`) is more reliable than
-a model-authored CSS selector. The snapshot includes iframe content, so it
-partially covers the iframe read limitation noted below. Reach for `screenshot`
-only when a visual check is needed (charts, layout).
+a model-authored CSS selector. The snapshot includes iframe content (see
+[Embedded content](#embedded-content-iframes)). Reach for `screenshot` only when
+a visual check is needed (charts, layout).
+
+`type_text` fills a field but does not submit it; `press_key('Enter')` does. A
+native `<select>` does not open as page content, so `select_option` operates it
+rather than `click`.
 
 `screenshot` (and the optional `screenshot_on_navigate` attachment) return the
 image as [`BinaryContent`](/ai/api/messages/#pydantic_ai.messages.BinaryContent)
@@ -103,7 +119,8 @@ not raised to abort the agent run.
 | `block_private_addresses` | `True` | Refuse navigation to private, loopback, link-local, and other reserved IP literals (see [Egress](#egress-and-ssrf)). |
 | `screenshot_on_navigate` | `False` | Attach a screenshot to every `navigate` result. |
 | `max_content_tokens` | `4000` | Approximate token budget for every textual tool result. |
-| `timeout_ms` | `30000` | Default Playwright navigation/action timeout, and the deadline for starting or attaching to the browser. `0` disables both. |
+| `action_timeout_ms` | `5000` | Default deadline for element actions (click, type, read, wait). `0` disables it. |
+| `navigation_timeout_ms` | `60000` | Default deadline for navigation and load settling, and for starting or attaching to the browser. `0` disables it. |
 | `auto_install_chromium` | `False` | Fetch Chromium automatically when the binary is missing. |
 | `storage_state` | `None` | Playwright storage state (cookies + localStorage) loaded at launch; see [Authenticated sites](#authenticated-sites). |
 | `cdp_url` | `None` | Attach to a Chromium already running at this CDP endpoint instead of launching one; see [Attaching to a running browser](#attaching-to-a-running-browser). |
@@ -219,14 +236,79 @@ async with PlaywrightBrowserSession() as session:
 ```
 
 `PlaywrightBrowserToolset` is exported on the same basis: pass it a session to
-get the eleven tools without the capability's hooks.
+get the sixteen tools without the capability's hooks.
+
+## Embedded content (iframes)
+
+Page-level selectors stop at the frame boundary, so an embedded schedule,
+checkout step, or chat widget is not reachable through a CSS selector, and a page
+that is mostly an embed can look almost empty. The capability closes that gap in
+three places:
+
+- Tools that return page text (`navigate`, `click`, `get_text` without a
+  selector, and the rest) append the text of each child frame that has any,
+  inside the same token budget.
+- `wait_for` watches the page and every child frame at once; the first match
+  wins.
+- `snapshot` includes frame content, and its refs carry the frame they came
+  from (`f1e4` rather than `e4`). Passing such a ref to `click`, `type_text`,
+  `hover` or `get_text` resolves inside that frame -- the one handle that reaches
+  embedded content.
+
+The sweep over child frames is bounded, so one unresponsive embed cannot consume
+the action's deadline; whatever the other frames returned is kept.
+
+## Debugging a run
+
+Three things make a browser agent hard to follow: the page is invisible, a
+missing element looks the same as a slow one, and the interesting failures happen
+between tool calls.
+
+- Set `headless=False` to watch the run in a real window.
+- Every browser operation opens an OpenTelemetry span named `browser <action>`
+  (`browser click`, `browser navigate`), carrying `browser.action`,
+  `browser.timeout_ms`, `browser.outcome`, and the resulting `url.full`. What the
+  page did during that operation is attached as span events: console output,
+  uncaught script errors, responses, requests the egress policy refused, and
+  popups the session closed. The spans go to the run's own tracer, so an agent
+  instrumented for [Logfire](/ai/guides/logfire/) reports them with everything
+  else.
+- The agent can read the same log through `console_messages` and
+  `network_requests`, which is often how it recovers from a page that renders
+  from an API rather than from HTML.
+- A wait that seems to hang is usually an action timeout. `action_timeout_ms`
+  defaults to 5s so the failure arrives quickly; lower it further while
+  debugging, and read the timeout value in the error string to tell a slow page
+  from a wrong selector.
+
+Logfire's default scrubbing redacts values matching `session` (and `auth`), which
+matches page content more often than you would expect -- a conference site whose
+every heading says "session" comes back as `[Scrubbed due to 'session']`. Keep
+tool results readable by scrubbing them selectively:
+
+```python {test="skip"}
+import logfire
+
+
+def keep_browser_results(match: logfire.ScrubMatch) -> str | None:
+    if match.path[:2] == ('attributes', 'tool_response'):
+        return match.value
+    return None
+
+
+logfire.configure(scrubbing=logfire.ScrubbingOptions(callback=keep_browser_results))
+```
+
+Returning `match.value` keeps the original text; returning `None` leaves the
+redaction in place.
 
 ## Limitations
 
 - The browser is single-tab: popups are closed automatically, so flows that
   depend on a second window do not complete.
-- Page-level selectors cannot reach content inside iframes (payment widgets,
-  some CAPTCHAs); `snapshot` does surface iframe content for reading.
+- CSS selectors cannot reach content inside iframes; reading and acting there
+  goes through `snapshot` refs (see
+  [Embedded content](#embedded-content-iframes)).
 - Download-triggering clicks are not handled.
 - Durable execution (e.g. `TemporalDurability`) is rejected at agent
   construction: a live Chromium page cannot survive activity replay or worker
