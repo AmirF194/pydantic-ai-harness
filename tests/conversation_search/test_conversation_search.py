@@ -20,6 +20,7 @@ from pydantic_ai.messages import (
     ModelRequest,
     ModelResponse,
     RetryPromptPart,
+    SpeechPart,
     SystemPromptPart,
     TextContent,
     TextPart,
@@ -792,3 +793,29 @@ class TestConfigValidation:
         await _seed_run(store, 'r1', [_user(f'needle entry {i} filler') for i in range(5)])
         with pytest.raises(ValueError, match='max_matches must be non-negative'):
             await _search(SnapshotHistorySource(store), 'needle', max_matches=-1)
+
+
+class TestSpeechIsSearchable:
+    """A realtime `SpeechPart` carries a transcript; the index renders it so speech is recallable."""
+
+    async def test_an_assistant_speech_turn_is_indexed_and_rendered(self) -> None:
+        history: list[ModelMessage] = [
+            _user('boot up'),
+            ModelResponse(parts=[SpeechPart(speaker='assistant', transcript='the PANGOLIN protocol is ready')]),
+        ]
+        rendered = await _search(_StubSource({'r1': history}), 'PANGOLIN')
+        assert 'PANGOLIN' in rendered
+        assert 'Speech [assistant]:' in rendered
+
+    async def test_a_user_speech_turn_is_indexed_and_rendered(self) -> None:
+        history: list[ModelMessage] = [
+            ModelRequest(parts=[SpeechPart(speaker='user', transcript='remember the MARMOT codeword')]),
+        ]
+        rendered = await _search(_StubSource({'r1': history}), 'MARMOT')
+        assert 'MARMOT' in rendered
+        assert 'Speech [user]:' in rendered
+
+    async def test_audio_only_speech_contributes_no_searchable_text(self) -> None:
+        """A `SpeechPart` with no transcript renders no line, so it cannot match a query."""
+        history: list[ModelMessage] = [ModelRequest(parts=[SpeechPart(speaker='user')])]
+        assert 'No matches' in await _search(_StubSource({'r1': history}), 'anything')
