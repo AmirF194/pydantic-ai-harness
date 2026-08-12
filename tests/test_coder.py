@@ -1,10 +1,13 @@
+import subprocess
+import sys
 from pathlib import Path
 
+import pytest
 from pydantic_ai import Agent
 from pydantic_ai.capabilities import Capability
 from pydantic_ai.models.test import TestModel
 
-from pydantic_ai_harness.coder import DEFAULT_ALLOWED_COMMANDS, DEFAULT_CODER_INSTRUCTIONS, Coder
+from pydantic_ai_harness.coder import DEFAULT_ALLOWED_COMMANDS, DEFAULT_CODER_INSTRUCTIONS, Coder, coder_agent
 from pydantic_ai_harness.compaction import ClearToolResults, WarnNearLimits
 from pydantic_ai_harness.filesystem import FileSystem
 from pydantic_ai_harness.planning import Planning
@@ -18,6 +21,35 @@ def test_coder_constructs_agent() -> None:
     agent = Agent(TestModel(), capabilities=[Coder()])
 
     assert isinstance(agent, Agent)
+
+
+def test_coder_agent_is_model_less_and_composed() -> None:
+    assert isinstance(coder_agent, Agent)
+    assert coder_agent.model is None
+    assert any(isinstance(capability, FileSystem) for capability in coder_agent.root_capability.capabilities)
+
+
+def test_coder_agent_export_is_lazy() -> None:
+    result = subprocess.run(
+        [
+            sys.executable,
+            '-c',
+            'import sys; import pydantic_ai_harness.coder; '
+            "assert 'pydantic_ai_harness.coder._agent' not in sys.modules",
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+
+
+def test_coder_unknown_export() -> None:
+    import pydantic_ai_harness.coder
+
+    with pytest.raises(AttributeError, match='has no attribute'):
+        pydantic_ai_harness.coder.__getattr__('missing')
 
 
 def test_coder_members_are_transparent() -> None:

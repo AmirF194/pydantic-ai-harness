@@ -23,6 +23,8 @@ agent = Agent('anthropic:claude-fable-5', capabilities=[Coder()])
 agent.to_cli_sync()
 ```
 
+Or run the exported agent directly: `uvx --with pydantic-ai-harness clai -a pydantic_ai_harness.coder:coder_agent`.
+
 That's a complete coding agent in your terminal: sandboxed file access, allowlisted shell, repo orientation, planning, and context management that survives long sessions.
 
 Every model works — swap the string for `'openai:gpt-5.6-sol'`, `'google:gemini-3-pro'`, or [any other provider](/ai/models/overview/). Need more? Add capabilities to the list:
@@ -75,9 +77,9 @@ One index, both packages: every capability is a self-contained unit you drop int
 
 ### Harnesses
 
-Complete, opinionated stacks: one import, a working agent — and every one can be taken apart into the blocks below.
+These harnesses are regular combined capabilities: one import gives you a working stack, and you can take either apart into the blocks below.
 
-| Preset | Ships in | What it provides |
+| Harness | Ships in | What it provides |
 |---|---|---|
 | [Coder](coder.md) | Harness | A complete coding-agent stack: files, shell, repo context, planning, a read-only explorer sub-agent, and context controls |
 | [Researcher](researcher.md) | Harness | A complete web-research stack: Code Mode, web search, and bounded tool output |

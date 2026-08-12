@@ -1,6 +1,7 @@
 # Coder
 
 `Coder` gives a Pydantic AI agent a complete, opinionated stack for working in a local codebase.
+It is a regular combined capability made from the capabilities below, so you can use it as-is or take it apart.
 
 ```python
 from pathlib import Path
@@ -11,6 +12,14 @@ from pydantic_ai_harness.coder import Coder
 agent = Agent('anthropic:claude-fable-5', capabilities=[Coder('.')])
 agent.to_cli_sync()
 ```
+
+To run the exported model-less agent with Pydantic AI's CLI:
+
+```bash
+uvx --with pydantic-ai-harness clai -a pydantic_ai_harness.coder:coder_agent
+```
+
+`clai` supplies its default model when `-m` is omitted; pass `-m provider:model` to select or override it.
 
 It is literally these capabilities combined, in this order:
 

@@ -1,4 +1,4 @@
-"""Complete coding-agent preset assembled from harness capabilities."""
+"""Complete coding-agent harness assembled from regular capabilities."""
 
 from __future__ import annotations
 
@@ -60,11 +60,14 @@ def _explorer(workspace: str | Path) -> SubAgent[AgentDepsT]:
 
 
 class Coder(CombinedCapability[AgentDepsT]):
-    """A complete coding-agent preset.
+    """A complete coding-agent harness.
 
     This is literally `Capability`, `FileSystem`, `Shell`, `RepoContext`,
     `Planning`, optional `SubAgents`, `ClearToolResults`, `WarnNearLimits`, and
     `ToolOutputLimits` combined.
+
+    `Coder` is a regular combined capability. Use its component capabilities
+    directly when you need a different composition.
     """
 
     def __init__(

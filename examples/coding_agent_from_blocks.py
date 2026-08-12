@@ -1,4 +1,4 @@
-"""The `Coder` preset expanded into its component capabilities.
+"""The `Coder` harness expanded into its component capabilities.
 
 Run it from any repository root:
 

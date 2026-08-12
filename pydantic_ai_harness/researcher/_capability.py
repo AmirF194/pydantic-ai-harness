@@ -1,4 +1,4 @@
-"""Complete research-agent preset assembled from harness capabilities."""
+"""Complete research-agent harness assembled from regular capabilities."""
 
 from pydantic_ai.capabilities import Capability, CombinedCapability, WebSearch
 from pydantic_ai.tools import AgentDepsT
@@ -17,10 +17,13 @@ Distinguish sourced facts from your own inference.
 
 
 class Researcher(CombinedCapability[AgentDepsT]):
-    """A complete research-agent preset.
+    """A complete research-agent harness.
 
     This is literally `Capability`, `CodeMode`, `WebSearch(native=False)`, and
     `ToolOutputLimits` combined.
+
+    `Researcher` is a regular combined capability. Use its component
+    capabilities directly when you need a different composition.
     """
 
     def __init__(self, *, instructions: str | None = None) -> None:
