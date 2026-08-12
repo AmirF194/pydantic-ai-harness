@@ -434,6 +434,22 @@ class _ControlledNavigationPage(_FakePage):
             await self.release_first_navigation.wait()
 
 
+class _HangingMousePage(_FakePage):
+    """A page whose mouse never settles, to drive the coordinate-scroll deadline."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.mouse = _HangingMouse()
+
+
+class _HangingMouse(_FakeMouse):
+    async def move(self, x: float, y: float) -> None:
+        await asyncio.Event().wait()
+
+    async def wheel(self, delta_x: float, delta_y: float) -> None:
+        await asyncio.Event().wait()  # pragma: no cover -- unreachable; move never returns
+
+
 class _HangingScreenshotPage(_FakePage):
     """A page whose `screenshot` blocks until cancelled, to drive mid-tool teardown."""
 
@@ -2483,3 +2499,77 @@ class TestBrowserEvents:
         agent = Agent(model, capabilities=[PlaywrightBrowser()])
         await agent.run('screenshot the page')
         assert 'browser screenshot' in [span.name for span in exporter.get_finished_spans()]
+
+
+# --- Review fixes -----------------------------------------------------------
+
+
+class TestSessionAndToolsetAgree:
+    async def test_toolset_defaults_to_the_sessions_policy(self) -> None:
+        # A session built to allow a local app must not be second-guessed by a
+        # toolset that made its own default policy.
+        page = _FakePage(url='http://127.0.0.1:8000/admin')
+        session = PlaywrightBrowserSession(policy=toolset_module.NavigationPolicy(block_private_addresses=False))
+        session.page = page
+        toolset = PlaywrightBrowserToolset[None](session=session)
+        result = await toolset.navigate('http://127.0.0.1:8000/admin')
+        assert isinstance(result, str)
+        assert result.startswith('URL: http://127.0.0.1:8000/admin')
+
+    async def test_an_explicit_policy_still_wins(self) -> None:
+        session = PlaywrightBrowserSession(policy=toolset_module.NavigationPolicy(block_private_addresses=False))
+        session.page = _FakePage()
+        toolset = PlaywrightBrowserToolset[None](
+            session=session, policy=toolset_module.NavigationPolicy(allowed_domains=['example.com'])
+        )
+        assert await toolset.navigate('https://evil.com/') == (
+            'Error: domain not in allowed_domains: https://evil.com/'
+        )
+
+
+class TestDeadlinesCoverEveryAwait:
+    async def test_frame_sweep_never_outlives_a_shorter_per_call_deadline(self) -> None:
+        page = _FakePage()
+        page.frames.append(_HangingFrame())
+        toolset = _toolset(page)
+        # The sweep is capped by the caller's deadline when that is the shorter of
+        # the two, and by the sweep budget when it is not.
+        assert toolset._frame_budget(50) == 50
+        assert toolset._frame_budget(30_000) == toolset_module._FRAME_TEXT_BUDGET_MS
+        assert toolset._frame_budget(None) == toolset_module._FRAME_TEXT_BUDGET_MS
+        assert toolset._frame_budget(0) == toolset_module._FRAME_TEXT_BUDGET_MS
+        assert await toolset.get_text(timeout_ms=50) == 'Hello body'
+
+    async def test_coordinate_scroll_runs_under_the_deadline(self) -> None:
+        # `Mouse.move`/`Mouse.wheel` take no timeout, so an unbounded await would
+        # hold the operation lock for the rest of the run.
+        result = await _toolset(_HangingMousePage()).scroll('down', x=10, y=20, timeout_ms=1)
+        assert result.startswith('Error: scroll timed out after 1ms.')
+
+
+class TestCredentialsStayOutOfTelemetry:
+    async def test_recorded_urls_lose_their_userinfo(self) -> None:
+        page = _FakePage()
+        session = PlaywrightBrowserSession()
+        session.page = page
+        session._on_response(_FakeResponse(url='https://user:secret@example.com/api?q=1'))
+        assert await _toolset(page, session=session).network_requests() == (
+            '[info] response GET 200 https://example.com/api?q=1'
+        )
+
+    async def test_span_url_loses_its_userinfo(self) -> None:
+        page = _FakePage(url='https://user:secret@example.com/dashboard')
+        session = PlaywrightBrowserSession()
+        session.page = page
+        tracer, exporter = _recording_tracer()
+        session.tracer = tracer
+        await _toolset(page, session=session, block_private_addresses=False).get_text()
+        (span,) = exporter.get_finished_spans()
+        assert span.attributes is not None
+        assert span.attributes['url.full'] == 'https://example.com/dashboard'
+
+    def test_a_url_urlsplit_rejects_is_still_cleaned(self) -> None:
+        # Chromium accepts hosts the stdlib parser raises on, so the strip cannot
+        # depend on parsing succeeding.
+        assert toolset_module._without_userinfo('http://user:pw@[::1/x') == 'http://[::1/x'
+        assert toolset_module._without_userinfo('https://example.com/a@b') == 'https://example.com/a@b'

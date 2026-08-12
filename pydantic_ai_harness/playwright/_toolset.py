@@ -82,10 +82,11 @@ import asyncio
 import ipaddress
 import json
 import os
+import re
 import sys
 from collections import deque
 from contextlib import AbstractAsyncContextManager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Literal, Protocol, TypeVar
 from urllib.parse import urlparse
 
@@ -421,6 +422,17 @@ class NavigationPolicy:
         return domains
 
 
+def _without_userinfo(url: str) -> str:
+    """Return `url` with any `user:password@` credentials removed.
+
+    Recorded URLs reach an OpenTelemetry backend, where userinfo is replayable
+    credential material; the OTel HTTP conventions ask for it to be stripped from
+    `url.full`. A regex rather than a parse-and-rebuild so a URL Chromium accepted
+    but `urlsplit` rejects is still cleaned rather than raising.
+    """
+    return re.sub(r'^([a-zA-Z][\w+.\-]*://)[^/?#@]*@', r'\1', url)
+
+
 def _without_endpoint_credentials(message: str, cdp_url: str) -> str:
     """Replace the CDP endpoint in `message` with a form carrying no credentials.
 
@@ -615,7 +627,8 @@ class PlaywrightBrowserSession:
         auto_install_chromium: bool = False,
         launch_timeout_ms: int = DEFAULT_NAVIGATION_TIMEOUT_MS,
     ) -> None:
-        self._policy = policy if policy is not None else NavigationPolicy()
+        self.policy = policy if policy is not None else NavigationPolicy()
+        """Egress policy the route guard enforces, and the default for a toolset built on this session."""
         self._headless = headless
         self._storage_state = storage_state
         self._cdp_url = cdp_url
@@ -643,7 +656,14 @@ class PlaywrightBrowserSession:
         """
 
     def record(self, event: BrowserEvent) -> None:
-        """Log a browser event and attach it to the operation that was running."""
+        """Log a browser event and attach it to the operation that was running.
+
+        The URL is stripped of credentials here, at the one point every event
+        passes through, so neither the tool output nor the exported span carries
+        them.
+        """
+        if event.url is not None:
+            event = replace(event, url=_without_userinfo(event.url))
         self.events.append(event)
         span = self.operation_span
         if span is not None and span.is_recording():
@@ -735,7 +755,7 @@ class PlaywrightBrowserSession:
             accept_downloads=False,
         )
         page = await context.new_page()
-        if self._policy.enforced():
+        if self.policy.enforced():
             await context.route('**/*', self._route_guard)
         page.on('popup', self._on_popup)
         page.on('console', self._on_console)
@@ -793,10 +813,10 @@ class PlaywrightBrowserSession:
         allowlist covers top-level navigation only, so a permitted page keeps its
         own CDN assets, identity-provider frames, and payment steps.
         """
-        if self._policy.refused_in_every_frame(request.url):
+        if self.policy.refused_in_every_frame(request.url):
             await self._abort(route, request.url, _PRIVATE_ADDRESS_REASON)
             return
-        reason = self._policy.blocked_reason(request.url)
+        reason = self.policy.blocked_reason(request.url)
         if not request.is_navigation_request() or reason is None:
             await route.continue_()
             return
@@ -908,7 +928,10 @@ class PlaywrightBrowserToolset(FunctionToolset[AgentDepsT]):
             raise ValueError('navigation_timeout_ms must be greater than or equal to 0')
         super().__init__(id='playwright')
         self._session = session
-        self._policy = policy if policy is not None else NavigationPolicy()
+        # Defaults to the session's policy rather than a fresh one: the guard the
+        # session installs and the checks these tools run have to agree, and a
+        # second default would silently refuse what the session was built to allow.
+        self._policy = policy if policy is not None else session.policy
         self._screenshot_on_navigate = screenshot_on_navigate
         self._max_content_tokens = max_content_tokens
         self._action_timeout_ms = action_timeout_ms
@@ -968,8 +991,20 @@ class PlaywrightBrowserToolset(FunctionToolset[AgentDepsT]):
         callers only guard against `PlaywrightError`.
         """
         text = await page.inner_text('body', timeout=timeout_ms)
-        frames = await self._frame_text(page, _FRAME_TEXT_BUDGET_MS)
+        frames = await self._frame_text(page, self._frame_budget(timeout_ms))
         return self._truncate_output('\n\n'.join([text, *frames]))
+
+    def _frame_budget(self, timeout_ms: int | None) -> int:
+        """Return the deadline for the child-frame sweep.
+
+        The sweep is capped so one unresponsive embed cannot spend the whole
+        action budget, and it is capped again by a shorter caller deadline, so a
+        tight `timeout_ms` is not overrun by the frames the caller never asked
+        about. A caller with no deadline at all still gets the cap.
+        """
+        if timeout_ms is None or timeout_ms == 0:
+            return _FRAME_TEXT_BUDGET_MS
+        return min(timeout_ms, _FRAME_TEXT_BUDGET_MS)
 
     def _truncate_output(self, text: str) -> str:
         """Apply the configured token budget to a model-facing textual result."""
@@ -1122,7 +1157,7 @@ class PlaywrightBrowserToolset(FunctionToolset[AgentDepsT]):
                 finally:
                     self._session.operation_span = None
                 span.set_attribute('browser.outcome', 'ok')
-                span.set_attribute('url.full', page.url)
+                span.set_attribute('url.full', _without_userinfo(page.url))
                 return result
 
     async def _refuse(self, timeout_ms: int | None, message: str) -> str:
@@ -1396,8 +1431,11 @@ class PlaywrightBrowserToolset(FunctionToolset[AgentDepsT]):
 
         async def _scroll(page: _Page, deadlines: _Deadlines) -> str:
             if x is not None and y is not None:
-                await page.mouse.move(x, y)
-                await page.mouse.wheel(*delta)
+                # `Mouse.move`/`Mouse.wheel` take no `timeout`, so they are bounded
+                # externally like `evaluate` below: an unbounded await here would
+                # hold the operation lock for the rest of the run.
+                await self._await_with_timeout(page.mouse.move(x, y), deadlines.action)
+                await self._await_with_timeout(page.mouse.wheel(*delta), deadlines.action)
             else:
                 # `evaluate` has no `timeout` parameter and hangs if the page's
                 # main thread is blocked, so it is bounded externally.

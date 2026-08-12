@@ -227,7 +227,9 @@ async with PlaywrightBrowserSession() as session:
 ```
 
 `PlaywrightBrowserToolset` is exported on the same basis: pass it a session to
-get the sixteen tools without the capability's hooks.
+get the sixteen tools without the capability's hooks. It adopts that session's
+`policy`, so the guard the session installs and the checks the tools run always
+agree; pass `policy=` only to override both.
 
 ## Embedded content (iframes)
 
