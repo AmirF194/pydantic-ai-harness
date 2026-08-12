@@ -542,7 +542,13 @@ parameters rather than dropping the query. The list covers the OAuth grant and
 the signed-URL parameters of the major clouds.
 """
 
-_USERINFO = re.compile(r'^([a-zA-Z][\w+.\-]*://)[^/?#@]*@')
+_USERINFO = re.compile(r'(?<![\w.+-])([a-zA-Z][\w+.\-]*://)[^/?#\s@]*@')
+"""A URL's `user:password@` prefix, wherever the URL sits.
+
+Unanchored, because this also cleans console text, where the URL a page logged is
+rarely the first thing on the line. Whitespace ends the authority so an ordinary
+sentence with an `@` in it later cannot be swallowed into one match.
+"""
 
 _CREDENTIAL_VALUE = re.compile(
     r'(?i)([?&#](?:' + '|'.join(_CREDENTIAL_PARAMETERS) + r')=)[^&#]*',
@@ -785,6 +791,7 @@ class PlaywrightBrowserSession:
         storage_state: StorageState | None = None,
         cdp_url: str | None = None,
         auto_install_chromium: bool = False,
+        chromium_sandbox: bool = True,
         launch_timeout_ms: int = DEFAULT_NAVIGATION_TIMEOUT_MS,
     ) -> None:
         self.policy = policy if policy is not None else NavigationPolicy()
@@ -793,6 +800,7 @@ class PlaywrightBrowserSession:
         self._storage_state = storage_state
         self._cdp_url = cdp_url
         self._auto_install_chromium = auto_install_chromium
+        self._chromium_sandbox = chromium_sandbox
         self._launch_timeout_ms = launch_timeout_ms
         self.page: _Page | None = None
         """Active page: the one every tool acts on, or `None` before the browser is launched."""
@@ -948,6 +956,12 @@ class PlaywrightBrowserSession:
         unresponsive endpoint would otherwise hold the operation lock with no
         deadline at all. The auto-install download is deliberately left unbounded,
         since a first-run browser fetch legitimately outlasts an action timeout.
+
+        A launched browser gets Chromium's renderer sandbox, which Playwright
+        leaves off by default. This capability exists to open pages nobody vetted,
+        and the sandbox is what keeps a compromised renderer inside the browser.
+        A browser reached over `cdp_url` is already running, so its own
+        configuration decides this.
         """
         if self._cdp_url is not None:
             try:
@@ -955,7 +969,9 @@ class PlaywrightBrowserSession:
             except PlaywrightError as exc:
                 raise PlaywrightError(_without_endpoint_credentials(str(exc), self._cdp_url)) from exc
         if os.path.exists(pw.chromium.executable_path):
-            return await pw.chromium.launch(headless=self._headless, timeout=self._launch_timeout_ms)
+            return await pw.chromium.launch(
+                headless=self._headless, chromium_sandbox=self._chromium_sandbox, timeout=self._launch_timeout_ms
+            )
         # Binary genuinely absent: raise a clear install hint, or fetch it when
         # opted in. A launch failure with the binary present (sandbox, missing
         # system libs, no display) is left to surface as its own error rather than
@@ -976,7 +992,7 @@ class PlaywrightBrowserSession:
         install_output = await _auto_install_chromium()
         if install_output is None:
             return await pw.chromium.launch(  # pragma: no cover
-                headless=self._headless, timeout=self._launch_timeout_ms
+                headless=self._headless, chromium_sandbox=self._chromium_sandbox, timeout=self._launch_timeout_ms
             )
         self.launch_error = f'{_CHROMIUM_MISSING_MESSAGE}\nAuto-install failed:\n{install_output[-300:]}'
         return None
@@ -1157,10 +1173,14 @@ class PlaywrightBrowserSession:
 
         The driver flag is cleared as well as set: a session entered a second time
         gets a fresh, unentered context manager, and a flag left over from the
-        first use would have teardown exit a driver that was never started.
+        first use would have teardown exit a driver that was never started. A
+        recorded launch failure is cleared for the same reason: it described the
+        previous use, and keeping it would refuse every tool call of this one
+        without ever trying to start a browser.
         """
         self._driver_cm = async_playwright()
         self._driver_entered = False
+        self.launch_error = None
         return self
 
     async def __aexit__(self, exc_type: type[BaseException] | None, *_: object) -> None:
@@ -2024,6 +2044,8 @@ class PlaywrightBrowserToolset(FunctionToolset[AgentDepsT]):
             if action == 'list':
                 return self._truncate_output(await self._describe_tabs(session.pages, page, deadlines))
             if action == 'new':
+                if len(session.pages) >= _MAX_TABS:
+                    return self._error(f'Error: the tab limit of {_MAX_TABS} is reached. Close one first.')
                 await session.open_tab()
                 return self._truncate_output(
                     f'Opened blank tab {len(session.pages) - 1} and made it active. Load it with navigate.'

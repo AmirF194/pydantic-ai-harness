@@ -641,6 +641,7 @@ class _FakeChromium:
         self._launch_error = launch_error
         self._close_error = close_error
         self.launched: list[bool] = []
+        self.sandboxed: list[bool] = []
         self.connected: list[str] = []
         self.launch_timeouts: list[int] = []
         self.browser: _FakePlaywrightBrowser | None = None
@@ -649,8 +650,11 @@ class _FakeChromium:
     def executable_path(self) -> str:
         return self._executable_path
 
-    async def launch(self, *, headless: bool, timeout: int | None = None) -> _FakePlaywrightBrowser:
+    async def launch(
+        self, *, headless: bool, chromium_sandbox: bool = False, timeout: int | None = None
+    ) -> _FakePlaywrightBrowser:
         self.launched.append(headless)
+        self.sandboxed.append(chromium_sandbox)
         self.launch_timeouts.append(timeout if timeout is not None else -1)
         if self._launch_error is not None:
             raise self._launch_error
@@ -3041,6 +3045,17 @@ class TestTabs:
         assert result == "Error: unknown tabs action 'reorder'; use list, select, close or new."
         assert session.page is None
 
+    async def test_the_tab_limit_applies_to_tabs_the_model_opens(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        page = _FakePage()
+        _install_fake_driver(monkeypatch, page)
+        session = PlaywrightBrowserSession()
+        async with session:
+            await session.ensure_page()
+            session.pages.extend(_FakePage() for _ in range(toolset_module._MAX_TABS - 1))
+            result = await _toolset(page, session=session).tabs('new')
+            assert result == f'Error: the tab limit of {toolset_module._MAX_TABS} is reached. Close one first.'
+            assert len(session.pages) == toolset_module._MAX_TABS
+
     async def test_an_active_tab_with_nothing_behind_it_is_reported(self) -> None:
         page = _FakePage()
         session = PlaywrightBrowserSession()
@@ -3118,3 +3133,51 @@ class TestDialogs:
         async with self._launched(monkeypatch, page) as session:
             await self._open(session, page, _FakeUnanswerableDialog())
             assert session._event_tasks == set()
+
+
+class TestReviewFollowUps:
+    """Fixes for findings raised on the pushed branch."""
+
+    async def test_the_renderer_sandbox_is_on_by_default(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        page = _FakePage()
+        cm = _install_fake_driver(monkeypatch, page)
+        await Agent(TestModel(call_tools=['screenshot']), capabilities=[PlaywrightBrowser()]).run('shot')
+        assert cm._driver.chromium.sandboxed == [True]
+
+    async def test_the_renderer_sandbox_can_be_turned_off(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        page = _FakePage()
+        cm = _install_fake_driver(monkeypatch, page)
+        capability = PlaywrightBrowser[object](chromium_sandbox=False)
+        await Agent(TestModel(call_tools=['screenshot']), capabilities=[capability]).run('shot')
+        assert cm._driver.chromium.sandboxed == [False]
+
+    async def test_a_session_entered_again_retries_a_failed_launch(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        page = _FakePage()
+        session = PlaywrightBrowserSession()
+        _install_fake_driver(monkeypatch, page, executable_missing=True)
+        async with session:
+            with pytest.raises(RuntimeError, match='Chromium is not installed'):
+                await session.ensure_page()
+        # The binary is there the second time: the recorded failure described the
+        # previous use and must not refuse this one before it tries.
+        _install_fake_driver(monkeypatch, page)
+        async with session:
+            assert await session.ensure_page() is page
+
+    async def test_userinfo_is_stripped_from_the_middle_of_a_message(self) -> None:
+        page = _FakePage()
+        session = PlaywrightBrowserSession()
+        session.page = page
+        session._on_console(_FakeConsoleMessage('error', 'failed https://user:secret@example.com/api'))
+        assert await _toolset(page, session=session).console_messages() == (
+            '[error] console error: failed https://example.com/api'
+        )
+
+    async def test_an_ordinary_sentence_with_an_at_sign_is_left_alone(self) -> None:
+        page = _FakePage()
+        session = PlaywrightBrowserSession()
+        session.page = page
+        session._on_console(_FakeConsoleMessage('log', 'see http://example.com/ then mail me@example.com'))
+        assert await _toolset(page, session=session).console_messages() == (
+            '[info] console log: see http://example.com/ then mail me@example.com'
+        )

@@ -172,6 +172,18 @@ class PlaywrightBrowser(AbstractCapability[AgentDepsT]):
     navigation_timeout_ms: int = DEFAULT_NAVIGATION_TIMEOUT_MS
     """Default deadline for navigation and load settling, and for starting or attaching to the browser, in milliseconds."""
 
+    chromium_sandbox: bool = True
+    """Run the launched Chromium with its renderer sandbox.
+
+    On by default, unlike Playwright itself: this capability opens pages nobody
+    vetted, and the sandbox is what keeps a renderer that a crafted page
+    compromises from reaching the host. Set `False` where the sandbox cannot
+    start -- a container without the kernel privileges it needs is the usual case
+    -- and accept that a renderer exploit then runs with the agent's own access.
+    Ignored when `cdp_url` is set: that browser is already running under its own
+    configuration.
+    """
+
     auto_install_chromium: bool = False
     """Fetch the Chromium binary via `playwright install chromium` on the first miss.
 
@@ -223,6 +235,7 @@ class PlaywrightBrowser(AbstractCapability[AgentDepsT]):
             storage_state=self.storage_state,
             cdp_url=self.cdp_url,
             auto_install_chromium=self.auto_install_chromium,
+            chromium_sandbox=self.chromium_sandbox,
             launch_timeout_ms=self.navigation_timeout_ms,
         )
         self._toolset = PlaywrightBrowserToolset[AgentDepsT](
@@ -314,6 +327,7 @@ class PlaywrightBrowser(AbstractCapability[AgentDepsT]):
         action_timeout_ms: int = DEFAULT_ACTION_TIMEOUT_MS,
         navigation_timeout_ms: int = DEFAULT_NAVIGATION_TIMEOUT_MS,
         auto_install_chromium: bool = False,
+        chromium_sandbox: bool = True,
         cdp_url: str | None = None,
     ) -> PlaywrightBrowser[AgentDepsT]:
         """Construct the capability from serializable spec options (all fields are plain scalars/lists).
@@ -332,5 +346,6 @@ class PlaywrightBrowser(AbstractCapability[AgentDepsT]):
             action_timeout_ms=action_timeout_ms,
             navigation_timeout_ms=navigation_timeout_ms,
             auto_install_chromium=auto_install_chromium,
+            chromium_sandbox=chromium_sandbox,
             cdp_url=cdp_url,
         )
