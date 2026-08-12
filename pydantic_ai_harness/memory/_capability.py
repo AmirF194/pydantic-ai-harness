@@ -16,6 +16,7 @@ from pydantic_ai.toolsets import AgentToolset
 
 from pydantic_ai_harness.memory._store import InMemoryStore, MemoryStore, validate_store_path
 from pydantic_ai_harness.memory._toolset import (
+    DEFAULT_AGENT_NAME,
     MAIN_FILENAME,
     MemoryToolset,
     injection_listing_limit,
@@ -60,9 +61,11 @@ class Memory(AbstractCapability[AgentDepsT]):
     store_resolver: Callable[[RunContext[AgentDepsT]], MemoryStore] | None = None
     """Optional per-run store resolver. Resolver failures always propagate."""
 
-    agent_name: str = 'main'
+    agent_name: str = DEFAULT_AGENT_NAME
     """Storage segment that isolates memory within a namespace. Part of the scope
-    key only; never rendered into the model-facing memory block."""
+    key only; never rendered into the model-facing memory block. Also identifies the
+    contributed toolset, so composing several `Memory` capabilities on one agent needs a
+    distinct `agent_name` per instance -- which their separate storage already requires."""
 
     heading: str = field(default='', kw_only=True)
     """Markdown heading for rendered guidance and the injected memory block,
@@ -134,7 +137,7 @@ class Memory(AbstractCapability[AgentDepsT]):
         return store, scope
 
     def get_toolset(self) -> AgentToolset[AgentDepsT] | None:
-        """Provide the stable `memory` toolset."""
+        """Provide the memory toolset, identified by this instance's `agent_name` scope."""
         return MemoryToolset(self)
 
     def get_instructions(self) -> AgentInstructions[AgentDepsT] | None:
@@ -274,7 +277,7 @@ class Memory(AbstractCapability[AgentDepsT]):
         backend: Literal['memory', 'file', 'sqlite'] = 'memory',
         directory: str = '.agent-memory',
         database: str = '.agent-memory.db',
-        agent_name: str = 'main',
+        agent_name: str = DEFAULT_AGENT_NAME,
         heading: str = '',
         namespace: str = '',
         inject_memory: bool = True,
