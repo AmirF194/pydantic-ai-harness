@@ -4,6 +4,13 @@
     "items": [
       { "label": "Overview", "slug": "index" },
       {
+        "label": "Harnesses",
+        "items": [
+          { "label": "Coder", "slug": "coder" },
+          { "label": "Researcher", "slug": "researcher" }
+        ]
+      },
+      {
         "label": "Execution",
         "items": [
           { "label": "Code Mode", "slug": "code-mode" },
@@ -70,6 +77,12 @@
           { "label": "Managed Prompt", "slug": "managed-prompt" },
           { "label": "StackOne", "slug": "stackone" },
           { "label": "Macroscope", "slug": "macroscope" }
+        ]
+      },
+      {
+        "label": "Examples",
+        "items": [
+          { "label": "Examples", "slug": "examples" }
         ]
       }
     ]

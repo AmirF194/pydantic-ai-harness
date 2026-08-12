@@ -9,11 +9,12 @@ prose match the code as written) is a review-time concern, not a unit test.
 
 from __future__ import annotations
 
-import json
 import re
 from pathlib import Path
 
 import pytest
+from pydantic import TypeAdapter
+from typing_extensions import TypedDict
 
 _ROOT = Path(__file__).parent.parent
 _PACKAGE = _ROOT / 'pydantic_ai_harness'
@@ -89,7 +90,7 @@ def test_capability_linked_from_top_readme(package: Path) -> None:
 # ACP is the one page that stays experimental.
 
 _DOCS_DIR = _ROOT / 'docs'
-_NON_CAPABILITY_PAGES = {'index.md', 'mutation-testing.md'}
+_NON_CAPABILITY_PAGES = {'examples.md', 'index.md', 'mutation-testing.md'}
 _ACP_PAGE = 'acp.md'
 
 _SOURCE_LINK = 'github.com/pydantic/pydantic-ai-harness/tree/main/pydantic_ai_harness/'
@@ -115,6 +116,7 @@ _CAPABILITY_DOC_PAGES = _capability_doc_pages()
 _CAPABILITY_PAGE_META = {
     'advisor.md': ('advisor', 'Advisor'),
     'code-mode.md': ('code_mode', 'Code Mode'),
+    'coder.md': ('coder', 'Coder'),
     'skills.md': ('skills', 'Skills'),
     'filesystem.md': ('filesystem', 'FileSystem'),
     'shell.md': ('shell', 'Shell'),
@@ -122,6 +124,7 @@ _CAPABILITY_PAGE_META = {
     'memory.md': ('memory', 'Memory'),
     'modal-sandbox.md': ('modal_sandbox', 'Modal Sandbox'),
     'repo-context.md': ('repo_context', 'Repo Context'),
+    'researcher.md': ('researcher', 'Researcher'),
     'pydantic-ai-docs.md': ('pydantic_ai_docs', 'Pydantic AI Docs'),
     'exa-search.md': ('exa', 'Exa Search'),
     'macroscope.md': ('macroscope', 'Macroscope'),
@@ -317,9 +320,25 @@ _NAV_JSON = _DOCS_DIR / 'nav.json'
 _NAV_EXCLUDED_PAGES = {'mutation-testing.md'}
 
 
+class _NavItem(TypedDict, total=False):
+    label: str
+    slug: str
+    items: list[_NavItem]
+
+
 def _nav_slugs() -> set[str]:
-    groups = json.loads(_NAV_JSON.read_text(encoding='utf-8'))
-    return {item['slug'] for group in groups for item in group['items']}
+    groups = TypeAdapter(list[_NavItem]).validate_json(_NAV_JSON.read_text(encoding='utf-8'))
+
+    def collect(items: list[_NavItem]) -> set[str]:
+        slugs: set[str] = set()
+        for item in items:
+            if (slug := item.get('slug')) is not None:
+                slugs.add(slug)
+            if (children := item.get('items')) is not None:
+                slugs.update(collect(children))
+        return slugs
+
+    return collect(groups)
 
 
 _NAV_SLUGS = _nav_slugs()

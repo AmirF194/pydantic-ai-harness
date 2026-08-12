@@ -19,22 +19,23 @@ uv add pydantic-ai-harness
 
 ```python
 from pydantic_ai import Agent
-from pydantic_ai_harness import CodingHarness
+from pydantic_ai_harness import Coder
 
-agent = Agent('anthropic:claude-opus-4-7', capabilities=[CodingHarness()])
+agent = Agent('anthropic:claude-fable-5', capabilities=[Coder()])
 agent.to_cli_sync()
 ```
 
 That's a complete coding agent in your terminal: sandboxed file access, allowlisted shell, repo orientation, planning, and context management that survives long sessions.
 
-Every model works — swap the string for `'openai:gpt-5.5'`, `'google:gemini-3-pro'`, or [any other provider](https://ai.pydantic.dev/models/). Need more? Add capabilities to the list:
+Every model works — swap the string for `'openai:gpt-5.6-sol'`, `'google:gemini-3-pro'`, or [any other provider](https://ai.pydantic.dev/models/). Need more? Add capabilities to the list:
 
 ```python
-from pydantic_ai_harness import CodingHarness, Memory
+from pydantic_ai_harness import Coder
+from pydantic_ai_harness.memory import Memory
 
 agent = Agent(
-    'anthropic:claude-opus-4-7',
-    capabilities=[CodingHarness(), Memory()],  # remembers across sessions
+    'anthropic:claude-fable-5',
+    capabilities=[Coder(), Memory()],  # remembers across sessions
 )
 ```
 
@@ -42,22 +43,28 @@ And it's an ordinary Pydantic AI agent: run it headless with `agent.run_sync(...
 
 ## No magic: it's capabilities all the way down
 
-`CodingHarness` is not a framework inside the framework — it's a [`CombinedCapability`](https://ai.pydantic.dev/capabilities/custom/) bundling the same blocks you can use directly. This is its actual definition, spelled out:
+`Coder` is not a framework inside the framework — it's a [`CombinedCapability`](https://ai.pydantic.dev/capabilities/custom/) bundling the same blocks you can use directly. The main blocks are spelled out below; the [Coder README](pydantic_ai_harness/coder/) includes the read-only explorer and exact equivalent:
 
 ```python
+from pathlib import Path
+
 from pydantic_ai import Agent
-from pydantic_ai_harness import FileSystem, Planning, RepoContext, Shell
-from pydantic_ai_harness.compaction import SlidingWindowCompaction, WarnNearLimits
+from pydantic_ai_harness import FileSystem, Shell
+from pydantic_ai_harness.compaction import ClearToolResults, WarnNearLimits
+from pydantic_ai_harness.planning import Planning
+from pydantic_ai_harness.repo_context import RepoContext
+from pydantic_ai_harness.tool_output_limits import ToolOutputLimits
 
 agent = Agent(
-    'anthropic:claude-opus-4-7',
+    'anthropic:claude-fable-5',
     capabilities=[
         FileSystem('.'),  # read/write/edit/search, path-traversal safe
         Shell(),  # allowlisted command execution
-        RepoContext(),  # loads AGENTS.md/CLAUDE.md + repo structure
+        RepoContext(workspace_dir=Path('.')),  # loads AGENTS.md/CLAUDE.md + repo structure
         Planning(),  # structured task plans the model maintains
-        SlidingWindowCompaction(),  # stays within the context window
-        WarnNearLimits(),  # warns the model before it hits limits
+        ClearToolResults(max_fraction=0.7),  # clears old tool results near the limit
+        WarnNearLimits(max_context_fraction=0.9),  # warns the model before it hits limits
+        ToolOutputLimits(),  # bounds oversized tool results
     ],
 )
 ```
@@ -67,6 +74,13 @@ Start from the harness and remove what you don't want, or start from the blocks 
 ## Capabilities
 
 Each capability is a self-contained unit you drop into `capabilities=[...]`. They compose with each other and with Pydantic AI's [built-in capabilities](https://ai.pydantic.dev/capabilities/). Grouped by what they give your agent:
+
+### Harnesses
+
+| Preset | What it provides |
+|---|---|
+| [Coder](pydantic_ai_harness/coder/) | A complete local coding-agent stack with files, shell, repo context, planning, delegation, and context controls |
+| [Researcher](pydantic_ai_harness/researcher/) | A complete web-research stack with Code Mode, local search, and bounded tool output |
 
 ### Execution
 
@@ -148,7 +162,7 @@ Community capability packages (by [vstorm-co](https://github.com/vstorm-co), [Do
 
 ## Composing from blocks
 
-A research agent, from three capabilities — the same pattern as `CodingHarness`, different blocks:
+A research agent, from three capabilities — the same pattern as `Coder`, different blocks:
 
 ```python
 from pydantic_ai import Agent
@@ -157,7 +171,7 @@ from pydantic_ai_harness import CodeMode
 from pydantic_ai_harness.tool_output_limits import ToolOutputLimits
 
 agent = Agent(
-    'anthropic:claude-opus-4-7',
+    'anthropic:claude-fable-5',
     capabilities=[
         CodeMode(),  # batches searches + filtering into single sandboxed scripts
         WebSearch(native=False),  # local fallback so CodeMode can wrap it
