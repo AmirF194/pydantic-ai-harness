@@ -108,6 +108,11 @@ A missing, invalid, or unreachable remote value degrades to exactly the agent yo
 crashed run. Values resolve **once per run**, and the resolved label and version ride as baggage on
 every span of that run, so a trace always shows which version produced which behavior.
 
+An agent with no model of its own is the exception, because there is nothing to degrade *to*: with
+`Agent(capabilities=[AgentControl(...)])` and no valid managed `model`, the run raises rather than
+guessing one. Keep a model in code if you want a Logfire outage to be a non-event; leave it out only
+when the managed value is meant to be the single source of truth for which model runs.
+
 ## Instructions add, or take over
 
 Instructions are the one section that is a **composition point** rather than a field. Pydantic AI

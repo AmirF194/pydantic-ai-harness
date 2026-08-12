@@ -673,6 +673,23 @@ async def test_non_json_baseline_setting_does_not_affect_run(capfire: CaptureLog
     assert result.output.startswith('success')
 
 
+async def test_oversized_code_instructions_do_not_affect_run(capfire: CaptureLogfire) -> None:
+    """The length bound is about what a managed value may add, not about what the agent already says.
+
+    `AgentConfig` describes what to apply and what exists with the same fields, so building the
+    baseline validates code-side text too. An agent whose own instructions exceed the bound has a
+    snapshot too big to publish -- not a broken run -- so it warns and keeps going.
+    """
+    with variables_provider(capfire, published_value('agent__oversized_code', {})):
+        with pytest.warns(UserWarning, match='Failed to publish the code baseline'):
+            result = await Agent(
+                TestModel(),
+                instructions='x' * (_agent_control._MAX_MODEL_FACING_TEXT_LENGTH + 1),
+                capabilities=[AgentControl('oversized_code')],
+            ).run('hello')
+    assert result.output.startswith('success')
+
+
 async def test_publish_baseline_opt_out(capfire: CaptureLogfire, monkeypatch: pytest.MonkeyPatch) -> None:
     def fail_spawn(_variable: Variable[object], _example: str) -> None:
         raise AssertionError('baseline publishing should be disabled')

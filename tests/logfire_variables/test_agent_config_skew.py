@@ -171,6 +171,23 @@ def test_instruction_entry_that_is_not_a_string_or_object_drops_only_itself() ->
     assert_other_sections_survived(config)
 
 
+def test_instruction_entries_are_bounded_in_total_not_just_individually() -> None:
+    """The bound is on what this section adds to every request, so splitting the text can't evade it.
+
+    A section written as one string is capped, so the same text written as several entries has to be
+    capped too. Entries are kept in order until the budget runs out; the ones that don't fit drop
+    like any other invalid entry, leaving every other section alone.
+    """
+    half = 'x' * (_agent_control._MAX_MODEL_FACING_TEXT_LENGTH // 2)
+    with pytest.warns(UserWarning, match=r'does not fit in the \d+ remaining of the \d+-character limit'):
+        config = AgentConfig.model_validate(full_value(instructions=[half, half, half]))
+
+    # Two fit; the third is what pushes the section past the limit.
+    assert_other_sections_survived(
+        config, instructions=[InstructionBlock(instructions=half), InstructionBlock(instructions=half)]
+    )
+
+
 def test_instruction_entry_with_empty_text_drops_only_itself() -> None:
     # `''` is a half-filled field, not a way to blank a block: `instructions: null` is how a block is
     # dropped, and keeping the two distinguishable is worth losing the entry that confuses them.

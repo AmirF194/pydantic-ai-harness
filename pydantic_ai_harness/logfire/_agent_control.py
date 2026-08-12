@@ -510,19 +510,25 @@ class AgentConfig(BaseModel):
                 return None
             return data
         blocks: list[InstructionBlock] = []
+        # The bound is on the text this section adds to every model request, so it has to be the total
+        # across entries, not just each one: a section written as one string is capped, and the same
+        # text written as ten entries has to be capped too or the limit means nothing.
+        remaining = _MAX_MODEL_FACING_TEXT_LENGTH
         for entry in cast(list[Any], data):
             text: object | None = entry if isinstance(entry, str) else None
             if isinstance(entry, dict):
                 # Runtime narrowing cannot recover a dictionary's generic parameters from untyped JSON.
                 typed_entry = cast(dict[str, object], entry)
                 text = typed_entry.get('instructions')
-            if isinstance(text, str) and len(text) > _MAX_MODEL_FACING_TEXT_LENGTH:
+            if isinstance(text, str) and len(text) > remaining:
                 _warn_dropped(
-                    f'Managed instruction entry contains {len(text)} characters, exceeding the '
-                    f'{_MAX_MODEL_FACING_TEXT_LENGTH}-character limit; ignoring that entry and keeping the rest '
-                    'of the managed config.'
+                    f'Managed instruction entry contains {len(text)} characters, which does not fit in the '
+                    f'{remaining} remaining of the {_MAX_MODEL_FACING_TEXT_LENGTH}-character limit across all '
+                    'entries; ignoring that entry and keeping the rest of the managed config.'
                 )
                 continue
+            if isinstance(text, str):
+                remaining -= len(text)
             try:
                 block = InstructionBlock.model_validate({'instructions': entry} if isinstance(entry, str) else entry)
             except ValidationError as error:
@@ -985,7 +991,14 @@ class AgentControl(ManagedVariableCapability[AgentDepsT, AgentConfig]):
     _auto_create_in_wrap_run: ClassVar[bool] = False
     _selection_resolved: ContextVar[ResolvedVariable[AgentConfig] | None] = field(init=False, repr=False)
     _code_model: ContextVar[str | None] = field(init=False, repr=False)
-    _code_settings: ContextVar[ModelSettings | None] = field(init=False, repr=False)
+    _code_settings: ContextVar[Mapping[str, Any] | None] = field(init=False, repr=False)
+    """The settings in force before this capability's patch, snapshotted for the baseline.
+
+    Held as a plain mapping rather than `ModelSettings`: `RunContext.model_settings` is whatever the
+    session is running with, which is `RealtimeModelSettings` in a realtime session, and the only
+    thing done with it is `AgentConfigSettings.model_validate`, which takes any mapping. Narrowing
+    to one of the two would either cast away a real case or drop a realtime agent's baseline.
+    """
     _code_tools: ContextVar[list[ToolDefinition] | None] = field(init=False, repr=False)
 
     def __post_init__(self) -> None:
@@ -1048,7 +1061,7 @@ class AgentControl(ManagedVariableCapability[AgentDepsT, AgentConfig]):
         """Contribute the lowered managed settings patch for each model request."""
 
         def model_settings(ctx: RunContext[AgentDepsT]) -> ModelSettings:
-            self._code_settings.set(ModelSettings(ctx.model_settings or {}))
+            self._code_settings.set(dict(ctx.model_settings or {}))
             resolved = self.resolved
             if resolved is None or resolved.value.settings is None:
                 return ModelSettings()
@@ -1233,6 +1246,39 @@ class AgentControl(ManagedVariableCapability[AgentDepsT, AgentConfig]):
         if _in_durable_context(ctx):
             _warn_durable_write_skipped(self._variable)
             return
+        # Built inside the `try`, alongside the serialization it feeds. `AgentConfig` says what to
+        # *apply* as well as what exists, so its validation -- the length bound in particular -- also
+        # runs over code-side text nobody asked to change. An agent whose own instructions exceed the
+        # bound would otherwise raise straight out of `before_model_request` and take down every model
+        # request, when what it has is a snapshot too big to publish, not a broken run.
+        try:
+            example = self._code_baseline(request_context)
+            serialized = json.dumps(example.model_dump(exclude_none=True), indent=2)
+        except Exception as error:
+            warnings.warn(
+                f'Failed to publish the code baseline for Logfire managed variable {self._variable.name!r}: {error}'
+            )
+            return
+        key = (self._variable.logfire_instance, self._variable.name)
+        with _baseline_publish_lock:
+            if key in _baseline_publish_attempted:
+                return
+            _baseline_publish_attempted.add(key)
+        if self._should_auto_create_for(resolved):
+            self._maybe_auto_create(self._variable, example=serialized, ctx=ctx)
+            return
+        _spawn_baseline_publish(self._variable, serialized)
+
+    def _code_baseline(self, request_context: ModelRequestContext) -> AgentConfig:
+        """The agent as written: what it would do with `AgentControl` removed.
+
+        Instructions come straight off the assembled parts, minus this capability's own block, since
+        the point is to describe what a managed value would be layered onto. Model, settings, and tool
+        definitions were captured at their override sites, before managed behavior replaced them.
+
+        Only ever called from inside the caller's `try`: everything here validates, and a snapshot
+        that can't be built must not reach the run.
+        """
         own_instruction_id = f'capability:{self.id}'
         instructions: list[InstructionText | InstructionBlock] = [
             InstructionBlock(id=part.id, instructions=part.content, dynamic=part.dynamic)
@@ -1256,7 +1302,7 @@ class AgentControl(ManagedVariableCapability[AgentDepsT, AgentConfig]):
                     name=tool.name, description=tool.description or None, parameter_descriptions=descriptions or None
                 )
             )
-        example = AgentConfig(
+        return AgentConfig(
             instructions=instructions or None,
             model=self._code_model.get(),
             settings=AgentConfigSettings.model_validate(self._code_settings.get())
@@ -1264,19 +1310,3 @@ class AgentControl(ManagedVariableCapability[AgentDepsT, AgentConfig]):
             else None,
             tool_definitions=tool_definitions or None,
         )
-        try:
-            serialized = json.dumps(example.model_dump(exclude_none=True), indent=2)
-        except Exception as error:
-            warnings.warn(
-                f'Failed to publish the code baseline for Logfire managed variable {self._variable.name!r}: {error}'
-            )
-            return
-        key = (self._variable.logfire_instance, self._variable.name)
-        with _baseline_publish_lock:
-            if key in _baseline_publish_attempted:
-                return
-            _baseline_publish_attempted.add(key)
-        if self._should_auto_create_for(resolved):
-            self._maybe_auto_create(self._variable, example=serialized, ctx=ctx)
-            return
-        _spawn_baseline_publish(self._variable, serialized)
