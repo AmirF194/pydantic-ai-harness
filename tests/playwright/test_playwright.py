@@ -3041,6 +3041,15 @@ class TestTabs:
         assert result == "Error: unknown tabs action 'reorder'; use list, select, close or new."
         assert session.page is None
 
+    async def test_an_active_tab_with_nothing_behind_it_is_reported(self) -> None:
+        page = _FakePage()
+        session = PlaywrightBrowserSession()
+        session.page = page
+        session.pages = []
+        toolset = PlaywrightBrowserToolset[None](session=session)
+        assert await toolset.tabs('list') == 'No tabs open.'
+        assert await toolset.tabs('close') == "Error: the active tab has closed. Open one with tabs('new')."
+
     async def test_a_tab_that_closes_itself_leaves_the_list(self, monkeypatch: pytest.MonkeyPatch) -> None:
         page = _FakePage()
         _install_fake_driver(monkeypatch, page)

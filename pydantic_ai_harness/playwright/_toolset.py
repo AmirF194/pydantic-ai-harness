@@ -2028,6 +2028,10 @@ class PlaywrightBrowserToolset(FunctionToolset[AgentDepsT]):
                 return self._truncate_output(
                     f'Opened blank tab {len(session.pages) - 1} and made it active. Load it with navigate.'
                 )
+            if page not in session.pages:
+                # A page can close itself, and the session moves the active pointer
+                # to whatever is left. Nothing was, so there is no tab to act on.
+                return self._error("Error: the active tab has closed. Open one with tabs('new').")
             target = session.pages.index(page) if index is None else index
             if not 0 <= target < len(session.pages):
                 return self._error(f'Error: no tab {target}. {len(session.pages)} open; list them with tabs.')
@@ -2054,6 +2058,8 @@ class PlaywrightBrowserToolset(FunctionToolset[AgentDepsT]):
         A title that cannot be read does not fail the listing: the reason to list
         tabs is often that one of them is misbehaving.
         """
+        if not pages:
+            return 'No tabs open.'
         lines: list[str] = []
         for position, page in enumerate(pages):
             try:
