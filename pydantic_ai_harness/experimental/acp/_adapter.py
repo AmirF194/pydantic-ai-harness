@@ -615,6 +615,7 @@ class PydanticAIACPAgent(acp.Agent, Generic[AgentDepsT, OutputDataT]):
                     output_type=output_type,
                     deps=config.deps,
                     toolsets=config.toolsets,
+                    sandbox=config.sandbox,
                     # Per-run override for the client's model config choice; `None` uses the
                     # agent's own model, never mutating the shared agent. A `model_resolver` (if
                     # given) maps the advertised id to a pre-built `Model` for ids `infer_model`

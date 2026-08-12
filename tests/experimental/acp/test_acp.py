@@ -45,6 +45,7 @@ from pydantic_ai.messages import (
 )
 from pydantic_ai.models.function import AgentInfo, DeltaToolCall, FunctionModel
 from pydantic_ai.models.test import TestModel
+from pydantic_ai.sandboxes import LocalSandbox
 from pydantic_ai.toolsets import FunctionToolset
 from pydantic_ai.usage import UsageLimits
 
@@ -2236,7 +2237,11 @@ class TestWorkspaceRooting:
         agent = Agent(_calls_tool_each_turn(write))  # the agent itself has no filesystem tools
 
         def session_config(session: AcpSession) -> AcpSessionConfig[None]:
-            return AcpSessionConfig(deps=None, toolsets=[FileSystem[None](root_dir=session.cwd).get_toolset()])
+            return AcpSessionConfig(
+                deps=None,
+                toolsets=[FileSystem[None](root_dir=session.cwd).get_toolset()],
+                sandbox=LocalSandbox(root=session.cwd),
+            )
 
         adapter: PydanticAIACPAgent[None, str] = PydanticAIACPAgent(agent, session_config=session_config)
         client = FakeClient()
