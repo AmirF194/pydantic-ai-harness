@@ -236,9 +236,10 @@ async with PlaywrightBrowserSession() as session:
 ```
 
 `PlaywrightBrowserToolset` is exported on the same basis: pass it a session to
-get the sixteen tools without the capability's hooks. It adopts that session's
-`policy`, so the guard the session installs and the checks the tools run always
-agree; pass `policy=` only to override both.
+get the sixteen tools without the capability's hooks. The policy lives on the
+session and only there, so the guard the session installs and the checks the
+tools run cannot diverge: they are two layers of one decision, applied at
+different moments.
 
 ## Embedded content (iframes)
 

@@ -219,7 +219,6 @@ class PlaywrightBrowser(AbstractCapability[AgentDepsT]):
         )
         self._toolset = PlaywrightBrowserToolset[AgentDepsT](
             session=self._session,
-            policy=self._policy,
             screenshot_on_navigate=self.screenshot_on_navigate,
             max_content_tokens=self.max_content_tokens,
             action_timeout_ms=self.action_timeout_ms,

@@ -921,8 +921,14 @@ class PlaywrightBrowserSession:
         task.add_done_callback(self._popup_done)
 
     async def __aenter__(self) -> Self:
-        """Arm the session. Cheap by design: no driver and no browser start here."""
+        """Arm the session. Cheap by design: no driver and no browser start here.
+
+        The driver flag is cleared as well as set: a session entered a second time
+        gets a fresh, unentered context manager, and a flag left over from the
+        first use would have teardown exit a driver that was never started.
+        """
         self._driver_cm = async_playwright()
+        self._driver_entered = False
         return self
 
     async def __aexit__(self, exc_type: type[BaseException] | None, *_: object) -> None:
@@ -982,7 +988,6 @@ class PlaywrightBrowserToolset(FunctionToolset[AgentDepsT]):
         self,
         *,
         session: PlaywrightBrowserSession,
-        policy: NavigationPolicy | None = None,
         screenshot_on_navigate: bool = False,
         max_content_tokens: int = DEFAULT_MAX_CONTENT_TOKENS,
         action_timeout_ms: int = DEFAULT_ACTION_TIMEOUT_MS,
@@ -996,10 +1001,12 @@ class PlaywrightBrowserToolset(FunctionToolset[AgentDepsT]):
             raise ValueError('navigation_timeout_ms must be greater than or equal to 0')
         super().__init__(id='playwright')
         self._session = session
-        # Defaults to the session's policy rather than a fresh one: the guard the
-        # session installs and the checks these tools run have to agree, and a
-        # second default would silently refuse what the session was built to allow.
-        self._policy = policy if policy is not None else session.policy
+        # The session's policy, never a separate one. These checks and the route
+        # guard the session installs are two layers of one decision: a toolset
+        # holding its own policy could refuse what the guard allows, or -- worse --
+        # let the guard send a request the tools would have refused, since the
+        # guard acts first and the tool check only bounces the page afterwards.
+        self._policy = session.policy
         self._screenshot_on_navigate = screenshot_on_navigate
         self._max_content_tokens = max_content_tokens
         self._action_timeout_ms = action_timeout_ms

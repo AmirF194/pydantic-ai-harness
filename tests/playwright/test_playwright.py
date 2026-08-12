@@ -9,6 +9,7 @@ the `playwright` Python package installed (no browser binary).
 from __future__ import annotations
 
 import asyncio
+import inspect
 import sys
 from collections.abc import Awaitable, Callable, Sequence
 from typing import Protocol
@@ -650,13 +651,18 @@ def _toolset(
     session: PlaywrightBrowserSession | None = None,
 ) -> PlaywrightBrowserToolset[None]:
     """Build a toolset whose active page is the given double."""
-    session = session if session is not None else PlaywrightBrowserSession()
+    session = (
+        session
+        if session is not None
+        else PlaywrightBrowserSession(
+            policy=toolset_module.NavigationPolicy(
+                allowed_domains=allowed_domains, block_private_addresses=block_private_addresses
+            )
+        )
+    )
     session.page = page
     return PlaywrightBrowserToolset[None](
         session=session,
-        policy=toolset_module.NavigationPolicy(
-            allowed_domains=allowed_domains, block_private_addresses=block_private_addresses
-        ),
         screenshot_on_navigate=screenshot_on_navigate,
         max_content_tokens=max_content_tokens,
         action_timeout_ms=action_timeout_ms,
@@ -2531,9 +2537,9 @@ class TestBrowserEvents:
 
 
 class TestSessionAndToolsetAgree:
-    async def test_toolset_defaults_to_the_sessions_policy(self) -> None:
+    async def test_the_toolset_uses_the_sessions_policy(self) -> None:
         # A session built to allow a local app must not be second-guessed by a
-        # toolset that made its own default policy.
+        # toolset holding a policy of its own.
         page = _FakePage(url='http://127.0.0.1:8000/admin')
         session = PlaywrightBrowserSession(policy=toolset_module.NavigationPolicy(block_private_addresses=False))
         session.page = page
@@ -2542,15 +2548,32 @@ class TestSessionAndToolsetAgree:
         assert isinstance(result, str)
         assert result.startswith('URL: http://127.0.0.1:8000/admin')
 
-    async def test_an_explicit_policy_still_wins(self) -> None:
-        session = PlaywrightBrowserSession(policy=toolset_module.NavigationPolicy(block_private_addresses=False))
+    async def test_the_toolset_cannot_hold_a_second_policy(self) -> None:
+        # The two layers act at different moments -- the route guard before the
+        # request leaves, the tool check after the page settled -- so a toolset
+        # with its own stricter policy would let the guard send what the tools
+        # would have refused. There is no parameter to create that split.
+        session = PlaywrightBrowserSession(policy=toolset_module.NavigationPolicy(allowed_domains=['example.com']))
         session.page = _FakePage()
-        toolset = PlaywrightBrowserToolset[None](
-            session=session, policy=toolset_module.NavigationPolicy(allowed_domains=['example.com'])
-        )
+        toolset = PlaywrightBrowserToolset[None](session=session)
+        assert 'policy' not in inspect.signature(PlaywrightBrowserToolset.__init__).parameters
         assert await toolset.navigate('https://evil.com/') == (
             'Error: domain not in allowed_domains: https://evil.com/'
         )
+
+
+class TestSessionReuse:
+    async def test_a_session_can_be_entered_again(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # The second block never touches the browser, so its driver context manager
+        # is never entered; teardown must not exit one that was never started.
+        page = _FakePage()
+        cm = _install_fake_driver(monkeypatch, page)
+        session = PlaywrightBrowserSession()
+        async with session:
+            await session.ensure_page()
+        assert cm.exited is True
+        async with session:
+            pass
 
 
 class TestDeadlinesCoverEveryAwait:
