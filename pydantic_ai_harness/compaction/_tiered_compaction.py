@@ -20,12 +20,13 @@ from pydantic_ai_harness.compaction._shared import (
     context_for_request,
     estimate_context_tokens,
     estimate_token_count,
+    record_compaction_reclaim,
     resolve_token_trigger,
     validate_token_trigger,
 )
 
 if TYPE_CHECKING:
-    from pydantic_ai.models import Model, ModelRequestContext
+    from pydantic_ai.models import Model, ModelRequestContext, ModelRequestParameters
 
 
 @dataclass
@@ -139,6 +140,7 @@ class TieredCompaction(AbstractCapability[AgentDepsT]):
         messages: list[ModelMessage],
         ctx: RunContext[AgentDepsT],
         target: int,
+        model_request_parameters: ModelRequestParameters | None = None,
     ) -> list[ModelMessage]:
         """Apply tiers in order until the history fits *target* or tiers run out."""
         original = messages
@@ -148,7 +150,7 @@ class TieredCompaction(AbstractCapability[AgentDepsT]):
         # message text, so the baseline's fixed overhead (tool definitions, instructions) is
         # never treated as compacted away. On content the estimator undercounts, this
         # understates the reclaim and escalates a tier early -- the cheap direction.
-        baseline = estimate_context_tokens(messages, self.tokenizer)
+        baseline = estimate_context_tokens(messages, self.tokenizer, model_request_parameters=model_request_parameters)
         heuristic_baseline = estimate_token_count(messages, self.tokenizer)
         estimate = baseline
         for tier in self.tiers:
@@ -182,13 +184,26 @@ class TieredCompaction(AbstractCapability[AgentDepsT]):
         request_ctx = context_for_request(ctx, request_context)
         # Resolved once, so the gate and the escalation loop cannot disagree about the target.
         target = self._target(request_ctx.model)
-        if estimate_context_tokens(messages, self.tokenizer) <= target:
+        if (
+            estimate_context_tokens(
+                messages,
+                self.tokenizer,
+                model_request_parameters=request_context.model_request_parameters,
+            )
+            <= target
+        ):
             return request_context
-        request_context.messages = await compact_with_span(
+        compacted = await compact_with_span(
             request_ctx,
             strategy='TieredCompaction',
             messages=messages,
-            compact=lambda: self._escalate(messages, request_ctx, target),
+            compact=lambda: self._escalate(messages, request_ctx, target, request_context.model_request_parameters),
             tokenizer=self.tokenizer,
         )
+        record_compaction_reclaim(
+            request_context,
+            estimate_token_count(messages, self.tokenizer),
+            estimate_token_count(compacted, self.tokenizer),
+        )
+        request_context.messages = compacted
         return request_context
