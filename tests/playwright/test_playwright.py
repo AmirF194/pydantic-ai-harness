@@ -682,10 +682,12 @@ class _FakeDriverCM:
         self.driver = driver
         self._driver = driver
         self.entered = False
+        self.entries = 0
         self.exited = False
 
     async def __aenter__(self) -> _FakeDriver:
         self.entered = True
+        self.entries += 1
         return self._driver
 
     async def __aexit__(self, *exc: object) -> bool:
@@ -3213,6 +3215,19 @@ class TestReviewFollowUps:
             # What an agent with a shell does between the two calls.
             chromium._executable_path = sys.executable
             assert await toolset.get_text() == 'Hello body'
+
+    async def test_retrying_a_failed_launch_reuses_the_one_driver(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        page = _FakePage()
+        cm = _install_fake_driver(monkeypatch, page, executable_missing=True)
+        session = PlaywrightBrowserSession()
+        async with session:
+            toolset = PlaywrightBrowserToolset[None](session=session)
+            with pytest.warns(BrowserUnavailableWarning):
+                await toolset.get_text()
+                await toolset.get_text()
+        # Each retry re-launches Chromium; re-entering the driver as well would leave
+        # the earlier connection running until teardown.
+        assert cm.entries == 1
 
     async def test_a_callback_url_is_redacted_wherever_a_tool_reports_it(self) -> None:
         landing = 'https://example.com/cb?code=secret&state=xyz'

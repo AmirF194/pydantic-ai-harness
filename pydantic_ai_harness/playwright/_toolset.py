@@ -843,6 +843,7 @@ class PlaywrightBrowserSession:
         self.launch_error: str | None = None
         """Set when a launch attempt failed (e.g. the Chromium binary is missing)."""
         self._driver_cm: AbstractAsyncContextManager[PlaywrightDriver] | None = None
+        self._driver: PlaywrightDriver | None = None
         self._driver_entered = False
         self._browser: PlaywrightBrowserHandle | None = None
         self._context: PlaywrightBrowserContext | None = None
@@ -954,11 +955,18 @@ class PlaywrightBrowserSession:
         return self.page
 
     async def _launch(self) -> None:
-        """Start the driver and Chromium, then open the guarded page."""
+        """Start the driver and Chromium, then open the guarded page.
+
+        The driver is entered once per session rather than once per attempt: a
+        launch that failed is retried on the next tool call, and re-entering the
+        context manager would start a second driver connection and leave the first
+        one running until teardown.
+        """
         assert self._driver_cm is not None
-        pw = await self._driver_cm.__aenter__()
-        self._driver_entered = True
-        browser = await self._connect(pw)
+        if self._driver is None:
+            self._driver = await self._driver_cm.__aenter__()
+            self._driver_entered = True
+        browser = await self._connect(self._driver)
         if browser is None:
             return
         # Assigned before the context and page are built, so teardown closes Chromium
@@ -1216,6 +1224,7 @@ class PlaywrightBrowserSession:
         without ever trying to start a browser.
         """
         self._driver_cm = async_playwright()
+        self._driver = None
         self._driver_entered = False
         self.launch_error = None
         return self
@@ -1230,6 +1239,7 @@ class PlaywrightBrowserSession:
         """
         driver_cm = self._driver_cm
         self._driver_cm = None
+        self._driver = None
         if self._event_tasks:
             for task in self._event_tasks:
                 task.cancel()
