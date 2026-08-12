@@ -168,7 +168,10 @@ async def capture_state() -> object:
         context = await browser.new_context()
         page = await context.new_page()
         await page.goto('https://example.com/login')
-        # log in by hand in the window that opened
+        # Log in by hand in the window that opened. The capture waits for a page
+        # only a signed-in session reaches, so it runs after the login rather than
+        # racing it; the deadline is long because a person is typing.
+        await page.wait_for_url('https://example.com/account', timeout=300_000)
         state = await context.storage_state()
         await browser.close()
         return state
