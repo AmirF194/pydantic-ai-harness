@@ -27,6 +27,13 @@ def test_lazy_import_shell():
     assert hasattr(Shell, 'get_toolset')
 
 
+def test_lazy_import_presets():
+    from pydantic_ai_harness import Coder, Researcher
+
+    assert inspect.isclass(Coder)
+    assert inspect.isclass(Researcher)
+
+
 def test_lazy_import_llm_api_key_env_patterns():
     from pydantic_ai_harness import LLM_API_KEY_ENV_PATTERNS
 

@@ -6,6 +6,7 @@ from ._warn import HarnessDeprecationWarning
 
 if TYPE_CHECKING:
     from .code_mode import CodeMode
+    from .coder import Coder
     from .filesystem import FileSystem
     from .guardrails import (
         GuardrailError,
@@ -18,10 +19,12 @@ if TYPE_CHECKING:
         OutputGuardrailFunc,
     )
     from .logfire import ManagedPrompt
+    from .researcher import Researcher
     from .shell import LLM_API_KEY_ENV_PATTERNS, Shell
 
 __all__ = [
     'CodeMode',
+    'Coder',
     'FileSystem',
     'GuardrailError',
     'GuardrailResult',
@@ -34,6 +37,7 @@ __all__ = [
     'OutputBlocked',
     'OutputGuardrail',
     'OutputGuardrailFunc',
+    'Researcher',
     'Shell',
 ]
 
@@ -61,6 +65,10 @@ def __getattr__(name: str) -> object:
         from .code_mode import CodeMode
 
         return CodeMode
+    if name == 'Coder':
+        from .coder import Coder
+
+        return Coder
     if name in _GUARDRAIL_EXPORTS:
         from . import guardrails
 
@@ -73,6 +81,10 @@ def __getattr__(name: str) -> object:
         from .logfire import ManagedPrompt
 
         return ManagedPrompt
+    if name == 'Researcher':
+        from .researcher import Researcher
+
+        return Researcher
     if name == 'Shell':
         from .shell import Shell
 

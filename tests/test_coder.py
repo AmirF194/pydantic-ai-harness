@@ -1,0 +1,68 @@
+from pathlib import Path
+
+from pydantic_ai import Agent
+from pydantic_ai.capabilities import Capability
+from pydantic_ai.models.test import TestModel
+
+from pydantic_ai_harness.coder import DEFAULT_ALLOWED_COMMANDS, DEFAULT_CODER_INSTRUCTIONS, Coder
+from pydantic_ai_harness.compaction import ClearToolResults, WarnNearLimits
+from pydantic_ai_harness.filesystem import FileSystem
+from pydantic_ai_harness.planning import Planning
+from pydantic_ai_harness.repo_context import RepoContext
+from pydantic_ai_harness.shell import Shell
+from pydantic_ai_harness.subagents import SubAgents
+from pydantic_ai_harness.tool_output_limits import ToolOutputLimits
+
+
+def test_coder_constructs_agent() -> None:
+    agent = Agent(TestModel(), capabilities=[Coder()])
+
+    assert isinstance(agent, Agent)
+
+
+def test_coder_members_are_transparent() -> None:
+    coder = Coder()
+
+    assert [type(capability) for capability in coder.capabilities] == [
+        Capability,
+        FileSystem,
+        Shell,
+        RepoContext,
+        Planning,
+        SubAgents,
+        ClearToolResults,
+        WarnNearLimits,
+        ToolOutputLimits,
+    ]
+    assert coder.capabilities[0].get_instructions() == [DEFAULT_CODER_INSTRUCTIONS]
+
+
+def test_coder_threads_parameters(tmp_path: Path) -> None:
+    coder = Coder(tmp_path, allowed_commands=['git'], subagents=[], instructions='Custom instructions')
+
+    filesystem = next(capability for capability in coder.capabilities if isinstance(capability, FileSystem))
+    shell = next(capability for capability in coder.capabilities if isinstance(capability, Shell))
+    repo_context = next(capability for capability in coder.capabilities if isinstance(capability, RepoContext))
+    assert filesystem.root_dir == tmp_path
+    assert shell.cwd == tmp_path
+    assert shell.allowed_commands == ['git']
+    assert repo_context.workspace_dir == tmp_path
+    assert not any(isinstance(capability, SubAgents) for capability in coder.capabilities)
+    assert coder.capabilities[0].get_instructions() == ['Custom instructions']
+
+
+def test_coder_default_commands_and_empty_allowlist() -> None:
+    default_shell = next(capability for capability in Coder().capabilities if isinstance(capability, Shell))
+    empty_shell = next(
+        capability for capability in Coder(allowed_commands=[]).capabilities if isinstance(capability, Shell)
+    )
+
+    assert default_shell.allowed_commands == DEFAULT_ALLOWED_COMMANDS
+    assert empty_shell.allowed_commands == []
+
+
+def test_coder_for_agent_preserves_subclass(tmp_path: Path) -> None:
+    coder = Coder(tmp_path)
+    bound = coder.for_agent(Agent(TestModel()))
+
+    assert isinstance(bound, Coder)
