@@ -299,15 +299,20 @@ def resolve_token_trigger(
     `ModelRequestContext.model` before the request leaves, so the run's model and the request's
     model are not always the same one.
 
-    Returns `None` for a realtime model -- an `AbstractModel` that is not a request-response
-    `Model`. A realtime run has no context-window/token semantics, so the token trigger is
-    skipped entirely and such a run compacts on message count alone, if at all. #585
+    A realtime model -- an `AbstractModel` that is not a request-response `Model` -- has no
+    context window, so a `max_fraction` trigger cannot resolve and is skipped. The absolute
+    `max_tokens` trigger is model-independent, so it still applies: a realtime run with an
+    absolute budget compacts on it, and one configured only by fraction compacts on message
+    count alone, if at all. #585
     """
-    if is_realtime_model(model):
-        return None
     if max_tokens is not None:
         return max_tokens
     if max_fraction is None:
+        return None
+    if is_realtime_model(model):
+        # Only `max_fraction` reaches here, and it resolves against a context window a realtime
+        # model does not have. The absolute `max_tokens` path above already returned, so a realtime
+        # run still honours an absolute budget -- only the fraction trigger is skipped. #585
         return None
     if context_window is None:
         context_window = resolve_context_window(model)

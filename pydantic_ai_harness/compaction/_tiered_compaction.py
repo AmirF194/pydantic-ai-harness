@@ -127,10 +127,12 @@ class TieredCompaction(AbstractCapability[AgentDepsT]):
     def _target(self, model: AbstractModel | str) -> int | None:
         """Absolute token target, resolved against *model* when expressed as a fraction.
 
-        Returns `None` when *model* is not a request-response `Model` (a realtime model is an
-        `AbstractModel` but not one): there is no token window to resolve a target against, so
-        `TieredCompaction` does not compact. `__post_init__` requires one of `target_tokens` /
-        `target_fraction`, so a real `Model` never resolves to `None`. #585
+        Returns `None` only when the target is a *fraction* and *model* is realtime (an
+        `AbstractModel` that is not a request-response `Model`): a fraction resolves against a
+        context window a realtime model does not have, so `TieredCompaction` does not compact. An
+        absolute `target_tokens` is model-independent and still applies. `__post_init__` requires
+        one of `target_tokens` / `target_fraction`, so a request-response `Model` never resolves
+        to `None`. #585
         """
         return resolve_token_trigger(
             self.target_tokens, self.target_fraction, model, self.fallback_context_window, self.context_window

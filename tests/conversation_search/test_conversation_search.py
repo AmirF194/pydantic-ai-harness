@@ -819,3 +819,25 @@ class TestSpeechIsSearchable:
         """A `SpeechPart` with no transcript renders no line, so it cannot match a query."""
         history: list[ModelMessage] = [ModelRequest(parts=[SpeechPart(speaker='user')])]
         assert 'No matches' in await _search(_StubSource({'r1': history}), 'anything')
+
+    async def test_a_long_assistant_transcript_truncates_but_stays_searchable(self) -> None:
+        # A spoken turn is capped in the display excerpt like `TextPart`, while the full transcript
+        # stays in the index so a term past the 500-char cutoff still matches.
+        long_transcript = 'nightingale ' * 60 + 'SPEECHTAIL'
+        source = _StubSource(
+            {'r1': [_user('go'), ModelResponse(parts=[SpeechPart(speaker='assistant', transcript=long_transcript)])]}
+        )
+        rendered = await _search(source, 'SPEECHTAIL')
+        excerpts = rendered.split(':\n\n', 1)[1]
+        assert 'Found 1 match(es)' in rendered
+        assert 'SPEECHTAIL' not in excerpts
+        assert '...' in excerpts
+
+    async def test_a_long_user_transcript_truncates_but_stays_searchable(self) -> None:
+        long_transcript = 'petrichor ' * 60 + 'USERSPEECHTAIL'
+        source = _StubSource({'r1': [ModelRequest(parts=[SpeechPart(speaker='user', transcript=long_transcript)])]})
+        rendered = await _search(source, 'USERSPEECHTAIL')
+        excerpts = rendered.split(':\n\n', 1)[1]
+        assert 'Found 1 match(es)' in rendered
+        assert 'USERSPEECHTAIL' not in excerpts
+        assert '...' in excerpts
