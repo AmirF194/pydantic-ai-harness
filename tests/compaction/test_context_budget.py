@@ -906,6 +906,62 @@ class TestReportContextUsage:
         expected = estimate_context_tokens(messages) - (before - estimate_token_count(request_context.messages))
         assert [usage.used_tokens for usage in seen] == [expected, expected]
 
+    async def test_accumulates_reclaim_from_multiple_compactors(self, monkeypatch: pytest.MonkeyPatch):
+        _fixed_window(monkeypatch, 1_000)
+        seen: list[ContextUsage] = []
+        messages: list[ModelMessage] = [
+            ModelRequest(parts=[UserPromptPart(content='x' * 4_000)]),
+            ModelResponse(parts=[TextPart(content='old reply ' + 'x' * 4_000)]),
+            ModelRequest(parts=[UserPromptPart(content='before anchor ' + 'x' * 4_000)]),
+            ModelResponse(parts=[TextPart(content='done')], usage=RequestUsage(input_tokens=10_000, output_tokens=0)),
+            ModelRequest(parts=[UserPromptPart(content='after anchor ' + 'x' * 4_000)]),
+            ModelResponse(parts=[TextPart(content='new reply ' + 'x' * 4_000)]),
+            ModelRequest(parts=[UserPromptPart(content='continue')]),
+        ]
+        request_context = _request_context(messages)
+        first_compactor: SlidingWindowCompaction[None] = SlidingWindowCompaction(
+            max_messages=6, keep_messages=6, preserve_first_user_message=False
+        )
+        second_compactor: SlidingWindowCompaction[None] = SlidingWindowCompaction(
+            max_messages=4, keep_messages=4, preserve_first_user_message=False
+        )
+        monitor: ReportContextUsage[None] = ReportContextUsage(on_usage=seen.append)
+        before = estimate_token_count(messages)
+
+        await first_compactor.before_model_request(_ctx(), request_context)
+        await second_compactor.before_model_request(_ctx(), request_context)
+        await monitor.before_model_request(_ctx(), request_context)
+
+        expected = estimate_context_tokens(messages) - (before - estimate_token_count(request_context.messages))
+        assert [usage.used_tokens for usage in seen] == [expected]
+
+    async def test_ignores_reclaim_from_a_different_request_context(self, monkeypatch: pytest.MonkeyPatch):
+        _fixed_window(monkeypatch, 1_000)
+        compacted_context = _request_context(
+            [
+                ModelRequest(parts=[UserPromptPart(content='x' * 4_000)]),
+                ModelResponse(parts=[TextPart(content='done')], usage=RequestUsage(input_tokens=10_000, output_tokens=0)),
+                ModelRequest(parts=[UserPromptPart(content='continue')]),
+            ]
+        )
+        compactor: SlidingWindowCompaction[None] = SlidingWindowCompaction(
+            max_messages=2, keep_messages=2, preserve_first_user_message=False
+        )
+        seen: list[ContextUsage] = []
+        monitor: ReportContextUsage[None] = ReportContextUsage(on_usage=seen.append)
+        unrelated_context = _request_context(
+            [
+                ModelRequest(parts=[UserPromptPart(content='different request')]),
+                ModelResponse(parts=[TextPart(content='done')], usage=RequestUsage(input_tokens=500, output_tokens=0)),
+                ModelRequest(parts=[UserPromptPart(content='continue')]),
+            ]
+        )
+
+        await compactor.before_model_request(_ctx(), compacted_context)
+        await monitor.before_model_request(_ctx(), unrelated_context)
+
+        assert [usage.used_tokens for usage in seen] == [estimate_context_tokens(unrelated_context.messages)]
+
     async def test_after_a_compactor_reports_the_rewritten_unanchored_history(self, monkeypatch: pytest.MonkeyPatch):
         _fixed_window(monkeypatch, 1_000)
         seen: list[ContextUsage] = []
