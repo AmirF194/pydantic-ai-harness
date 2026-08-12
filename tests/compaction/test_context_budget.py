@@ -940,7 +940,9 @@ class TestReportContextUsage:
         compacted_context = _request_context(
             [
                 ModelRequest(parts=[UserPromptPart(content='x' * 4_000)]),
-                ModelResponse(parts=[TextPart(content='done')], usage=RequestUsage(input_tokens=10_000, output_tokens=0)),
+                ModelResponse(
+                    parts=[TextPart(content='done')], usage=RequestUsage(input_tokens=10_000, output_tokens=0)
+                ),
                 ModelRequest(parts=[UserPromptPart(content='continue')]),
             ]
         )
