@@ -11,41 +11,42 @@
         ]
       },
       {
-        "label": "Execution",
+        "label": "Tools & Environments",
         "items": [
-          { "label": "Code Mode", "slug": "code-mode" },
           { "label": "Shell", "slug": "shell" },
           { "label": "FileSystem", "slug": "filesystem" },
           { "label": "Modal Sandbox", "slug": "modal-sandbox" },
-          { "label": "LocalStack", "slug": "localstack" }
+          { "label": "LocalStack", "slug": "localstack" },
+          { "label": "Browser Use", "slug": "browser-use" },
+          { "label": "StackOne", "slug": "stackone" },
+          { "label": "Macroscope", "slug": "macroscope" }
         ]
       },
       {
         "label": "Web & Research",
         "items": [
-          { "label": "Exa Search", "slug": "exa-search" },
-          { "label": "Browser Use", "slug": "browser-use" }
+          { "label": "Exa Search", "slug": "exa-search" }
         ]
       },
       {
-        "label": "Context",
+        "label": "Context Efficiency",
         "items": [
+          { "label": "Code Mode", "slug": "code-mode" },
           { "label": "Compaction", "slug": "compaction" },
           { "label": "Tool Output Limits", "slug": "tool-output-limits" },
-          { "label": "System Reminders", "slug": "system-reminders" },
-          { "label": "Repo Context", "slug": "repo-context" },
-          { "label": "Skills", "slug": "skills" },
-          { "label": "Pydantic AI Docs", "slug": "pydantic-ai-docs" },
+          { "label": "Media", "slug": "media" },
           { "label": "Warn On Cache Busts", "slug": "warn-on-cache-busts" }
         ]
       },
       {
-        "label": "Memory & Persistence",
+        "label": "Knowledge & Memory",
         "items": [
           { "label": "Memory", "slug": "memory" },
           { "label": "Step Persistence", "slug": "step-persistence" },
           { "label": "Conversation Search", "slug": "conversation-search" },
-          { "label": "Media", "slug": "media" }
+          { "label": "Skills", "slug": "skills" },
+          { "label": "Repo Context", "slug": "repo-context" },
+          { "label": "Pydantic AI Docs", "slug": "pydantic-ai-docs" }
         ]
       },
       {
@@ -58,25 +59,24 @@
         ]
       },
       {
-        "label": "Self-Improvement",
+        "label": "Steering & Safety",
+        "items": [
+          { "label": "Guardrails", "slug": "guardrails" },
+          { "label": "Spend Limits", "slug": "spend" },
+          { "label": "System Reminders", "slug": "system-reminders" },
+          { "label": "Managed Prompt", "slug": "managed-prompt" }
+        ]
+      },
+      {
+        "label": "Self-Extension",
         "items": [
           { "label": "Capability Creation", "slug": "capability-creation" }
         ]
       },
       {
-        "label": "Safety & Spend",
+        "label": "Interfaces",
         "items": [
-          { "label": "Guardrails", "slug": "guardrails" },
-          { "label": "Spend", "slug": "spend" }
-        ]
-      },
-      {
-        "label": "Integrations",
-        "items": [
-          { "label": "ACP", "slug": "acp" },
-          { "label": "Managed Prompt", "slug": "managed-prompt" },
-          { "label": "StackOne", "slug": "stackone" },
-          { "label": "Macroscope", "slug": "macroscope" }
+          { "label": "ACP", "slug": "acp" }
         ]
       },
       {
