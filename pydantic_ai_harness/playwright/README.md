@@ -337,7 +337,8 @@ The two policies differ in how far they reach. The allowlist governs top-level
 navigation only, so a page's own subresources and third-party frames (identity
 providers, payment steps) still load. The private-address block applies to
 **every** frame and **every** resource type, including a `fetch` or XHR issued
-by `execute_js`. Both channels end at the model: `snapshot()` reads the ARIA
+by `execute_js`, and WebSocket connections, which a network route never sees, get
+their own guard that refuses a socket to a private address and records why. Both channels end at the model: `snapshot()` reads the ARIA
 tree of cross-origin child frames, and a page can read back a subresource it
 fetched itself, so either would otherwise hand over the response body the block
 exists to withhold.
@@ -346,8 +347,7 @@ Neither policy is a general security boundary. Microsoft's own playwright-mcp
 disclaims its origin filter the same way. The allowlist governs navigation, not
 requests initiated by in-page JavaScript (`fetch`/XHR via `execute_js`); both
 policies match IP literals and `localhost` names, not hostnames that resolve to
-private addresses (DNS rebinding); and the route guard does not see WebSocket
-connections. Constraining in-page requests against the allowlist and
+private addresses (DNS rebinding). Constraining in-page requests against the allowlist and
 resolution-based blocking are tracked in
 [#415](https://github.com/pydantic/pydantic-ai-harness/issues/415).
 

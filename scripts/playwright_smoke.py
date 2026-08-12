@@ -7,7 +7,7 @@ it after installing the browser binary to verify the real integration end to end
     playwright install chromium
     uv run python scripts/playwright_smoke.py
 
-It exercises the public `PlaywrightBrowser` surface and checks eight things:
+It exercises the public `PlaywrightBrowser` surface and checks nine things:
 
 - lazy launch plus a real navigation to https://example.com (prints the title),
 - the allowlist bounce (a disallowed host returns an error result, not content),
@@ -22,6 +22,8 @@ It exercises the public `PlaywrightBrowser` surface and checks eight things:
 - the browser event log: console output and a failed request land in
   `console_messages` / `network_requests` (a refused request is checked in the
   private-address scenario, where the guard is what refuses it),
+- the WebSocket guard: a socket to a loopback port is refused and recorded, while
+  a public socket still connects, sends and receives through it,
 - attaching over `cdp_url` to a browser that already holds a session: the run gets
   its own context (the existing cookie is not visible), the allowlist still bounces,
   and the host browser's own page survives teardown,
@@ -33,6 +35,8 @@ It exercises the public `PlaywrightBrowser` surface and checks eight things:
 from __future__ import annotations
 
 import asyncio
+import base64
+import hashlib
 import socket
 from tempfile import TemporaryDirectory
 
@@ -306,6 +310,85 @@ async def _check_browser_event_log() -> None:
     print('browser event log ok -- console error and failed request recorded')
 
 
+_WS_GUID = b'258EAFA5-E914-47DA-95CA-C5AB0DC85B11'
+
+
+async def _serve_websocket_secret() -> tuple[asyncio.Server, int]:
+    """Serve `_SECRET` over a real WebSocket on a loopback port.
+
+    Hand-rolled rather than pulled from a library: the handshake is a hash and one
+    unmasked text frame, and the script stays dependency-free like the HTTP
+    servers above.
+    """
+
+    async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        key = b''
+        while True:
+            line = await reader.readline()
+            if line in (b'\r\n', b''):
+                break
+            if line.lower().startswith(b'sec-websocket-key:'):
+                key = line.split(b':', 1)[1].strip()
+        accept = base64.b64encode(hashlib.sha1(key + _WS_GUID).digest())
+        writer.write(
+            b'HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n'
+            b'Connection: Upgrade\r\nSec-WebSocket-Accept: ' + accept + b'\r\n\r\n'
+        )
+        payload = _SECRET.encode()
+        writer.write(bytes([0x81, len(payload)]) + payload)
+        await writer.drain()
+        await asyncio.sleep(5)
+
+    server = await asyncio.start_server(handle, '127.0.0.1', 0)
+    return server, server.sockets[0].getsockname()[1]
+
+
+async def _check_websocket_block() -> None:
+    """A WebSocket to a private address is refused; a public one still works.
+
+    `context.route` never sees a WebSocket, so this exercises the separate socket
+    guard. The proof that the guard refused it is the recorded entry, not the
+    failure itself: Chromium's own private-network protection also stops a public
+    page from reaching loopback, so a socket that merely fails proves nothing.
+    """
+    server, port = await _serve_websocket_secret()
+    async with server:
+        script = (
+            'new Promise(resolve => {'
+            f"const s = new WebSocket('ws://127.0.0.1:{port}/');"
+            "s.onmessage = e => resolve('received:' + e.data);"
+            "s.onerror = () => resolve('error');"
+            "s.onclose = () => resolve('closed');"
+            "setTimeout(() => resolve('timeout'), 3000)})"
+        )
+        _, result, network = await _run_tools(
+            PlaywrightBrowser[object](),
+            [
+                ('navigate', {'url': 'http://example.com/'}),
+                ('execute_js', {'script': script, 'timeout_ms': 8000}),
+                ('network_requests', {}),
+            ],
+        )
+        assert _SECRET not in result, result
+        assert f'request_blocked ws://127.0.0.1:{port}' in network, f'the socket guard did not refuse it: {network}'
+    print('websocket to a private address refused ok (recorded by the guard)')
+
+    echo = (
+        'new Promise(resolve => {'
+        "const s = new WebSocket('wss://echo.websocket.org/');"
+        "s.onopen = () => s.send('ping');"
+        "s.onmessage = e => resolve('received');"
+        "s.onerror = () => resolve('error');"
+        "setTimeout(() => resolve('timeout'), 8000)})"
+    )
+    _, echoed = await _run_tools(
+        PlaywrightBrowser[object](),
+        [('navigate', {'url': 'https://example.com/'}), ('execute_js', {'script': echo, 'timeout_ms': 15000})],
+    )
+    assert echoed == 'received', f'a permitted socket did not survive the guard: {echoed}'
+    print('public websocket still connects through the guard ok')
+
+
 async def _main() -> None:
     """Run every smoke scenario in sequence."""
     await _check_navigate()
@@ -314,6 +397,7 @@ async def _main() -> None:
     await _check_storage_state_round_trip()
     await _check_embedded_frame()
     await _check_browser_event_log()
+    await _check_websocket_block()
     await _check_cdp_attach()
     print('all checks passed')
 

@@ -190,6 +190,20 @@ class _FakeRouteHandler(Protocol):
     def __call__(self, route: _FakeRoute, request: _FakeRequest) -> Awaitable[None]: ...  # pragma: no cover
 
 
+class _FakeWebSocketRoute:
+    def __init__(self, url: str) -> None:
+        self.url = url
+        self.closed = False
+        self.connected = False
+
+    async def close(self, *, code: int | None = None, reason: str | None = None) -> None:
+        self.closed = True
+
+    def connect_to_server(self) -> _FakeWebSocketRoute:
+        self.connected = True
+        return self
+
+
 class _FakeBrowserContext:
     def __init__(
         self,
@@ -205,6 +219,8 @@ class _FakeBrowserContext:
         self.accept_downloads = accept_downloads
         self.routes: list[str] = []
         self.route_handler: _FakeRouteHandler | None = None
+        self.websocket_routes: list[str] = []
+        self.websocket_handler: Callable[[_FakeWebSocketRoute], Awaitable[None]] | None = None
 
     async def new_page(self) -> _FakePage:
         return self.page
@@ -212,6 +228,16 @@ class _FakeBrowserContext:
     async def route(self, url: str, handler: _FakeRouteHandler) -> None:
         self.routes.append(url)
         self.route_handler = handler
+
+    async def route_web_socket(self, url: str, handler: Callable[[_FakeWebSocketRoute], Awaitable[None]]) -> None:
+        self.websocket_routes.append(url)
+        self.websocket_handler = handler
+
+    async def dispatch_websocket(self, url: str) -> _FakeWebSocketRoute:
+        assert self.websocket_handler is not None
+        websocket = _FakeWebSocketRoute(url)
+        await self.websocket_handler(websocket)
+        return websocket
 
     async def dispatch(self, request: _FakeRequest) -> _FakeRoute:
         assert self.route_handler is not None
@@ -2590,3 +2616,60 @@ class TestCredentialsStayOutOfTelemetry:
         # depend on parsing succeeding.
         assert toolset_module._without_credentials('http://user:pw@[::1/x') == 'http://[::1/x'
         assert toolset_module._without_credentials('https://example.com/a@b') == 'https://example.com/a@b'
+
+
+class TestWebSocketEgress:
+    """`context.route` never sees a WebSocket, so the block needs its own guard."""
+
+    async def _context(self, monkeypatch: pytest.MonkeyPatch, browser: PlaywrightBrowser[object]) -> _FakePage:
+        page = _FakePage()
+        _install_fake_driver(monkeypatch, page)
+        agent = Agent(TestModel(call_tools=['screenshot']), capabilities=[browser])
+        await agent.run('screenshot the page')
+        return page
+
+    async def test_socket_to_a_private_address_is_closed(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        page = await self._context(monkeypatch, PlaywrightBrowser[object]())
+        websocket = await page.context.dispatch_websocket('ws://127.0.0.1:9000/admin')
+        assert websocket.closed is True
+        assert websocket.connected is False
+
+    async def test_a_public_socket_is_connected_through(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        page = await self._context(monkeypatch, PlaywrightBrowser[object]())
+        websocket = await page.context.dispatch_websocket('wss://example.com/live')
+        assert websocket.connected is True
+        assert websocket.closed is False
+
+    async def test_the_allowlist_does_not_reach_sockets(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # The allowlist governs top-level navigation; cutting a permitted page off
+        # from its own realtime API would be a different policy than the one
+        # documented.
+        page = await self._context(monkeypatch, PlaywrightBrowser[object](allowed_domains=['example.com']))
+        websocket = await page.context.dispatch_websocket('wss://realtime.other.com/live')
+        assert websocket.connected is True
+
+    async def test_no_socket_guard_when_the_block_is_off(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        page = await self._context(monkeypatch, PlaywrightBrowser[object](block_private_addresses=False))
+        assert page.context.websocket_routes == []
+
+    async def test_a_closed_socket_is_recorded_with_its_reason(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        session = PlaywrightBrowserSession()
+        page = _FakePage()
+        _install_fake_driver(monkeypatch, page)
+        async with session:
+            await session.ensure_page()
+            await page.context.dispatch_websocket('ws://169.254.169.254/')
+        assert [event.describe() for event in session.events] == [
+            '[warning] request_blocked ws://169.254.169.254/ blocked private or link-local address'
+        ]
+
+
+class TestMessageRedaction:
+    async def test_a_console_message_loses_its_credentials(self) -> None:
+        page = _FakePage()
+        session = PlaywrightBrowserSession()
+        session.page = page
+        session._on_console(_FakeConsoleMessage('error', 'failed: https://api.example.com/v1?access_token=secret'))
+        assert await _toolset(page, session=session).console_messages() == (
+            '[error] console error: failed: https://api.example.com/v1?access_token=REDACTED'
+        )

@@ -127,6 +127,7 @@ if TYPE_CHECKING:
     from playwright.async_api import Request as PlaywrightRequest
     from playwright.async_api import Route as PlaywrightRoute
     from playwright.async_api import StorageState
+    from playwright.async_api import WebSocketRoute as PlaywrightWebSocketRoute
 
 _T = TypeVar('_T')
 
@@ -698,8 +699,14 @@ class PlaywrightBrowserSession:
         Credentials are removed here, at the one point every event passes
         through, so neither the tool output nor the exported span carries them.
         """
-        if event.url is not None:
-            event = replace(event, url=_without_credentials(event.url))
+        # The message is sanitised alongside the URL: a page that logs its own
+        # request (`console.error('...?access_token=...')`) reaches the model and
+        # the exporter through exactly the same two methods.
+        event = replace(
+            event,
+            url=None if event.url is None else _without_credentials(event.url),
+            message=_without_credentials(event.message),
+        )
         self.events.append(event)
         span = self.operation_span
         if span is not None and span.is_recording():
@@ -793,6 +800,8 @@ class PlaywrightBrowserSession:
         page = await context.new_page()
         if self.policy.enforced():
             await context.route('**/*', self._route_guard)
+        if self.policy.block_private_addresses:
+            await context.route_web_socket('**/*', self._websocket_guard)
         page.on('popup', self._on_popup)
         page.on('console', self._on_console)
         page.on('pageerror', self._on_page_error)
@@ -865,6 +874,29 @@ class PlaywrightBrowserSession:
             await self._abort(route, request.url, reason)
             return
         await route.continue_()
+
+    async def _websocket_guard(self, websocket: PlaywrightWebSocketRoute) -> None:
+        """Apply the private-address block to WebSocket connections.
+
+        `context.route` never sees a WebSocket, so without this a page could open
+        `ws://127.0.0.1:<port>` and talk to an internal service the HTTP guard
+        refuses. Only the private-address block applies, matching how the two
+        policies already differ elsewhere: it covers every resource type, while
+        the allowlist governs top-level navigation and would otherwise cut a
+        permitted page off from its own realtime API.
+
+        A socket that is permitted has to be connected explicitly: registering a
+        handler at all takes Playwright out of its pass-through mode.
+        """
+        if self.policy.refused_in_every_frame(websocket.url):
+            self.record(
+                BrowserEvent(
+                    kind='request_blocked', level='warning', message=_PRIVATE_ADDRESS_REASON, url=websocket.url
+                )
+            )
+            await websocket.close()
+            return
+        websocket.connect_to_server()
 
     async def _abort(self, route: PlaywrightRoute, url: str, reason: str) -> None:
         """Refuse a request and record why, so a blocked page is diagnosable."""
