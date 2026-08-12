@@ -3,20 +3,34 @@
 from __future__ import annotations
 
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
 from pydantic_ai._run_context import AgentDepsT
 from pydantic_ai.capabilities import AbstractCapability
-from pydantic_ai.messages import ModelMessage
+from pydantic_ai.messages import ModelMessage, ModelRequest
 from pydantic_ai.tools import RunContext
 
+from pydantic_ai_harness.compaction._context_window import DEFAULT_CONTEXT_WINDOW
+from pydantic_ai_harness.compaction._pinning import reinject_pinned
+from pydantic_ai_harness.compaction._receipts import (
+    ReceiptInfo,
+    discover_transcript_handle,
+    format_receipt,
+    is_receipt_part,
+    make_receipt_part,
+    record_receipt,
+)
 from pydantic_ai_harness.compaction._shared import (
     compact_with_span,
+    context_for_request,
+    estimate_token_count,
     exceeds,
     find_safe_cutoff,
     find_token_cutoff,
     prepend_first_user_message,
+    resolve_token_trigger,
+    validate_token_trigger,
 )
 
 if TYPE_CHECKING:
@@ -47,10 +61,30 @@ class SlidingWindowCompaction(AbstractCapability[AgentDepsT]):
     """
 
     max_messages: int | None = None
-    """Trigger trimming when message count reaches this value. ``None`` disables."""
+    """Trigger trimming when message count exceeds this value. ``None`` disables."""
 
     max_tokens: int | None = None
-    """Trigger trimming when estimated token count reaches this value. ``None`` disables."""
+    """Trigger trimming when estimated token count exceeds this value. ``None`` disables."""
+
+    max_fraction: float | None = field(default=None, kw_only=True)
+    """Trigger when estimated tokens exceed this fraction of the model's context window.
+
+    Resolved per request from the request's model, so one setting behaves correctly on any
+    model. Mutually exclusive with `max_tokens`."""
+
+    context_window: int | None = field(default=None, kw_only=True)
+    """Window override in tokens. `None` resolves it from the request's model.
+
+    Unlike `fallback_context_window`, this applies whether or not resolution succeeds. Reach
+    for it when the registry is confidently wrong: a beta- or tier-gated window it records as
+    the maximum, or a self-hosted endpoint whose model id describes someone else's
+    deployment. Only consulted alongside `max_fraction`."""
+
+    fallback_context_window: int = field(default=DEFAULT_CONTEXT_WINDOW, kw_only=True)
+    """Window assumed when the request's model is not in the pricing registry.
+
+    Only consulted alongside `max_fraction`. Supply the real number for a deployment the
+    registry cannot resolve."""
 
     keep_messages: int = 40
     """Number of tail messages to retain after trimming (message-count trigger)."""
@@ -73,13 +107,20 @@ class SlidingWindowCompaction(AbstractCapability[AgentDepsT]):
     is always kept after trimming, in addition to system prompts.
     """
 
+    receipts: bool = False
+    """When ``True``, prepend a deterministic compaction receipt recording how much history
+    was dropped, with a transcript handle when a ``TranscriptHandleProvider`` capability is attached.
+
+    Opt-in for now: the receipt text is content, so defaulting it on is deferred to the
+    benchmark eval-rig pass.  The mechanism itself is structural.
+    """
+
     def __post_init__(self) -> None:
-        if self.max_messages is None and self.max_tokens is None:
-            raise ValueError('At least one of max_messages or max_tokens must be set.')
+        if self.max_messages is None and self.max_tokens is None and self.max_fraction is None:
+            raise ValueError('At least one of max_messages, max_tokens, or max_fraction must be set.')
         if self.max_messages is not None and self.max_messages < 1:
             raise ValueError('max_messages must be positive.')
-        if self.max_tokens is not None and self.max_tokens < 1:
-            raise ValueError('max_tokens must be positive.')
+        validate_token_trigger(self.max_tokens, self.max_fraction, self.fallback_context_window, self.context_window)
         if self.keep_messages < 0:
             raise ValueError('keep_messages must be non-negative.')
         if self.keep_tokens is not None and self.keep_tokens < 0:
@@ -92,9 +133,10 @@ class SlidingWindowCompaction(AbstractCapability[AgentDepsT]):
     ) -> list[ModelMessage]:
         """Drop the oldest messages down to the configured tail."""
         if self.keep_tokens is not None:
-            cutoff = find_token_cutoff(messages, self.keep_tokens, self.tokenizer)
+            reservation = self._receipt_token_reservation(messages, ctx) if self.receipts else 0
+            cutoff = find_token_cutoff(messages, max(0, self.keep_tokens - reservation), self.tokenizer)
         else:
-            cutoff = find_safe_cutoff(messages, self.keep_messages)
+            cutoff = find_safe_cutoff(messages, max(0, self.keep_messages - int(self.receipts)))
 
         if cutoff <= 0:
             return messages
@@ -102,7 +144,77 @@ class SlidingWindowCompaction(AbstractCapability[AgentDepsT]):
         trimmed = messages[cutoff:]
         if self.preserve_first_user_message:
             trimmed = prepend_first_user_message(messages, cutoff, trimmed)
+        trimmed = reinject_pinned(messages, trimmed)
+        if self.receipts:
+            trimmed = self._without_receipts(trimmed)
+            dropped = self._dropped_messages(messages, trimmed)
+            trimmed = [self._receipt_message(dropped, ctx), *trimmed]
         return trimmed
+
+    def _receipt_token_reservation(self, messages: list[ModelMessage], ctx: RunContext[AgentDepsT]) -> int:
+        """Reserve enough tokens for any receipt this compaction can emit."""
+        text = format_receipt(
+            dropped_messages=len(messages),
+            dropped_tokens=estimate_token_count(messages, self.tokenizer),
+            by='the harness',
+            handle=discover_transcript_handle(ctx),
+            has_summary=False,
+        )
+        return estimate_token_count([ModelRequest(parts=[make_receipt_part(text)])], self.tokenizer)
+
+    @staticmethod
+    def _without_receipts(messages: list[ModelMessage]) -> list[ModelMessage]:
+        """Remove prior receipt-only requests before inserting the current receipt."""
+        return [
+            message
+            for message in messages
+            if not (
+                isinstance(message, ModelRequest)
+                and message.parts
+                and all(is_receipt_part(part) for part in message.parts)
+            )
+        ]
+
+    @staticmethod
+    def _dropped_messages(messages: list[ModelMessage], retained: list[ModelMessage]) -> list[ModelMessage]:
+        """Return original messages that are absent from the retained history."""
+        unmatched = list(retained)
+        dropped: list[ModelMessage] = []
+        for message in messages:
+            for index, survivor in enumerate(unmatched):
+                if message is survivor:
+                    del unmatched[index]
+                    break
+            else:
+                if not (
+                    isinstance(message, ModelRequest)
+                    and message.parts
+                    and all(is_receipt_part(part) for part in message.parts)
+                ):
+                    dropped.append(message)
+        return dropped
+
+    def _receipt_message(self, dropped: list[ModelMessage], ctx: RunContext[AgentDepsT]) -> ModelRequest:
+        """Build (and record for tracing) a receipt for the *dropped* prefix."""
+        dropped_tokens = estimate_token_count(dropped, self.tokenizer)
+        handle = discover_transcript_handle(ctx)
+        record_receipt(
+            ReceiptInfo(
+                strategy='SlidingWindowCompaction',
+                dropped_messages=len(dropped),
+                dropped_tokens=dropped_tokens,
+                by='the harness',
+                handle=handle,
+            )
+        )
+        text = format_receipt(
+            dropped_messages=len(dropped),
+            dropped_tokens=dropped_tokens,
+            by='the harness',
+            handle=handle,
+            has_summary=False,
+        )
+        return ModelRequest(parts=[make_receipt_part(text)])
 
     async def before_model_request(
         self,
@@ -111,13 +223,17 @@ class SlidingWindowCompaction(AbstractCapability[AgentDepsT]):
     ) -> ModelRequestContext:
         """Trim the message list if it exceeds the configured threshold."""
         messages: list[ModelMessage] = list(request_context.messages)
-        if not exceeds(messages, self.max_messages, self.max_tokens, self.tokenizer):
+        request_ctx = context_for_request(ctx, request_context)
+        token_trigger = resolve_token_trigger(
+            self.max_tokens, self.max_fraction, request_ctx.model, self.fallback_context_window, self.context_window
+        )
+        if not exceeds(messages, self.max_messages, token_trigger, self.tokenizer):
             return request_context
         request_context.messages = await compact_with_span(
-            ctx,
+            request_ctx,
             strategy='SlidingWindowCompaction',
             messages=messages,
-            compact=lambda: self.compact(messages, ctx),
+            compact=lambda: self.compact(messages, request_ctx),
             tokenizer=self.tokenizer,
         )
         return request_context
