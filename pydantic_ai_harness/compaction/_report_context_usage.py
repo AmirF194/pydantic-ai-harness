@@ -12,7 +12,7 @@ from pydantic_ai.messages import ModelMessage
 from pydantic_ai.tools import RunContext
 
 from pydantic_ai_harness.compaction._context_window import DEFAULT_CONTEXT_WINDOW, resolve_context_window
-from pydantic_ai_harness.compaction._shared import estimate_context_tokens, get_compaction_reclaim
+from pydantic_ai_harness.compaction._shared import estimate_context_tokens, get_compaction_reclaim, has_context_usage_anchor
 
 if TYPE_CHECKING:
     from pydantic_ai.models import ModelRequestContext
@@ -109,7 +109,8 @@ class ReportContextUsage(AbstractCapability[AgentDepsT]):
             self.tokenizer,
             model_request_parameters=request_context.model_request_parameters,
         )
-        used = max(used - get_compaction_reclaim(request_context), 0)
+        if has_context_usage_anchor(messages):
+            used = max(used - get_compaction_reclaim(request_context), 0)
         if self.context_window is not None:
             return ContextUsage(used_tokens=used, window_tokens=self.context_window, resolved=True)
         # Resolved from the request's model rather than the run's: a capability may replace

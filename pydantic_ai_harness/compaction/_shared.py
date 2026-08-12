@@ -223,26 +223,39 @@ def estimate_context_tokens(
     underestimate on dense content, which lets the history blow the context window, is the
     expensive one.
     """
-    for index in range(len(messages) - 1, -1, -1):
-        message = messages[index]
-        if isinstance(message, ModelResponse) and message.usage.input_tokens:
-            anchored = message.usage.input_tokens + message.usage.output_tokens
-            segments = _collect_message_text(messages[index + 1 :])
-            # The anchor paid for the instructions in force when its request was made. When the
-            # latest instructions differ (dynamic instructions, or a persisted history resumed
-            # under a new prompt), the new set is absent from both the anchor and the message
-            # text, so count it; when unchanged, counting it would double what the anchor holds.
-            current_instructions = _instructions_text(messages)
-            if current_instructions != _instructions_text(messages[: index + 1]):
-                segments = [*segments, *current_instructions]
-            segments.extend(_revealed_tool_schema_text(messages[index + 1 :], model_request_parameters))
-            if tokenizer is not None:
-                return anchored + sum(tokenizer(s) for s in segments)
-            return anchored + sum(len(s) for s in segments) // _CHARS_PER_TOKEN
+    if anchor := _latest_usage_anchor(messages):
+        index, message = anchor
+        anchored = message.usage.input_tokens + message.usage.output_tokens
+        segments = _collect_message_text(messages[index + 1 :])
+        # The anchor paid for the instructions in force when its request was made. When the
+        # latest instructions differ (dynamic instructions, or a persisted history resumed
+        # under a new prompt), the new set is absent from both the anchor and the message
+        # text, so count it; when unchanged, counting it would double what the anchor holds.
+        current_instructions = _instructions_text(messages)
+        if current_instructions != _instructions_text(messages[: index + 1]):
+            segments = [*segments, *current_instructions]
+        segments.extend(_revealed_tool_schema_text(messages[index + 1 :], model_request_parameters))
+        if tokenizer is not None:
+            return anchored + sum(tokenizer(s) for s in segments)
+        return anchored + sum(len(s) for s in segments) // _CHARS_PER_TOKEN
     segments = [*_collect_text(messages), *_revealed_tool_schema_text(messages, model_request_parameters)]
     if tokenizer is not None:
         return sum(tokenizer(s) for s in segments)
     return sum(len(s) for s in segments) // _CHARS_PER_TOKEN
+
+
+def has_context_usage_anchor(messages: Sequence[ModelMessage]) -> bool:
+    """Return whether `estimate_context_tokens` uses provider-reported usage for *messages*."""
+    return _latest_usage_anchor(messages) is not None
+
+
+def _latest_usage_anchor(messages: Sequence[ModelMessage]) -> tuple[int, ModelResponse] | None:
+    """Return the most recent response with provider-reported input usage."""
+    for index in range(len(messages) - 1, -1, -1):
+        message = messages[index]
+        if isinstance(message, ModelResponse) and message.usage.input_tokens:
+            return index, message
+    return None
 
 
 def _revealed_tool_names(messages: Sequence[ModelMessage]) -> set[str]:

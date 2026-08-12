@@ -887,6 +887,25 @@ class TestReportContextUsage:
         expected = estimate_context_tokens(messages) - (before - estimate_token_count(request_context.messages))
         assert [usage.used_tokens for usage in seen] == [expected, expected]
 
+    async def test_after_a_compactor_reports_the_rewritten_unanchored_history(self, monkeypatch: pytest.MonkeyPatch):
+        _fixed_window(monkeypatch, 1_000)
+        seen: list[ContextUsage] = []
+        messages: list[ModelMessage] = [
+            ModelRequest(parts=[UserPromptPart(content='x' * 4_000)]),
+            ModelResponse(parts=[TextPart(content='done')]),
+            ModelRequest(parts=[UserPromptPart(content='continue')]),
+        ]
+        request_context = _request_context(messages)
+        compactor: SlidingWindowCompaction[None] = SlidingWindowCompaction(
+            max_messages=2, keep_messages=2, preserve_first_user_message=False
+        )
+        monitor: ReportContextUsage[None] = ReportContextUsage(on_usage=seen.append)
+
+        await compactor.before_model_request(_ctx(), request_context)
+        await monitor.before_model_request(_ctx(), request_context)
+
+        assert seen[0].used_tokens == estimate_context_tokens(request_context.messages)
+
     async def test_an_async_callback_is_awaited(self, monkeypatch: pytest.MonkeyPatch):
         _fixed_window(monkeypatch, 1_000)
         seen: list[ContextUsage] = []
