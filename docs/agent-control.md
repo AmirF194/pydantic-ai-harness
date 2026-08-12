@@ -78,11 +78,29 @@ to the Logfire UI.
 Pinning `label='production'` is the recommended default, for the same
 [prompt-cache reasons](managed-prompt.md#prompt-cache-trade-off) as a managed prompt.
 
-## Presence semantics
+## One rule: a managed value is a patch
 
 The variable holds an `AgentConfig`. Every section that is **present** is managed from Logfire; every
 **absent** section keeps whatever the code does. Removing a section in Logfire is therefore a
-deliberate revert to code, not a gap:
+deliberate revert to code, not a gap.
+
+The four sections read differently because a patch's unit is whatever the thing it patches is keyed
+by, and the four are keyed differently:
+
+| Section | Patched per | Can add something new? |
+| --- | --- | --- |
+| `model` | the whole value | no |
+| `settings` | each setting | -- |
+| `tool_definitions` | each tool, by its code-side `name` | no -- an entry naming a tool that doesn't exist is inert |
+| `instructions` | each block, by its `id` | **yes** -- an entry with no `id` adds a block |
+
+Instructions are the only section that can add, and what makes them the exception is what rules the
+others out: text is the only thing a remote value can supply whole. A tool needs an implementation
+and a model needs a provider, so for those a managed value can only ever patch what the code already
+declares -- which is also what keeps a published config from being able to make an agent do something
+its code cannot.
+
+Together those look like this:
 
 ```json
 {
