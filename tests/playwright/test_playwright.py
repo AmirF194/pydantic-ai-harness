@@ -3181,3 +3181,16 @@ class TestReviewFollowUps:
         assert await _toolset(page, session=session).console_messages() == (
             '[info] console log: see http://example.com/ then mail me@example.com'
         )
+
+    async def test_a_callback_url_is_redacted_wherever_a_tool_reports_it(self) -> None:
+        landing = 'https://example.com/cb?code=secret&state=xyz'
+        page = _FakePage(url=landing)
+        toolset = _toolset(page)
+        redacted = 'https://example.com/cb?code=REDACTED&state=xyz'
+        landed = await toolset.navigate(landing)
+        assert isinstance(landed, str)
+        assert f'URL: {redacted}' in landed
+        assert 'secret' not in landed
+        assert f'URL: {redacted}' in await toolset.click('a#next')
+        assert f'URL: {redacted}' in await toolset.go_back()
+        assert redacted in await toolset.tabs('list')

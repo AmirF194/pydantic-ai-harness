@@ -558,7 +558,12 @@ _CREDENTIAL_VALUE = re.compile(
 def _without_credentials(url: str) -> str:
     """Return `url` with userinfo removed and credential parameter values redacted.
 
-    Recorded URLs reach the model and an OpenTelemetry backend, where a bearer
+    Applied to every URL that leaves the browser: the ones tools return, the ones
+    events carry, and the one each operation's span records. An OAuth callback or
+    a signed link puts a usable credential in the address bar, and a tool result
+    is written into the message history like anything else the model reads.
+
+    URLs reach the model and an OpenTelemetry backend, where a bearer
     token, an OAuth code, or a signed-URL signature is replayable by anyone who
     can read them. Regexes rather than a parse-and-rebuild, so a URL Chromium
     accepted but `urlsplit` rejects is still cleaned rather than raising. The
@@ -1450,7 +1455,7 @@ class PlaywrightBrowserToolset(FunctionToolset[AgentDepsT]):
         reason = self._policy.blocked_reason(page.url)
         if reason is None:
             return None
-        blocked = page.url
+        blocked = _without_credentials(page.url)
         await page.goto(_BLANK_PAGE, timeout=timeout)
         return self._error(f'Error: {action} reached a {reason}: {blocked}')
 
@@ -1549,6 +1554,9 @@ class PlaywrightBrowserToolset(FunctionToolset[AgentDepsT]):
         reason = self._policy.blocked_reason(url)
         if reason is not None:
             # Refused before `_in_operation`, so a disallowed URL never launches Chromium.
+            # Not redacted, unlike the URLs below: this one is the argument the model
+            # just passed, so echoing it tells it nothing it did not write, and a
+            # refusal that hid the userinfo would hide what was refused.
             return await self._refuse(timeout_ms, f'Error: {reason}: {url}')
 
         async def _navigate(page: _Page, deadlines: _Deadlines) -> str | ToolReturn[str]:
@@ -1557,7 +1565,7 @@ class PlaywrightBrowserToolset(FunctionToolset[AgentDepsT]):
                 return blocked
             title = await self._await_with_timeout(page.title(), deadlines.action)
             text = await self._page_text(page, deadlines.action)
-            result = self._truncate_output(f'URL: {page.url}\nTitle: {title}\n\n{text}')
+            result = self._truncate_output(f'URL: {_without_credentials(page.url)}\nTitle: {title}\n\n{text}')
             if not self._screenshot_on_navigate:
                 return result
             png = await page.screenshot(timeout=deadlines.action)
@@ -1599,7 +1607,7 @@ class PlaywrightBrowserToolset(FunctionToolset[AgentDepsT]):
             if (blocked := await self._settle(page, 'click', deadlines)) is not None:
                 return blocked
             text = await self._page_text(page, deadlines.action)
-            return self._truncate_output(f"Clicked '{selector}'. URL: {page.url}\n\n{text}")
+            return self._truncate_output(f"Clicked '{selector}'. URL: {_without_credentials(page.url)}\n\n{text}")
 
         return await self._in_operation('click', timeout_ms, _click)
 
@@ -1733,7 +1741,7 @@ class PlaywrightBrowserToolset(FunctionToolset[AgentDepsT]):
             if (oversized := self._oversized_screenshot_error(png)) is not None:
                 return self._error(oversized)
             return ToolReturn(
-                self._truncate_output(f'Screenshot captured. URL: {page.url}'),
+                self._truncate_output(f'Screenshot captured. URL: {_without_credentials(page.url)}'),
                 content=[BinaryContent(data=png, media_type='image/png')],
             )
 
@@ -1828,7 +1836,7 @@ class PlaywrightBrowserToolset(FunctionToolset[AgentDepsT]):
             if (blocked := await self._settle(page, 'go_back', deadlines)) is not None:
                 return blocked
             return self._truncate_output(
-                f'Went back. URL: {page.url}\n\n{await self._page_text(page, deadlines.action)}'
+                f'Went back. URL: {_without_credentials(page.url)}\n\n{await self._page_text(page, deadlines.action)}'
             )
 
         return await self._in_operation('go_back', timeout_ms, _go_back, governed_by_navigation=True)
@@ -1851,7 +1859,7 @@ class PlaywrightBrowserToolset(FunctionToolset[AgentDepsT]):
             if (blocked := await self._settle(page, 'go_forward', deadlines)) is not None:
                 return blocked
             return self._truncate_output(
-                f'Went forward. URL: {page.url}\n\n{await self._page_text(page, deadlines.action)}'
+                f'Went forward. URL: {_without_credentials(page.url)}\n\n{await self._page_text(page, deadlines.action)}'
             )
 
         return await self._in_operation('go_forward', timeout_ms, _go_forward, governed_by_navigation=True)
@@ -2070,7 +2078,8 @@ class PlaywrightBrowserToolset(FunctionToolset[AgentDepsT]):
             if (blocked := await self._enforce_navigation_policy(selected, 'tabs', deadlines.navigation)) is not None:
                 return blocked
             text = await self._page_text(selected, deadlines.action)
-            return self._truncate_output(f'Selected tab {target}. URL: {selected.url}\n\n{text}')
+            url = _without_credentials(selected.url)
+            return self._truncate_output(f'Selected tab {target}. URL: {url}\n\n{text}')
 
         return await self._in_operation('tabs', None, _tabs)
 
@@ -2089,7 +2098,7 @@ class PlaywrightBrowserToolset(FunctionToolset[AgentDepsT]):
             except PlaywrightError:
                 title = '<title unavailable>'
             marker = ' (active)' if page is active else ''
-            lines.append(f'{position}{marker}: {title} -- {page.url}')
+            lines.append(f'{position}{marker}: {title} -- {_without_credentials(page.url)}')
         return '\n'.join(lines)
 
     async def handle_next_dialog(self, accept: bool, prompt_text: str | None = None) -> str:
