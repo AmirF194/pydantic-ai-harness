@@ -26,7 +26,7 @@ from pydantic_ai_harness.compaction._shared import (
 )
 
 if TYPE_CHECKING:
-    from pydantic_ai.models import Model, ModelRequestContext, ModelRequestParameters
+    from pydantic_ai.models import AbstractModel, ModelRequestContext, ModelRequestParameters
 
 
 @dataclass
@@ -126,14 +126,17 @@ class TieredCompaction(AbstractCapability[AgentDepsT]):
             tiers=[tier.with_focus(focus) if isinstance(tier, SupportsFocus) else tier for tier in self.tiers],
         )
 
-    def _target(self, model: Model | str) -> int:
-        """Absolute token target, resolved against *model* when expressed as a fraction."""
-        target = resolve_token_trigger(
+    def _target(self, model: AbstractModel | str) -> int | None:
+        """Absolute token target, resolved against *model* when expressed as a fraction.
+
+        Returns `None` when *model* is realtime (an `AbstractModel` that is not a request-response
+        `Model`): a realtime session never compacts, so this only guards the widened
+        `RunContext.model` type. `__post_init__` requires one of `target_tokens` /
+        `target_fraction`, so a request-response `Model` never resolves to `None`. #585
+        """
+        return resolve_token_trigger(
             self.target_tokens, self.target_fraction, model, self.fallback_context_window, self.context_window
         )
-        if target is None:  # pragma: no cover -- __post_init__ rejects both being unset
-            raise ValueError('One of target_tokens or target_fraction must be set.')
-        return target
 
     async def _escalate(
         self,
@@ -169,7 +172,11 @@ class TieredCompaction(AbstractCapability[AgentDepsT]):
         ctx: RunContext[AgentDepsT],
     ) -> list[ModelMessage]:
         """Apply tiers in order until the history fits the target or tiers run out."""
-        return await self._escalate(messages, ctx, self._target(ctx.model))
+        target = self._target(ctx.model)
+        if target is None:
+            # A realtime model has no token target to escalate toward; leave the history as-is.
+            return messages
+        return await self._escalate(messages, ctx, target)
 
     async def before_model_request(
         self,
@@ -184,7 +191,7 @@ class TieredCompaction(AbstractCapability[AgentDepsT]):
         request_ctx = context_for_request(ctx, request_context)
         # Resolved once, so the gate and the escalation loop cannot disagree about the target.
         target = self._target(request_ctx.model)
-        if (
+        if target is None or (
             estimate_context_tokens(
                 messages,
                 self.tokenizer,
