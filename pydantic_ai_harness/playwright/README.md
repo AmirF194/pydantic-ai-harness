@@ -50,11 +50,11 @@ result = await agent.run('Open https://example.com and tell me the page title.')
 | `navigate` | `(url, timeout_ms=None)` | page URL, title, and visible text (truncated) |
 | `snapshot` | `(timeout_ms=None)` | the accessibility tree with `aria-ref` handles (truncated) |
 | `click` | `(selector, timeout_ms=None)` | page text after the click; `selector` is a CSS selector, an `aria-ref=` handle, or `'x,y'` pixel coordinates |
-| `type_text` | `(selector, text, timeout_ms=None)` | page text after typing (replaces the field value, does not submit) |
+| `type_text` | `(selector, text, sequential=False, timeout_ms=None)` | page text after typing (replaces the field value, does not submit); `sequential=True` sends real key presses |
 | `press_key` | `(key, selector=None, timeout_ms=None)` | page text after the key press; `key` is a Playwright key name (`Enter`, `Escape`, `Tab`, `Control+a`) |
 | `select_option` | `(selector, values, timeout_ms=None)` | page text after choosing options in a `<select>` |
 | `hover` | `(selector, timeout_ms=None)` | page text after hovering, revealing hover-only menus |
-| `wait_for` | `(selector=None, text=None, timeout_ms=None)` | page text once the element/text appears, in the page or any frame; pass exactly one of `selector`/`text` |
+| `wait_for` | `(selector=None, text=None, gone=False, timeout_ms=None)` | page text once the element/text appears -- or, with `gone=True`, once it is gone -- in the page or any frame; pass exactly one of `selector`/`text` |
 | `screenshot` | `(full_page=False, timeout_ms=None)` | a note with the page URL, plus the PNG as image content |
 | `get_text` | `(selector=None, timeout_ms=None)` | the element's text, or the full page's visible text |
 | `scroll` | `(direction, x=None, y=None, timeout_ms=None)` | page text after scrolling; `direction` is up/down/left/right |
@@ -62,12 +62,19 @@ result = await agent.run('Open https://example.com and tell me the page title.')
 | `go_forward` | `(timeout_ms=None)` | the next page's text |
 | `execute_js` | `(script, timeout_ms=None)` | the JavaScript result (string as-is, objects as JSON, `null` as `undefined`) |
 | `console_messages` | `(errors_only=False)` | console output and uncaught script errors, oldest first |
-| `network_requests` | `(url_contains=None)` | requests the page made with their status, including ones the egress policy refused |
+| `tabs` | `(action='list', index=None)` | the open tabs, or a confirmation plus the active tab's text; `action` is `list`/`select`/`close`/`new` |
+| `handle_next_dialog` | `(accept, prompt_text=None)` | a confirmation of how the next `alert`/`confirm`/`prompt` will be answered |
+| `network_requests` | `(url_contains=None, errors_only=False)` | requests the page made with their status, including ones the egress policy refused |
 
 Every page action accepts an optional `timeout_ms` to override both defaults for
 that one call. An override has to be greater than 0: `0` disables the deadline
 entirely, which stays available as a capability default but not as an argument
 the model picks.
+
+A deadline bounds the whole tool call, not each Playwright call inside it. One
+`navigate` waits on a goto, a load state, a title, a body read and possibly a
+screenshot; each stage gets what is left of the budget rather than the whole
+number again, so `timeout_ms` is the longest the call can take.
 
 Two defaults rather than one, because the two failures differ. An action that
 misses (`click`, `get_text`, `wait_for`) is normally a selector matching nothing,
@@ -85,7 +92,23 @@ a visual check is needed (charts, layout).
 
 `type_text` fills a field but does not submit it; `press_key('Enter')` does. A
 native `<select>` does not open as page content, so `select_option` operates it
-rather than `click`.
+rather than `click`. `type_text` sets the value in one step and dispatches no key
+events, which is faster and enough for an ordinary form; pass `sequential=True`
+for a field that reacts to each keystroke -- autocomplete and type-ahead widgets,
+masked or formatted inputs, and editors that ignore a value set directly.
+
+`wait_for` waits for content to arrive; `wait_for(gone=True)` waits for it to go
+away, which is how a spinner or an overlay is waited out when what replaces it is
+not known in advance.
+
+Every tool acts on the active tab. A `target="_blank"` link, a sign-in popup or a
+payment step opens a second one, which stays open rather than being closed:
+`tabs('list')` shows what is open and `tabs('select', index)` moves there. A
+session keeps up to eight tabs; past that a newly opened one is closed and
+recorded. A page dialog (`alert`, `confirm`, `prompt`) blocks the page until it
+is answered, and is dismissed unless `handle_next_dialog(accept=True)` was called
+before the action that opened it -- that call covers one dialog, not the rest of
+the run.
 
 `screenshot` (and the optional `screenshot_on_navigate` attachment) return the
 image as [`BinaryContent`](https://ai.pydantic.dev/api/messages/#pydantic_ai.messages.BinaryContent)
@@ -216,7 +239,7 @@ page and browser, so concurrent `agent.run()` calls never share a tab.
 That lifecycle lives in `PlaywrightBrowserSession`, which the capability creates
 per run. It is exported for the case where you want the same guarded browser
 without an agent around it -- the allowlist, the private-address block, the
-service-worker block, and the single-tab behavior all come with it:
+service-worker block, the tab tracking, and the dialog handling all come with it:
 
 ```python
 from pydantic_ai_harness.playwright import PlaywrightBrowserSession
@@ -227,7 +250,7 @@ async with PlaywrightBrowserSession() as session:
 ```
 
 `PlaywrightBrowserToolset` is exported on the same basis: pass it a session to
-get the sixteen tools without the capability's hooks. The policy lives on the
+get the eighteen tools without the capability's hooks. The policy lives on the
 session and only there, so the guard the session installs and the checks the
 tools run cannot diverge: they are two layers of one decision, applied at
 different moments.
@@ -263,13 +286,17 @@ between tool calls.
   (`browser click`, `browser navigate`), carrying `browser.action`,
   `browser.timeout_ms`, `browser.outcome`, and the resulting `url.full`. What the
   page did during that operation is attached as span events: console output,
-  uncaught script errors, responses, requests the egress policy refused, and
-  popups the session closed. The spans go to the run's own tracer, so an agent
+  uncaught script errors, responses, requests the egress policy refused, dialogs
+  the page opened, and tabs it opened. The spans go to the run's own tracer, so an agent
   instrumented for [Logfire](https://logfire.pydantic.dev/docs/) reports them with everything
   else.
 - The agent can read the same log through `console_messages` and
   `network_requests`, which is often how it recovers from a page that renders
-  from an API rather than from HTML. Recorded URLs keep their host, path and
+  from an API rather than from HTML. Only what identifies a request is recorded,
+  never a response body. A busy page produces more entries than fit the token
+  budget, and it is the oldest that are dropped, so the failure that prompted the
+  call survives; `network_requests(errors_only=True)` narrows it further.
+  Recorded URLs keep their host, path and
   parameter names but lose `user:password@` credentials and the values of
   credential-bearing parameters (`token`, `code`, `signature`, and the rest),
   since those reach both the model and the telemetry backend.
@@ -301,8 +328,8 @@ redaction in place.
 
 ## Limitations
 
-- The browser is single-tab: popups are closed automatically, so flows that
-  depend on a second window do not complete.
+- A session keeps up to eight tabs open; a page that opens more has the extras
+  closed, which is recorded in the event log.
 - CSS selectors cannot reach content inside iframes; reading and acting there
   goes through `snapshot` refs (see
   [Embedded content](#embedded-content-iframes)).

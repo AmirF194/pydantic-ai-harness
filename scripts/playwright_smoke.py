@@ -7,7 +7,7 @@ it after installing the browser binary to verify the real integration end to end
     playwright install chromium
     uv run python scripts/playwright_smoke.py
 
-It exercises the public `PlaywrightBrowser` surface and checks nine things:
+It exercises the public `PlaywrightBrowser` surface and checks twelve things:
 
 - lazy launch plus a real navigation to https://example.com (prints the title),
 - the allowlist bounce (a disallowed host returns an error result, not content),
@@ -24,6 +24,13 @@ It exercises the public `PlaywrightBrowser` surface and checks nine things:
   private-address scenario, where the guard is what refuses it),
 - the WebSocket guard: a socket to a loopback port is refused and recorded, while
   a public socket still connects, sends and receives through it,
+- tabs: a `target="_blank"` link opens a second tab that stays open, `tabs` lists
+  it, selects it, reads it, and closes it,
+- dialogs: a real `confirm` is dismissed by default and accepted after
+  `handle_next_dialog`, and a `prompt` is answered with the given text,
+- keystroke-level typing and a disappearance wait: a type-ahead handler that
+  `fill` never triggers fires under `sequential=True`, and `wait_for(gone=True)`
+  returns once a spinner is hidden,
 - attaching over `cdp_url` to a browser that already holds a session: the run gets
   its own context (the existing cookie is not visible), the allowlist still bounces,
   and the host browser's own page survives teardown,
@@ -61,6 +68,7 @@ async def _run_tools(
     browser: PlaywrightBrowser[object],
     calls: list[tuple[str, dict[str, object]]],
     resolve_ref: tuple[str, int] | None = None,
+    pause: float = 0.0,
 ) -> list[str]:
     """Drive a fixed sequence of tool calls through one agent run, in order.
 
@@ -85,6 +93,10 @@ async def _run_tools(
 
     async def model(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
         nonlocal index
+        # A real run spends a model round trip between tool calls; this scripted one
+        # spends none, which is short enough that a browser event triggered by the
+        # previous call (a tab opening) may not have been delivered yet.
+        await asyncio.sleep(pause)
         for part in messages[-1].parts:
             if isinstance(part, ToolReturnPart):
                 results.append(str(part.content))
@@ -313,6 +325,98 @@ async def _check_browser_event_log() -> None:
 _WS_GUID = b'258EAFA5-E914-47DA-95CA-C5AB0DC85B11'
 
 
+async def _check_tabs() -> None:
+    """A `target="_blank"` link opens a tab that stays open, and `tabs` drives it."""
+    second, second_port = await _serve_html(b'<html><body><h1>SECOND-TAB</h1></body></html>')
+    first, first_port = await _serve_html(
+        f'<html><body><h1>First</h1>'
+        f'<a id="open" href="http://127.0.0.1:{second_port}/" target="_blank">Open</a>'
+        f'</body></html>'.encode()
+    )
+    async with first, second:
+        browser = PlaywrightBrowser[object](block_private_addresses=False)
+        _, _, listed, selected, closed = await _run_tools(
+            browser,
+            [
+                ('navigate', {'url': f'http://127.0.0.1:{first_port}/'}),
+                ('click', {'selector': '#open'}),
+                ('tabs', {'action': 'list'}),
+                ('tabs', {'action': 'select', 'index': 1}),
+                ('tabs', {'action': 'close', 'index': 1}),
+            ],
+            pause=0.3,
+        )
+        assert listed.count('\n') == 1, f'the opened tab is missing from the list: {listed}'
+        assert '(active)' in listed.splitlines()[0], f'the popup took over as active tab: {listed}'
+        assert 'SECOND-TAB' in selected, f'selecting the tab did not read it: {selected}'
+        assert closed.startswith('Closed tab 1.'), closed
+    print('tabs ok -- popup kept, listed, selected, read and closed')
+
+
+_DIALOG_PAGE = (
+    b'<html><body><h1>Dialogs</h1><div id="out">none</div>'
+    b'<button id="ask">Ask</button><button id="name">Name</button>'
+    b"<script>document.getElementById('ask').onclick = () => "
+    b"{ document.getElementById('out').textContent = confirm('Sure?') ? 'CONFIRMED' : 'CANCELLED' };"
+    b"document.getElementById('name').onclick = () => "
+    b"{ document.getElementById('out').textContent = 'NAME:' + prompt('Who?') };"
+    b'</script></body></html>'
+)
+
+
+async def _check_dialogs() -> None:
+    """A real `confirm` takes the cancelling branch by default and the accepting one when armed."""
+    server, port = await _serve_html(_DIALOG_PAGE)
+    async with server:
+        browser = PlaywrightBrowser[object](block_private_addresses=False)
+        _, dismissed, _, accepted, _, answered = await _run_tools(
+            browser,
+            [
+                ('navigate', {'url': f'http://127.0.0.1:{port}/'}),
+                ('click', {'selector': '#ask'}),
+                ('handle_next_dialog', {'accept': True}),
+                ('click', {'selector': '#ask'}),
+                ('handle_next_dialog', {'accept': True, 'prompt_text': 'Ada'}),
+                ('click', {'selector': '#name'}),
+            ],
+        )
+        assert 'CANCELLED' in dismissed, f'an unarmed confirm was not dismissed: {dismissed}'
+        assert 'CONFIRMED' in accepted, f'an armed confirm was not accepted: {accepted}'
+        assert 'NAME:Ada' in answered, f'the prompt was not answered with the given text: {answered}'
+    print('dialogs ok -- confirm dismissed, confirm accepted, prompt answered')
+
+
+_TYPEAHEAD_PAGE = (
+    b'<html><body><input id="q"><div id="hint"></div><div id="spinner">Loading</div>'
+    b"<script>document.getElementById('q').addEventListener('keydown', () => "
+    b"{ document.getElementById('hint').textContent = 'TYPEAHEAD-FIRED' });"
+    b"setTimeout(() => { document.getElementById('spinner').style.display = 'none' }, 800);"
+    b'</script></body></html>'
+)
+
+
+async def _check_typing_and_waiting() -> None:
+    """`sequential=True` dispatches real key events, and `gone=True` waits for a spinner to go."""
+    server, port = await _serve_html(_TYPEAHEAD_PAGE)
+    async with server:
+        browser = PlaywrightBrowser[object](block_private_addresses=False)
+        _, waited, _, after_fill, _, after_keys = await _run_tools(
+            browser,
+            [
+                ('navigate', {'url': f'http://127.0.0.1:{port}/'}),
+                ('wait_for', {'text': 'Loading', 'gone': True, 'timeout_ms': 5000}),
+                ('type_text', {'selector': '#q', 'text': 'ada'}),
+                ('get_text', {'selector': '#hint'}),
+                ('type_text', {'selector': '#q', 'text': 'ada', 'sequential': True}),
+                ('get_text', {'selector': '#hint'}),
+            ],
+        )
+        assert 'timed out' not in waited, waited
+        assert 'TYPEAHEAD-FIRED' not in after_fill, f'fill dispatched key events after all: {after_fill}'
+        assert 'TYPEAHEAD-FIRED' in after_keys, f'sequential typing dispatched no key events: {after_keys}'
+    print('typing and waiting ok -- key events dispatched, spinner waited out')
+
+
 async def _serve_websocket_secret() -> tuple[asyncio.Server, int]:
     """Serve `_SECRET` over a real WebSocket on a loopback port.
 
@@ -398,6 +502,9 @@ async def _main() -> None:
     await _check_embedded_frame()
     await _check_browser_event_log()
     await _check_websocket_block()
+    await _check_tabs()
+    await _check_dialogs()
+    await _check_typing_and_waiting()
     await _check_cdp_attach()
     print('all checks passed')
 

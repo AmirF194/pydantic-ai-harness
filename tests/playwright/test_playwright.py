@@ -11,7 +11,8 @@ from __future__ import annotations
 import asyncio
 import inspect
 import sys
-from collections.abc import Awaitable, Callable, Sequence
+from collections.abc import AsyncGenerator, Awaitable, Callable, Sequence
+from contextlib import asynccontextmanager
 from typing import Protocol
 
 import pytest
@@ -59,6 +60,38 @@ def anyio_backend() -> str:
 # --- Doubles for the Playwright API surface ---------------------------------
 
 
+class _FakeLocator:
+    def __init__(self, page: _FakePage, selector: str) -> None:
+        self._page = page
+        self._selector = selector
+
+    async def press_sequentially(self, text: str, *, delay: float | None = None, timeout: float | None = None) -> None:
+        self._page.timeouts['press_sequentially'] = timeout
+        self._page.typed.append((self._selector, text))
+
+
+class _FakeDialog:
+    def __init__(self, *, type: str = 'confirm', message: str = 'Delete this?') -> None:
+        self.type = type
+        self.message = message
+        self.accepted_with: str | None = None
+        self.answer: str | None = None
+
+    async def accept(self, prompt_text: str | None = None) -> None:
+        self.answer = 'accept'
+        self.accepted_with = prompt_text
+
+    async def dismiss(self) -> None:
+        self.answer = 'dismiss'
+
+
+class _FakeUnanswerableDialog(_FakeDialog):
+    """A dialog whose page has already gone away."""
+
+    async def dismiss(self) -> None:
+        raise PlaywrightError('Target page, context or browser has been closed')
+
+
 class _FakeMouse:
     def __init__(self) -> None:
         self.calls: list[tuple[str, int, int]] = []
@@ -98,13 +131,17 @@ class _FakeFrameContent:
         self._inner_text_error = inner_text_error
         self._wait_for_error = wait_for_error
         self._wait_delay = wait_delay
+        self.wait_states: list[str | None] = []
 
     async def inner_text(self, selector: str, *, timeout: float | None = None) -> str:
         if self._inner_text_error is not None:
             raise self._inner_text_error
         return self._text
 
-    async def wait_for_selector(self, selector: str, *, timeout: float | None = None) -> object:
+    async def wait_for_selector(
+        self, selector: str, *, timeout: float | None = None, state: str | None = None
+    ) -> object:
+        self.wait_states.append(state)
         if self._wait_delay:
             await asyncio.sleep(self._wait_delay)
         if self._wait_for_error is not None:
@@ -215,6 +252,7 @@ class _FakeBrowserContext:
         accept_downloads: bool | None = None,
     ) -> None:
         self.page = page
+        self.opened: list[_FakePage] = []
         self.storage_state = storage_state
         self.service_workers = service_workers
         self.accept_downloads = accept_downloads
@@ -224,7 +262,13 @@ class _FakeBrowserContext:
         self.websocket_handler: Callable[[_FakeWebSocketRoute], Awaitable[None]] | None = None
 
     async def new_page(self) -> _FakePage:
-        return self.page
+        if not self.opened:
+            self.opened.append(self.page)
+            return self.page
+        page = _FakePage(url='about:blank', title='')
+        page._context = self
+        self.opened.append(page)
+        return page
 
     async def route(self, url: str, handler: _FakeRouteHandler) -> None:
         self.routes.append(url)
@@ -277,6 +321,7 @@ class _FakePage:
         select_option_error: PlaywrightError | None = None,
         aria_snapshot_tree: str = '- heading "Example" [ref=e1]\n- button "Go" [ref=e2]',
         aria_snapshot_error: PlaywrightError | None = None,
+        title_error: PlaywrightError | None = None,
     ) -> None:
         self._url = url
         self._title = title
@@ -304,6 +349,7 @@ class _FakePage:
         self._select_option_error = select_option_error
         self._aria_snapshot_tree = aria_snapshot_tree
         self._aria_snapshot_error = aria_snapshot_error
+        self._title_error = title_error
         self._context: _FakeBrowserContext | None = None
         self._popup_on_screenshot: _FakePage | None = None
         self.mouse = _FakeMouse()
@@ -320,6 +366,9 @@ class _FakePage:
         self.handlers: dict[str, list[Callable[[object], None]]] = {}
         self.popup_events: list[str] = []
         self.popup_handlers: list[Callable[[_FakePage], None]] = []
+        self.typed: list[tuple[str, str]] = []
+        self.wait_states: list[str | None] = []
+        self.brought_to_front = 0
         self.closed = False
 
     @property
@@ -347,7 +396,15 @@ class _FakePage:
         self.timeouts['wait_for_load_state'] = timeout
 
     async def title(self) -> str:
+        if self._title_error is not None:
+            raise self._title_error
         return self._title
+
+    def locator(self, selector: str) -> _FakeLocator:
+        return _FakeLocator(self, selector)
+
+    async def bring_to_front(self) -> None:
+        self.brought_to_front += 1
 
     async def inner_text(self, selector: str, *, timeout: float | None = None) -> str:
         self.timeouts['inner_text'] = timeout
@@ -399,8 +456,11 @@ class _FakePage:
             raise self._go_forward_error
         return self._go_forward_result
 
-    async def wait_for_selector(self, selector: str, *, timeout: float | None = None) -> object:
+    async def wait_for_selector(
+        self, selector: str, *, timeout: float | None = None, state: str | None = None
+    ) -> object:
         self.timeouts['wait_for_selector'] = timeout
+        self.wait_states.append(state)
         if self._wait_for_error is not None:
             raise self._wait_for_error
         return None
@@ -415,6 +475,7 @@ class _FakePage:
         self.closed = True
         if self._close_error is not None:
             raise self._close_error
+        self.emit('close', self)
 
     async def hover(self, selector: str, *, timeout: float | None = None) -> None:
         self.timeouts['hover'] = timeout
@@ -661,6 +722,8 @@ def _toolset(
         )
     )
     session.page = page
+    if not session.pages:
+        session.pages = [page]
     return PlaywrightBrowserToolset[None](
         session=session,
         screenshot_on_navigate=screenshot_on_navigate,
@@ -1333,17 +1396,27 @@ class TestPerCallTimeout:
     async def test_override_reaches_each_playwright_call(self) -> None:
         page = _FakePage()
         toolset = _toolset(page)
+
+        def under(stage: str, budget: int) -> None:
+            """Assert `stage` ran under `budget`, allowing for what earlier stages spent."""
+            spent = page.timeouts[stage]
+            # The first Playwright call of an operation gets the whole override and
+            # each later one gets what is left of it, so a trailing stage lands just
+            # under. The slack is far smaller than the gap between two budgets here,
+            # so a value left behind by the previous operation still fails.
+            assert spent is not None and budget - 500 < spent <= budget, f'{stage}={spent}, budget={budget}'
+
         await toolset.navigate('https://example.com/', timeout_ms=1111)
         assert page.timeouts['goto'] == 1111
         # Trailing operations (load wait, page-text read) run under the same
         # override, not the capability default.
         await toolset.click('button#go', timeout_ms=2222)
         assert page.timeouts['click'] == 2222
-        assert page.timeouts['wait_for_load_state'] == 2222
-        assert page.timeouts['inner_text'] == 2222
+        under('wait_for_load_state', 2222)
+        under('inner_text', 2222)
         await toolset.type_text('input#q', 'hi', timeout_ms=3333)
         assert page.timeouts['fill'] == 3333
-        assert page.timeouts['inner_text'] == 3333
+        under('inner_text', 3333)
         await toolset.get_text('h1', timeout_ms=4444)
         assert page.timeouts['inner_text'] == 4444
         await toolset.get_text(timeout_ms=4545)
@@ -1352,18 +1425,18 @@ class TestPerCallTimeout:
         assert page.timeouts['screenshot'] == 5555
         await toolset.go_back(timeout_ms=6666)
         assert page.timeouts['go_back'] == 6666
-        assert page.timeouts['wait_for_load_state'] == 6666
-        assert page.timeouts['inner_text'] == 6666
+        under('wait_for_load_state', 6666)
+        under('inner_text', 6666)
         await toolset.go_forward(timeout_ms=7777)
         assert page.timeouts['go_forward'] == 7777
-        assert page.timeouts['wait_for_load_state'] == 7777
+        under('wait_for_load_state', 7777)
         await toolset.wait_for(selector='.ready', timeout_ms=8888)
         assert page.timeouts['wait_for_selector'] == 8888
-        assert page.timeouts['inner_text'] == 8888
+        under('inner_text', 8888)
         await toolset.snapshot(timeout_ms=9999)
         assert page.timeouts['aria_snapshot'] == 9999
         await toolset.scroll('down', timeout_ms=1234)
-        assert page.timeouts['inner_text'] == 1234
+        under('inner_text', 1234)
 
     async def test_override_bounds_the_disallowed_navigation_bounce(self) -> None:
         # The bounce to about:blank is itself a navigation, so it must run under the
@@ -1862,15 +1935,15 @@ class TestPlaywrightBrowserLifecycle:
         assert allowed.aborted is False
         assert allowed.continued is True
 
-    async def test_only_popup_listener_registered_not_dialog(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    async def test_every_page_event_the_session_acts_on_is_subscribed(self, monkeypatch: pytest.MonkeyPatch) -> None:
         page = _FakePage()
         _install_fake_driver(monkeypatch, page)
         agent = Agent(TestModel(call_tools=['screenshot']), capabilities=[PlaywrightBrowser()])
         await agent.run('screenshot the page')
-        # Only a 'popup' listener is registered, never a 'dialog' one: the capability
-        # deliberately relies on Playwright auto-dismissing dialogs (alert/confirm/
-        # beforeunload) when no handler is attached, rather than managing them.
-        assert page.popup_events == ['popup']
+        # The dialog listener is what takes Playwright out of its auto-dismiss mode,
+        # and the close listener is what keeps the tab list honest when a page closes
+        # itself.
+        assert set(page.handlers) == {'popup', 'console', 'pageerror', 'response', 'requestfailed', 'dialog', 'close'}
 
     async def test_cancellation_mid_tool_call_tears_down_browser(self, monkeypatch: pytest.MonkeyPatch) -> None:
         page = _HangingScreenshotPage()
@@ -2001,40 +2074,43 @@ class TestPlaywrightBrowserLifecycle:
         assert local.aborted is False
         assert local.continued is True
 
-    async def test_popup_is_closed_without_navigating_main_page(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    async def test_popup_is_kept_as_a_tab_without_taking_over_the_page(self, monkeypatch: pytest.MonkeyPatch) -> None:
         popup = _FakePage(url='https://example.com/popup')
         page = _FakePage()
         page._popup_on_screenshot = popup
         _install_fake_driver(monkeypatch, page)
-        agent = Agent(TestModel(call_tools=['screenshot']), capabilities=[PlaywrightBrowser()])
-        await agent.run('screenshot the page')
-        assert popup.closed is True
-        assert page.goto_calls == []
+        session = PlaywrightBrowserSession()
+        async with session:
+            await session.ensure_page()
+            await _toolset(page, session=session).screenshot()
+            assert popup.closed is False
+            assert session.pages == [page, popup]
+            # The tab the operation started on is still the active one, and it never moved.
+            assert session.page is page
+            assert page.goto_calls == []
 
-    async def test_popup_close_error_is_observed_and_does_not_fail_run(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        popup = _FakePage(url='https://example.com/popup', close_error=RuntimeError('popup close failed'))
+    async def test_popup_past_the_tab_limit_is_closed(self, monkeypatch: pytest.MonkeyPatch) -> None:
         page = _FakePage()
-        page._popup_on_screenshot = popup
         _install_fake_driver(monkeypatch, page)
-        browser = PlaywrightBrowser[object]()
+        refused = _FakePage(url='https://example.com/popup')
+        session = PlaywrightBrowserSession()
+        async with session:
+            await session.ensure_page()
+            session.pages.extend(_FakePage() for _ in range(toolset_module._MAX_TABS - 1))
+            page.emit('popup', refused)
+            await asyncio.gather(*session._event_tasks, return_exceptions=True)
+            assert refused.closed is True
+            assert len(session.pages) == toolset_module._MAX_TABS
+            assert [event.kind for event in session.events] == ['popup_closed']
 
-        async def _same_instance(self: PlaywrightBrowser[object], ctx: RunContext[object]) -> PlaywrightBrowser[object]:
-            return self
-
-        monkeypatch.setattr(PlaywrightBrowser, 'for_run', _same_instance)
-        agent = Agent(TestModel(call_tools=['screenshot']), capabilities=[browser])
-        await agent.run('screenshot the page')
-        assert popup.closed is True
-        assert browser._session._popup_tasks == set()
-
-    async def test_cancelled_popup_task_is_discarded(self) -> None:
+    async def test_cancelled_event_task_is_discarded(self) -> None:
         browser = PlaywrightBrowser[None]()
         task = asyncio.create_task(asyncio.sleep(1))
-        browser._session._popup_tasks.add(task)
+        browser._session._event_tasks.add(task)
         task.cancel()
         await asyncio.gather(task, return_exceptions=True)
-        browser._session._popup_done(task)
-        assert browser._session._popup_tasks == set()
+        browser._session._event_task_done(task)
+        assert browser._session._event_tasks == set()
 
     async def test_run_without_browser_tool_skips_launch(self, monkeypatch: pytest.MonkeyPatch) -> None:
         page = _FakePage()
@@ -2193,7 +2269,7 @@ class TestPlaywrightBrowserLifecycle:
         # driver still tore down and only the masking close error was swallowed.
         assert cm.exited is True
 
-    async def test_pending_popup_tasks_cancelled_on_run_end(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    async def test_pending_event_tasks_cancelled_on_run_end(self, monkeypatch: pytest.MonkeyPatch) -> None:
         page = _FakePage()
         _install_fake_driver(monkeypatch, page)
         browser = PlaywrightBrowser()
@@ -2203,11 +2279,11 @@ class TestPlaywrightBrowserLifecycle:
 
         monkeypatch.setattr(PlaywrightBrowser, 'for_run', _same_instance)
         pending = asyncio.ensure_future(asyncio.sleep(3600))
-        browser._session._popup_tasks.add(pending)
+        browser._session._event_tasks.add(pending)
         agent = Agent(TestModel(call_tools=['screenshot']), capabilities=[browser])
         await agent.run('screenshot the page')
         assert pending.cancelled()
-        assert browser._session._popup_tasks == set()
+        assert browser._session._event_tasks == set()
 
 
 # --- Package surface --------------------------------------------------------
@@ -2358,6 +2434,7 @@ class TestBrowserEvents:
     def _session(self, page: _FakePage) -> PlaywrightBrowserSession:
         session = PlaywrightBrowserSession()
         session.page = page
+        session.pages = [page]
         return session
 
     async def test_console_messages_carry_the_page_severity(self) -> None:
@@ -2424,7 +2501,7 @@ class TestBrowserEvents:
             '[warning] request_blocked https://evil.com/ domain not in allowed_domains'
         ]
 
-    async def test_closed_popup_is_recorded(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    async def test_opened_popup_is_recorded(self, monkeypatch: pytest.MonkeyPatch) -> None:
         page = _FakePage()
         _install_fake_driver(monkeypatch, page)
         session = PlaywrightBrowserSession()
@@ -2433,7 +2510,7 @@ class TestBrowserEvents:
             page.emit('popup', _FakePage(url='https://example.com/popup'))
             await asyncio.sleep(0)
         assert [event.describe() for event in session.events] == [
-            '[warning] popup_closed https://example.com/popup popup closed'
+            '[info] popup_opened https://example.com/popup opened by the page'
         ]
 
     async def test_empty_log_reports_that_rather_than_nothing(self) -> None:
@@ -2500,7 +2577,9 @@ class TestBrowserEvents:
         (span,) = exporter.get_finished_spans()
         assert span.attributes is not None
         assert span.attributes['browser.outcome'] == 'error'
-        assert 'url.full' not in span.attributes
+        # Recorded on the failure path too: which page the click failed on is what
+        # makes the span diagnosable.
+        assert span.attributes['url.full'] == 'https://example.com/'
 
     async def test_events_outside_an_operation_are_still_logged(self) -> None:
         page = _FakePage()
@@ -2696,3 +2775,337 @@ class TestMessageRedaction:
         assert await _toolset(page, session=session).console_messages() == (
             '[error] console error: failed: https://api.example.com/v1?access_token=REDACTED'
         )
+
+
+# --- Tabs, dialogs and the operation deadline -------------------------------
+
+
+class _HangingClickMouse(_FakeMouse):
+    async def click(self, x: float, y: float) -> None:
+        await asyncio.Event().wait()
+
+
+class _HangingClickMousePage(_FakePage):
+    """A page whose coordinate click never settles."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.mouse = _HangingClickMouse()
+
+
+class TestOperationDeadline:
+    async def test_each_stage_gets_what_is_left_not_the_whole_budget(self) -> None:
+        class _SlowGotoPage(_FakePage):
+            async def goto(self, url: str, *, timeout: float | None = None) -> None:
+                await asyncio.sleep(0.05)
+                await super().goto(url, timeout=timeout)
+
+        page = _SlowGotoPage()
+        await _toolset(page).navigate('https://example.com/', timeout_ms=2000)
+        # The goto saw the full budget; every later call in the same operation saw
+        # less, because the time the goto spent is gone.
+        assert page.timeouts['goto'] == 2000
+        for stage in ('wait_for_load_state', 'inner_text'):
+            remaining = page.timeouts[stage]
+            assert remaining is not None and 0 < remaining < 2000
+
+    async def test_a_zero_default_still_means_no_deadline(self) -> None:
+        page = _FakePage()
+        await _toolset(page, action_timeout_ms=0, navigation_timeout_ms=0).get_text()
+        assert page.timeouts['inner_text'] == 0
+
+    async def test_coordinate_click_is_bounded(self) -> None:
+        page = _HangingClickMousePage()
+        result = await _toolset(page).click('10,20', timeout_ms=20)
+        assert result.startswith('Error: click timed out after 20ms.')
+
+    async def test_the_reported_budget_is_the_one_that_was_configured(self) -> None:
+        class _SlowClickPage(_FakePage):
+            async def click(self, selector: str, *, timeout: float | None = None) -> None:
+                await asyncio.sleep(0.03)
+                raise PlaywrightTimeoutError('Timeout 1000ms exceeded.')
+
+        result = await _toolset(_SlowClickPage()).click('button#go', timeout_ms=1000)
+        assert result.startswith('Error: click timed out after 1000ms.')
+
+
+class TestSpanOutcome:
+    async def test_a_returned_error_marks_the_span_failed(self) -> None:
+        page = _FakePage(selector_raises=True)
+        session = PlaywrightBrowserSession()
+        session.page = page
+        session.pages = [page]
+        tracer, exporter = _recording_tracer()
+        session.tracer = tracer
+        result = await _toolset(page, session=session).get_text('#missing')
+        assert result.startswith('Error getting text')
+        (span,) = exporter.get_finished_spans()
+        assert span.attributes is not None and span.attributes['browser.outcome'] == 'error'
+
+    async def test_an_escaping_exception_marks_the_span_failed(self) -> None:
+        session = PlaywrightBrowserSession()
+        session.launch_error = 'Chromium is not installed.'
+        tracer, exporter = _recording_tracer()
+        session.tracer = tracer
+        toolset = PlaywrightBrowserToolset[None](session=session)
+        with pytest.raises(RuntimeError):
+            await toolset.snapshot()
+        (span,) = exporter.get_finished_spans()
+        assert span.attributes is not None and span.attributes['browser.outcome'] == 'error'
+        assert 'url.full' not in span.attributes
+
+    async def test_the_log_tools_open_their_own_span(self) -> None:
+        page = _FakePage()
+        session = PlaywrightBrowserSession()
+        session.page = page
+        session.pages = [page]
+        tracer, exporter = _recording_tracer()
+        session.tracer = tracer
+        toolset = _toolset(page, session=session)
+        await toolset.console_messages()
+        await toolset.network_requests()
+        await toolset.handle_next_dialog(accept=True)
+        assert [span.name for span in exporter.get_finished_spans()] == [
+            'browser console_messages',
+            'browser network_requests',
+            'browser handle_next_dialog',
+        ]
+
+
+class TestEventLogBounds:
+    def _session(self, page: _FakePage) -> PlaywrightBrowserSession:
+        session = PlaywrightBrowserSession()
+        session.page = page
+        session.pages = [page]
+        return session
+
+    async def test_a_long_console_message_is_clipped_when_recorded(self) -> None:
+        page = _FakePage()
+        session = self._session(page)
+        session._on_console(_FakeConsoleMessage('log', 'x' * 5000))
+        (event,) = session.events
+        assert len(event.message) == toolset_module._MAX_EVENT_CHARS + len('...')
+
+    async def test_the_oldest_requests_are_dropped_not_the_newest(self) -> None:
+        page = _FakePage()
+        session = self._session(page)
+        for index in range(60):
+            session.record(
+                toolset_module.BrowserEvent(
+                    kind='response', level='info', message='', url=f'https://example.com/{index}', status=200
+                )
+            )
+        result = await _toolset(page, session=session, max_content_tokens=40).network_requests()
+        assert result.startswith('[... ')
+        assert 'https://example.com/59' in result
+        assert 'https://example.com/0 ' not in result
+
+    async def test_one_request_larger_than_the_budget_is_still_returned(self) -> None:
+        page = _FakePage()
+        session = self._session(page)
+        session.record(
+            toolset_module.BrowserEvent(
+                kind='response', level='info', message='', url='https://example.com/' + 'a' * 80
+            )
+        )
+        result = await _toolset(page, session=session, max_content_tokens=5).network_requests()
+        # Nothing fits, so the one entry is kept and cut rather than replaced by a
+        # marker saying it was dropped.
+        assert result == '[info] response http'
+        assert len(result) == 20
+
+    async def test_errors_only_drops_the_successful_requests(self) -> None:
+        page = _FakePage()
+        session = self._session(page)
+        session._on_response(_FakeResponse(url='https://example.com/ok', status=200))
+        session._on_response(_FakeResponse(url='https://example.com/gone', status=404))
+        result = await _toolset(page, session=session).network_requests(errors_only=True)
+        assert 'https://example.com/gone' in result
+        assert 'https://example.com/ok' not in result
+
+
+class TestTypingAndWaiting:
+    async def test_sequential_typing_clears_then_presses_each_key(self) -> None:
+        page = _FakePage()
+        await _toolset(page).type_text('input#q', 'hello', sequential=True)
+        assert page.filled == [('input#q', '')]
+        assert page.typed == [('input#q', 'hello')]
+
+    async def test_waiting_for_something_to_go_away_asks_for_the_hidden_state(self) -> None:
+        page = _FakePage()
+        page.frames.append(_FakeFrameContent())
+        result = await _toolset(page).wait_for(selector='.spinner', gone=True)
+        assert result.startswith("Gone '.spinner'.")
+        assert page.wait_states == ['hidden']
+        assert page.frames[1].wait_states == ['hidden']
+
+    async def test_a_frame_that_keeps_the_element_fails_the_disappearance_wait(self) -> None:
+        page = _FakePage()
+        page.frames.append(_FakeFrameContent(wait_for_error=PlaywrightTimeoutError('Timeout 5000ms exceeded.')))
+        result = await _toolset(page).wait_for(text='Loading', gone=True)
+        assert result.startswith('Error: wait_for timed out')
+
+
+class TestTabs:
+    def _session(self, page: _FakePage) -> PlaywrightBrowserSession:
+        session = PlaywrightBrowserSession()
+        session.page = page
+        session.pages = [page]
+        return session
+
+    async def test_list_marks_the_active_tab(self) -> None:
+        page = _FakePage(url='https://example.com/', title='Example')
+        session = self._session(page)
+        session.pages.append(_FakePage(url='https://example.com/popup', title='Popup'))
+        assert await _toolset(page, session=session).tabs() == (
+            '0 (active): Example -- https://example.com/\n1: Popup -- https://example.com/popup'
+        )
+
+    async def test_a_tab_whose_title_cannot_be_read_is_still_listed(self) -> None:
+        page = _FakePage(title_error=PlaywrightError('page crashed'))
+        assert await _toolset(page).tabs() == '0 (active): <title unavailable> -- https://example.com/'
+
+    async def test_select_switches_the_page_every_tool_acts_on(self) -> None:
+        page = _FakePage()
+        popup = _FakePage(url='https://example.com/popup', body='Popup body')
+        session = self._session(page)
+        session.pages.append(popup)
+        result = await _toolset(page, session=session).tabs('select', 1)
+        assert result == 'Selected tab 1. URL: https://example.com/popup\n\nPopup body'
+        assert session.page is popup
+        assert popup.brought_to_front == 1
+
+    async def test_selecting_a_tab_outside_the_allowlist_bounces_it(self) -> None:
+        page = _FakePage()
+        popup = _FakePage(url='https://evil.example/')
+        session = PlaywrightBrowserSession(policy=toolset_module.NavigationPolicy(allowed_domains=['example.com']))
+        session.page = page
+        session.pages = [page, popup]
+        result = await _toolset(page, session=session).tabs('select', 1)
+        assert result == 'Error: tabs reached a domain not in allowed_domains: https://evil.example/'
+        assert popup.goto_calls == ['about:blank']
+
+    async def test_new_opens_a_blank_tab_and_makes_it_active(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        page = _FakePage()
+        _install_fake_driver(monkeypatch, page)
+        session = PlaywrightBrowserSession()
+        async with session:
+            await session.ensure_page()
+            result = await _toolset(page, session=session).tabs('new')
+            assert result == 'Opened blank tab 1 and made it active. Load it with navigate.'
+            assert len(session.pages) == 2
+            assert session.page is session.pages[1]
+
+    async def test_closing_the_active_tab_moves_to_the_one_that_remains(self) -> None:
+        page = _FakePage()
+        popup = _FakePage(url='https://example.com/popup')
+        session = self._session(page)
+        session.pages.append(popup)
+        session.page = popup
+        result = await _toolset(popup, session=session).tabs('close')
+        assert result == 'Closed tab 1. Active tab is now 0.'
+        assert popup.closed is True
+        assert session.pages == [page]
+        assert session.page is page
+
+    async def test_closing_another_tab_leaves_the_active_one_alone(self) -> None:
+        page = _FakePage()
+        popup = _FakePage(url='https://example.com/popup')
+        session = self._session(page)
+        session.pages.append(popup)
+        result = await _toolset(page, session=session).tabs('close', 1)
+        assert result == 'Closed tab 1. Active tab is now 0.'
+        assert session.pages == [page]
+
+    async def test_a_tab_that_refuses_to_close_reports_it(self) -> None:
+        page = _FakePage()
+        popup = _FakePage(url='https://example.com/popup', close_error=PlaywrightError('page is busy'))
+        session = self._session(page)
+        session.pages.append(popup)
+        result = await _toolset(page, session=session).tabs('close', 1)
+        assert result == 'Error: tabs failed: page is busy'
+        assert session.pages == [page, popup]
+
+    async def test_the_last_tab_cannot_be_closed(self) -> None:
+        page = _FakePage()
+        assert await _toolset(page).tabs('close') == 'Error: the last tab cannot be closed.'
+        assert page.closed is False
+
+    async def test_an_index_with_no_tab_behind_it_is_refused(self) -> None:
+        assert await _toolset(_FakePage()).tabs('select', 4) == 'Error: no tab 4. 1 open; list them with tabs.'
+
+    async def test_an_unknown_action_never_reaches_the_browser(self) -> None:
+        session = PlaywrightBrowserSession()
+        toolset = PlaywrightBrowserToolset[None](session=session)
+        result = await toolset.tabs('reorder')
+        assert result == "Error: unknown tabs action 'reorder'; use list, select, close or new."
+        assert session.page is None
+
+    async def test_a_tab_that_closes_itself_leaves_the_list(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        page = _FakePage()
+        _install_fake_driver(monkeypatch, page)
+        popup = _FakePage(url='https://example.com/popup')
+        session = PlaywrightBrowserSession()
+        async with session:
+            await session.ensure_page()
+            page.emit('popup', popup)
+            session.page = popup
+            await popup.close()
+            assert session.pages == [page]
+            assert session.page is page
+
+
+class TestDialogs:
+    @asynccontextmanager
+    async def _launched(
+        self, monkeypatch: pytest.MonkeyPatch, page: _FakePage
+    ) -> AsyncGenerator[PlaywrightBrowserSession]:
+        """A session whose page is wired the way a launch wires it."""
+        _install_fake_driver(monkeypatch, page)
+        session = PlaywrightBrowserSession()
+        async with session:
+            await session.ensure_page()
+            yield session
+
+    async def _open(self, session: PlaywrightBrowserSession, page: _FakePage, dialog: _FakeDialog) -> None:
+        page.emit('dialog', dialog)
+        await asyncio.gather(*session._event_tasks, return_exceptions=True)
+
+    async def test_an_unarmed_dialog_is_dismissed(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        page = _FakePage()
+        dialog = _FakeDialog()
+        async with self._launched(monkeypatch, page) as session:
+            await self._open(session, page, dialog)
+            assert dialog.answer == 'dismiss'
+            assert [event.describe() for event in session.events] == [
+                '[warning] dialog confirm dismissed: Delete this?'
+            ]
+
+    async def test_an_armed_dialog_is_accepted_once(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        page = _FakePage()
+        first, second = _FakeDialog(), _FakeDialog()
+        async with self._launched(monkeypatch, page) as session:
+            await _toolset(page, session=session).handle_next_dialog(accept=True)
+            await self._open(session, page, first)
+            await self._open(session, page, second)
+        assert first.answer == 'accept'
+        assert second.answer == 'dismiss'
+
+    async def test_a_prompt_is_answered_with_the_given_text(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        page = _FakePage()
+        dialog = _FakeDialog(type='prompt', message='How many?')
+        async with self._launched(monkeypatch, page) as session:
+            result = await _toolset(page, session=session).handle_next_dialog(accept=True, prompt_text='42')
+            assert result == 'The next dialog will be accepted.'
+            await self._open(session, page, dialog)
+        assert dialog.accepted_with == '42'
+
+    async def test_arming_a_dismissal_reports_it(self) -> None:
+        page = _FakePage()
+        assert await _toolset(page).handle_next_dialog(accept=False) == 'The next dialog will be dismissed.'
+
+    async def test_a_dialog_whose_page_is_gone_does_not_fail_the_run(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        page = _FakePage()
+        async with self._launched(monkeypatch, page) as session:
+            await self._open(session, page, _FakeUnanswerableDialog())
+            assert session._event_tasks == set()

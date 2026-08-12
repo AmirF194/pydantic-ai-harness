@@ -39,16 +39,23 @@ URL, prefer web search or web fetch.
 
 Read: `navigate(url)`, `snapshot()`, `get_text(selector?)`, `screenshot(full_page?)`.
 Act: `click(selector)` (CSS selector, 'x,y' pixel coordinates, or an `aria-ref=` handle from
-`snapshot`), `type_text(selector, text)`, `press_key(key, selector?)`, `select_option(selector, values)`,
-`hover(selector)`, `scroll(direction)`, `wait_for(selector?, text?)`, `go_back()`, `go_forward()`,
-`execute_js(script)`.
-Inspect: `console_messages(errors_only?)`, `network_requests(url_contains?)`.
+`snapshot`), `type_text(selector, text, sequential?)`, `press_key(key, selector?)`,
+`select_option(selector, values)`, `hover(selector)`, `scroll(direction)`,
+`wait_for(selector?, text?, gone?)`, `go_back()`, `go_forward()`, `execute_js(script)`.
+Manage: `tabs(action, index?)`, `handle_next_dialog(accept, prompt_text?)`.
+Inspect: `console_messages(errors_only?)`, `network_requests(url_contains?, errors_only?)`.
 Every page action takes an optional `timeout_ms` override.
 
 Prefer `snapshot` to read the page structure and obtain `aria-ref` handles, then target elements by
 `aria-ref=` for reliable clicks. `type_text` fills a field but does not submit: use `press_key('Enter')`
-for a search box or form. Use `wait_for` for content that loads after an action, and `screenshot` only
-for visual checks (charts, layout).
+for a search box or form, and `sequential=True` for an autocomplete or masked field that reacts to
+each keystroke. Use `wait_for` for content that loads after an action and `wait_for(gone=True)` to
+wait out a spinner or overlay, and `screenshot` only for visual checks (charts, layout).
+
+Tools act on the active tab. When a link, sign-in popup or payment step opens a new one, `tabs('list')`
+shows what is open and `tabs('select', index)` moves there. A page dialog (`alert`, `confirm`,
+`prompt`) is dismissed unless you call `handle_next_dialog(accept=True)` before the action that
+opens it.
 
 When page text looks empty or is missing what you expect, the content is probably inside an iframe
 (embedded schedules, checkout steps, chat widgets). Call `snapshot`: refs inside an embed look like
@@ -57,7 +64,7 @@ there. If a page renders from an API, `network_requests` finds the request holdi
 often easier to read than the DOM.
 
 Textual tool results are truncated to roughly {max_content_tokens} tokens; use `get_text` with a
-selector to read a specific section of a large page. The browser is single-tab. Allowed domains: {allowed_domains}.
+selector to read a specific section of a large page. Allowed domains: {allowed_domains}.
 """
 
 
@@ -65,10 +72,11 @@ selector to read a specific section of a large page. The browser is single-tab. 
 class PlaywrightBrowser(AbstractCapability[AgentDepsT]):
     """A real, stateful Chromium browser for an agent, via async Playwright.
 
-    Adds sixteen tools -- navigate, snapshot, click, type_text, press_key,
+    Adds eighteen tools -- navigate, snapshot, click, type_text, press_key,
     select_option, hover, wait_for, screenshot, get_text, scroll, go_back,
-    go_forward, execute_js, console_messages, network_requests -- backed by one
-    Chromium page that persists across tool calls within a run. Reach for it when
+    go_forward, execute_js, tabs, handle_next_dialog, console_messages,
+    network_requests -- backed by a Chromium context that persists across tool
+    calls within a run. Reach for it when
     the lighter web tools fall short: pages behind login/session cookies,
     JavaScript-rendered SPAs, and interactive multi-step flows. For query-based
     research prefer
@@ -113,8 +121,8 @@ class PlaywrightBrowser(AbstractCapability[AgentDepsT]):
 
     Every browser operation runs inside an OpenTelemetry span, and what the page
     did during it (console output, responses, requests the egress policy refused,
-    popups closed) is attached to that span as span events and readable by the
-    agent through `console_messages` and `network_requests`.
+    dialogs it opened, tabs it opened) is attached to that span as span events and
+    readable by the agent through `console_messages` and `network_requests`.
 
     Durable execution (e.g. `TemporalDurability`) is not supported: durability
     replays tool calls as activities and a live Chromium page cannot survive
@@ -256,7 +264,7 @@ class PlaywrightBrowser(AbstractCapability[AgentDepsT]):
         return replace(self)
 
     def get_toolset(self) -> PlaywrightBrowserToolset[AgentDepsT]:
-        """Provide the sixteen browser tools."""
+        """Provide the eighteen browser tools."""
         return self._toolset
 
     def get_instructions(self) -> Callable[[RunContext[AgentDepsT]], str | None]:
