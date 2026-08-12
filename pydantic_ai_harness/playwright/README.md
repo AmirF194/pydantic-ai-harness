@@ -330,10 +330,13 @@ redaction in place.
 
 - A session keeps up to eight tabs open; a page that opens more has the extras
   closed, which is recorded in the event log.
+- Uploads and downloads are not exposed: the context refuses downloads, and there
+  is no tool to put a file into a page. Both need an artifact contract between the
+  page and the host filesystem, tracked in
+  [#590](https://github.com/pydantic/pydantic-ai-harness/issues/590).
 - CSS selectors cannot reach content inside iframes; reading and acting there
   goes through `snapshot` refs (see
   [Embedded content](#embedded-content-iframes)).
-- Download-triggering clicks are not handled.
 - Durable execution (e.g. `TemporalDurability`) is rejected at agent
   construction: a live Chromium page cannot survive activity replay or worker
   restart.
