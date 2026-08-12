@@ -1256,11 +1256,60 @@ class TestCodeMode:
         assert 'run_code' in by_name
 
         # The deferred member tool stays hidden until loaded: not folded into `run_code`
-        # and not surfaced as a plain native tool.
-        assert 'demo_tool' not in by_name
+        # and not surfaced as a plain native tool. Assert on reveal state rather than on the
+        # name being absent from `function_tools` -- once pydantic-ai splits declaration from
+        # visibility, `function_tools` keeps the hidden declaration and only the reveal set
+        # distinguishes the two. `revealed_tool_names` means the same thing on both sides of
+        # that change, so this holds without version-sniffing.
+        assert 'demo_tool' not in model.last_model_request_parameters.revealed_tool_names
         run_code_desc = by_name['run_code'].description or ''
         assert 'demo_tool' not in run_code_desc
         assert 'load_capability' not in run_code_desc
+
+    async def test_loaded_capability_tool_folds_into_run_code(self) -> None:
+        """Once the model loads a deferred capability, its tools become callable from `run_code`.
+
+        The step after `test_deferred_capability_loader_stays_native_with_tools_all`: the member
+        tool keeps `defer_loading=True` across the reveal (it records what the capability asked
+        for), so the fold-in has to key on the run's revealed-tool set instead.
+        """
+        from pydantic_ai.capabilities import Capability
+        from pydantic_ai.messages import ModelMessage, ModelResponse, TextPart
+        from pydantic_ai.models.function import AgentInfo, FunctionModel
+
+        capability = Capability[object](
+            id='demo',
+            description='Demo deferred capability.',
+            instructions='Use demo_tool.',
+            defer_loading=True,
+        )
+
+        @capability.tool_plain
+        def demo_tool() -> str:  # pyright: ignore[reportUnusedFunction]
+            return 'ok'  # pragma: no cover - only the signature reaches the model here
+
+        seen_tools: list[set[str]] = []
+        seen_descriptions: list[str] = []
+
+        def model_fn(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+            seen_tools.append({td.name for td in info.function_tools})
+            description = next(td for td in info.function_tools if td.name == 'run_code').description or ''
+            seen_descriptions.append(description)
+            if 'async def demo_tool' not in description:
+                return ModelResponse(parts=[ToolCallPart(tool_name='load_capability', args={'id': 'demo'})])
+            return ModelResponse(parts=[TextPart('done')])
+
+        agent: Agent[object, str] = Agent(
+            FunctionModel(model_fn),
+            capabilities=[capability, CodeMode[object](tools='all')],
+        )
+        result = await agent.run('inspect tools')
+
+        assert result.output == 'done'
+        assert 'async def demo_tool' not in seen_descriptions[0]
+        # Folded into `run_code` rather than surfaced as a native tool of its own.
+        assert 'async def demo_tool' in seen_descriptions[1]
+        assert 'demo_tool' not in seen_tools[1]
 
     # ---------------------------------------------------------------------------
     # Capability registration
@@ -2281,8 +2330,8 @@ class TestToolSearchIntegration:
         description = tools['run_code'].tool_def.description
         assert description is not None
         assert 'async def add' in description
-        # Post-discovery the deferred tool comes back with `defer_loading=False`,
-        # so it folds into run_code and is no longer a separate native tool.
+        # The discovered tool keeps `defer_loading=True` (the author's intent), but it is
+        # revealed, so it folds into run_code and is no longer a separate native tool.
         assert 'async def later' in description
         assert 'later' not in tools
 

@@ -93,7 +93,7 @@ class FakeMCPToolset(MCPToolset[object]):
             parameters_json_schema=_ADD_SCHEMA,
             metadata=self._tool_metadata,
         )
-        return {'add': self.tool_for_tool_def(tool_def)}
+        return {'add': self.tool_for_tool_def(tool_def, ctx=ctx)}
 
     async def get_instructions(self, ctx: RunContext[object]) -> InstructionPart | None:
         if not self.include_instructions or self._instructions_text is None:
