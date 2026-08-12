@@ -1262,19 +1262,17 @@ class TestSpeechPartCounting:
         assert estimate_token_count(silent) == 0
 
 
-class TestRealtimeModelSkipsFractionTriggers:
-    """A realtime model has no context window, so a `max_fraction` trigger is skipped -- but an
-    absolute `max_tokens` budget is model-independent and still applies."""
+class TestRealtimeModelSkipsTokenTriggers:
+    """A realtime session never compacts (its history can't change mid-run), so this is a
+    type-level guard: `resolve_token_trigger` returns `None` for a realtime model however it is
+    configured."""
 
-    def test_a_fraction_resolves_to_no_trigger(self):
+    def test_a_realtime_model_resolves_to_no_trigger(self):
         model = _FakeRealtimeModel()
         # A genuine `AbstractModel` identity, not a mock: it is skipped for being a non-`Model`.
         assert model.model_id == 'openai:gpt-4o-realtime-preview'
-        assert resolve_token_trigger(None, 0.5, model) is None
-
-    def test_an_absolute_budget_still_applies(self):
-        # `max_tokens` is model-independent, so a realtime run still honours the absolute budget.
-        assert resolve_token_trigger(1_000, None, _FakeRealtimeModel()) == 1_000
+        assert resolve_token_trigger(None, 0.5, model) is None  # fraction
+        assert resolve_token_trigger(1_000, None, model) is None  # absolute budget
 
     def test_a_request_response_model_still_resolves(self):
         assert resolve_token_trigger(1_000, None, TestModel()) == 1_000
