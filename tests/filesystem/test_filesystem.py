@@ -1052,16 +1052,19 @@ class TestFileSystemCapability:
         toolset = fs.get_toolset()
         assert isinstance(toolset, FileSystemToolset)
 
-    async def test_read_only_toolset_exposes_exactly_read_only_tools(self, tmp_path: Path) -> None:
-        filesystem = FileSystem[None](root_dir=tmp_path)
-        all_tool_names = set(filesystem.get_toolset().tools)
+    async def test_read_only_exposes_exactly_read_only_tools(self, tmp_path: Path) -> None:
+        filesystem = FileSystem[None](root_dir=tmp_path, read_only=True)
         context = RunContext(deps=None, model=TestModel(), usage=RunUsage(), run_id='test')
 
-        assert READ_ONLY_TOOL_NAMES <= all_tool_names
-        assert set(await filesystem.read_only_toolset().get_tools(context)) == READ_ONLY_TOOL_NAMES
+        tools = await filesystem.get_toolset().get_tools(context)
+
+        assert set(tools) == READ_ONLY_TOOL_NAMES
+        assert 'write_file' not in tools
 
     def test_search_files_description_has_string_return_type(self) -> None:
-        description = FileSystem().get_toolset().tools['search_files'].description
+        toolset = FileSystem().get_toolset()
+        assert isinstance(toolset, FileSystemToolset)
+        description = toolset.tools['search_files'].description
 
         assert description == (
             '<summary>Search file contents using a regular expression.</summary>\n'

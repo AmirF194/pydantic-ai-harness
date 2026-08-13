@@ -47,25 +47,22 @@ Report what changed, verification results, and any remaining risks.
 
 
 def _explorer(workspace: str | Path) -> SubAgent[AgentDepsT]:
-    files = FileSystem[AgentDepsT](workspace).read_only_toolset()
     agent = Agent[AgentDepsT](  # pyright: ignore[reportCallIssue, reportArgumentType]
         name='explorer',
         description='Explore the codebase and answer questions without modifying anything',
-        instructions='Explore the codebase using read-only tools. Answer with concrete paths and evidence.',
-        toolsets=[files],
+        instructions='Answer with concrete paths and evidence.',
+        capabilities=[
+            FileSystem[AgentDepsT](workspace, read_only=True),
+            RepoContext[AgentDepsT](workspace_dir=Path(workspace)),
+        ],
     )
     return SubAgent(agent)
 
 
 class Coder(CombinedCapability[AgentDepsT]):
-    """A complete coding-agent harness.
+    """A complete coding-agent harness built as a regular combined capability.
 
-    This is literally `Capability`, `FileSystem`, `Shell`, `RepoContext`,
-    `Planning`, optional `SubAgents`, `ClearToolResults`, `WarnNearLimits`, and
-    `ToolOutputLimits` combined.
-
-    `Coder` is a regular combined capability. Use its component capabilities
-    directly when you need a different composition.
+    See the class definition and [Coder docs](https://pydantic.dev/docs/ai/harness/coder/) for the exact composition.
 
     It comes with concise default instructions. Pass `instructions=` to
     replace them, or `instructions=None` to run with no default instructions.

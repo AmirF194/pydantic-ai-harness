@@ -26,6 +26,7 @@ def test_coder_constructs_agent() -> None:
 def test_coder_agent_is_model_less_and_composed() -> None:
     assert isinstance(coder_agent, Agent)
     assert coder_agent.model is None
+    assert coder_agent.name == 'coder'
     assert any(isinstance(capability, FileSystem) for capability in coder_agent.root_capability.capabilities)
 
 
@@ -81,6 +82,22 @@ def test_coder_threads_parameters(tmp_path: Path) -> None:
     assert repo_context.workspace_dir == tmp_path
     assert not any(isinstance(capability, SubAgents) for capability in coder.capabilities)
     assert coder.capabilities[0].get_instructions() == ['Custom instructions']
+
+
+def test_coder_explorer_uses_read_only_capabilities(tmp_path: Path) -> None:
+    coder = Coder(tmp_path)
+    subagents = next(capability for capability in coder.capabilities if isinstance(capability, SubAgents))
+    explorer = subagents.agents[0].agent
+
+    assert explorer.name == 'explorer'
+    filesystem = next(
+        capability for capability in explorer.root_capability.capabilities if isinstance(capability, FileSystem)
+    )
+    repo_context = next(
+        capability for capability in explorer.root_capability.capabilities if isinstance(capability, RepoContext)
+    )
+    assert filesystem.read_only is True
+    assert repo_context.workspace_dir == tmp_path
 
 
 def test_coder_none_disables_instructions() -> None:

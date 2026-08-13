@@ -55,8 +55,8 @@ def build_agent(model: Model | str = DEFAULT_MODEL, workspace: Path | None = Non
         Agent(
             name='explorer',
             description='Explore the codebase and answer questions without modifying anything',
-            instructions='Explore the codebase using read-only tools and answer with concrete evidence.',
-            toolsets=[FileSystem(workspace).read_only_toolset()],
+            instructions='Answer with concrete paths and evidence.',
+            capabilities=[FileSystem(workspace, read_only=True), RepoContext(workspace_dir=workspace)],
         )
     )
     return Agent(
