@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field, fields, replace
 from pathlib import Path
 
 import pytest
@@ -665,6 +665,74 @@ class TestSearchMemory:
 
 
 class TestInjection:
+    async def test_heading_is_omitted_by_default(self) -> None:
+        store = InMemoryStore()
+        await _seed(store, 'main/MEMORY.md', '- a durable fact')
+        captured: list[str] = []
+
+        def model(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+            captured.append(_latest_memory_context(messages))
+            return ModelResponse(parts=[TextPart('done')])
+
+        await Agent(FunctionModel(model), capabilities=[Memory(store=store, guidance='')]).run('go')
+        assert captured[0].startswith('<memory>\n')
+        assert not any(line.startswith('## ') for line in captured[0].splitlines())
+        assert 'main' not in captured[0]
+
+    async def test_heading_is_rendered_when_set(self) -> None:
+        store = InMemoryStore()
+        await _seed(store, 'main/MEMORY.md', '- a durable fact')
+        captured: list[str] = []
+
+        def model(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+            captured.append(_latest_memory_context(messages))
+            return ModelResponse(parts=[TextPart('done')])
+
+        await Agent(
+            FunctionModel(model),
+            capabilities=[Memory(store=store, guidance='', heading='Shared team notes')],
+        ).run('go')
+        assert '## Shared team notes' in captured[0]
+
+    async def test_oversized_heading_is_truncated_to_budget(self) -> None:
+        store = InMemoryStore()
+        await _seed(store, 'main/MEMORY.md', 'a durable fact')
+        captured: list[str] = []
+
+        def model(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+            captured.append(_latest_memory_context(messages))
+            return ModelResponse(parts=[TextPart('done')])
+
+        await Agent(
+            FunctionModel(model),
+            capabilities=[Memory(store=store, guidance='', heading='H' * 50, max_tokens=5)],
+        ).run('go')
+        assert captured[0].startswith('<memory>\n')
+        assert len(captured[0]) <= 20
+        assert 'H' * 50 not in captured[0]
+
+    async def test_composed_instances_render_distinct_headings(self) -> None:
+        store = InMemoryStore()
+        await _seed(store, 'you/MEMORY.md', '- your fact')
+        await _seed(store, 'team/MEMORY.md', '- team fact')
+        captured: list[list[str]] = []
+
+        def model(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+            captured.append(_memory_contexts(messages))
+            return ModelResponse(parts=[TextPart('done')])
+
+        await Agent(
+            FunctionModel(model),
+            capabilities=[
+                Memory(store=store, agent_name='you', guidance='', heading='Your notes'),
+                Memory(store=store, agent_name='team', guidance='', heading='Team notes').prefix_tools('team'),
+            ],
+        ).run('go')
+        blocks = captured[0]
+        assert len(blocks) == 2
+        assert any('## Your notes' in block and 'your fact' in block for block in blocks)
+        assert any('## Team notes' in block and 'team fact' in block for block in blocks)
+
     async def test_external_oversized_main_and_file_listing_are_backend_bounded(self) -> None:
         store = UnboundedListingStore()
         await store.inner.write('main/MEMORY.md', 'x' * 1_000, expected_version=None)
@@ -769,11 +837,13 @@ class TestInjection:
 
         await Agent(
             FunctionModel(model),
-            capabilities=[Memory(store=store, guidance='Keep memory factual.', max_tokens=100)],
+            capabilities=[Memory(store=store, guidance='Keep memory factual.', heading='Team notes', max_tokens=100)],
         ).run('go')
 
         instructions, context = captured[0]
         assert context.startswith('<memory>\n')
+        assert '## Team notes' in instructions
+        assert '## Team notes' in context
         assert len(instructions) + len(context) <= 400
         tiny_guidance = Memory[None](max_tokens=1).get_instructions()
         assert isinstance(tiny_guidance, str)
@@ -1044,6 +1114,63 @@ class TestInjection:
                 capabilities=[Memory(store=OutOfScopeListingStore(), injection_errors='raise')],
             ).run('go')
 
+    async def test_multiple_memories_compose_on_one_agent_without_clobbering(self) -> None:
+        store = InMemoryStore()
+        await _seed(store, 'main/MEMORY.md', '- personal fact')
+        await _seed(store, 'org/MEMORY.md', '- org fact')
+        captured: list[list[str]] = []
+
+        def capture(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+            captured.append(_memory_contexts(messages))
+            return ModelResponse(parts=[TextPart('done')])
+
+        agent = Agent(
+            FunctionModel(capture),
+            capabilities=[
+                Memory(store=store),
+                Memory(store=store, agent_name='org').prefix_tools('org'),
+            ],
+        )
+        first = await agent.run('first')
+        second = await agent.run('second', message_history=first.all_messages())
+
+        assert len(captured) == 2
+        for contexts in captured:
+            assert len(contexts) == 2
+            assert any('personal fact' in context for context in contexts)
+            assert any('org fact' in context for context in contexts)
+        assert len(_memory_contexts(second.all_messages())) == 2
+
+    async def test_legacy_unqualified_marker_is_stripped_from_continued_history(self) -> None:
+        store = InMemoryStore()
+        await _seed(store, 'main/MEMORY.md', '- durable fact')
+        history: list[ModelMessage] = [
+            ModelRequest(
+                parts=[
+                    UserPromptPart('earlier'),
+                    UserPromptPart(
+                        [TextContent('<memory>\n- stale fact\n</memory>', metadata='pydantic-ai-harness.memory.v1')]
+                    ),
+                ]
+            ),
+            ModelResponse(parts=[TextPart('ok')]),
+        ]
+        captured: list[list[str]] = []
+
+        def capture(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+            captured.append(_memory_contexts(messages))
+            return ModelResponse(parts=[TextPart('done')])
+
+        result = await Agent(FunctionModel(capture), capabilities=[Memory(store=store)]).run(
+            'continue', message_history=history
+        )
+
+        assert len(captured) == 1
+        assert len(captured[0]) == 1
+        assert 'durable fact' in captured[0][0]
+        assert 'stale fact' not in captured[0][0]
+        assert len(_memory_contexts(result.all_messages())) == 1
+
 
 class TestConfigurationAndSpecs:
     @pytest.mark.parametrize(
@@ -1086,7 +1213,27 @@ class TestConfigurationAndSpecs:
         with pytest.raises(ValueError, match='invalid memory path'):
             Memory[None](namespace='/tenant').resolve_scope(_ctx())
 
-    def test_spec_schema_and_custom_capability_loading(self) -> None:
+    def test_positional_field_order_is_stable(self) -> None:
+        """New fields must be keyword-only; inserting one would rebind callers' positional arguments."""
+        assert [f.name for f in fields(Memory) if f.init and not f.kw_only] == [
+            'store',
+            'store_resolver',
+            'agent_name',
+            'namespace',
+            'inject_memory',
+            'max_tokens',
+            'max_lines',
+            'max_memory_size',
+            'max_search_results',
+            'max_search_result_chars',
+            'max_search_files',
+            'guidance',
+            'injection_errors',
+        ]
+        capability = Memory[None](InMemoryStore(), None, 'main', 'tenant')
+        assert (capability.agent_name, capability.namespace) == ('main', 'tenant')
+
+    async def test_spec_schema_and_custom_capability_loading(self) -> None:
         schema = AgentSpec.model_json_schema_with_capabilities([Memory])
         params = schema['$defs']['spec_params_Memory']
         assert params['additionalProperties'] is False
@@ -1096,6 +1243,7 @@ class TestConfigurationAndSpecs:
             'database',
             'directory',
             'guidance',
+            'heading',
             'inject_memory',
             'injection_errors',
             'max_lines',
@@ -1107,10 +1255,25 @@ class TestConfigurationAndSpecs:
             'namespace',
         }
         agent = Agent.from_spec(
-            {'model': 'test', 'capabilities': [{'Memory': {'inject_memory': False}}]},
+            {
+                'model': 'test',
+                'capabilities': [
+                    {
+                        'Memory': {
+                            'agent_name': 'storage-id',
+                            'heading': 'Team notes',
+                            'inject_memory': False,
+                        }
+                    }
+                ],
+            },
             custom_capability_types=[Memory],
         )
-        assert isinstance(agent, Agent)
+        with agent.override(model=TestModel(call_tools=[])):
+            result = await agent.run('go')
+        instructions = _latest_instructions(result.all_messages())
+        assert '## Team notes' in instructions
+        assert 'storage-id' not in instructions
 
     def test_from_spec_backends_and_cross_backend_validation(self, tmp_path: Path) -> None:
         assert isinstance(Memory.from_spec().store, InMemoryStore)

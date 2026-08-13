@@ -61,7 +61,15 @@ class Memory(AbstractCapability[AgentDepsT]):
     """Optional per-run store resolver. Resolver failures always propagate."""
 
     agent_name: str = 'main'
-    """Agent segment used to isolate memory within a namespace."""
+    """Storage segment that isolates memory within a namespace. Part of the scope
+    key only; never rendered into the model-facing memory block."""
+
+    heading: str = field(default='', kw_only=True)
+    """Markdown heading for rendered guidance and the injected memory block,
+    rendered as `## {heading}` when set. The default is empty: the block already
+    sits inside `<memory>` markers, so none is added. Set a distinct value per
+    instance when several `Memory` capabilities share one agent (for example
+    `heading='Team notes'`) so the model can tell the blocks apart."""
 
     namespace: str | Callable[[RunContext[AgentDepsT]], str] = ''
     """Static or per-run tenant namespace, never exposed as a tool argument."""
@@ -145,7 +153,7 @@ class Memory(AbstractCapability[AgentDepsT]):
         return render_memory_prompt(
             '',
             [],
-            agent_name=self.agent_name,
+            heading=self.heading,
             guidance=guidance,
             max_lines=self.max_lines,
             max_tokens=self.max_tokens,
@@ -157,12 +165,14 @@ class Memory(AbstractCapability[AgentDepsT]):
         request_context: ModelRequestContext,
     ) -> ModelRequestContext:
         """Add a bounded memory snapshot to only the current user request."""
-        self._remove_previous_injection(request_context.messages)
-        if not self.inject_memory:
-            return request_context
-
         store, scope = self.resolve_scope(ctx)
         scope_hash = hashlib.sha256(scope.encode()).hexdigest()[:16]
+        # Scope-qualify the marker so several `Memory` capabilities on one agent
+        # each refresh only their own injection instead of clobbering each other.
+        marker = f'{_MEMORY_PART_METADATA}:{scope_hash}'
+        self._remove_previous_injection(request_context.messages, marker)
+        if not self.inject_memory:
+            return request_context
         with ctx.tracer.start_as_current_span(
             'memory.inject', record_exception=False, set_status_on_exception=False
         ) as span:
@@ -203,7 +213,7 @@ class Memory(AbstractCapability[AgentDepsT]):
                 rendered = render_memory_prompt(
                     main_content,
                     subfiles,
-                    agent_name=self.agent_name,
+                    heading=self.heading,
                     guidance='',
                     max_lines=self.max_lines,
                     max_tokens=max(1, content_budget // 4),
@@ -211,7 +221,7 @@ class Memory(AbstractCapability[AgentDepsT]):
                     files_truncated=files_truncated,
                 )[:content_budget]
                 rendered = f'{_MEMORY_DATA_PREFIX}{rendered}{_MEMORY_DATA_SUFFIX}'
-                part = UserPromptPart([TextContent(rendered, metadata=_MEMORY_PART_METADATA)])
+                part = UserPromptPart([TextContent(rendered, metadata=marker)])
                 latest = request_context.messages[-1]
                 if not isinstance(latest, ModelRequest):  # pragma: no cover - guaranteed by the agent graph
                     raise RuntimeError('model request history must end with a ModelRequest')
@@ -229,7 +239,7 @@ class Memory(AbstractCapability[AgentDepsT]):
                 )
         return request_context
 
-    def _remove_previous_injection(self, messages: list[ModelMessage]) -> None:
+    def _remove_previous_injection(self, messages: list[ModelMessage], marker: str) -> None:
         for index, message in enumerate(messages):
             if not isinstance(message, ModelRequest):
                 continue
@@ -239,10 +249,14 @@ class Memory(AbstractCapability[AgentDepsT]):
                 if not isinstance(part, UserPromptPart) or isinstance(part.content, str):
                     parts.append(part)
                     continue
+                # The bare `_MEMORY_PART_METADATA` match is a compatibility strip for
+                # histories persisted before markers were scope-qualified; without it a
+                # resumed pre-upgrade conversation keeps one stale block permanently.
+                # Removable once pre-upgrade histories are no longer a concern.
                 content = [
                     item
                     for item in part.content
-                    if not (isinstance(item, TextContent) and item.metadata == _MEMORY_PART_METADATA)
+                    if not (isinstance(item, TextContent) and item.metadata in (marker, _MEMORY_PART_METADATA))
                 ]
                 if len(content) == len(part.content):
                     parts.append(part)
@@ -261,6 +275,7 @@ class Memory(AbstractCapability[AgentDepsT]):
         directory: str = '.agent-memory',
         database: str = '.agent-memory.db',
         agent_name: str = 'main',
+        heading: str = '',
         namespace: str = '',
         inject_memory: bool = True,
         max_tokens: int = 2_000,
@@ -293,6 +308,7 @@ class Memory(AbstractCapability[AgentDepsT]):
         return cls(
             store=store,
             agent_name=agent_name,
+            heading=heading,
             namespace=namespace,
             inject_memory=inject_memory,
             max_tokens=max_tokens,

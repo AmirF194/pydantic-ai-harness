@@ -17,7 +17,7 @@ from pydantic_ai.messages import (
 )
 from pydantic_ai.tools import RunContext
 
-from pydantic_ai_harness.compaction._shared import compact_with_span, estimate_text_tokens
+from pydantic_ai_harness.compaction._shared import compact_with_span, context_for_request, estimate_text_tokens
 
 if TYPE_CHECKING:
     from pydantic_ai.models import ModelRequestContext
@@ -39,7 +39,7 @@ class ClampOversizedMessages(AbstractCapability[AgentDepsT]):
 
     A runaway generation -- a model response of repeated whitespace, a giant tool-call
     payload -- can produce one part so large the next request exceeds the provider's context
-    cap. The size-based strategies cannot help: `SlidingWindow` drops the *oldest* messages
+    cap. The size-based strategies cannot help: `SlidingWindowCompaction` drops the *oldest* messages
     (the offender is the newest), `ClearToolResults` only touches tool *results*, and feeding
     the history to `SummarizingCompaction` hits the same cap. This strategy truncates the
     offending part in place: it keeps a head slice and a tail slice and inserts a marker for
@@ -52,7 +52,9 @@ class ClampOversizedMessages(AbstractCapability[AgentDepsT]):
     - `ToolCallPart` args, when `clamp_tool_call_args` is set (the same failure shape for a
       giant tool-call payload). The args are replaced with a small JSON object so they stay
       valid function arguments; the original call already executed, so this only shrinks the
-      history copy.
+      history copy. Framework-typed subclasses (`ToolSearchCallPart`, `LoadCapabilityCallPart`)
+      are never clamped: their typed args must survive the `ModelMessagesTypeAdapter`
+      round-trip that persistence relies on.
 
     Request-side parts (user prompts, tool returns, system prompts) are out of scope: user
     input should not be silently rewritten, and oversized tool *returns* are the job of
@@ -153,7 +155,13 @@ class ClampOversizedMessages(AbstractCapability[AgentDepsT]):
                         new_parts.append(replace(part, content=clamped))
                         changed = True
                         continue
-                elif isinstance(part, ToolCallPart) and self.clamp_tool_call_args:
+                # Exact type, not `isinstance`: typed `ToolCallPart` subclasses such as
+                # `ToolSearchCallPart` and `LoadCapabilityCallPart` narrow `args` to a typed shape
+                # that `ModelMessagesTypeAdapter` validates when persisted history is restored
+                # (e.g. a `StepPersistence` resume). Replacing that shape with the `_clamped`
+                # object keeps the concrete class but fails the round-trip, so only plain tool
+                # calls are clamped.
+                elif type(part) is ToolCallPart and self.clamp_tool_call_args:
                     clamped = self._clamp(part.args_as_json_str())
                     if clamped is not None:
                         new_parts.append(replace(part, args={_CLAMP_ARGS_KEY: clamped}))
@@ -170,11 +178,12 @@ class ClampOversizedMessages(AbstractCapability[AgentDepsT]):
     ) -> ModelRequestContext:
         """Clamp any oversized response part before the request is sent."""
         messages: list[ModelMessage] = list(request_context.messages)
+        request_ctx = context_for_request(ctx, request_context)
         request_context.messages = await compact_with_span(
-            ctx,
+            request_ctx,
             strategy='ClampOversizedMessages',
             messages=messages,
-            compact=lambda: self.compact(messages, ctx),
+            compact=lambda: self.compact(messages, request_ctx),
             tokenizer=self.tokenizer,
         )
         return request_context
