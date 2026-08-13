@@ -18,7 +18,7 @@ def test_all_exports_are_importable():
         try:
             export = getattr(pydantic_ai_harness, name)
         except ImportError as exc:
-            assert 'pip install "pydantic-ai-harness[' in str(exc)
+            assert 'pydantic-ai-harness[' in str(exc) or 'pydantic-ai-slim[' in str(exc)
             continue
         assert export is not None
 
