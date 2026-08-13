@@ -13,6 +13,11 @@ def test_import():
     assert isinstance(pydantic_ai_harness.__all__, list)
 
 
+def test_all_exports_are_importable():
+    for name in pydantic_ai_harness.__all__:
+        assert getattr(pydantic_ai_harness, name) is not None
+
+
 def test_lazy_import_filesystem():
     from pydantic_ai_harness import FileSystem
 

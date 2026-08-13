@@ -11,8 +11,7 @@ from pydantic_ai import Agent
 from pydantic_ai.capabilities import Capability, WebSearch
 from pydantic_ai.models import Model
 
-from pydantic_ai_harness import CodeMode
-from pydantic_ai_harness.tool_output_limits import ToolOutputLimits
+from pydantic_ai_harness import CodeMode, ToolOutputLimits
 
 DEFAULT_MODEL = os.environ.get('PYDANTIC_AI_MODEL', 'openai:gpt-5.6-sol')
 
