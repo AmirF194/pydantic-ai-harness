@@ -354,6 +354,7 @@ class _FakePage:
         self._title_error = title_error
         self._context: _FakeBrowserContext | None = None
         self._popup_on_screenshot: _FakePage | None = None
+        self.evaluated: list[str] = []
         self.mouse = _FakeMouse()
         self.keyboard = _FakeKeyboard()
         self.frames: list[_FakePage | _FakeFrameContent] = [self]
@@ -442,6 +443,7 @@ class _FakePage:
         return self._screenshot_bytes
 
     async def evaluate(self, expression: str) -> object:
+        self.evaluated.append(expression)
         if self._evaluate_raises is not None:
             raise self._evaluate_raises
         return self._evaluate_result
@@ -1146,10 +1148,10 @@ class TestPlaywrightBrowserTools:
         assert result == 'Y' * 4
 
     async def test_scroll_window(self) -> None:
-        page = _FakePage(body='scrolled')
+        page = _FakePage(body='scrolled', evaluate_result='0|648|2000')
         toolset = _toolset(page)
         result = await toolset.scroll('down')
-        assert result == 'Scrolled down.\n\nscrolled'
+        assert result == 'Scrolled down. 648 of 2000 px down.\n\nscrolled'
         assert page.mouse.calls == []
 
     async def test_scroll_localized(self) -> None:
@@ -1161,7 +1163,43 @@ class TestPlaywrightBrowserTools:
     async def test_scroll_invalid_direction(self) -> None:
         toolset = _toolset(_FakePage())
         result = await toolset.scroll('sideways')
-        assert result == "Error: invalid direction 'sideways'; use up/down/left/right"
+        assert result == "Error: invalid direction 'sideways'; use up/down/left/right/top/bottom"
+
+    async def test_scroll_moves_about_one_screenful(self) -> None:
+        page = _FakePage()
+        await _toolset(page).scroll('down')
+        assert 'window.scrollBy(0, window.innerHeight * 0.9)' in page.evaluated[0]
+
+    async def test_scroll_bottom_jumps_to_the_end_of_the_page(self) -> None:
+        page = _FakePage(body='loaded more', evaluate_result='0|1532|1532')
+        result = await _toolset(page).scroll('bottom')
+        assert 'window.scrollTo(0, document.body.scrollHeight)' in page.evaluated[0]
+        assert result == 'Scrolled bottom. At the bottom of the page.\n\nloaded more'
+
+    async def test_scroll_bottom_ignores_coordinates(self) -> None:
+        # `top`/`bottom` name a place in the page, which a wheel event over one
+        # element cannot express, so they stay page-level whatever is passed.
+        page = _FakePage(evaluate_result='0|0|0')
+        await _toolset(page).scroll('bottom', 5, 6)
+        assert page.mouse.calls == []
+        assert 'window.scrollTo(0, document.body.scrollHeight)' in page.evaluated[0]
+
+    async def test_scroll_reports_a_page_that_cannot_scroll(self) -> None:
+        page = _FakePage(body='short page', evaluate_result='0|0|0')
+        result = await _toolset(page).scroll('bottom')
+        assert result == 'Scrolled bottom. The page has nothing to scroll.\n\nshort page'
+
+    async def test_scroll_reports_reaching_the_top(self) -> None:
+        page = _FakePage(body='top of page', evaluate_result='500|0|2000')
+        result = await _toolset(page).scroll('top')
+        assert result == 'Scrolled top. At the top of the page.\n\ntop of page'
+
+    async def test_scroll_reports_a_position_that_did_not_move(self) -> None:
+        # A page whose own handler intercepts the wheel: the model needs to see that
+        # repeating the call will not reveal anything new.
+        page = _FakePage(body='same view', evaluate_result='300|300|2000')
+        result = await _toolset(page).scroll('down')
+        assert result == 'Scrolled down. Position unchanged, 300 of 2000 px down.\n\nsame view'
 
     async def test_go_back(self) -> None:
         toolset = _toolset(_FakePage(url='https://example.com/prev', body='prev'))

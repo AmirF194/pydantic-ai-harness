@@ -70,7 +70,7 @@ manages the Chromium lifecycle for the run.
 | `wait_for` | `(selector=None, text=None, gone=False, timeout_ms=None)` | page text once the element/text appears -- or, with `gone=True`, once it is gone -- in the page or any frame; pass exactly one of `selector`/`text` |
 | `screenshot` | `(full_page=False, timeout_ms=None)` | a note with the page URL, plus the PNG as image content |
 | `get_text` | `(selector=None, timeout_ms=None)` | the element's text, or the full page's visible text |
-| `scroll` | `(direction, x=None, y=None, timeout_ms=None)` | page text after scrolling; `direction` is up/down/left/right |
+| `scroll` | `(direction, x=None, y=None, timeout_ms=None)` | where the page now sits, and its text; `direction` is up/down/left/right (one screenful) or top/bottom |
 | `go_back` | `(timeout_ms=None)` | the previous page's text |
 | `go_forward` | `(timeout_ms=None)` | the next page's text |
 | `execute_js` | `(script, timeout_ms=None)` | the JavaScript result (string as-is, objects as JSON, `null` as `undefined`) |

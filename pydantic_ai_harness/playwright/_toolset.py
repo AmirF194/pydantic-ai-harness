@@ -437,6 +437,38 @@ def is_blocked_address(host: str) -> bool:
     return not ip.is_global or ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved or ip.is_multicast
 
 
+def _scroll_script(move: str) -> str:
+    """Wrap a scroll expression so the page reports where it ended up."""
+    return (
+        '(() => { const before = window.scrollY; ' + move + '; return [before, window.scrollY, '
+        'Math.max(0, document.documentElement.scrollHeight - window.innerHeight)].join("|"); })()'
+    )
+
+
+def _scroll_position(reported: object) -> str:
+    """Say where the page now sits, so a scroll that moved nothing is visible as one.
+
+    Without this a scroll that hit the end of the page, or a page with nothing to
+    scroll, returns the same text as one that revealed new content, and the model
+    has no way to tell that repeating it is pointless.
+    """
+    if not isinstance(reported, str):
+        return ''  # pragma: no cover -- `evaluate` returns what the expression built
+    parts = reported.split('|')
+    if len(parts) != 3 or not all(part.lstrip('-').isdigit() for part in parts):
+        return ''  # pragma: no cover -- same
+    before, after, furthest = (int(part) for part in parts)
+    if furthest == 0:
+        return 'The page has nothing to scroll.'
+    if after >= furthest:
+        return 'At the bottom of the page.'
+    if after == 0:
+        return 'At the top of the page.'
+    if after == before:
+        return f'Position unchanged, {after} of {furthest} px down.'
+    return f'{after} of {furthest} px down.'
+
+
 def blocked_navigation_reason(url: str, allowed_domains: list[str] | None, block_private_addresses: bool) -> str | None:
     """Return why navigating to `url` is denied, or `None` when it is permitted.
 
@@ -1865,8 +1897,11 @@ class PlaywrightBrowserToolset(FunctionToolset[AgentDepsT]):
         """Scroll the page in a direction.
 
         Args:
-            direction: One of `'up'`, `'down'`, `'left'`, `'right'`.
-            x: Optional x coordinate to scroll from (paired with `y`).
+            direction: One of `'up'`, `'down'`, `'left'`, `'right'` -- about one
+                screenful each -- or `'top'`/`'bottom'` for the ends of the page.
+            x: Optional x coordinate to scroll from (paired with `y`), which scrolls
+                the element under that point by a fixed step instead of the page.
+                Ignored for `'top'` and `'bottom'`, which always move the page.
             y: Optional y coordinate to scroll from (paired with `x`).
             timeout_ms: Override the default timeout for this call, in milliseconds.
                 Must be greater than 0.
@@ -1874,18 +1909,32 @@ class PlaywrightBrowserToolset(FunctionToolset[AgentDepsT]):
         Returns:
             The page's visible text after scrolling.
         """
+        # A screenful, less a sliver of overlap, so consecutive scrolls do not skip
+        # a line: the previous fixed 300px moved less than half a default viewport,
+        # which cost several calls (and a full page read each) per screen.
+        moves = {
+            'up': 'window.scrollBy(0, -window.innerHeight * 0.9)',
+            'down': 'window.scrollBy(0, window.innerHeight * 0.9)',
+            'left': 'window.scrollBy(-window.innerWidth * 0.9, 0)',
+            'right': 'window.scrollBy(window.innerWidth * 0.9, 0)',
+            'top': 'window.scrollTo(0, 0)',
+            'bottom': 'window.scrollTo(0, document.body.scrollHeight)',
+        }
         deltas: dict[str, tuple[int, int]] = {
             'up': (0, -300),
             'down': (0, 300),
             'left': (-300, 0),
             'right': (300, 0),
         }
+        move = moves.get(direction.lower())
+        if move is None:
+            return await self._refuse(
+                timeout_ms, f'Error: invalid direction {direction!r}; use up/down/left/right/top/bottom'
+            )
         delta = deltas.get(direction.lower())
-        if delta is None:
-            return await self._refuse(timeout_ms, f'Error: invalid direction {direction!r}; use up/down/left/right')
 
         async def _scroll(page: _Page, deadlines: _Deadlines) -> str:
-            if x is not None and y is not None:
+            if x is not None and y is not None and delta is not None:
                 # `Mouse.move`/`Mouse.wheel` take no `timeout`, so they are bounded
                 # externally like `evaluate` below: an unbounded await here would
                 # hold the operation lock for the rest of the run.
@@ -1894,8 +1943,9 @@ class PlaywrightBrowserToolset(FunctionToolset[AgentDepsT]):
             else:
                 # `evaluate` has no `timeout` parameter and hangs if the page's
                 # main thread is blocked, so it is bounded externally.
-                await self._await_with_timeout(
-                    page.evaluate(f'window.scrollBy({delta[0]}, {delta[1]})'), deadlines.action
+                reported = await self._await_with_timeout(page.evaluate(_scroll_script(move)), deadlines.action)
+                return self._truncate_output(
+                    f'Scrolled {direction}. {_scroll_position(reported)}\n\n{await self._page_text(page, deadlines.action)}'
                 )
             return self._truncate_output(f'Scrolled {direction}.\n\n{await self._page_text(page, deadlines.action)}')
 

@@ -50,7 +50,11 @@ Prefer `snapshot` to read the page structure and obtain `aria-ref` handles, then
 `aria-ref=` for reliable clicks. `type_text` fills a field but does not submit: use `press_key('Enter')`
 for a search box or form, and `sequential=True` for an autocomplete or masked field that reacts to
 each keystroke. Use `wait_for` for content that loads after an action and `wait_for(gone=True)` to
-wait out a spinner or overlay, and `screenshot` only for visual checks (charts, layout).
+wait out a spinner or overlay, and `screenshot` only for visual checks (charts, layout). A page that
+renders after it loads returns little text at first: read it again with `snapshot` or `get_text`, or
+`wait_for` something a snapshot showed you -- waiting for text you have only guessed at spends the
+whole timeout. A list that grows as you scroll needs `scroll('down')` or `scroll('bottom')` repeated
+until the text it returns stops growing.
 
 Tools act on the active tab. When a link, sign-in popup or payment step opens a new one, `tabs('list')`
 shows what is open and `tabs('select', index)` moves there. A page dialog (`alert`, `confirm`,
