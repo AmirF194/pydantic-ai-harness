@@ -10,7 +10,7 @@ import pytest
 from logfire.testing import CaptureLogfire
 from logfire.variables import Rollout, Variable, VariableConfig, VariablesConfig
 from pydantic_ai import Agent, RunContext, Tool
-from pydantic_ai.capabilities import AbstractCapability, Capability
+from pydantic_ai.capabilities import AbstractCapability, Capability, CombinedCapability
 from pydantic_ai.exceptions import UserError
 from pydantic_ai.messages import InstructionPart, ModelMessage, ModelRequest, ModelResponse, TextPart, ToolCallPart
 from pydantic_ai.models.function import AgentInfo, FunctionModel
@@ -733,7 +733,8 @@ async def test_oversized_code_instructions_do_not_affect_run(capfire: CaptureLog
 
 async def test_publish_baseline_opt_out(capfire: CaptureLogfire, monkeypatch: pytest.MonkeyPatch) -> None:
     def fail_spawn(_variable: Variable[object], _example: str) -> None:
-        raise AssertionError('baseline publishing should be disabled')
+        # Never reached when the opt-out holds, which is the assertion.
+        raise AssertionError('baseline publishing should be disabled')  # pragma: no cover
 
     monkeypatch.setattr(_agent_control, '_spawn_baseline_publish', fail_spawn)
     with variables_provider(capfire, published_value('agent__no_publish', {})):
@@ -962,6 +963,10 @@ async def test_known_variable_skips_snapshot_build(capfire: CaptureLogfire, monk
 
 
 async def test_before_model_request_outside_run_is_inert() -> None:
-    capability = AgentControl('outside_run')
+    # Both halves of the split are asked: each reaches for the run's resolution, so each has to cope
+    # with there not being one.
+    bound = AgentControl('outside_run').for_agent(Agent(TestModel()))
+    assert isinstance(bound, CombinedCapability)
     request = cast(Any, object())
-    assert await capability.before_model_request(cast(Any, None), request) is request
+    for half in bound.capabilities:
+        assert await half.before_model_request(cast(Any, None), request) is request
