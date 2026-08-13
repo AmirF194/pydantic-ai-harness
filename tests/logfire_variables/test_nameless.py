@@ -42,14 +42,10 @@ def test_explicit_name_rules_unchanged() -> None:
         AgentControl('Checkout Agent')
 
 
-def test_nameless_get_model_returns_selector() -> None:
-    # A nameless capability can't source the model statically (no agent yet), so `get_model` hands
-    # back a selector Pydantic AI evaluates once it has a `ModelSelectionContext`.
-    assert callable(AgentControl().get_model())
-
-
 async def test_nameless_sources_model_for_model_less_agent() -> None:
-    # The nameless selector derives `agent__solo` from the agent's name and drives a model-less agent.
+    # A nameless capability can't source the model statically (there is no agent yet), so it hands
+    # back a selector Pydantic AI evaluates once it has a `ModelSelectionContext`. That selector
+    # derives `agent__solo` from the agent's name and drives a model-less agent.
     capability = AgentControl(default=AgentConfig(model='test'))
     result = await Agent(None, name='solo', capabilities=[capability]).run('hello')
     assert result.output.startswith('success')

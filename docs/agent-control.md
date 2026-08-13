@@ -273,10 +273,11 @@ setting and a provider-specific value wins over its canonical counterpart. They 
 agent's constructor `model_settings` and **under** per-run `model_settings=`, so run arguments always
 win.
 
-Another capability that supplies its own model or settings also beats this one, because capabilities
-nearer the model call merge last. That is deliberate: `AgentControl` sets the remotely controlled
-baseline, and code that deliberately overrides it for a run should win, the same way
-`run(model=...)` does.
+The only thing above a managed value in either list is the call site, and that is the whole rule: a
+published value overrides what the code says, and a `run(...)` argument overrides the published one
+for that single run. Nothing in between changes it -- another capability contributing a model or
+settings of its own does not outrank the config the Logfire UI is showing you, whichever order the
+capabilities were registered in.
 
 ## Degradation is per value, never per config
 

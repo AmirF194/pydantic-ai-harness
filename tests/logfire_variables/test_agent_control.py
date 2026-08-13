@@ -10,10 +10,12 @@ import pytest
 from logfire.testing import CaptureLogfire
 from logfire.variables import Rollout, Variable, VariableConfig, VariablesConfig
 from pydantic_ai import Agent, RunContext, Tool
+from pydantic_ai.capabilities import AbstractCapability, Capability
 from pydantic_ai.exceptions import UserError
 from pydantic_ai.messages import InstructionPart, ModelMessage, ModelRequest, ModelResponse, TextPart, ToolCallPart
 from pydantic_ai.models.function import AgentInfo, FunctionModel
 from pydantic_ai.models.test import TestModel
+from pydantic_ai.settings import ModelSettings
 from pydantic_ai.tools import ToolDefinition
 from pydantic_ai.toolsets import FunctionToolset
 from pydantic_ai.usage import RunUsage
@@ -426,7 +428,46 @@ def test_prebuilt_variable() -> None:
         default=AgentConfig(model='test'),
         logfire_instance=logfire.DEFAULT_LOGFIRE_INSTANCE,
     )
-    assert callable(AgentControl(variable).get_model())
+    assert AgentControl(variable)._variable is variable
+
+
+@pytest.mark.parametrize('control_first', [True, False])
+async def test_managed_values_beat_another_capability(control_first: bool) -> None:
+    """A published value outranks every other capability's, whichever order they were registered in.
+
+    Both directions are asserted because that order-independence is the whole point of the innermost
+    companion `for_agent` binds: contributions merge left to right, so a capability running outermost
+    -- which `AgentControl` must, to keep its baggage around the run span -- always loses on its own.
+    """
+    seen: list[dict[str, object]] = []
+
+    def capture_settings(_messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        seen.append(dict(info.model_settings or {}))
+        return ModelResponse(parts=[TextPart('done')])
+
+    class Opinionated(Capability[object]):
+        """Any other capability contributing a model and settings of its own."""
+
+        def get_model(self) -> TestModel:
+            return TestModel(custom_output_text='the other capability')
+
+        def get_model_settings(self) -> ModelSettings:
+            return ModelSettings(temperature=0.9, top_k=5)
+
+    def order(control: AgentControl[object]) -> list[AbstractCapability[object]]:
+        return [control, Opinionated()] if control_first else [Opinionated(), control]
+
+    # The managed `test` model answers, so the other capability's model never ran.
+    model_control: AgentControl[object] = AgentControl('contested_model', default=AgentConfig(model='test'))
+    result = await Agent(None, capabilities=order(model_control)).run('hello')
+    assert result.output.startswith('success')
+
+    # Settings still merge per key: the managed `temperature` wins, the uncontested `top_k` survives.
+    settings_control: AgentControl[object] = AgentControl(
+        'contested_settings', default=AgentConfig(settings=AgentConfigSettings(temperature=0.2))
+    )
+    await Agent(FunctionModel(capture_settings), capabilities=order(settings_control)).run('hello')
+    assert seen == [{'temperature': 0.2, 'top_k': 5}]
 
 
 def test_explicit_capability_id_is_preserved() -> None:

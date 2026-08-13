@@ -26,6 +26,7 @@ from logfire.variables import Variable
 from logfire.variables.abstract import NoOpVariableProvider
 from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, ValidationError, field_validator, model_validator
 from pydantic_ai import AbstractToolset, RunContext, TemplateStr, ToolDefinition, WrapperToolset
+from pydantic_ai.capabilities import AbstractCapability, CapabilityOrdering, CombinedCapability
 from pydantic_ai.exceptions import UserError
 from pydantic_ai.messages import InstructionPart
 from pydantic_ai.models import ModelRequestContext, infer_model
@@ -41,7 +42,7 @@ from pydantic_ai_harness.logfire._managed_variable import (
 
 if TYPE_CHECKING:
     from logfire.variables import ResolvedVariable
-    from pydantic_ai.agent.abstract import AgentModelSettings
+    from pydantic_ai.agent.abstract import AbstractAgent, AgentModelSettings
     from pydantic_ai.capabilities import AgentModel, ModelSelection
     from pydantic_ai.capabilities.abstract import WrapRunHandler
     from pydantic_ai.models import ModelSelectionContext
@@ -893,16 +894,14 @@ class AgentControl(ManagedVariableCapability[AgentDepsT, AgentConfig]):
     both resolve `agent__checkout_assistant`, so two agents that differ only in punctuation -- in one
     service or across several in the same project -- share one managed config. Pass an explicit `name`
     to keep them apart. The variable is resolved once per run, and its label and version baggage
-    remains active for the whole run. Managed settings override constructor settings; settings passed
-    to `run()` override both.
+    remains active for the whole run.
 
     The managed `model` is sourced during model selection, so it slots in with the right precedence:
-    a call-site `run(model=...)` beats it, it beats the agent's constructor model, and a fully
-    model-less `Agent(None, ...)` -- named or nameless -- can be driven entirely from managed config.
-    Another capability that supplies its own model or settings also beats this one, because
-    capabilities nearer the model call are merged last. That is deliberate: this capability sets the
-    remotely controlled baseline, and code that deliberately overrides it for a run should win, the
-    same way `run(model=...)` does.
+    a call-site `run(model=...)` beats it -- one run of one process, deliberately overriding what is
+    published -- and it beats everything else, the agent's constructor model and any other
+    capability's alike. A fully model-less `Agent(None, ...)` -- named or nameless -- can therefore be
+    driven entirely from managed config. Managed settings work the same way, patching over the
+    agent's and every other capability's; settings passed to `run()` still win.
     Static or callable targeting inputs participate in model selection, and the resulting variable
     resolution is reused for the rest of the run so the selected model and applied config cannot
     diverge. An unknown managed model warns and keeps the code model.
@@ -1057,29 +1056,17 @@ class AgentControl(ManagedVariableCapability[AgentDepsT, AgentConfig]):
 
         return instructions
 
-    def get_model_settings(self) -> AgentModelSettings[AgentDepsT] | None:
-        """Contribute the lowered managed settings patch for each model request."""
+    def for_agent(self, agent: AbstractAgent[AgentDepsT, Any]) -> AbstractCapability[AgentDepsT]:
+        """Bind alongside the companion that carries the overriding half of this capability.
 
-        def model_settings(ctx: RunContext[AgentDepsT]) -> ModelSettings:
-            self._code_settings.set(dict(ctx.model_settings or {}))
-            resolved = self.resolved
-            if resolved is None or resolved.value.settings is None:
-                return ModelSettings()
-            return _lower_settings(resolved.value.settings)
-
-        return model_settings
-
-    def get_model(self) -> AgentModel[AgentDepsT] | None:
-        """Source the managed model with the right precedence (`run(model=...)` > managed > constructor).
-
-        The selector records the lower-precedence code model, resolves static or callable targeting
-        inputs, and saves that exact resolution for `wrap_run`. This keeps model selection consistent
-        with the config and telemetry used by the run even when a targeting callable is stateful. The
-        selector does not enter the resolution as a context manager; `wrap_run` remains the owner of
-        its baggage. A fully model-less agent can be driven from Logfire, and a call-site
-        `run(model=...)` still wins. An unknown managed model warns and falls back to the code model.
+        See [`_AgentControlOverrides`][] for why the two halves cannot be one capability. The pair is
+        assembled here rather than at construction so `AgentControl` stays the leaf a user builds,
+        passes around, and finds with
+        [`find_capability`][pydantic_ai.capabilities.find_capability] -- flattening a
+        `CombinedCapability` keeps its children as siblings, so a container in this position would
+        take the user's capability out of the tree entirely.
         """
-        return self._model_selector()
+        return CombinedCapability([self, _AgentControlOverrides(self)])
 
     def _resolve_for_selection(
         self, variable: Variable[AgentConfig], ctx: ModelSelectionContext[AgentDepsT]
@@ -1169,16 +1156,14 @@ class AgentControl(ManagedVariableCapability[AgentDepsT, AgentConfig]):
     async def before_model_request(
         self, ctx: RunContext[AgentDepsT], request_context: ModelRequestContext
     ) -> ModelRequestContext:
-        """Swap out the instruction blocks the managed config addresses, and capture the code-side baseline.
+        """Capture the code-side baseline from the first assembled request.
 
-        This is the last point at which every contribution has been assembled, which is what makes it the
-        only place an override can reach text no capability owns -- the agent's own literal, a toolset's,
-        an MCP server's. The managed model and settings need no such hook; they are sourced through
-        [`get_model`][pydantic_ai_harness.logfire.AgentControl.get_model] and `get_model_settings`, where
-        Pydantic AI already gives them the right precedence.
+        Runs on this outermost half deliberately: the snapshot has to describe the agent *before*
+        managed values reach it, and the overriding half applies the instruction overrides from the
+        innermost position, after this. The request is left untouched here.
         """
         self._publish_request_baseline(ctx, request_context)
-        return self._apply_instruction_overrides(request_context)
+        return request_context
 
     def _apply_instruction_overrides(self, request_context: ModelRequestContext) -> ModelRequestContext:
         """Replace or drop the assembled instruction parts the managed config addresses by `id`.
@@ -1310,3 +1295,69 @@ class AgentControl(ManagedVariableCapability[AgentDepsT, AgentConfig]):
             else None,
             tool_definitions=tool_definitions or None,
         )
+
+
+@dataclass
+class _AgentControlOverrides(AbstractCapability[AgentDepsT]):
+    """The half of [`AgentControl`][pydantic_ai_harness.logfire.AgentControl] that has to win.
+
+    A capability's [`CapabilityOrdering`][pydantic_ai.capabilities.CapabilityOrdering] position
+    answers two questions at once: how its hooks nest around the run, and where its contributions
+    land when Pydantic AI merges them. `AgentControl` needs opposite answers. Its resolution's label
+    and version baggage has to envelop the whole run including the run span, which means `outermost`
+    -- and `outermost` contributions are merged *first*, so every other capability's model and
+    settings would be merged over the published ones. A managed value is an override, so the
+    contributions that have to beat other capabilities live here instead, pinned `innermost` where
+    they are merged last and win whatever order the capabilities were registered in.
+
+    That is why this is a separate capability rather than a few more methods on `AgentControl`, and
+    why it is *not* what a user constructs: `AgentControl` stays the leaf they build and find, and
+    [`for_agent`][pydantic_ai_harness.logfire.AgentControl.for_agent] stitches this alongside it. The
+    two share one object's state by reference, so there is still one variable, one resolution per
+    run, and one thing to configure. Decoupling ordering from precedence in the framework itself is
+    tracked in [#7420](https://github.com/pydantic/pydantic-ai/issues/7420); until then this split is
+    what gives a published value the precedence the Logfire UI promises.
+    """
+
+    control: AgentControl[AgentDepsT] = field(repr=False, compare=False)
+    """The capability whose state this contributes from; never a copy, so one resolution serves both."""
+
+    def get_ordering(self) -> CapabilityOrdering:
+        """Merge last, so a published model or settings beats every other capability's."""
+        return CapabilityOrdering(position='innermost')
+
+    def get_model_settings(self) -> AgentModelSettings[AgentDepsT] | None:
+        """Contribute the lowered managed settings patch for each model request."""
+
+        def model_settings(ctx: RunContext[AgentDepsT]) -> ModelSettings:
+            self.control._code_settings.set(dict(ctx.model_settings or {}))  # pyright: ignore[reportPrivateUsage]
+            resolved = self.control.resolved
+            if resolved is None or resolved.value.settings is None:
+                return ModelSettings()
+            return _lower_settings(resolved.value.settings)
+
+        return model_settings
+
+    def get_model(self) -> AgentModel[AgentDepsT] | None:
+        """Source the managed model with the right precedence (`run(model=...)` > managed > everything else).
+
+        The selector records the lower-precedence code model, resolves static or callable targeting
+        inputs, and saves that exact resolution for `wrap_run`. This keeps model selection consistent
+        with the config and telemetry used by the run even when a targeting callable is stateful. The
+        selector does not enter the resolution as a context manager; `wrap_run` remains the owner of
+        its baggage. A fully model-less agent can be driven from Logfire, and a call-site
+        `run(model=...)` still wins. An unknown managed model warns and falls back to the code model.
+        """
+        return self.control._model_selector()  # pyright: ignore[reportPrivateUsage]
+
+    async def before_model_request(
+        self, ctx: RunContext[AgentDepsT], request_context: ModelRequestContext
+    ) -> ModelRequestContext:
+        """Swap out the instruction blocks the managed config addresses by `id`.
+
+        Runs from the innermost position for the same reason the model and settings are contributed
+        from here: an override that another capability's hook could overwrite afterwards is not an
+        override. Being last also means every contribution has been assembled, which is what lets it
+        reach text no capability owns -- the agent's own literal, a toolset's, an MCP server's.
+        """
+        return self.control._apply_instruction_overrides(request_context)  # pyright: ignore[reportPrivateUsage]
