@@ -148,7 +148,12 @@ class FileSystemToolset(FunctionToolset[AgentDepsT]):
 
         Uses os.path.realpath for symlink resolution before checking containment.
         """
-        candidate = (self._root / path).resolve()
+        try:
+            candidate = (self._root / path).resolve()
+        except RuntimeError as e:
+            # Python 3.10-3.12 signal a symlink loop this way; 3.13+ resolve
+            # the path without complaint and fail later at the syscall.
+            raise ModelRetry(f'Path {path!r} resolves through a symlink loop.') from e
         real = Path(os.path.realpath(candidate))
         if not real.is_relative_to(self._real_root):
             raise PermissionError(f'Path {path!r} resolves outside the root directory.')

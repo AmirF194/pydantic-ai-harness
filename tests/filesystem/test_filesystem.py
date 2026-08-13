@@ -691,6 +691,20 @@ class TestFindFiles:
         assert 'skip.md' not in result
 
 
+class TestResolveSymlinkLoop:
+    async def test_symlink_loop_is_recoverable(
+        self, toolset: FileSystemToolset[None], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # `Path.resolve` only raises this on Python 3.10-3.12, so drive it
+        # directly to pin the behavior on every supported version.
+        def raise_loop(*args: object, **kwargs: object) -> None:
+            raise RuntimeError('Symlink loop from ...')
+
+        monkeypatch.setattr(Path, 'resolve', raise_loop)
+        with pytest.raises(ModelRetry, match='symlink loop'):
+            await toolset.read_file('hello.txt')
+
+
 class TestWriteFileOSErrors:
     async def test_write_name_too_long(self, toolset: FileSystemToolset[None]) -> None:
         with pytest.raises(ModelRetry, match='Could not write'):
@@ -698,7 +712,8 @@ class TestWriteFileOSErrors:
 
     async def test_write_through_symlink_loop(self, toolset: FileSystemToolset[None], fs_root: Path) -> None:
         (fs_root / 'loop').symlink_to(fs_root / 'loop')
-        with pytest.raises(ModelRetry, match='Could not write'):
+        # Python 3.10-3.12 raise at `Path.resolve`, 3.13+ at the write syscall.
+        with pytest.raises(ModelRetry, match='symlink loop'):
             await toolset.write_file('loop', 'content')
 
     async def test_write_non_recoverable_errno_propagates(
