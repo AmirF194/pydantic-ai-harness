@@ -17,10 +17,6 @@ AGENTS.local.md
 CLAUDE.local.md
 LOCAL_WORKTREES.md
 
-# One-off implementation and pull request artifacts
-/PLAN.md
-/PR_BODY.md
-
 # IDE
 .idea/
 
