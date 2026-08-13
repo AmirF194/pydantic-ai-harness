@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import errno
 import fnmatch
 import functools
 import hashlib
@@ -22,6 +23,17 @@ _P = ParamSpec('_P')
 # to the model; any other exception aborts the whole run. `_recoverable`
 # converts these so the agent can correct itself and continue.
 _RECOVERABLE_ERRORS = (PermissionError, FileNotFoundError, NotADirectoryError, IsADirectoryError, ValueError)
+
+# The same idea one level down, for failures Python raises as a bare `OSError`
+# with no dedicated subclass for `_RECOVERABLE_ERRORS` to name. The errno says
+# whose fault it is: these two are the model's, and it can pick another path and
+# retry. Every other errno (ENOSPC, EROFS) is the host's, and must keep aborting
+# the run rather than sending the model into a retry loop it can't win.
+# Keyed by `OSError.errno`, which the stdlib types as `int | None`.
+_RECOVERABLE_ERRNOS: dict[int | None, str] = {
+    errno.ENAMETOOLONG: 'the name is too long',
+    errno.ELOOP: 'it resolves through a symlink loop',
+}
 
 
 def _recoverable(
@@ -261,7 +273,13 @@ class FileSystemToolset(FunctionToolset[AgentDepsT]):
         if not resolved.parent.exists():
             parent_rel = str(resolved.parent.relative_to(self._root))
             raise FileNotFoundError(f"Parent directory '{parent_rel}' does not exist. Use create_directory first.")
-        resolved.write_text(content, encoding='utf-8')
+        try:
+            resolved.write_text(content, encoding='utf-8')
+        except OSError as e:
+            reason = _RECOVERABLE_ERRNOS.get(e.errno)
+            if reason is None:
+                raise
+            raise ModelRetry(f'Could not write {path!r}: {reason}.') from e
         new_hash = _content_hash(content)
         lines = len(content.splitlines())
         return f'Wrote {len(content)} chars ({lines} lines) to {path}. [hash:{new_hash}]'
@@ -431,9 +449,16 @@ class FileSystemToolset(FunctionToolset[AgentDepsT]):
         if not resolved.is_dir():
             raise NotADirectoryError(f'Not a directory: {path}')
 
+        try:
+            found = sorted(resolved.glob(pattern))
+        except NotImplementedError as e:
+            # `Path.glob` rejects rooted patterns outright, and it is not an
+            # `OSError`, so the recoverable tuple can't reach it.
+            raise ModelRetry(f'Pattern {pattern!r} must be relative to {path!r}, not an absolute path.') from e
+
         matches: list[str] = []
         real_root = Path(os.path.realpath(self._root))
-        for match in sorted(resolved.glob(pattern)):
+        for match in found:
             try:
                 rel_parts = match.relative_to(real_root).parts
             except ValueError:  # pragma: no cover
@@ -465,7 +490,17 @@ class FileSystemToolset(FunctionToolset[AgentDepsT]):
             Confirmation message.
         """
         resolved = self._safe_resolve(path, write=True)
-        resolved.mkdir(parents=True, exist_ok=True)
+        try:
+            resolved.mkdir(parents=True, exist_ok=True)
+        except FileExistsError as e:
+            # `exist_ok` only suppresses the error when the existing path is a
+            # directory. Re-raising `str(e)` would leak the absolute host path.
+            raise ModelRetry(f'Path {path!r} exists and is not a directory.') from e
+        except OSError as e:
+            reason = _RECOVERABLE_ERRNOS.get(e.errno)
+            if reason is None:
+                raise
+            raise ModelRetry(f'Could not create directory {path!r}: {reason}.') from e
         return f'Created directory: {path}'
 
     @_recoverable

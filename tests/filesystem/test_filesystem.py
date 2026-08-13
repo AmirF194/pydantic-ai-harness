@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import errno
 from pathlib import Path
 
 import pytest
@@ -690,6 +691,27 @@ class TestFindFiles:
         assert 'skip.md' not in result
 
 
+class TestWriteFileOSErrors:
+    async def test_write_name_too_long(self, toolset: FileSystemToolset[None]) -> None:
+        with pytest.raises(ModelRetry, match='Could not write'):
+            await toolset.write_file('x' * 300, 'content')
+
+    async def test_write_through_symlink_loop(self, toolset: FileSystemToolset[None], fs_root: Path) -> None:
+        (fs_root / 'loop').symlink_to(fs_root / 'loop')
+        with pytest.raises(ModelRetry, match='Could not write'):
+            await toolset.write_file('loop', 'content')
+
+    async def test_write_non_recoverable_errno_propagates(
+        self, toolset: FileSystemToolset[None], fs_root: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        def raise_enospc(*args: object, **kwargs: object) -> None:
+            raise OSError(errno.ENOSPC, 'No space left on device')
+
+        monkeypatch.setattr(Path, 'write_text', raise_enospc)
+        with pytest.raises(OSError, match='No space left on device'):
+            await toolset.write_file('new.txt', 'content')
+
+
 class TestCreateDirectory:
     async def test_create_basic(self, toolset: FileSystemToolset[None], fs_root: Path) -> None:
         result = await toolset.create_directory('newdir')
@@ -707,6 +729,28 @@ class TestCreateDirectory:
     async def test_create_protected_blocked(self, toolset: FileSystemToolset[None]) -> None:
         with pytest.raises(ModelRetry, match='protected'):
             await toolset.create_directory('.git/hooks')
+
+    async def test_create_name_too_long(self, toolset: FileSystemToolset[None]) -> None:
+        with pytest.raises(ModelRetry, match='Could not create directory'):
+            await toolset.create_directory('x' * 300)
+
+    async def test_create_non_recoverable_errno_propagates(
+        self, toolset: FileSystemToolset[None], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        def raise_erofs(*args: object, **kwargs: object) -> None:
+            raise OSError(errno.EROFS, 'Read-only file system')
+
+        monkeypatch.setattr(Path, 'mkdir', raise_erofs)
+        with pytest.raises(OSError, match='Read-only file system'):
+            await toolset.create_directory('newdir')
+
+    async def test_create_over_existing_file(self, toolset: FileSystemToolset[None]) -> None:
+        with pytest.raises(ModelRetry, match="'hello.txt' exists and is not a directory"):
+            await toolset.create_directory('hello.txt')
+
+    async def test_create_under_existing_file(self, toolset: FileSystemToolset[None]) -> None:
+        with pytest.raises(ModelRetry, match='hello.txt'):
+            await toolset.create_directory('hello.txt/nested')
 
 
 class TestFileInfo:
@@ -984,6 +1028,10 @@ class TestMutationKillers:
     async def test_find_files_error_message(self, toolset: FileSystemToolset[None]) -> None:
         with pytest.raises(ModelRetry, match='Not a directory'):
             await toolset.find_files('*.txt', path='hello.txt')
+
+    async def test_find_files_absolute_pattern(self, toolset: FileSystemToolset[None]) -> None:
+        with pytest.raises(ModelRetry, match='must be relative'):
+            await toolset.find_files('/etc/*.conf')
 
     async def test_find_files_no_suffix_on_files(self, toolset: FileSystemToolset[None]) -> None:
         result = await toolset.find_files('*')
