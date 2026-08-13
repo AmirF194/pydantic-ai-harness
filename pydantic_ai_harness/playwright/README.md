@@ -313,17 +313,20 @@ between tool calls.
   debugging, and read the timeout value in the error string to tell a slow page
   from a wrong selector.
 
-Logfire's default scrubbing redacts values matching `session` (and `auth`), which
-matches page content more often than you would expect -- a conference site whose
-every heading says "session" comes back as `[Scrubbed due to 'session']`. Keep
-tool results readable by scrubbing them selectively:
+Logfire's default scrubbing redacts values matching patterns such as `session`,
+`auth`, `cookie` and `credit card`, which match page content more often than you
+would expect -- a conference site whose every heading says "session" comes back
+as `[Scrubbed due to 'session']`, and a pricing page as
+`[Scrubbed due to 'credit card']`. Keep tool results readable by scrubbing them
+selectively:
 
 ```python {test="skip"}
 import logfire
 
 
 def keep_browser_results(match: logfire.ScrubMatch) -> str | None:
-    if match.path[:2] == ('attributes', 'tool_response'):
+    # 'tool_response' is the same attribute under instrumentation version 2
+    if match.path[:2] in {('attributes', 'gen_ai.tool.call.result'), ('attributes', 'tool_response')}:
         return match.value
     return None
 
