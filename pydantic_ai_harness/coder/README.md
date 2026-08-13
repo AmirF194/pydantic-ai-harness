@@ -4,16 +4,18 @@
 It is a regular combined capability made from the capabilities below, so you can use it as-is or take it apart.
 
 ```python
-from pathlib import Path
-
 from pydantic_ai import Agent
-from pydantic_ai_harness.coder import Coder
+from pydantic_ai_harness import Coder
 
 agent = Agent('anthropic:claude-fable-5', capabilities=[Coder('.')])
-agent.to_cli_sync()
+
+result = agent.run_sync('Find out why tests/test_parser.py fails and fix the bug it caught.')
+print(result.output)
 ```
 
-To run the exported model-less agent with Pydantic AI's CLI:
+The same agent works with every Pydantic AI interface: `agent.to_cli_sync()` starts an interactive chat in your terminal, and `agent.to_web()` serves a browser chat UI.
+
+Or skip the file entirely and run the exported `coder_agent` with Pydantic AI's CLI:
 
 ```bash
 uvx --with pydantic-ai-harness clai -a pydantic_ai_harness.coder:coder_agent
@@ -23,45 +25,61 @@ uvx --with pydantic-ai-harness clai -a pydantic_ai_harness.coder:coder_agent
 
 It is literally these capabilities combined, in this order:
 
-- core `Capability` with concise coding instructions
-- `FileSystem` rooted at the workspace
-- `Shell` rooted at the workspace with an allowlist
-- `RepoContext` for repository instructions and structure
-- `Planning`
-- `SubAgents` with a read-only `explorer` by default
-- `ClearToolResults` at 70% of the model context window
-- `WarnNearLimits` at 90% of the model context window
-- `ToolOutputLimits`
+- `FileSystem` — sandboxed read, write, edit, and search tools rooted at the workspace
+- `Shell` — allowlisted commands rooted at the workspace (`DEFAULT_ALLOWED_COMMANDS` is the default allowlist)
+- `RepoContext` — repository instructions and structure
+- `Planning` — a plan the agent creates and keeps current during multi-step work
+- `SubAgents` — delegation, with a read-only `explorer` sub-agent by default
+- `ClearToolResults` — clears stale tool results at 70% of the model context window
+- `WarnNearLimits` — warns the agent at 90% of the model context window
+- `ToolOutputLimits` — bounds how much context any single tool result can consume
 
-Pass `subagents=[]` to disable delegation, or supply your own `SubAgent` entries. `DEFAULT_ALLOWED_COMMANDS` contains the default shell allowlist.
+Pass `subagents=[]` to disable delegation, or supply your own `SubAgent` entries.
+
+`Coder` ships with **no default instructions**: modern models don't need procedural coaching, and each composed capability already contributes its own tool guidance. Pass `instructions='...'` to add your own — identity, tone, or house rules.
 
 ## Blown-out equivalent
 
-```python
-from pydantic_ai import Agent
-from pydantic_ai.capabilities import Capability
-from pydantic_ai_harness.coder import DEFAULT_ALLOWED_COMMANDS, DEFAULT_CODER_INSTRUCTIONS
-from pydantic_ai_harness.compaction import ClearToolResults, WarnNearLimits
-from pydantic_ai_harness.filesystem import FileSystem
-from pydantic_ai_harness.planning import Planning
-from pydantic_ai_harness.repo_context import RepoContext
-from pydantic_ai_harness.shell import Shell
-from pydantic_ai_harness.subagents import SubAgent, SubAgents
-from pydantic_ai_harness.tool_output_limits import ToolOutputLimits
+<!-- Keep this in sync with pydantic_ai_harness/coder — it intentionally shows the complete picture. -->
 
-read_tools = {'read_file', 'list_directory', 'search_files', 'find_files', 'file_info'}
-read_only = FileSystem('.').get_toolset().filtered(lambda ctx, tool: tool.name in read_tools)
-explorer = SubAgent(Agent(name='explorer', toolsets=[read_only]))
+```python
+from pathlib import Path
+
+from pydantic_ai import Agent
+from pydantic_ai_harness import (
+    ClearToolResults,
+    FileSystem,
+    Planning,
+    RepoContext,
+    Shell,
+    SubAgent,
+    SubAgents,
+    ToolOutputLimits,
+    WarnNearLimits,
+)
+
+allowed_commands = [
+    'git', 'rg', 'grep', 'find', 'ls', 'cat', 'sed', 'head', 'tail',
+    'python', 'uv', 'pytest', 'ruff', 'make',
+]
+
+explorer = SubAgent(
+    Agent(
+        name='explorer',
+        description='Explore the codebase and answer questions without modifying anything',
+        instructions='Answer with concrete paths and evidence.',
+        capabilities=[FileSystem('.', read_only=True), RepoContext(workspace_dir=Path('.'))],
+    )
+)
 
 agent = Agent(
     'anthropic:claude-fable-5',
     capabilities=[
-        Capability(instructions=DEFAULT_CODER_INSTRUCTIONS),
         FileSystem('.'),
-        Shell(cwd='.', allowed_commands=DEFAULT_ALLOWED_COMMANDS),
+        Shell(cwd='.', allowed_commands=allowed_commands),
         RepoContext(workspace_dir=Path('.')),
         Planning(),
-        SubAgents(agents=[explorer], agent_folders=None),
+        SubAgents(agents=[explorer], agent_folders=None),  # don't auto-load agent definitions from `agents/` folders
         ClearToolResults(max_fraction=0.7),
         WarnNearLimits(max_context_fraction=0.9),
         ToolOutputLimits(),

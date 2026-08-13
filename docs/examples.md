@@ -8,8 +8,8 @@ description: Complete, self-contained agents built from harness capabilities, wr
 The [`examples/`](https://github.com/pydantic/pydantic-ai-harness/tree/main/examples)
 directory contains complete agents assembled from individual capabilities. They are
 meant to be read as much as run: every capability choice has the reasoning next to it,
-and each example writes out its full configuration — instructions, allowlists — so you
-can copy it into your own code and tweak it, without chasing imports.
+and each example writes out its full configuration so you can copy it into your own
+code and tweak it, without chasing imports.
 
 | Example | What it does |
 |---|---|

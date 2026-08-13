@@ -2,8 +2,8 @@
 
 Complete agents assembled from individual harness capabilities, written to be
 read as much as run: every capability choice has the reasoning next to it, and
-each example writes out its full configuration — instructions, allowlists — so
-you can copy it into your own code and tweak it.
+each example writes out its full configuration so you can copy it into your own
+code and tweak it.
 
 If you just want the assembled version, use the packaged harnesses instead
 ([`Coder`](../docs/coder.md), [`Researcher`](../docs/researcher.md)) — or run one

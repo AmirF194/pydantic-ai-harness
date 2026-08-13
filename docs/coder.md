@@ -24,7 +24,7 @@ result = agent.run_sync('Find out why tests/test_parser.py fails and fix the bug
 print(result.output)
 ```
 
-The same agent works with every Pydantic AI interface: [`agent.to_cli_sync()`](https://pydantic.dev/docs/ai/cli/#using-the-cli-from-python) starts an interactive chat in your terminal, and [`agent.to_web()`](https://pydantic.dev/docs/ai/web/) serves a browser chat UI.
+The same agent works with every Pydantic AI interface: [`agent.to_cli_sync()`](https://pydantic.dev/docs/ai/cli/#custom-agents) starts an interactive chat in your terminal, and [`agent.to_web()`](https://pydantic.dev/docs/ai/web/) serves a browser chat UI.
 
 Or skip the file entirely and run the exported [`coder_agent`](#api-reference) with [Pydantic AI's CLI](https://pydantic.dev/docs/ai/cli/#custom-agents):
 
@@ -38,7 +38,6 @@ uvx --with pydantic-ai-harness clai -a pydantic_ai_harness.coder:coder_agent
 
 It is literally these capabilities combined, in this order:
 
-- Concise default coding instructions — see [Instructions](#instructions) below
 - [`FileSystem`](filesystem.md) — sandboxed read, write, edit, and search tools rooted at the workspace
 - [`Shell`](shell.md) — allowlisted commands rooted at the workspace (`DEFAULT_ALLOWED_COMMANDS` is the default allowlist)
 - [`RepoContext`](repo-context.md) — repository instructions and structure
@@ -52,7 +51,7 @@ Pass `subagents=[]` to disable delegation, or supply your own `SubAgent` entries
 
 ### Instructions
 
-`Coder` comes with short default coding instructions (`DEFAULT_CODER_INSTRUCTIONS`, written out in full in the [blown-out equivalent](#blown-out-equivalent) below). Pass `instructions='...'` to replace them with your own, or `instructions=None` to get only the abilities, with no default instructions at all.
+`Coder` ships with **no default instructions**: modern models don't need procedural coaching ("work step by step", "run the tests"), and each composed capability already contributes its own tool guidance. Pass `instructions='...'` to add your own — identity, tone, or house rules — and it becomes a regular instructions capability at the front of the composition.
 
 ### Not included by default
 
@@ -86,15 +85,6 @@ from pydantic_ai_harness import (
     WarnNearLimits,
 )
 
-instructions = """\
-Work step by step and keep the task's goal in view.
-Read relevant files and repository instructions before editing.
-Make the smallest coherent change that solves the task.
-Keep the plan current during multi-step work.
-Run the relevant tests and checks after editing.
-Report what changed, verification results, and any remaining risks.
-"""
-
 allowed_commands = [
     'git', 'rg', 'grep', 'find', 'ls', 'cat', 'sed', 'head', 'tail',
     'python', 'uv', 'pytest', 'ruff', 'make',
@@ -111,7 +101,6 @@ explorer = SubAgent(
 
 agent = Agent(
     'anthropic:claude-fable-5',
-    instructions=instructions,
     capabilities=[
         FileSystem('.'),
         Shell(cwd='.', allowed_commands=allowed_commands),
