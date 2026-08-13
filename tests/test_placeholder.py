@@ -15,7 +15,12 @@ def test_import():
 
 def test_all_exports_are_importable():
     for name in pydantic_ai_harness.__all__:
-        assert getattr(pydantic_ai_harness, name) is not None
+        try:
+            export = getattr(pydantic_ai_harness, name)
+        except ImportError as exc:
+            assert 'pip install "pydantic-ai-harness[' in str(exc)
+            continue
+        assert export is not None
 
 
 def test_lazy_import_filesystem():
