@@ -14,8 +14,7 @@ pytestmark = pytest.mark.anyio
 async def test_coder_completes_task(
     tmp_path: Path, allow_model_requests: None, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    if 'ANTHROPIC_API_KEY' not in os.environ:
-        monkeypatch.setenv('ANTHROPIC_API_KEY', 'replay-key')
+    monkeypatch.setenv('ANTHROPIC_API_KEY', os.environ.get('ANTHROPIC_API_KEY', 'replay-key'))
     workspace = tmp_path / 'workspace'
     workspace.mkdir()
     (workspace / 'calculator.py').write_text('def add(a: int, b: int) -> int:\n    return a - b\n')
