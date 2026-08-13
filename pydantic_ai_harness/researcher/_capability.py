@@ -1,6 +1,6 @@
 """Complete research-agent harness assembled from regular capabilities."""
 
-from pydantic_ai.capabilities import Capability, CombinedCapability, WebSearch
+from pydantic_ai.capabilities import AbstractCapability, Capability, CombinedCapability, WebSearch
 from pydantic_ai.tools import AgentDepsT
 
 from pydantic_ai_harness.code_mode import CodeMode
@@ -24,16 +24,20 @@ class Researcher(CombinedCapability[AgentDepsT]):
 
     `Researcher` is a regular combined capability. Use its component
     capabilities directly when you need a different composition.
+
+    It comes with concise default instructions. Pass `instructions=` to
+    replace them, or `instructions=None` to run with no default instructions.
     """
 
-    def __init__(self, *, instructions: str | None = None) -> None:
-        super().__init__(
+    def __init__(self, *, instructions: str | None = DEFAULT_RESEARCHER_INSTRUCTIONS) -> None:
+        capabilities: list[AbstractCapability[AgentDepsT]] = []
+        if instructions is not None:
+            capabilities.append(Capability[AgentDepsT](instructions=instructions))
+        capabilities.extend(
             [
-                Capability[AgentDepsT](
-                    instructions=DEFAULT_RESEARCHER_INSTRUCTIONS if instructions is None else instructions
-                ),
                 CodeMode[AgentDepsT](),
                 WebSearch[AgentDepsT](native=False, local=True),
                 ToolOutputLimits[AgentDepsT](),
             ]
         )
+        super().__init__(capabilities)

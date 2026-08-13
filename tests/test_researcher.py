@@ -48,6 +48,12 @@ def test_researcher_threads_instructions() -> None:
     assert capability.get_instructions() == ['Custom instructions']
 
 
+def test_researcher_none_disables_instructions() -> None:
+    researcher = Researcher(instructions=None)
+
+    assert not any(isinstance(capability, Capability) for capability in researcher.capabilities)
+
+
 def test_researcher_for_agent_preserves_subclass() -> None:
     researcher = Researcher()
     bound = researcher.for_agent(Agent(TestModel()))

@@ -68,6 +68,9 @@ class Coder(CombinedCapability[AgentDepsT]):
 
     `Coder` is a regular combined capability. Use its component capabilities
     directly when you need a different composition.
+
+    It comes with concise default instructions. Pass `instructions=` to
+    replace them, or `instructions=None` to run with no default instructions.
     """
 
     def __init__(
@@ -76,19 +79,23 @@ class Coder(CombinedCapability[AgentDepsT]):
         *,
         allowed_commands: Sequence[str] | None = None,
         subagents: Sequence[SubAgent[AgentDepsT]] | None = None,
-        instructions: str | None = None,
+        instructions: str | None = DEFAULT_CODER_INSTRUCTIONS,
     ) -> None:
         delegates = [_explorer(workspace)] if subagents is None else subagents
-        capabilities: list[AbstractCapability[AgentDepsT]] = [
-            Capability[AgentDepsT](instructions=DEFAULT_CODER_INSTRUCTIONS if instructions is None else instructions),
-            FileSystem[AgentDepsT](workspace),
-            Shell[AgentDepsT](
-                cwd=workspace,
-                allowed_commands=DEFAULT_ALLOWED_COMMANDS if allowed_commands is None else allowed_commands,
-            ),
-            RepoContext[AgentDepsT](workspace_dir=Path(workspace)),
-            Planning[AgentDepsT](),
-        ]
+        capabilities: list[AbstractCapability[AgentDepsT]] = []
+        if instructions is not None:
+            capabilities.append(Capability[AgentDepsT](instructions=instructions))
+        capabilities.extend(
+            [
+                FileSystem[AgentDepsT](workspace),
+                Shell[AgentDepsT](
+                    cwd=workspace,
+                    allowed_commands=DEFAULT_ALLOWED_COMMANDS if allowed_commands is None else allowed_commands,
+                ),
+                RepoContext[AgentDepsT](workspace_dir=Path(workspace)),
+                Planning[AgentDepsT](),
+            ]
+        )
         if delegates:
             capabilities.append(SubAgents[AgentDepsT](agents=delegates, agent_folders=None))
         capabilities.extend(

@@ -83,6 +83,12 @@ def test_coder_threads_parameters(tmp_path: Path) -> None:
     assert coder.capabilities[0].get_instructions() == ['Custom instructions']
 
 
+def test_coder_none_disables_instructions() -> None:
+    coder = Coder(instructions=None)
+
+    assert not any(isinstance(capability, Capability) for capability in coder.capabilities)
+
+
 def test_coder_default_commands_and_empty_allowlist() -> None:
     default_shell = next(capability for capability in Coder().capabilities if isinstance(capability, Shell))
     empty_shell = next(
