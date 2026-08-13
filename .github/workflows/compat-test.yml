@@ -32,15 +32,6 @@ on:
 permissions:
   contents: read
 
-# `UV_FROZEN=1` so the lock-resolved sync + the editable-overlay of pydantic-ai-slim /
-# pydantic-graph stays put when the subsequent `uv run ruff/pyright/pytest` calls fire.
-# Without this, `uv run` auto-re-resolves against PyPI ("Ignoring existing lockfile due
-# to change in resolution mode"), silently uninstalls the overlay, and ends up testing
-# harness main against whatever `pydantic-ai-slim` is on PyPI — i.e. the compat check
-# becomes a no-op against the actual pydantic-ai checkout we wanted to validate.
-env:
-  UV_FROZEN: '1'
-
 jobs:
   compat:
     name: harness vs pydantic-ai @ ${{ inputs.pydantic-ai-ref }}
@@ -88,7 +79,34 @@ jobs:
             -e "${RUNNER_TEMP}/pydantic-ai/pydantic_ai_slim" \
             -e "${RUNNER_TEMP}/pydantic-ai/pydantic_graph"
 
-      - run: uv run ruff format --check
-      - run: uv run ruff check
-      - run: uv run pyright
-      - run: uv run pytest
+      # The editable overrides are intentionally not represented in `uv.lock`.
+      # A regular `uv run` would sync the environment and restore the locked wheels.
+      - run: uv run --no-sync ruff format --check
+      - run: uv run --no-sync ruff check
+      - run: uv run --no-sync pyright
+      - run: uv run --no-sync pytest
+
+      - name: Verify the requested pydantic-ai checkout remained installed
+        run: |
+          .venv/bin/python - <<'PY'
+          import os
+          from pathlib import Path
+
+          import pydantic_ai
+          import pydantic_graph
+
+          checkout = Path(os.environ['RUNNER_TEMP'], 'pydantic-ai').resolve()
+          modules = {
+              'pydantic-ai-slim': (pydantic_ai, checkout / 'pydantic_ai_slim'),
+              'pydantic-graph': (pydantic_graph, checkout / 'pydantic_graph'),
+          }
+          for distribution, (module, expected_root) in modules.items():
+              module_file = module.__file__
+              if module_file is None:
+                  raise SystemExit(f'{distribution} does not have an importable source file')
+              actual = Path(module_file).resolve()
+              expected = expected_root.resolve()
+              print(f'{distribution}: {actual}')
+              if not actual.is_relative_to(expected):
+                  raise SystemExit(f'{distribution} is not installed from {expected}')
+          PY
