@@ -70,9 +70,6 @@ acp = [
 exa = [
     "exa-py>=2.16.0",
 ]
-absurd = [
-    "absurd-sdk>=0.4.0",
-]
 mongodb = [
     "pymongo>=4.17.0",
 ]
@@ -85,6 +82,9 @@ browser-use = [
 stackone = [
     "fastmcp>=3.4.5,<4",
     "pydantic-ai-slim[mcp]>=2.18.0",
+]
+absurd = [
+    "absurd-sdk>=0.4.0",
 ]
 
 [project.urls]
@@ -124,6 +124,7 @@ source = 'uv-dynamic-versioning'
 vcs = 'git'
 style = 'pep440'
 bump = true
+
 
 [tool.uv.sources]
 pydantic-ai-slim = { git = "https://github.com/pydantic/pydantic-ai.git", branch = "claude/durable-base-declarative", subdirectory = "pydantic_ai_slim" }
