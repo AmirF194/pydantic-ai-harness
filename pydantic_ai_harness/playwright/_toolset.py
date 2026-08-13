@@ -185,6 +185,7 @@ _PRIVATE_ADDRESS_REASON = 'blocked private or link-local address'
 """Why the private-address block refused a URL, shared by the pre-check and the route guard."""
 
 _BLANK_PAGE = 'about:blank'
+_ERROR_PAGE_SCHEME = 'chrome-error://'
 """The blank page a context starts on, and where a disallowed navigation is sent."""
 
 _MAX_TABS = 8
@@ -853,6 +854,14 @@ class PlaywrightBrowserSession:
         """Tracer browser operations report to. `PlaywrightBrowser.wrap_run` sets the run's own."""
         self.events: deque[BrowserEvent] = deque(maxlen=_EVENT_LOG_LIMIT)
         """What the browser did outside the tool calls, newest last."""
+        self.events_recorded = 0
+        """How many events have been recorded, including those the log has dropped.
+
+        The log is bounded, so a position in it is not stable; this count is, which
+        is what lets an operation ask only about the events its own action caused.
+        """
+        self.operation_events_mark = 0
+        """Value of `events_recorded` when the running operation started."""
         self.operation_span: Span | None = None
         """Span of the browser operation currently running, when one is.
 
@@ -876,9 +885,25 @@ class PlaywrightBrowserSession:
             message=_clip(_without_credentials(event.message)),
         )
         self.events.append(event)
+        self.events_recorded += 1
         span = self.operation_span
         if span is not None and span.is_recording():
             span.add_event(f'browser.{event.kind}', event.attributes())
+
+    def failure_since_operation_start(self) -> BrowserEvent | None:
+        """The last refused or failed request caused by the running operation, if any.
+
+        A navigation Chromium could not complete leaves the page on its own error
+        page, whose URL (`chrome-error://chromewebdata/`) names neither the
+        destination nor what stopped it. The event log holds both, and scoping the
+        search to this operation keeps an older refusal from being reported as the
+        cause of this one.
+        """
+        caused_here = self.events_recorded - self.operation_events_mark
+        for event in reversed(list(self.events)[-caused_here:] if caused_here > 0 else []):
+            if event.kind in ('request_blocked', 'request_failed'):
+                return event
+        return None
 
     def _on_console(self, message: _ConsoleMessage) -> None:
         """Record a console message, keeping the page's own severity."""
@@ -1493,7 +1518,17 @@ class PlaywrightBrowserToolset(FunctionToolset[AgentDepsT]):
 
         The bounce runs under the caller's resolved `timeout` so a short
         per-call `timeout_ms` is not silently replaced by Playwright's default.
+
+        A navigation the browser could not complete lands on Chromium's own error
+        page, which is not a destination the policy has an opinion about: reporting
+        it as an allowlist miss names `chrome-error://chromewebdata/` as the domain
+        the model reached. That case reports the refused or failed request instead.
         """
+        if page.url.startswith(_ERROR_PAGE_SCHEME):
+            await page.goto(_BLANK_PAGE, timeout=timeout)
+            failure = self._session.failure_since_operation_start()
+            cause = 'the navigation did not complete' if failure is None else f'{failure.message}: {failure.url}'
+            return self._error(f'Error: {action} loaded no page ({cause}); the browser is back at about:blank.')
         reason = self._policy.blocked_reason(page.url)
         if reason is None:
             return None
@@ -1542,6 +1577,7 @@ class PlaywrightBrowserToolset(FunctionToolset[AgentDepsT]):
                 attributes={'browser.action': action, 'browser.timeout_ms': reported, 'browser.outcome': 'ok'},
             ) as span:
                 self._session.operation_span = span
+                self._session.operation_events_mark = self._session.events_recorded
                 page: _Page | None = None
                 try:
                     page = await self._session.ensure_page()

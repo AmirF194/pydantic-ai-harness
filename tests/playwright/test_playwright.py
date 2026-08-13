@@ -1000,6 +1000,53 @@ class TestPlaywrightBrowserTools:
         assert result == 'Error: click reached a domain not in allowed_domains: https://evil.com/landing'
         assert page.goto_calls == ['about:blank']
 
+    async def test_a_blocked_redirect_names_the_refused_url_not_the_error_page(self) -> None:
+        session = PlaywrightBrowserSession(
+            policy=toolset_module.NavigationPolicy(allowed_domains=['example.com'], block_private_addresses=False)
+        )
+
+        class _RefusedRedirectPage(_FakePage):
+            """A click whose redirect the route guard refused: Chromium keeps its error page."""
+
+            async def click(self, selector: str, *, timeout: float | None = None) -> None:
+                await super().click(selector, timeout=timeout)
+                session.record(
+                    toolset_module.BrowserEvent(
+                        kind='request_blocked',
+                        level='warning',
+                        message='domain not in allowed_domains',
+                        url='https://join.example.org/invite',
+                    )
+                )
+                # The refusal is rarely the last thing a page reports before it settles.
+                session.record(
+                    toolset_module.BrowserEvent(
+                        kind='console', level='error', message='error: navigation failed', url=None
+                    )
+                )
+
+        page = _RefusedRedirectPage(url='chrome-error://chromewebdata/')
+        result = await _toolset(page, session=session).click('a.external')
+        assert result == (
+            'Error: click loaded no page (domain not in allowed_domains: https://join.example.org/invite); '
+            'the browser is back at about:blank.'
+        )
+        assert page.goto_calls == ['about:blank']
+
+    async def test_an_earlier_refusal_is_not_reported_as_this_failures_cause(self) -> None:
+        page = _FakePage(url='chrome-error://chromewebdata/')
+        session = PlaywrightBrowserSession(policy=toolset_module.NavigationPolicy(allowed_domains=['example.com']))
+        session.record(
+            toolset_module.BrowserEvent(
+                kind='request_blocked', level='warning', message='domain not in allowed_domains', url='https://old/'
+            )
+        )
+        result = await _toolset(page, session=session).click('a.external')
+        assert (
+            result
+            == 'Error: click loaded no page (the navigation did not complete); the browser is back at about:blank.'
+        )
+
     async def test_type_text_fills_field(self) -> None:
         page = _FakePage(body='typed')
         toolset = _toolset(page)
