@@ -7,7 +7,7 @@ from pydantic_ai import Agent
 from pydantic_ai.capabilities import Capability
 from pydantic_ai.models.test import TestModel
 
-from pydantic_ai_harness.coder import DEFAULT_ALLOWED_COMMANDS, DEFAULT_CODER_INSTRUCTIONS, Coder, coder_agent
+from pydantic_ai_harness.coder import DEFAULT_ALLOWED_COMMANDS, Coder, coder_agent
 from pydantic_ai_harness.compaction import ClearToolResults, WarnNearLimits
 from pydantic_ai_harness.filesystem import FileSystem
 from pydantic_ai_harness.planning import Planning
@@ -57,7 +57,6 @@ def test_coder_members_are_transparent() -> None:
     coder = Coder()
 
     assert [type(capability) for capability in coder.capabilities] == [
-        Capability,
         FileSystem,
         Shell,
         RepoContext,
@@ -67,7 +66,7 @@ def test_coder_members_are_transparent() -> None:
         WarnNearLimits,
         ToolOutputLimits,
     ]
-    assert coder.capabilities[0].get_instructions() == [DEFAULT_CODER_INSTRUCTIONS]
+    assert not any(isinstance(capability, Capability) for capability in coder.capabilities)
 
 
 def test_coder_threads_parameters(tmp_path: Path) -> None:
@@ -100,10 +99,12 @@ def test_coder_explorer_uses_read_only_capabilities(tmp_path: Path) -> None:
     assert repo_context.workspace_dir == tmp_path
 
 
-def test_coder_none_disables_instructions() -> None:
-    coder = Coder(instructions=None)
+def test_coder_instructions_adds_capability() -> None:
+    coder = Coder(instructions='Custom instructions')
 
-    assert not any(isinstance(capability, Capability) for capability in coder.capabilities)
+    instructions = [capability for capability in coder.capabilities if isinstance(capability, Capability)]
+    assert len(instructions) == 1
+    assert instructions[0].get_instructions() == ['Custom instructions']
 
 
 def test_coder_default_commands_and_empty_allowlist() -> None:

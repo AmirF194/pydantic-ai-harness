@@ -9,7 +9,7 @@ if TYPE_CHECKING:
     from .browser_use import BrowserUse
     from .capability_creation import CapabilityCreation
     from .code_mode import CodeMode
-    from .coder import DEFAULT_ALLOWED_COMMANDS, DEFAULT_CODER_INSTRUCTIONS, Coder
+    from .coder import DEFAULT_ALLOWED_COMMANDS, Coder
     from .compaction import (
         ClampOversizedMessages,
         ClearToolResults,
@@ -64,7 +64,6 @@ __all__ = [
     'Coder',
     'ConversationSearch',
     'DEFAULT_ALLOWED_COMMANDS',
-    'DEFAULT_CODER_INSTRUCTIONS',
     'DEFAULT_RESEARCHER_INSTRUCTIONS',
     'DeduplicateFileReads',
     'DynamicWorkflow',
@@ -151,7 +150,6 @@ _CAPABILITY_EXPORTS = {
 
 _CONSTANT_EXPORTS = {
     'DEFAULT_ALLOWED_COMMANDS': 'coder',
-    'DEFAULT_CODER_INSTRUCTIONS': 'coder',
     'DEFAULT_RESEARCHER_INSTRUCTIONS': 'researcher',
     'LLM_API_KEY_ENV_PATTERNS': 'shell',
     'READ_ONLY_TOOL_NAMES': 'filesystem',

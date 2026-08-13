@@ -9,7 +9,6 @@ import os
 from pathlib import Path
 
 from pydantic_ai import Agent
-from pydantic_ai.capabilities import Capability
 from pydantic_ai.models import Model
 
 from pydantic_ai_harness import (
@@ -26,7 +25,7 @@ from pydantic_ai_harness import (
 
 DEFAULT_MODEL = os.environ.get('PYDANTIC_AI_MODEL', 'anthropic:claude-fable-5')
 
-# Keep these written-out blocks in sync with the defaults in `pydantic_ai_harness.coder`.
+# Keep this written-out allowlist in sync with the default in `pydantic_ai_harness.coder`.
 ALLOWED_COMMANDS = (
     'git',
     'rg',
@@ -43,14 +42,6 @@ ALLOWED_COMMANDS = (
     'ruff',
     'make',
 )
-INSTRUCTIONS = """\
-Work step by step and keep the task's goal in view.
-Read relevant files and repository instructions before editing.
-Make the smallest coherent change that solves the task.
-Keep the plan current during multi-step work.
-Run the relevant tests and checks after editing.
-Report what changed, verification results, and any remaining risks.
-"""
 
 
 def build_agent(model: Model | str = DEFAULT_MODEL, workspace: Path | None = None) -> Agent:
@@ -67,7 +58,6 @@ def build_agent(model: Model | str = DEFAULT_MODEL, workspace: Path | None = Non
     return Agent(
         model,
         capabilities=[
-            Capability(instructions=INSTRUCTIONS),  # Set a focused working method.
             FileSystem(root_dir=workspace),  # Provide workspace-scoped file operations.
             Shell(cwd=workspace, allowed_commands=ALLOWED_COMMANDS),  # Run common development commands.
             RepoContext(workspace_dir=workspace),  # Add repository metadata to the context.

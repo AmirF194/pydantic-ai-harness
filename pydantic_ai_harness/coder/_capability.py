@@ -35,16 +35,6 @@ DEFAULT_ALLOWED_COMMANDS: tuple[str, ...] = (
 )
 """Commands available to `Coder` unless an explicit allowlist is supplied."""
 
-DEFAULT_CODER_INSTRUCTIONS = """\
-Work step by step and keep the task's goal in view.
-Read relevant files and repository instructions before editing.
-Make the smallest coherent change that solves the task.
-Keep the plan current during multi-step work.
-Run the relevant tests and checks after editing.
-Report what changed, verification results, and any remaining risks.
-"""
-"""Default instructions for `Coder`."""
-
 
 def _explorer(workspace: str | Path) -> SubAgent[AgentDepsT]:
     agent = Agent[AgentDepsT](  # pyright: ignore[reportCallIssue, reportArgumentType]
@@ -64,8 +54,8 @@ class Coder(CombinedCapability[AgentDepsT]):
 
     See the class definition and [Coder docs](https://pydantic.dev/docs/ai/harness/coder/) for the exact composition.
 
-    It comes with concise default instructions. Pass `instructions=` to
-    replace them, or `instructions=None` to run with no default instructions.
+    It ships with no default instructions: modern models don't need procedural coaching, and the composed capabilities
+    contribute their own tool guidance. Pass `instructions=` to add your own.
     """
 
     def __init__(
@@ -74,7 +64,7 @@ class Coder(CombinedCapability[AgentDepsT]):
         *,
         allowed_commands: Sequence[str] | None = None,
         subagents: Sequence[SubAgent[AgentDepsT]] | None = None,
-        instructions: str | None = DEFAULT_CODER_INSTRUCTIONS,
+        instructions: str | None = None,
     ) -> None:
         delegates = [_explorer(workspace)] if subagents is None else subagents
         capabilities: list[AbstractCapability[AgentDepsT]] = []
