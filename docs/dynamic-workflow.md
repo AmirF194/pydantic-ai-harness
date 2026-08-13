@@ -8,10 +8,10 @@ description: Let an orchestrator agent coordinate a catalog of sub-agents by wri
 `DynamicWorkflow` is for the case where the coordination *between* sub-agents is the actual work. Say you have a few specialists -- one reviews code, one summarizes findings, one writes the final note. Each is easy to call on its own; the hard part is the choreography: review three files at once, keep only the reports that found something, summarize those, and hand the summary to the writer. Reach for this capability when that orchestration involves fan-out, chaining, voting, or retry loops that you do not want to run one model turn at a time, with every intermediate result flowing back through the orchestrator's context.
 
 !!! note "Import path"
-    Import this capability from its submodule -- there is no top-level `pydantic_ai_harness` re-export:
+    Like every capability, it is importable from the top level (the underlying dependencies come from the `dynamic-workflow` extra):
 
     ```python
-    from pydantic_ai_harness.dynamic_workflow import DynamicWorkflow
+    from pydantic_ai_harness import DynamicWorkflow
     ```
 
 ## The idea

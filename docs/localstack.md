@@ -13,11 +13,10 @@ stop the LocalStack Docker container for each run.
 
 [Source](https://github.com/pydantic/pydantic-ai-harness/tree/main/pydantic_ai_harness/localstack/)
 
-> Import this capability from its submodule -- there is no top-level
-> `pydantic_ai_harness` re-export:
+> Like every capability, `LocalStack` is importable from the top level:
 >
 > ```python
-> from pydantic_ai_harness.localstack import LocalStack
+> from pydantic_ai_harness import LocalStack
 > ```
 >
 > The API may change between releases. Where practical, breaking changes ship with a deprecation warning.

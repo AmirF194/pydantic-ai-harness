@@ -12,6 +12,10 @@ Use this before opening a PR or reviewing a capability change.
 ## Implementation
 
 - Public exports are intentional.
+- Every public capability class is lazily re-exported from the top-level
+  `pydantic_ai_harness` package (`__all__` + `TYPE_CHECKING` + `__getattr__`;
+  ACP/experimental excepted) — see `capability-authoring.md` "Capability
+  Submodules And Exports".
 - Private helpers stay private.
 - Types are precise; new public signatures do not use `Any`.
 - No casts are used to paper over type design.
