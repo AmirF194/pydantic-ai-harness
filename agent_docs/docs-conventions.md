@@ -58,3 +58,10 @@ A harness page (`Coder`, `Researcher`, …) must state near the top that it is a
 capability composing other capabilities** and show the blown-out equivalent `capabilities=[...]`
 list — the transparency promise is part of the product. Harness classes are named like the agent
 they create (`Coder`), not like capabilities; the word "preset" is not used.
+
+The blown-out equivalent — on the docs page and in the harness's `examples/` counterpart — writes
+the harness's defaults out literally (instructions, command allowlists) instead of importing the
+constants: the reader is meant to see the entire picture and copy-tweak it. That makes it a
+**three-way sync contract**: implementation, docs page, and example must change together in the
+same PR whenever a harness's composition or defaults change. Each written-out block carries a
+keep-in-sync comment; the review checklist enforces the parity.
