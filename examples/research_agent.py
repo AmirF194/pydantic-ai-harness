@@ -11,7 +11,7 @@ from pydantic_ai import Agent
 from pydantic_ai.capabilities import Capability, WebSearch
 from pydantic_ai.models import Model
 
-from pydantic_ai_harness.code_mode import CodeMode
+from pydantic_ai_harness import CodeMode
 from pydantic_ai_harness.tool_output_limits import ToolOutputLimits
 
 DEFAULT_MODEL = os.environ.get('PYDANTIC_AI_MODEL', 'openai:gpt-5.6-sol')
@@ -33,7 +33,7 @@ def build_agent(model: Model | str = DEFAULT_MODEL) -> Agent:
         capabilities=[
             Capability(instructions=INSTRUCTIONS),  # Set evidence and citation expectations.
             CodeMode(),  # Let the model orchestrate research tools in code.
-            WebSearch(native=False, local=True),  # Provide portable local web search.
+            WebSearch(local=True),  # Use native search when supported, with DuckDuckGo as the local fallback.
             ToolOutputLimits(),  # Bound large search responses.
         ],
     )

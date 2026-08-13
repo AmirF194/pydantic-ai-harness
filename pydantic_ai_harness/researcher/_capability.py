@@ -17,13 +17,9 @@ Distinguish sourced facts from your own inference.
 
 
 class Researcher(CombinedCapability[AgentDepsT]):
-    """A complete research-agent harness.
+    """A complete research-agent harness built as a regular combined capability.
 
-    This is literally `Capability`, `CodeMode`, `WebSearch(native=False)`, and
-    `ToolOutputLimits` combined.
-
-    `Researcher` is a regular combined capability. Use its component
-    capabilities directly when you need a different composition.
+    See the class definition and [Researcher docs](https://pydantic.dev/docs/ai/harness/researcher/) for the exact composition.
 
     It comes with concise default instructions. Pass `instructions=` to
     replace them, or `instructions=None` to run with no default instructions.
@@ -36,7 +32,7 @@ class Researcher(CombinedCapability[AgentDepsT]):
         capabilities.extend(
             [
                 CodeMode[AgentDepsT](),
-                WebSearch[AgentDepsT](native=False, local=True),
+                WebSearch[AgentDepsT](local=True),
                 ToolOutputLimits[AgentDepsT](),
             ]
         )
