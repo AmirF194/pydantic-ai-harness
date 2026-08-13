@@ -79,8 +79,8 @@ jobs:
             -e "${RUNNER_TEMP}/pydantic-ai/pydantic_ai_slim" \
             -e "${RUNNER_TEMP}/pydantic-ai/pydantic_graph"
 
-      # The editable overrides are intentionally not represented in `uv.lock`.
-      # A regular `uv run` would sync the environment and restore the locked wheels.
+      # Keep `--no-sync`: the editable overrides are intentionally not represented in
+      # `uv.lock`, so a regular `uv run` would remove them and restore the locked wheels.
       - run: uv run --no-sync ruff format --check
       - run: uv run --no-sync ruff check
       - run: uv run --no-sync pyright
