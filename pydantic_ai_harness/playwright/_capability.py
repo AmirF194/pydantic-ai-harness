@@ -53,8 +53,9 @@ each keystroke. Use `wait_for` for content that loads after an action and `wait_
 wait out a spinner or overlay, and `screenshot` only for visual checks (charts, layout). A page that
 renders after it loads returns little text at first: read it again with `snapshot` or `get_text`, or
 `wait_for` something a snapshot showed you -- waiting for text you have only guessed at spends the
-whole timeout. A list that grows as you scroll needs `scroll('down')` or `scroll('bottom')` repeated
-until the text it returns stops growing.
+whole timeout. A long list needs `scroll('down')` repeated, collecting what you need from each result as you
+go: `scroll` reports where the page now sits, and a feed that renders only the rows near the
+viewport drops the earlier ones, so jumping to `bottom` and reading once returns a fraction of it.
 
 Tools act on the active tab. When a link, sign-in popup or payment step opens a new one, `tabs('list')`
 shows what is open and `tabs('select', index)` moves there. A page dialog (`alert`, `confirm`,
