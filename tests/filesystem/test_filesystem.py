@@ -8,8 +8,10 @@ import pytest
 from pydantic_ai import Agent
 from pydantic_ai.exceptions import ModelRetry
 from pydantic_ai.models.test import TestModel
+from pydantic_ai.tools import RunContext
+from pydantic_ai.usage import RunUsage
 
-from pydantic_ai_harness.filesystem import FileSystem
+from pydantic_ai_harness.filesystem import READ_ONLY_TOOL_NAMES, FileSystem
 from pydantic_ai_harness.filesystem._toolset import FileSystemToolset, _content_hash, _format_lines, _is_binary
 
 
@@ -1049,6 +1051,14 @@ class TestFileSystemCapability:
         fs = FileSystem(root_dir=tmp_path)
         toolset = fs.get_toolset()
         assert isinstance(toolset, FileSystemToolset)
+
+    async def test_read_only_toolset_exposes_exactly_read_only_tools(self, tmp_path: Path) -> None:
+        filesystem = FileSystem[None](root_dir=tmp_path)
+        all_tool_names = set(filesystem.get_toolset().tools)
+        context = RunContext(deps=None, model=TestModel(), usage=RunUsage(), run_id='test')
+
+        assert READ_ONLY_TOOL_NAMES <= all_tool_names
+        assert set(await filesystem.read_only_toolset().get_tools(context)) == READ_ONLY_TOOL_NAMES
 
     def test_search_files_description_has_string_return_type(self) -> None:
         description = FileSystem().get_toolset().tools['search_files'].description

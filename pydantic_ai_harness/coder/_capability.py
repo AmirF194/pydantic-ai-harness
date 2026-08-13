@@ -45,11 +45,9 @@ Report what changed, verification results, and any remaining risks.
 """
 """Default instructions for `Coder`."""
 
-_READ_TOOLS = frozenset({'read_file', 'list_directory', 'search_files', 'find_files', 'file_info'})
-
 
 def _explorer(workspace: str | Path) -> SubAgent[AgentDepsT]:
-    files = FileSystem[AgentDepsT](workspace).get_toolset().filtered(lambda ctx, tool: tool.name in _READ_TOOLS)
+    files = FileSystem[AgentDepsT](workspace).read_only_toolset()
     agent = Agent[AgentDepsT](  # pyright: ignore[reportCallIssue, reportArgumentType]
         name='explorer',
         description='Explore the codebase and answer questions without modifying anything',

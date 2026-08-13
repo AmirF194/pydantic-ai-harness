@@ -9,8 +9,9 @@ from typing import Any
 
 from pydantic_ai.capabilities import AbstractCapability
 from pydantic_ai.tools import AgentDepsT
+from pydantic_ai.toolsets import FilteredToolset
 
-from pydantic_ai_harness.filesystem._toolset import FileSystemToolset
+from pydantic_ai_harness.filesystem._toolset import READ_ONLY_TOOL_NAMES, FileSystemToolset
 
 _DEFAULT_PROTECTED: list[str] = [
     '.git/*',
@@ -78,3 +79,7 @@ class FileSystem(AbstractCapability[AgentDepsT]):
             max_search_results=self.max_search_results,
             max_find_results=self.max_find_results,
         )
+
+    def read_only_toolset(self) -> FilteredToolset[AgentDepsT]:
+        """Build the filesystem toolset filtered to read-only tools."""
+        return self.get_toolset().filtered(lambda ctx, tool: tool.name in READ_ONLY_TOOL_NAMES)
