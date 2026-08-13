@@ -1,0 +1,797 @@
+interactions:
+  - request:
+      body: '{"max_tokens":4096,"messages":[{"role":"user","content":[{"text":"Run the tests, fix the bug they catch, and re-run them to confirm.","type":"text"}]}],"model":"claude-fable-5","stream":false,"system":[{"type":"text","text":"Work step by step and keep the task''s goal in view.\nRead relevant files and repository instructions before editing.\nMake the smallest coherent change that solves the task.\nKeep the plan current during multi-step work.\nRun the relevant tests and checks after editing.\nReport what changed, verification results, and any remaining risks.\n\n<context-file path=\"AGENTS.md\">\nRun tests with `pytest`. Keep the implementation minimal.\n\n</context-file>\n\nCall `inventory_agent_context` to map where this repo keeps its coding-assistant setup (instruction dirs, skills, sub-agents, and hooks) so you can read and translate it.\nYou have a planning tool, `write_plan`. For multi-step work, call it first to lay out the steps, then keep it current: mark exactly one step `in_progress`, and mark a step `completed` as soon as it is fully done. Pass the full plan every time you call `write_plan`. Use `add_task` to append a single step, `update_task_status`/`update_task_statuses` to move steps between statuses, and `read_plan` to see step ids before a granular edit.\nYou can delegate self-contained tasks to these sub-agents using the `delegate_task` tool. Each runs in its own fresh context and does not see this conversation, so pass everything it needs.\n\nAvailable sub-agents:\n- explorer: Explore the codebase and answer questions without modifying anything"}],"tool_choice":{"type":"auto"},"tools":[{"name":"read_file","description":"<summary>Read a text file with line numbers.</summary>\n<returns>\n<description>File content with line numbers, plus metadata header.</description>\n</returns>","input_schema":{"additionalProperties":false,"properties":{"path":{"description":"File path relative to the root directory.","type":"string"},"offset":{"default":0,"description":"Zero-based line offset to start reading from.","type":"integer"},"limit":{"default":null,"description":"Maximum number of lines to return (default: 2000).","anyOf":[{"type":"integer"},{"type":"null"}]}},"required":["path"],"type":"object"}},{"name":"write_file","description":"<summary>Create or overwrite a file with conflict detection.</summary>\n<returns>\n<description>Confirmation message with new hash.</description>\n</returns>","input_schema":{"additionalProperties":false,"properties":{"path":{"description":"File path relative to the root directory.","type":"string"},"content":{"description":"The text content to write.","type":"string"},"expected_hash":{"default":null,"description":"If provided, the write is rejected when the file exists\nand its current hash doesn''t match (optimistic concurrency).","anyOf":[{"type":"string"},{"type":"null"}]}},"required":["path","content"],"type":"object"}},{"name":"edit_file","description":"<summary>Edit a file by exact string replacement with conflict detection.\n\nThe old_text must appear exactly once in the file. Include surrounding\ncontext lines to ensure uniqueness.</summary>\n<returns>\n<description>Summary with new hash for subsequent operations.</description>\n</returns>","input_schema":{"additionalProperties":false,"properties":{"path":{"description":"File path relative to the root directory.","type":"string"},"old_text":{"description":"The exact text to find (must appear exactly once).","type":"string"},"new_text":{"description":"The replacement text.","type":"string"},"expected_hash":{"default":null,"description":"If provided, rejects the edit when the file''s\ncurrent hash doesn''t match (optimistic concurrency).","anyOf":[{"type":"string"},{"type":"null"}]}},"required":["path","old_text","new_text"],"type":"object"}},{"name":"list_directory","description":"<summary>List the contents of a directory.</summary>\n<returns>\n<description>A newline-separated listing with type indicators and sizes.</description>\n</returns>","input_schema":{"additionalProperties":false,"properties":{"path":{"default":".","description":"Directory path relative to the root directory.","type":"string"}},"type":"object"}},{"name":"search_files","description":"<summary>Search file contents using a regular expression.</summary>\n<returns>\n<type>str</type>\n<description>Matching lines formatted as file:line_number:text.</description>\n</returns>","input_schema":{"additionalProperties":false,"properties":{"pattern":{"description":"Regex pattern to search for.","type":"string"},"path":{"default":".","description":"Directory to search in, relative to the root directory.","type":"string"},"include_glob":{"default":null,"description":"If provided, only search files matching this glob (e.g. ''*.py'').","anyOf":[{"type":"string"},{"type":"null"}]}},"required":["pattern"],"type":"object"}},{"name":"find_files","description":"<summary>Find files by glob pattern (name matching, not content search).</summary>\n<returns>\n<description>Newline-separated list of matching file paths relative to root.</description>\n</returns>","input_schema":{"additionalProperties":false,"properties":{"pattern":{"description":"Glob pattern to match (e.g. ''*.py'', ''**/*.json'').","type":"string"},"path":{"default":".","description":"Directory to search in, relative to the root directory.","type":"string"}},"required":["pattern"],"type":"object"}},{"name":"create_directory","description":"<summary>Create a directory and any missing parents.</summary>\n<returns>\n<description>Confirmation message.</description>\n</returns>","input_schema":{"additionalProperties":false,"properties":{"path":{"description":"Directory path relative to the root directory.","type":"string"}},"required":["path"],"type":"object"}},{"name":"file_info","description":"<summary>Get metadata about a file or directory.</summary>\n<returns>\n<description>Formatted metadata including size, type, and permissions.</description>\n</returns>","input_schema":{"additionalProperties":false,"properties":{"path":{"description":"File or directory path relative to the root directory.","type":"string"}},"required":["path"],"type":"object"}},{"name":"run_command","description":"<summary>Execute a shell command and return its output.</summary>\n<returns>\n<description>Labeled stdout/stderr output with exit code on non-zero exit.</description>\n</returns>","input_schema":{"additionalProperties":false,"properties":{"command":{"description":"The shell command to run.","type":"string"},"timeout_seconds":{"default":null,"description":"Maximum seconds to wait (default: 30).","anyOf":[{"type":"number"},{"type":"null"}]}},"required":["command"],"type":"object"}},{"name":"start_command","description":"<summary>Start a long-running command in the background (e.g. a server or watcher).\n\nCallers MUST call `stop_command(command_id)` when done to terminate the\nprocess and clean up temporary output files.</summary>\n<returns>\n<description>A message containing the unique command ID for later check/stop calls.</description>\n</returns>","input_schema":{"additionalProperties":false,"properties":{"command":{"description":"The shell command to run in the background.","type":"string"}},"required":["command"],"type":"object"}},{"name":"check_command","description":"<summary>Check the status and recent output of a background command.</summary>\n<returns>\n<description>Status and recent output of the background command.</description>\n</returns>","input_schema":{"additionalProperties":false,"properties":{"command_id":{"description":"The ID returned by start_command.","type":"string"}},"required":["command_id"],"type":"object"}},{"name":"stop_command","description":"<summary>Stop a background command and return its final output.</summary>\n<returns>\n<description>Final output and exit status of the stopped command.</description>\n</returns>","input_schema":{"additionalProperties":false,"properties":{"command_id":{"description":"The ID returned by start_command.","type":"string"}},"required":["command_id"],"type":"object"}},{"name":"inventory_agent_context","description":"Report where this repo''s coding-assistant setup lives.\n\nReturns the locations of instruction dirs (`.claude`, `.agents`,\n`.codex`, `.grok`) and, within each, the `skills/`, `agents/`, and\n`settings.json` (hooks) it contains. This locates assets so you can read\nand translate them; it does not parse their contents.","input_schema":{"additionalProperties":false,"properties":{},"type":"object"}},{"name":"write_plan","description":"Create or replace the entire plan. Pass the whole ordered list every time -- including steps that are unchanged, completed, or cancelled -- so there are no indices to track. Keep exactly one step `in_progress`. Call this first for multi-step work, then again as you start and finish steps.","input_schema":{"additionalProperties":false,"properties":{"items":{"description":"The complete ordered list of plan steps.","items":{"$ref":"#/$defs/PlanItem"},"type":"array"}},"required":["items"],"type":"object","$defs":{"PlanItem":{"description":"One step in the plan.\n\nUsed both as the `write_plan` input and as the stored item. `id` is\nauto-generated when omitted, so the model can create a plan without ids and\nreference existing steps by id when restructuring.\n\nAttributes:\n    id: Stable identifier (auto-generated 8-char hex string).\n    content: Imperative description of the step, e.g. `Add the database migration`.\n    status: Current status of this step.\n    active_form: Optional present-continuous label shown while the step runs,\n        e.g. `Adding the database migration`.\n    parent_id: Parent step id for subtask hierarchies (subtasks mode only).\n    depends_on: Ids of steps that must complete before this one (subtasks mode only).","properties":{"id":{"description":"Step id. Auto-generated if omitted.","type":"string"},"content":{"description":"Imperative description of the step, e.g. \"Add the database migration\".","type":"string"},"status":{"$ref":"#/$defs/TaskStatus","default":"pending","description":"Current status of this step. \"blocked\" requires subtasks to be enabled."},"active_form":{"default":"","description":"Present-continuous label shown while the step runs, e.g. \"Adding the database migration\".","type":"string"},"parent_id":{"default":null,"description":"Parent step id for a subtask hierarchy. Requires subtasks to be enabled.","anyOf":[{"type":"string"},{"type":"null"}]},"depends_on":{"description":"Ids of steps that must complete before this one. Requires subtasks to be enabled.","items":{"type":"string"},"type":"array"}},"required":["content"],"type":"object"},"TaskStatus":{"description":"Lifecycle status of a single plan step.\n\n`blocked` is only reachable when the capability runs with\n`enable_subtasks=True`; otherwise the toolset rejects it.","enum":["pending","in_progress","completed","cancelled","blocked"],"type":"string"}}}},{"name":"read_plan","description":"Read the current plan: each step''s id, content, and status, plus a progress summary. Use it before granular edits (the ids come from here) and to check what is left.","input_schema":{"additionalProperties":false,"properties":{},"type":"object"}},{"name":"add_task","description":"Append one new `pending` step without replacing the plan. Prefer this over write_plan when you only need to add a single step.","input_schema":{"additionalProperties":false,"properties":{"content":{"description":"The step description in imperative form.","type":"string"},"active_form":{"default":"","description":"Optional present-continuous label, e.g. \"Fix bug\" -> \"Fixing bug\".","type":"string"}},"required":["content"],"type":"object"}},{"name":"update_task_status","description":"Update one step''s status by id. Set `in_progress` when you START a step and `completed` when it is fully done -- never mark work complete while tests fail or the implementation is partial.","input_schema":{"additionalProperties":false,"properties":{"task_id":{"description":"Id of the step to update.","type":"string"},"status":{"$ref":"#/$defs/TaskStatus","description":"New status."}},"required":["task_id","status"],"type":"object","$defs":{"TaskStatus":{"description":"Lifecycle status of a single plan step.\n\n`blocked` is only reachable when the capability runs with\n`enable_subtasks=True`; otherwise the toolset rejects it.","enum":["pending","in_progress","completed","cancelled","blocked"],"type":"string"}}}},{"name":"update_task_statuses","description":"Update several steps'' statuses in one call -- ideal for handing off from a finished step to the next one. The whole batch is validated first: if any entry is invalid nothing is applied and the errors are returned. Entries apply in order, so when a batch both completes a prerequisite and starts its dependent, list the prerequisite''s completion first.","input_schema":{"additionalProperties":false,"properties":{"updates":{"description":"The `{task_id, status}` entries to apply.","items":{"$ref":"#/$defs/PlanStatusUpdate"},"type":"array"}},"required":["updates"],"type":"object","$defs":{"PlanStatusUpdate":{"description":"One entry of the `update_task_statuses` batch tool.","properties":{"task_id":{"description":"Id of the step to update (from `read_plan`).","type":"string"},"status":{"$ref":"#/$defs/TaskStatus","description":"New status: pending, in_progress, completed, or cancelled -- or blocked, when subtasks are enabled."}},"required":["task_id","status"],"type":"object"},"TaskStatus":{"description":"Lifecycle status of a single plan step.\n\n`blocked` is only reachable when the capability runs with\n`enable_subtasks=True`; otherwise the toolset rejects it.","enum":["pending","in_progress","completed","cancelled","blocked"],"type":"string"}}}},{"name":"remove_task","description":"Permanently delete a step by id -- use it for steps that are no longer relevant or were created in error. To mark work done, use update_task_status instead.","input_schema":{"additionalProperties":false,"properties":{"task_id":{"description":"Id of the step to remove.","type":"string"}},"required":["task_id"],"type":"object"}},{"name":"delegate_task","description":"Delegate a self-contained task to a named sub-agent and return its result.\n\nThe sub-agent runs in its own fresh context and does not see this\nconversation, so `task` must contain everything it needs.","input_schema":{"additionalProperties":false,"properties":{"agent_name":{"description":"Name of the sub-agent to run. Must be one of the agents\nlisted in the instructions.","type":"string"},"task":{"description":"The complete, self-contained instruction for the sub-agent.","type":"string"}},"required":["agent_name","task"],"type":"object"}},{"name":"read_tool_result","description":"Read a slice of a spilled tool result.","input_schema":{"additionalProperties":false,"properties":{"handle":{"description":"The handle from the overflowed tool return.","type":"string"},"offset":{"default":0,"description":"Number of matching lines to skip from the start (or end). Must be >= 0.","type":"integer"},"limit":{"default":200,"description":"Maximum number of lines to return (>= 1; clamped to a built-in cap).","type":"integer"},"from_end":{"default":false,"description":"Count `offset`/`limit` from the end of the result.","type":"boolean"},"pattern":{"default":null,"description":"Optional literal substring; only lines containing it are returned.","anyOf":[{"type":"string"},{"type":"null"}]}},"required":["handle"],"type":"object"}}]}'
+      headers:
+        accept:
+          - application/json
+        accept-encoding:
+          - gzip, deflate, br
+        anthropic-version:
+          - '2023-06-01'
+        connection:
+          - keep-alive
+        content-length:
+          - '15528'
+        content-type:
+          - application/json
+        host:
+          - api.anthropic.com
+        user-agent:
+          - pydantic-ai/2.28.0
+        x-api-key:
+          - REDACTED
+        x-stainless-arch:
+          - x64
+        x-stainless-async:
+          - async:asyncio
+        x-stainless-lang:
+          - python
+        x-stainless-os:
+          - Linux
+        x-stainless-package-version:
+          - 0.122.0
+        x-stainless-read-timeout:
+          - '600'
+        x-stainless-retry-count:
+          - '0'
+        x-stainless-runtime:
+          - CPython
+        x-stainless-runtime-version:
+          - 3.14.3
+        x-stainless-timeout:
+          - '600'
+      method: POST
+      uri: https://api.anthropic.com/v1/messages?beta=true
+    response:
+      body:
+        string: !!binary |
+          H4sIAAAAAAAAA4RSbWvbMBD+L/dZhZgmTadvW6GF0RVCGEspQ5ztq61FPrnSqW1q/N+H0po0Hds+
+          6nnR89xJA3S+JgcaKoepppN7LB2dLECBrUFDFxszK4oLKsrvL+F5vS4u7c168aPt4xkokF1PWUUx
+          YkOgIHiXAYzRRkEWUFB5FmIBfTdMevHemRRpSsnnZGbFKm6vA35bnF/y9fx2M2/oy69NCQoYu+wL
+          iU3luw65zlbuk4AeYII09DuhKDAqqNA5Cpl9y6xtoEpgHNV/a2zOm4fVzRV+Wl19LenJrj/Pn8Lm
+          UMPyI7H4sDPYEIvZT/gs7yr9s8BPBVF8bwJh9HzcY09EekjEFYHm5NwbWJOgdXHC0n7heniNNOK3
+          xBH02Wx5mrOrlkwVCMV6NseS2cQHwvpv3OTNCdS31FFAZxbdn/oDW7Qf2VGBT/IeWi4/QIe5BpDW
+          8tZyc3RBpPBoKzJi8zYh/6oaw+v731PIezINedDQOF+ig3H8DQAA//8DAJhCbtvVAgAA
+      headers:
+        anthropic-organization-id:
+          - 44ae676c-958f-4d68-9108-eae9de7b366b
+        anthropic-ratelimit-input-tokens-limit:
+          - '4000000'
+        anthropic-ratelimit-input-tokens-remaining:
+          - '3997000'
+        anthropic-ratelimit-input-tokens-reset:
+          - '2026-08-13T23:13:12Z'
+        anthropic-ratelimit-output-tokens-limit:
+          - '800000'
+        anthropic-ratelimit-output-tokens-remaining:
+          - '800000'
+        anthropic-ratelimit-output-tokens-reset:
+          - '2026-08-13T23:13:12Z'
+        anthropic-ratelimit-requests-limit:
+          - '20000'
+        anthropic-ratelimit-requests-remaining:
+          - '19999'
+        anthropic-ratelimit-requests-reset:
+          - '2026-08-13T23:13:09Z'
+        anthropic-ratelimit-tokens-limit:
+          - '4800000'
+        anthropic-ratelimit-tokens-remaining:
+          - '4797000'
+        anthropic-ratelimit-tokens-reset:
+          - '2026-08-13T23:13:12Z'
+        anthropic-workspace-id:
+          - wrkspc_01L52HbY7uCkD17LL3R3voXT
+        cf-cache-status:
+          - DYNAMIC
+        cf-ray:
+          - a2ab68a038bda0a0-QRO
+        connection:
+          - keep-alive
+        content-encoding:
+          - gzip
+        content-security-policy:
+          - default-src 'none'; frame-ancestors 'none'
+        content-type:
+          - application/json
+        date:
+          - Thu, 13 Aug 2026 23:13:12 GMT
+        request-id:
+          - req_011Ce1bUymiw2EZ9ocQPGqWb
+        server:
+          - cloudflare
+        strict-transport-security:
+          - max-age=31536000; includeSubDomains; preload
+        traceresponse:
+          - 00-dfb6524fab0b9340eaeefebb982d2092-05d80218b3018cd4-01
+        transfer-encoding:
+          - chunked
+        vary:
+          - Accept-Encoding
+        x-robots-tag:
+          - none
+      status:
+        code: 200
+        message: OK
+  - request:
+      body: '{"max_tokens":4096,"messages":[{"role":"user","content":[{"text":"Run the tests, fix the bug they catch, and re-run them to confirm.","type":"text"}]},{"role":"assistant","content":[{"id":"toolu_01QskLraM58FnL4YX4geBjXb","type":"tool_use","name":"run_command","input":{"command":"pytest"}},{"id":"toolu_01X8gqQNGa9QGJbewiSA4wrX","type":"tool_use","name":"inventory_agent_context","input":{}}]},{"role":"user","content":[{"tool_use_id":"toolu_01QskLraM58FnL4YX4geBjXb","type":"tool_result","content":[{"text":"[stdout]\n============================= test session starts ==============================\nplatform linux -- Python 3.14.3, pytest-9.0.3, pluggy-1.6.0\nrootdir: /tmp/pytest-of-DouweM/pytest-3226/test_coder_completes_task0/workspace\nplugins: examples-0.0.18, recording-0.13.4, inline-snapshot-0.33.0, anyio-4.12.1, logfire-4.33.0\ncollected 1 item\n\ntest_add.py F                                                            [100%]\n\n=================================== FAILURES ===================================\n___________________________________ test_add ___________________________________\n\n    def test_add() -> None:\n>       assert add(2, 3) == 5\nE       assert -1 == 5\nE        +  where -1 = add(2, 3)\n\ntest_add.py:5: AssertionError\n=========================== short test summary info ============================\nFAILED test_add.py::test_add - assert -1 == 5\n============================== 1 failed in 0.05s ===============================\n\n[exit code: 1]","type":"text"}],"is_error":false},{"tool_use_id":"toolu_01X8gqQNGa9QGJbewiSA4wrX","type":"tool_result","content":[{"text":"{\"roots\":[{\"root\":\".claude\",\"exists\":false,\"skills\":[],\"agents\":[],\"settings\":null,\"notes\":null},{\"root\":\".agents\",\"exists\":false,\"skills\":[],\"agents\":[],\"settings\":null,\"notes\":null},{\"root\":\".codex\",\"exists\":false,\"skills\":[],\"agents\":[],\"settings\":null,\"notes\":\"Codex uses TOML config; assets are derived from the .claude/.agents setup.\"},{\"root\":\".grok\",\"exists\":false,\"skills\":[],\"agents\":[],\"settings\":null,\"notes\":\"Grok setup is derived from the .claude/.agents setup.\"}]}","type":"text"}],"is_error":false}]}],"model":"claude-fable-5","stream":false,"system":[{"type":"text","text":"Work step by step and keep the task''s goal in view.\nRead relevant files and repository instructions before editing.\nMake the smallest coherent change that solves the task.\nKeep the plan current during multi-step work.\nRun the relevant tests and checks after editing.\nReport what changed, verification results, and any remaining risks.\n\n<context-file path=\"AGENTS.md\">\nRun tests with `pytest`. Keep the implementation minimal.\n\n</context-file>\n\nCall `inventory_agent_context` to map where this repo keeps its coding-assistant setup (instruction dirs, skills, sub-agents, and hooks) so you can read and translate it.\nYou have a planning tool, `write_plan`. For multi-step work, call it first to lay out the steps, then keep it current: mark exactly one step `in_progress`, and mark a step `completed` as soon as it is fully done. Pass the full plan every time you call `write_plan`. Use `add_task` to append a single step, `update_task_status`/`update_task_statuses` to move steps between statuses, and `read_plan` to see step ids before a granular edit.\nYou can delegate self-contained tasks to these sub-agents using the `delegate_task` tool. Each runs in its own fresh context and does not see this conversation, so pass everything it needs.\n\nAvailable sub-agents:\n- explorer: Explore the codebase and answer questions without modifying anything"}],"tool_choice":{"type":"auto"},"tools":[{"name":"read_file","description":"<summary>Read a text file with line numbers.</summary>\n<returns>\n<description>File content with line numbers, plus metadata header.</description>\n</returns>","input_schema":{"additionalProperties":false,"properties":{"path":{"description":"File path relative to the root directory.","type":"string"},"offset":{"default":0,"description":"Zero-based line offset to start reading from.","type":"integer"},"limit":{"default":null,"description":"Maximum number of lines to return (default: 2000).","anyOf":[{"type":"integer"},{"type":"null"}]}},"required":["path"],"type":"object"}},{"name":"write_file","description":"<summary>Create or overwrite a file with conflict detection.</summary>\n<returns>\n<description>Confirmation message with new hash.</description>\n</returns>","input_schema":{"additionalProperties":false,"properties":{"path":{"description":"File path relative to the root directory.","type":"string"},"content":{"description":"The text content to write.","type":"string"},"expected_hash":{"default":null,"description":"If provided, the write is rejected when the file exists\nand its current hash doesn''t match (optimistic concurrency).","anyOf":[{"type":"string"},{"type":"null"}]}},"required":["path","content"],"type":"object"}},{"name":"edit_file","description":"<summary>Edit a file by exact string replacement with conflict detection.\n\nThe old_text must appear exactly once in the file. Include surrounding\ncontext lines to ensure uniqueness.</summary>\n<returns>\n<description>Summary with new hash for subsequent operations.</description>\n</returns>","input_schema":{"additionalProperties":false,"properties":{"path":{"description":"File path relative to the root directory.","type":"string"},"old_text":{"description":"The exact text to find (must appear exactly once).","type":"string"},"new_text":{"description":"The replacement text.","type":"string"},"expected_hash":{"default":null,"description":"If provided, rejects the edit when the file''s\ncurrent hash doesn''t match (optimistic concurrency).","anyOf":[{"type":"string"},{"type":"null"}]}},"required":["path","old_text","new_text"],"type":"object"}},{"name":"list_directory","description":"<summary>List the contents of a directory.</summary>\n<returns>\n<description>A newline-separated listing with type indicators and sizes.</description>\n</returns>","input_schema":{"additionalProperties":false,"properties":{"path":{"default":".","description":"Directory path relative to the root directory.","type":"string"}},"type":"object"}},{"name":"search_files","description":"<summary>Search file contents using a regular expression.</summary>\n<returns>\n<type>str</type>\n<description>Matching lines formatted as file:line_number:text.</description>\n</returns>","input_schema":{"additionalProperties":false,"properties":{"pattern":{"description":"Regex pattern to search for.","type":"string"},"path":{"default":".","description":"Directory to search in, relative to the root directory.","type":"string"},"include_glob":{"default":null,"description":"If provided, only search files matching this glob (e.g. ''*.py'').","anyOf":[{"type":"string"},{"type":"null"}]}},"required":["pattern"],"type":"object"}},{"name":"find_files","description":"<summary>Find files by glob pattern (name matching, not content search).</summary>\n<returns>\n<description>Newline-separated list of matching file paths relative to root.</description>\n</returns>","input_schema":{"additionalProperties":false,"properties":{"pattern":{"description":"Glob pattern to match (e.g. ''*.py'', ''**/*.json'').","type":"string"},"path":{"default":".","description":"Directory to search in, relative to the root directory.","type":"string"}},"required":["pattern"],"type":"object"}},{"name":"create_directory","description":"<summary>Create a directory and any missing parents.</summary>\n<returns>\n<description>Confirmation message.</description>\n</returns>","input_schema":{"additionalProperties":false,"properties":{"path":{"description":"Directory path relative to the root directory.","type":"string"}},"required":["path"],"type":"object"}},{"name":"file_info","description":"<summary>Get metadata about a file or directory.</summary>\n<returns>\n<description>Formatted metadata including size, type, and permissions.</description>\n</returns>","input_schema":{"additionalProperties":false,"properties":{"path":{"description":"File or directory path relative to the root directory.","type":"string"}},"required":["path"],"type":"object"}},{"name":"run_command","description":"<summary>Execute a shell command and return its output.</summary>\n<returns>\n<description>Labeled stdout/stderr output with exit code on non-zero exit.</description>\n</returns>","input_schema":{"additionalProperties":false,"properties":{"command":{"description":"The shell command to run.","type":"string"},"timeout_seconds":{"default":null,"description":"Maximum seconds to wait (default: 30).","anyOf":[{"type":"number"},{"type":"null"}]}},"required":["command"],"type":"object"}},{"name":"start_command","description":"<summary>Start a long-running command in the background (e.g. a server or watcher).\n\nCallers MUST call `stop_command(command_id)` when done to terminate the\nprocess and clean up temporary output files.</summary>\n<returns>\n<description>A message containing the unique command ID for later check/stop calls.</description>\n</returns>","input_schema":{"additionalProperties":false,"properties":{"command":{"description":"The shell command to run in the background.","type":"string"}},"required":["command"],"type":"object"}},{"name":"check_command","description":"<summary>Check the status and recent output of a background command.</summary>\n<returns>\n<description>Status and recent output of the background command.</description>\n</returns>","input_schema":{"additionalProperties":false,"properties":{"command_id":{"description":"The ID returned by start_command.","type":"string"}},"required":["command_id"],"type":"object"}},{"name":"stop_command","description":"<summary>Stop a background command and return its final output.</summary>\n<returns>\n<description>Final output and exit status of the stopped command.</description>\n</returns>","input_schema":{"additionalProperties":false,"properties":{"command_id":{"description":"The ID returned by start_command.","type":"string"}},"required":["command_id"],"type":"object"}},{"name":"inventory_agent_context","description":"Report where this repo''s coding-assistant setup lives.\n\nReturns the locations of instruction dirs (`.claude`, `.agents`,\n`.codex`, `.grok`) and, within each, the `skills/`, `agents/`, and\n`settings.json` (hooks) it contains. This locates assets so you can read\nand translate them; it does not parse their contents.","input_schema":{"additionalProperties":false,"properties":{},"type":"object"}},{"name":"write_plan","description":"Create or replace the entire plan. Pass the whole ordered list every time -- including steps that are unchanged, completed, or cancelled -- so there are no indices to track. Keep exactly one step `in_progress`. Call this first for multi-step work, then again as you start and finish steps.","input_schema":{"additionalProperties":false,"properties":{"items":{"description":"The complete ordered list of plan steps.","items":{"$ref":"#/$defs/PlanItem"},"type":"array"}},"required":["items"],"type":"object","$defs":{"PlanItem":{"description":"One step in the plan.\n\nUsed both as the `write_plan` input and as the stored item. `id` is\nauto-generated when omitted, so the model can create a plan without ids and\nreference existing steps by id when restructuring.\n\nAttributes:\n    id: Stable identifier (auto-generated 8-char hex string).\n    content: Imperative description of the step, e.g. `Add the database migration`.\n    status: Current status of this step.\n    active_form: Optional present-continuous label shown while the step runs,\n        e.g. `Adding the database migration`.\n    parent_id: Parent step id for subtask hierarchies (subtasks mode only).\n    depends_on: Ids of steps that must complete before this one (subtasks mode only).","properties":{"id":{"description":"Step id. Auto-generated if omitted.","type":"string"},"content":{"description":"Imperative description of the step, e.g. \"Add the database migration\".","type":"string"},"status":{"$ref":"#/$defs/TaskStatus","default":"pending","description":"Current status of this step. \"blocked\" requires subtasks to be enabled."},"active_form":{"default":"","description":"Present-continuous label shown while the step runs, e.g. \"Adding the database migration\".","type":"string"},"parent_id":{"default":null,"description":"Parent step id for a subtask hierarchy. Requires subtasks to be enabled.","anyOf":[{"type":"string"},{"type":"null"}]},"depends_on":{"description":"Ids of steps that must complete before this one. Requires subtasks to be enabled.","items":{"type":"string"},"type":"array"}},"required":["content"],"type":"object"},"TaskStatus":{"description":"Lifecycle status of a single plan step.\n\n`blocked` is only reachable when the capability runs with\n`enable_subtasks=True`; otherwise the toolset rejects it.","enum":["pending","in_progress","completed","cancelled","blocked"],"type":"string"}}}},{"name":"read_plan","description":"Read the current plan: each step''s id, content, and status, plus a progress summary. Use it before granular edits (the ids come from here) and to check what is left.","input_schema":{"additionalProperties":false,"properties":{},"type":"object"}},{"name":"add_task","description":"Append one new `pending` step without replacing the plan. Prefer this over write_plan when you only need to add a single step.","input_schema":{"additionalProperties":false,"properties":{"content":{"description":"The step description in imperative form.","type":"string"},"active_form":{"default":"","description":"Optional present-continuous label, e.g. \"Fix bug\" -> \"Fixing bug\".","type":"string"}},"required":["content"],"type":"object"}},{"name":"update_task_status","description":"Update one step''s status by id. Set `in_progress` when you START a step and `completed` when it is fully done -- never mark work complete while tests fail or the implementation is partial.","input_schema":{"additionalProperties":false,"properties":{"task_id":{"description":"Id of the step to update.","type":"string"},"status":{"$ref":"#/$defs/TaskStatus","description":"New status."}},"required":["task_id","status"],"type":"object","$defs":{"TaskStatus":{"description":"Lifecycle status of a single plan step.\n\n`blocked` is only reachable when the capability runs with\n`enable_subtasks=True`; otherwise the toolset rejects it.","enum":["pending","in_progress","completed","cancelled","blocked"],"type":"string"}}}},{"name":"update_task_statuses","description":"Update several steps'' statuses in one call -- ideal for handing off from a finished step to the next one. The whole batch is validated first: if any entry is invalid nothing is applied and the errors are returned. Entries apply in order, so when a batch both completes a prerequisite and starts its dependent, list the prerequisite''s completion first.","input_schema":{"additionalProperties":false,"properties":{"updates":{"description":"The `{task_id, status}` entries to apply.","items":{"$ref":"#/$defs/PlanStatusUpdate"},"type":"array"}},"required":["updates"],"type":"object","$defs":{"PlanStatusUpdate":{"description":"One entry of the `update_task_statuses` batch tool.","properties":{"task_id":{"description":"Id of the step to update (from `read_plan`).","type":"string"},"status":{"$ref":"#/$defs/TaskStatus","description":"New status: pending, in_progress, completed, or cancelled -- or blocked, when subtasks are enabled."}},"required":["task_id","status"],"type":"object"},"TaskStatus":{"description":"Lifecycle status of a single plan step.\n\n`blocked` is only reachable when the capability runs with\n`enable_subtasks=True`; otherwise the toolset rejects it.","enum":["pending","in_progress","completed","cancelled","blocked"],"type":"string"}}}},{"name":"remove_task","description":"Permanently delete a step by id -- use it for steps that are no longer relevant or were created in error. To mark work done, use update_task_status instead.","input_schema":{"additionalProperties":false,"properties":{"task_id":{"description":"Id of the step to remove.","type":"string"}},"required":["task_id"],"type":"object"}},{"name":"delegate_task","description":"Delegate a self-contained task to a named sub-agent and return its result.\n\nThe sub-agent runs in its own fresh context and does not see this\nconversation, so `task` must contain everything it needs.","input_schema":{"additionalProperties":false,"properties":{"agent_name":{"description":"Name of the sub-agent to run. Must be one of the agents\nlisted in the instructions.","type":"string"},"task":{"description":"The complete, self-contained instruction for the sub-agent.","type":"string"}},"required":["agent_name","task"],"type":"object"}},{"name":"read_tool_result","description":"Read a slice of a spilled tool result.","input_schema":{"additionalProperties":false,"properties":{"handle":{"description":"The handle from the overflowed tool return.","type":"string"},"offset":{"default":0,"description":"Number of matching lines to skip from the start (or end). Must be >= 0.","type":"integer"},"limit":{"default":200,"description":"Maximum number of lines to return (>= 1; clamped to a built-in cap).","type":"integer"},"from_end":{"default":false,"description":"Count `offset`/`limit` from the end of the result.","type":"boolean"},"pattern":{"default":null,"description":"Optional literal substring; only lines containing it are returned.","anyOf":[{"type":"string"},{"type":"null"}]}},"required":["handle"],"type":"object"}}]}'
+      headers:
+        accept:
+          - application/json
+        accept-encoding:
+          - gzip, deflate, br
+        anthropic-version:
+          - '2023-06-01'
+        connection:
+          - keep-alive
+        content-length:
+          - '17569'
+        content-type:
+          - application/json
+        host:
+          - api.anthropic.com
+        user-agent:
+          - pydantic-ai/2.28.0
+        x-api-key:
+          - REDACTED
+        x-stainless-arch:
+          - x64
+        x-stainless-async:
+          - async:asyncio
+        x-stainless-lang:
+          - python
+        x-stainless-os:
+          - Linux
+        x-stainless-package-version:
+          - 0.122.0
+        x-stainless-read-timeout:
+          - '600'
+        x-stainless-retry-count:
+          - '0'
+        x-stainless-runtime:
+          - CPython
+        x-stainless-runtime-version:
+          - 3.14.3
+        x-stainless-timeout:
+          - '600'
+      method: POST
+      uri: https://api.anthropic.com/v1/messages?beta=true
+    response:
+      body:
+        string: !!binary |
+          H4sIAAAAAAAAA3RRXUvDMBT9L/c5yursxvKmPjoGIk5BJKTNXRuWJjW5UbbS/y6pq3MTH3M+cu49
+          t4PGKTTAoTQyKrzYyMLgRQ4MtAIOTajEJMvuMCvWy2l4WM32631TPO/m9h4Y0K7FpMIQZIXAwDuT
+          ABmCDiQtAYPSWUJLwF+7UU/OGREDjinpHcUku8kfb9s5vizqVfBPV/ozmzb5EhhY2SSfR6nERpvB
+          aNtIwDtoJdUpUqnLdgc9g1Iagz5RhzilPZYEff/GIJBrhUcZnD0dZCACvke0JQK30ZgDqJCkNmHE
+          4rAq774nEOS2aAPw2TyfpOyyRlF6lKSdFaeSH37Y4x9u9KYEbGts0Esj8uav/shm9TnbM3CRfkPX
+          izPouFcHVGu71bY6+SCg/9AlCtKpTUj3VNKrofsN+tSTqNABh8q4Qhro+y8AAAD//wMA+XQAkU8C
+          AAA=
+      headers:
+        anthropic-organization-id:
+          - 44ae676c-958f-4d68-9108-eae9de7b366b
+        anthropic-ratelimit-input-tokens-limit:
+          - '4000000'
+        anthropic-ratelimit-input-tokens-remaining:
+          - '3997000'
+        anthropic-ratelimit-input-tokens-reset:
+          - '2026-08-13T23:13:16Z'
+        anthropic-ratelimit-output-tokens-limit:
+          - '800000'
+        anthropic-ratelimit-output-tokens-remaining:
+          - '800000'
+        anthropic-ratelimit-output-tokens-reset:
+          - '2026-08-13T23:13:16Z'
+        anthropic-ratelimit-requests-limit:
+          - '20000'
+        anthropic-ratelimit-requests-remaining:
+          - '19999'
+        anthropic-ratelimit-requests-reset:
+          - '2026-08-13T23:13:13Z'
+        anthropic-ratelimit-tokens-limit:
+          - '4800000'
+        anthropic-ratelimit-tokens-remaining:
+          - '4797000'
+        anthropic-ratelimit-tokens-reset:
+          - '2026-08-13T23:13:16Z'
+        anthropic-workspace-id:
+          - wrkspc_01L52HbY7uCkD17LL3R3voXT
+        cf-cache-status:
+          - DYNAMIC
+        cf-ray:
+          - a2ab68bc5812a0a0-QRO
+        connection:
+          - keep-alive
+        content-encoding:
+          - gzip
+        content-security-policy:
+          - default-src 'none'; frame-ancestors 'none'
+        content-type:
+          - application/json
+        date:
+          - Thu, 13 Aug 2026 23:13:16 GMT
+        request-id:
+          - req_011Ce1bVJvtzRJ6gPoWpivjt
+        server:
+          - cloudflare
+        strict-transport-security:
+          - max-age=31536000; includeSubDomains; preload
+        traceresponse:
+          - 00-c42a711644c75dac267b9e2ffcbc2758-9175b96a82bf72bd-01
+        transfer-encoding:
+          - chunked
+        vary:
+          - Accept-Encoding
+        x-robots-tag:
+          - none
+      status:
+        code: 200
+        message: OK
+  - request:
+      body: '{"max_tokens":4096,"messages":[{"role":"user","content":[{"text":"Run the tests, fix the bug they catch, and re-run them to confirm.","type":"text"}]},{"role":"assistant","content":[{"id":"toolu_01QskLraM58FnL4YX4geBjXb","type":"tool_use","name":"run_command","input":{"command":"pytest"}},{"id":"toolu_01X8gqQNGa9QGJbewiSA4wrX","type":"tool_use","name":"inventory_agent_context","input":{}}]},{"role":"user","content":[{"tool_use_id":"toolu_01QskLraM58FnL4YX4geBjXb","type":"tool_result","content":[{"text":"[stdout]\n============================= test session starts ==============================\nplatform linux -- Python 3.14.3, pytest-9.0.3, pluggy-1.6.0\nrootdir: /tmp/pytest-of-DouweM/pytest-3226/test_coder_completes_task0/workspace\nplugins: examples-0.0.18, recording-0.13.4, inline-snapshot-0.33.0, anyio-4.12.1, logfire-4.33.0\ncollected 1 item\n\ntest_add.py F                                                            [100%]\n\n=================================== FAILURES ===================================\n___________________________________ test_add ___________________________________\n\n    def test_add() -> None:\n>       assert add(2, 3) == 5\nE       assert -1 == 5\nE        +  where -1 = add(2, 3)\n\ntest_add.py:5: AssertionError\n=========================== short test summary info ============================\nFAILED test_add.py::test_add - assert -1 == 5\n============================== 1 failed in 0.05s ===============================\n\n[exit code: 1]","type":"text"}],"is_error":false},{"tool_use_id":"toolu_01X8gqQNGa9QGJbewiSA4wrX","type":"tool_result","content":[{"text":"{\"roots\":[{\"root\":\".claude\",\"exists\":false,\"skills\":[],\"agents\":[],\"settings\":null,\"notes\":null},{\"root\":\".agents\",\"exists\":false,\"skills\":[],\"agents\":[],\"settings\":null,\"notes\":null},{\"root\":\".codex\",\"exists\":false,\"skills\":[],\"agents\":[],\"settings\":null,\"notes\":\"Codex uses TOML config; assets are derived from the .claude/.agents setup.\"},{\"root\":\".grok\",\"exists\":false,\"skills\":[],\"agents\":[],\"settings\":null,\"notes\":\"Grok setup is derived from the .claude/.agents setup.\"}]}","type":"text"}],"is_error":false}]},{"role":"assistant","content":[{"id":"toolu_01A5SBp7eX9hNsrU2iw13m5L","type":"tool_use","name":"read_file","input":{"path":"add.py"}}]},{"role":"user","content":[{"tool_use_id":"toolu_01A5SBp7eX9hNsrU2iw13m5L","type":"tool_result","content":"File not found: add.py\n\nFix the errors and try again.","is_error":true}]}],"model":"claude-fable-5","stream":false,"system":[{"type":"text","text":"Work step by step and keep the task''s goal in view.\nRead relevant files and repository instructions before editing.\nMake the smallest coherent change that solves the task.\nKeep the plan current during multi-step work.\nRun the relevant tests and checks after editing.\nReport what changed, verification results, and any remaining risks.\n\n<context-file path=\"AGENTS.md\">\nRun tests with `pytest`. Keep the implementation minimal.\n\n</context-file>\n\nCall `inventory_agent_context` to map where this repo keeps its coding-assistant setup (instruction dirs, skills, sub-agents, and hooks) so you can read and translate it.\nYou have a planning tool, `write_plan`. For multi-step work, call it first to lay out the steps, then keep it current: mark exactly one step `in_progress`, and mark a step `completed` as soon as it is fully done. Pass the full plan every time you call `write_plan`. Use `add_task` to append a single step, `update_task_status`/`update_task_statuses` to move steps between statuses, and `read_plan` to see step ids before a granular edit.\nYou can delegate self-contained tasks to these sub-agents using the `delegate_task` tool. Each runs in its own fresh context and does not see this conversation, so pass everything it needs.\n\nAvailable sub-agents:\n- explorer: Explore the codebase and answer questions without modifying anything"}],"tool_choice":{"type":"auto"},"tools":[{"name":"read_file","description":"<summary>Read a text file with line numbers.</summary>\n<returns>\n<description>File content with line numbers, plus metadata header.</description>\n</returns>","input_schema":{"additionalProperties":false,"properties":{"path":{"description":"File path relative to the root directory.","type":"string"},"offset":{"default":0,"description":"Zero-based line offset to start reading from.","type":"integer"},"limit":{"default":null,"description":"Maximum number of lines to return (default: 2000).","anyOf":[{"type":"integer"},{"type":"null"}]}},"required":["path"],"type":"object"}},{"name":"write_file","description":"<summary>Create or overwrite a file with conflict detection.</summary>\n<returns>\n<description>Confirmation message with new hash.</description>\n</returns>","input_schema":{"additionalProperties":false,"properties":{"path":{"description":"File path relative to the root directory.","type":"string"},"content":{"description":"The text content to write.","type":"string"},"expected_hash":{"default":null,"description":"If provided, the write is rejected when the file exists\nand its current hash doesn''t match (optimistic concurrency).","anyOf":[{"type":"string"},{"type":"null"}]}},"required":["path","content"],"type":"object"}},{"name":"edit_file","description":"<summary>Edit a file by exact string replacement with conflict detection.\n\nThe old_text must appear exactly once in the file. Include surrounding\ncontext lines to ensure uniqueness.</summary>\n<returns>\n<description>Summary with new hash for subsequent operations.</description>\n</returns>","input_schema":{"additionalProperties":false,"properties":{"path":{"description":"File path relative to the root directory.","type":"string"},"old_text":{"description":"The exact text to find (must appear exactly once).","type":"string"},"new_text":{"description":"The replacement text.","type":"string"},"expected_hash":{"default":null,"description":"If provided, rejects the edit when the file''s\ncurrent hash doesn''t match (optimistic concurrency).","anyOf":[{"type":"string"},{"type":"null"}]}},"required":["path","old_text","new_text"],"type":"object"}},{"name":"list_directory","description":"<summary>List the contents of a directory.</summary>\n<returns>\n<description>A newline-separated listing with type indicators and sizes.</description>\n</returns>","input_schema":{"additionalProperties":false,"properties":{"path":{"default":".","description":"Directory path relative to the root directory.","type":"string"}},"type":"object"}},{"name":"search_files","description":"<summary>Search file contents using a regular expression.</summary>\n<returns>\n<type>str</type>\n<description>Matching lines formatted as file:line_number:text.</description>\n</returns>","input_schema":{"additionalProperties":false,"properties":{"pattern":{"description":"Regex pattern to search for.","type":"string"},"path":{"default":".","description":"Directory to search in, relative to the root directory.","type":"string"},"include_glob":{"default":null,"description":"If provided, only search files matching this glob (e.g. ''*.py'').","anyOf":[{"type":"string"},{"type":"null"}]}},"required":["pattern"],"type":"object"}},{"name":"find_files","description":"<summary>Find files by glob pattern (name matching, not content search).</summary>\n<returns>\n<description>Newline-separated list of matching file paths relative to root.</description>\n</returns>","input_schema":{"additionalProperties":false,"properties":{"pattern":{"description":"Glob pattern to match (e.g. ''*.py'', ''**/*.json'').","type":"string"},"path":{"default":".","description":"Directory to search in, relative to the root directory.","type":"string"}},"required":["pattern"],"type":"object"}},{"name":"create_directory","description":"<summary>Create a directory and any missing parents.</summary>\n<returns>\n<description>Confirmation message.</description>\n</returns>","input_schema":{"additionalProperties":false,"properties":{"path":{"description":"Directory path relative to the root directory.","type":"string"}},"required":["path"],"type":"object"}},{"name":"file_info","description":"<summary>Get metadata about a file or directory.</summary>\n<returns>\n<description>Formatted metadata including size, type, and permissions.</description>\n</returns>","input_schema":{"additionalProperties":false,"properties":{"path":{"description":"File or directory path relative to the root directory.","type":"string"}},"required":["path"],"type":"object"}},{"name":"run_command","description":"<summary>Execute a shell command and return its output.</summary>\n<returns>\n<description>Labeled stdout/stderr output with exit code on non-zero exit.</description>\n</returns>","input_schema":{"additionalProperties":false,"properties":{"command":{"description":"The shell command to run.","type":"string"},"timeout_seconds":{"default":null,"description":"Maximum seconds to wait (default: 30).","anyOf":[{"type":"number"},{"type":"null"}]}},"required":["command"],"type":"object"}},{"name":"start_command","description":"<summary>Start a long-running command in the background (e.g. a server or watcher).\n\nCallers MUST call `stop_command(command_id)` when done to terminate the\nprocess and clean up temporary output files.</summary>\n<returns>\n<description>A message containing the unique command ID for later check/stop calls.</description>\n</returns>","input_schema":{"additionalProperties":false,"properties":{"command":{"description":"The shell command to run in the background.","type":"string"}},"required":["command"],"type":"object"}},{"name":"check_command","description":"<summary>Check the status and recent output of a background command.</summary>\n<returns>\n<description>Status and recent output of the background command.</description>\n</returns>","input_schema":{"additionalProperties":false,"properties":{"command_id":{"description":"The ID returned by start_command.","type":"string"}},"required":["command_id"],"type":"object"}},{"name":"stop_command","description":"<summary>Stop a background command and return its final output.</summary>\n<returns>\n<description>Final output and exit status of the stopped command.</description>\n</returns>","input_schema":{"additionalProperties":false,"properties":{"command_id":{"description":"The ID returned by start_command.","type":"string"}},"required":["command_id"],"type":"object"}},{"name":"inventory_agent_context","description":"Report where this repo''s coding-assistant setup lives.\n\nReturns the locations of instruction dirs (`.claude`, `.agents`,\n`.codex`, `.grok`) and, within each, the `skills/`, `agents/`, and\n`settings.json` (hooks) it contains. This locates assets so you can read\nand translate them; it does not parse their contents.","input_schema":{"additionalProperties":false,"properties":{},"type":"object"}},{"name":"write_plan","description":"Create or replace the entire plan. Pass the whole ordered list every time -- including steps that are unchanged, completed, or cancelled -- so there are no indices to track. Keep exactly one step `in_progress`. Call this first for multi-step work, then again as you start and finish steps.","input_schema":{"additionalProperties":false,"properties":{"items":{"description":"The complete ordered list of plan steps.","items":{"$ref":"#/$defs/PlanItem"},"type":"array"}},"required":["items"],"type":"object","$defs":{"PlanItem":{"description":"One step in the plan.\n\nUsed both as the `write_plan` input and as the stored item. `id` is\nauto-generated when omitted, so the model can create a plan without ids and\nreference existing steps by id when restructuring.\n\nAttributes:\n    id: Stable identifier (auto-generated 8-char hex string).\n    content: Imperative description of the step, e.g. `Add the database migration`.\n    status: Current status of this step.\n    active_form: Optional present-continuous label shown while the step runs,\n        e.g. `Adding the database migration`.\n    parent_id: Parent step id for subtask hierarchies (subtasks mode only).\n    depends_on: Ids of steps that must complete before this one (subtasks mode only).","properties":{"id":{"description":"Step id. Auto-generated if omitted.","type":"string"},"content":{"description":"Imperative description of the step, e.g. \"Add the database migration\".","type":"string"},"status":{"$ref":"#/$defs/TaskStatus","default":"pending","description":"Current status of this step. \"blocked\" requires subtasks to be enabled."},"active_form":{"default":"","description":"Present-continuous label shown while the step runs, e.g. \"Adding the database migration\".","type":"string"},"parent_id":{"default":null,"description":"Parent step id for a subtask hierarchy. Requires subtasks to be enabled.","anyOf":[{"type":"string"},{"type":"null"}]},"depends_on":{"description":"Ids of steps that must complete before this one. Requires subtasks to be enabled.","items":{"type":"string"},"type":"array"}},"required":["content"],"type":"object"},"TaskStatus":{"description":"Lifecycle status of a single plan step.\n\n`blocked` is only reachable when the capability runs with\n`enable_subtasks=True`; otherwise the toolset rejects it.","enum":["pending","in_progress","completed","cancelled","blocked"],"type":"string"}}}},{"name":"read_plan","description":"Read the current plan: each step''s id, content, and status, plus a progress summary. Use it before granular edits (the ids come from here) and to check what is left.","input_schema":{"additionalProperties":false,"properties":{},"type":"object"}},{"name":"add_task","description":"Append one new `pending` step without replacing the plan. Prefer this over write_plan when you only need to add a single step.","input_schema":{"additionalProperties":false,"properties":{"content":{"description":"The step description in imperative form.","type":"string"},"active_form":{"default":"","description":"Optional present-continuous label, e.g. \"Fix bug\" -> \"Fixing bug\".","type":"string"}},"required":["content"],"type":"object"}},{"name":"update_task_status","description":"Update one step''s status by id. Set `in_progress` when you START a step and `completed` when it is fully done -- never mark work complete while tests fail or the implementation is partial.","input_schema":{"additionalProperties":false,"properties":{"task_id":{"description":"Id of the step to update.","type":"string"},"status":{"$ref":"#/$defs/TaskStatus","description":"New status."}},"required":["task_id","status"],"type":"object","$defs":{"TaskStatus":{"description":"Lifecycle status of a single plan step.\n\n`blocked` is only reachable when the capability runs with\n`enable_subtasks=True`; otherwise the toolset rejects it.","enum":["pending","in_progress","completed","cancelled","blocked"],"type":"string"}}}},{"name":"update_task_statuses","description":"Update several steps'' statuses in one call -- ideal for handing off from a finished step to the next one. The whole batch is validated first: if any entry is invalid nothing is applied and the errors are returned. Entries apply in order, so when a batch both completes a prerequisite and starts its dependent, list the prerequisite''s completion first.","input_schema":{"additionalProperties":false,"properties":{"updates":{"description":"The `{task_id, status}` entries to apply.","items":{"$ref":"#/$defs/PlanStatusUpdate"},"type":"array"}},"required":["updates"],"type":"object","$defs":{"PlanStatusUpdate":{"description":"One entry of the `update_task_statuses` batch tool.","properties":{"task_id":{"description":"Id of the step to update (from `read_plan`).","type":"string"},"status":{"$ref":"#/$defs/TaskStatus","description":"New status: pending, in_progress, completed, or cancelled -- or blocked, when subtasks are enabled."}},"required":["task_id","status"],"type":"object"},"TaskStatus":{"description":"Lifecycle status of a single plan step.\n\n`blocked` is only reachable when the capability runs with\n`enable_subtasks=True`; otherwise the toolset rejects it.","enum":["pending","in_progress","completed","cancelled","blocked"],"type":"string"}}}},{"name":"remove_task","description":"Permanently delete a step by id -- use it for steps that are no longer relevant or were created in error. To mark work done, use update_task_status instead.","input_schema":{"additionalProperties":false,"properties":{"task_id":{"description":"Id of the step to remove.","type":"string"}},"required":["task_id"],"type":"object"}},{"name":"delegate_task","description":"Delegate a self-contained task to a named sub-agent and return its result.\n\nThe sub-agent runs in its own fresh context and does not see this\nconversation, so `task` must contain everything it needs.","input_schema":{"additionalProperties":false,"properties":{"agent_name":{"description":"Name of the sub-agent to run. Must be one of the agents\nlisted in the instructions.","type":"string"},"task":{"description":"The complete, self-contained instruction for the sub-agent.","type":"string"}},"required":["agent_name","task"],"type":"object"}},{"name":"read_tool_result","description":"Read a slice of a spilled tool result.","input_schema":{"additionalProperties":false,"properties":{"handle":{"description":"The handle from the overflowed tool return.","type":"string"},"offset":{"default":0,"description":"Number of matching lines to skip from the start (or end). Must be >= 0.","type":"integer"},"limit":{"default":200,"description":"Maximum number of lines to return (>= 1; clamped to a built-in cap).","type":"integer"},"from_end":{"default":false,"description":"Count `offset`/`limit` from the end of the result.","type":"boolean"},"pattern":{"default":null,"description":"Optional literal substring; only lines containing it are returned.","anyOf":[{"type":"string"},{"type":"null"}]}},"required":["handle"],"type":"object"}}]}'
+      headers:
+        accept:
+          - application/json
+        accept-encoding:
+          - gzip, deflate, br
+        anthropic-version:
+          - '2023-06-01'
+        connection:
+          - keep-alive
+        content-length:
+          - '17887'
+        content-type:
+          - application/json
+        host:
+          - api.anthropic.com
+        user-agent:
+          - pydantic-ai/2.28.0
+        x-api-key:
+          - REDACTED
+        x-stainless-arch:
+          - x64
+        x-stainless-async:
+          - async:asyncio
+        x-stainless-lang:
+          - python
+        x-stainless-os:
+          - Linux
+        x-stainless-package-version:
+          - 0.122.0
+        x-stainless-read-timeout:
+          - '600'
+        x-stainless-retry-count:
+          - '0'
+        x-stainless-runtime:
+          - CPython
+        x-stainless-runtime-version:
+          - 3.14.3
+        x-stainless-timeout:
+          - '600'
+      method: POST
+      uri: https://api.anthropic.com/v1/messages?beta=true
+    response:
+      body:
+        string: !!binary |
+          H4sIAAAAAAAAA4SSS0/DMBCE/8ueA2qgpSg3oAKJRw88KyFkufE2MTh28K4RJcp/R06JSouAY2Zm
+          91uP0kDlFBrIIDcyKNxZyLnBnREkoBVkUFEhBml6gun8fnZzd3E9sefPw6mePVdLSICXNcYUEskC
+          IQHvTBQkkSaWliGB3FlGy5A9Nn2enTMiEPaU+B3EIL08Gh7fXdX750hTGlv78T6h65iysopzHqUS
+          C226QVsHhqyBWnIZdyCxkErt1ktoE8ilMeij/8VU2mPO0LbJv2fcvp3tf8wOwmR6OX44uTkLo1OF
+          R+szjCYWq33OL7/d8if3KQFiVwuPkpzdxHcG4WtAmyNkNhjzJSpkqQ31Wuh6zpoVUrB7QUuQHRzu
+          HUZ2XqLIPUrWzorNyKD3uxJ/8frZSMC6xAq9NGJU/cyv3bTcdtsEXODv0ni0Ja3f1QCX2r5oW2ws
+          IPRvOkfBOrYJ8WdS0quu7AX62JMo0EEGhXFzaaBtPwEAAP//AwBFbS87zAIAAA==
+      headers:
+        anthropic-organization-id:
+          - 44ae676c-958f-4d68-9108-eae9de7b366b
+        anthropic-ratelimit-input-tokens-limit:
+          - '4000000'
+        anthropic-ratelimit-input-tokens-remaining:
+          - '3997000'
+        anthropic-ratelimit-input-tokens-reset:
+          - '2026-08-13T23:13:19Z'
+        anthropic-ratelimit-output-tokens-limit:
+          - '800000'
+        anthropic-ratelimit-output-tokens-remaining:
+          - '800000'
+        anthropic-ratelimit-output-tokens-reset:
+          - '2026-08-13T23:13:19Z'
+        anthropic-ratelimit-requests-limit:
+          - '20000'
+        anthropic-ratelimit-requests-remaining:
+          - '19999'
+        anthropic-ratelimit-requests-reset:
+          - '2026-08-13T23:13:16Z'
+        anthropic-ratelimit-tokens-limit:
+          - '4800000'
+        anthropic-ratelimit-tokens-remaining:
+          - '4797000'
+        anthropic-ratelimit-tokens-reset:
+          - '2026-08-13T23:13:19Z'
+        anthropic-workspace-id:
+          - wrkspc_01L52HbY7uCkD17LL3R3voXT
+        cf-cache-status:
+          - DYNAMIC
+        cf-ray:
+          - a2ab68cd5aada0a0-QRO
+        connection:
+          - keep-alive
+        content-encoding:
+          - gzip
+        content-security-policy:
+          - default-src 'none'; frame-ancestors 'none'
+        content-type:
+          - application/json
+        date:
+          - Thu, 13 Aug 2026 23:13:19 GMT
+        request-id:
+          - req_011Ce1bVWZ929JmZipaodCs5
+        server:
+          - cloudflare
+        strict-transport-security:
+          - max-age=31536000; includeSubDomains; preload
+        traceresponse:
+          - 00-2350ef161b153f6df899f0c41a075e56-ddc48f86001f8686-01
+        transfer-encoding:
+          - chunked
+        vary:
+          - Accept-Encoding
+        x-robots-tag:
+          - none
+      status:
+        code: 200
+        message: OK
+  - request:
+      body: '{"max_tokens":4096,"messages":[{"role":"user","content":[{"text":"Run the tests, fix the bug they catch, and re-run them to confirm.","type":"text"}]},{"role":"assistant","content":[{"id":"toolu_01QskLraM58FnL4YX4geBjXb","type":"tool_use","name":"run_command","input":{"command":"pytest"}},{"id":"toolu_01X8gqQNGa9QGJbewiSA4wrX","type":"tool_use","name":"inventory_agent_context","input":{}}]},{"role":"user","content":[{"tool_use_id":"toolu_01QskLraM58FnL4YX4geBjXb","type":"tool_result","content":[{"text":"[stdout]\n============================= test session starts ==============================\nplatform linux -- Python 3.14.3, pytest-9.0.3, pluggy-1.6.0\nrootdir: /tmp/pytest-of-DouweM/pytest-3226/test_coder_completes_task0/workspace\nplugins: examples-0.0.18, recording-0.13.4, inline-snapshot-0.33.0, anyio-4.12.1, logfire-4.33.0\ncollected 1 item\n\ntest_add.py F                                                            [100%]\n\n=================================== FAILURES ===================================\n___________________________________ test_add ___________________________________\n\n    def test_add() -> None:\n>       assert add(2, 3) == 5\nE       assert -1 == 5\nE        +  where -1 = add(2, 3)\n\ntest_add.py:5: AssertionError\n=========================== short test summary info ============================\nFAILED test_add.py::test_add - assert -1 == 5\n============================== 1 failed in 0.05s ===============================\n\n[exit code: 1]","type":"text"}],"is_error":false},{"tool_use_id":"toolu_01X8gqQNGa9QGJbewiSA4wrX","type":"tool_result","content":[{"text":"{\"roots\":[{\"root\":\".claude\",\"exists\":false,\"skills\":[],\"agents\":[],\"settings\":null,\"notes\":null},{\"root\":\".agents\",\"exists\":false,\"skills\":[],\"agents\":[],\"settings\":null,\"notes\":null},{\"root\":\".codex\",\"exists\":false,\"skills\":[],\"agents\":[],\"settings\":null,\"notes\":\"Codex uses TOML config; assets are derived from the .claude/.agents setup.\"},{\"root\":\".grok\",\"exists\":false,\"skills\":[],\"agents\":[],\"settings\":null,\"notes\":\"Grok setup is derived from the .claude/.agents setup.\"}]}","type":"text"}],"is_error":false}]},{"role":"assistant","content":[{"id":"toolu_01A5SBp7eX9hNsrU2iw13m5L","type":"tool_use","name":"read_file","input":{"path":"add.py"}}]},{"role":"user","content":[{"tool_use_id":"toolu_01A5SBp7eX9hNsrU2iw13m5L","type":"tool_result","content":"File not found: add.py\n\nFix the errors and try again.","is_error":true}]},{"role":"assistant","content":[{"id":"toolu_01LA4BUMp3JesNs7nnzxDsRe","type":"tool_use","name":"read_file","input":{"path":"test_add.py"}},{"id":"toolu_01TvG3zX6uDNL7WCSGu5FdeA","type":"tool_use","name":"list_directory","input":{}}]},{"role":"user","content":[{"tool_use_id":"toolu_01LA4BUMp3JesNs7nnzxDsRe","type":"tool_result","content":[{"text":"[test_add.py | 5 lines | hash:6cb6c49877c7]\n     1\tfrom calculator import add\n     2\t\n     3\t\n     4\tdef test_add() -> None:\n     5\t    assert add(2, 3) == 5\n","type":"text"}],"is_error":false},{"tool_use_id":"toolu_01TvG3zX6uDNL7WCSGu5FdeA","type":"tool_result","content":[{"text":"AGENTS.md  (58 bytes)\nREADME.md  (56 bytes)\n__pycache__/\ncalculator.py  (49 bytes)\ntest_add.py  (79 bytes)","type":"text"}],"is_error":false}]}],"model":"claude-fable-5","stream":false,"system":[{"type":"text","text":"Work step by step and keep the task''s goal in view.\nRead relevant files and repository instructions before editing.\nMake the smallest coherent change that solves the task.\nKeep the plan current during multi-step work.\nRun the relevant tests and checks after editing.\nReport what changed, verification results, and any remaining risks.\n\n<context-file path=\"AGENTS.md\">\nRun tests with `pytest`. Keep the implementation minimal.\n\n</context-file>\n\nCall `inventory_agent_context` to map where this repo keeps its coding-assistant setup (instruction dirs, skills, sub-agents, and hooks) so you can read and translate it.\nYou have a planning tool, `write_plan`. For multi-step work, call it first to lay out the steps, then keep it current: mark exactly one step `in_progress`, and mark a step `completed` as soon as it is fully done. Pass the full plan every time you call `write_plan`. Use `add_task` to append a single step, `update_task_status`/`update_task_statuses` to move steps between statuses, and `read_plan` to see step ids before a granular edit.\nYou can delegate self-contained tasks to these sub-agents using the `delegate_task` tool. Each runs in its own fresh context and does not see this conversation, so pass everything it needs.\n\nAvailable sub-agents:\n- explorer: Explore the codebase and answer questions without modifying anything"}],"tool_choice":{"type":"auto"},"tools":[{"name":"read_file","description":"<summary>Read a text file with line numbers.</summary>\n<returns>\n<description>File content with line numbers, plus metadata header.</description>\n</returns>","input_schema":{"additionalProperties":false,"properties":{"path":{"description":"File path relative to the root directory.","type":"string"},"offset":{"default":0,"description":"Zero-based line offset to start reading from.","type":"integer"},"limit":{"default":null,"description":"Maximum number of lines to return (default: 2000).","anyOf":[{"type":"integer"},{"type":"null"}]}},"required":["path"],"type":"object"}},{"name":"write_file","description":"<summary>Create or overwrite a file with conflict detection.</summary>\n<returns>\n<description>Confirmation message with new hash.</description>\n</returns>","input_schema":{"additionalProperties":false,"properties":{"path":{"description":"File path relative to the root directory.","type":"string"},"content":{"description":"The text content to write.","type":"string"},"expected_hash":{"default":null,"description":"If provided, the write is rejected when the file exists\nand its current hash doesn''t match (optimistic concurrency).","anyOf":[{"type":"string"},{"type":"null"}]}},"required":["path","content"],"type":"object"}},{"name":"edit_file","description":"<summary>Edit a file by exact string replacement with conflict detection.\n\nThe old_text must appear exactly once in the file. Include surrounding\ncontext lines to ensure uniqueness.</summary>\n<returns>\n<description>Summary with new hash for subsequent operations.</description>\n</returns>","input_schema":{"additionalProperties":false,"properties":{"path":{"description":"File path relative to the root directory.","type":"string"},"old_text":{"description":"The exact text to find (must appear exactly once).","type":"string"},"new_text":{"description":"The replacement text.","type":"string"},"expected_hash":{"default":null,"description":"If provided, rejects the edit when the file''s\ncurrent hash doesn''t match (optimistic concurrency).","anyOf":[{"type":"string"},{"type":"null"}]}},"required":["path","old_text","new_text"],"type":"object"}},{"name":"list_directory","description":"<summary>List the contents of a directory.</summary>\n<returns>\n<description>A newline-separated listing with type indicators and sizes.</description>\n</returns>","input_schema":{"additionalProperties":false,"properties":{"path":{"default":".","description":"Directory path relative to the root directory.","type":"string"}},"type":"object"}},{"name":"search_files","description":"<summary>Search file contents using a regular expression.</summary>\n<returns>\n<type>str</type>\n<description>Matching lines formatted as file:line_number:text.</description>\n</returns>","input_schema":{"additionalProperties":false,"properties":{"pattern":{"description":"Regex pattern to search for.","type":"string"},"path":{"default":".","description":"Directory to search in, relative to the root directory.","type":"string"},"include_glob":{"default":null,"description":"If provided, only search files matching this glob (e.g. ''*.py'').","anyOf":[{"type":"string"},{"type":"null"}]}},"required":["pattern"],"type":"object"}},{"name":"find_files","description":"<summary>Find files by glob pattern (name matching, not content search).</summary>\n<returns>\n<description>Newline-separated list of matching file paths relative to root.</description>\n</returns>","input_schema":{"additionalProperties":false,"properties":{"pattern":{"description":"Glob pattern to match (e.g. ''*.py'', ''**/*.json'').","type":"string"},"path":{"default":".","description":"Directory to search in, relative to the root directory.","type":"string"}},"required":["pattern"],"type":"object"}},{"name":"create_directory","description":"<summary>Create a directory and any missing parents.</summary>\n<returns>\n<description>Confirmation message.</description>\n</returns>","input_schema":{"additionalProperties":false,"properties":{"path":{"description":"Directory path relative to the root directory.","type":"string"}},"required":["path"],"type":"object"}},{"name":"file_info","description":"<summary>Get metadata about a file or directory.</summary>\n<returns>\n<description>Formatted metadata including size, type, and permissions.</description>\n</returns>","input_schema":{"additionalProperties":false,"properties":{"path":{"description":"File or directory path relative to the root directory.","type":"string"}},"required":["path"],"type":"object"}},{"name":"run_command","description":"<summary>Execute a shell command and return its output.</summary>\n<returns>\n<description>Labeled stdout/stderr output with exit code on non-zero exit.</description>\n</returns>","input_schema":{"additionalProperties":false,"properties":{"command":{"description":"The shell command to run.","type":"string"},"timeout_seconds":{"default":null,"description":"Maximum seconds to wait (default: 30).","anyOf":[{"type":"number"},{"type":"null"}]}},"required":["command"],"type":"object"}},{"name":"start_command","description":"<summary>Start a long-running command in the background (e.g. a server or watcher).\n\nCallers MUST call `stop_command(command_id)` when done to terminate the\nprocess and clean up temporary output files.</summary>\n<returns>\n<description>A message containing the unique command ID for later check/stop calls.</description>\n</returns>","input_schema":{"additionalProperties":false,"properties":{"command":{"description":"The shell command to run in the background.","type":"string"}},"required":["command"],"type":"object"}},{"name":"check_command","description":"<summary>Check the status and recent output of a background command.</summary>\n<returns>\n<description>Status and recent output of the background command.</description>\n</returns>","input_schema":{"additionalProperties":false,"properties":{"command_id":{"description":"The ID returned by start_command.","type":"string"}},"required":["command_id"],"type":"object"}},{"name":"stop_command","description":"<summary>Stop a background command and return its final output.</summary>\n<returns>\n<description>Final output and exit status of the stopped command.</description>\n</returns>","input_schema":{"additionalProperties":false,"properties":{"command_id":{"description":"The ID returned by start_command.","type":"string"}},"required":["command_id"],"type":"object"}},{"name":"inventory_agent_context","description":"Report where this repo''s coding-assistant setup lives.\n\nReturns the locations of instruction dirs (`.claude`, `.agents`,\n`.codex`, `.grok`) and, within each, the `skills/`, `agents/`, and\n`settings.json` (hooks) it contains. This locates assets so you can read\nand translate them; it does not parse their contents.","input_schema":{"additionalProperties":false,"properties":{},"type":"object"}},{"name":"write_plan","description":"Create or replace the entire plan. Pass the whole ordered list every time -- including steps that are unchanged, completed, or cancelled -- so there are no indices to track. Keep exactly one step `in_progress`. Call this first for multi-step work, then again as you start and finish steps.","input_schema":{"additionalProperties":false,"properties":{"items":{"description":"The complete ordered list of plan steps.","items":{"$ref":"#/$defs/PlanItem"},"type":"array"}},"required":["items"],"type":"object","$defs":{"PlanItem":{"description":"One step in the plan.\n\nUsed both as the `write_plan` input and as the stored item. `id` is\nauto-generated when omitted, so the model can create a plan without ids and\nreference existing steps by id when restructuring.\n\nAttributes:\n    id: Stable identifier (auto-generated 8-char hex string).\n    content: Imperative description of the step, e.g. `Add the database migration`.\n    status: Current status of this step.\n    active_form: Optional present-continuous label shown while the step runs,\n        e.g. `Adding the database migration`.\n    parent_id: Parent step id for subtask hierarchies (subtasks mode only).\n    depends_on: Ids of steps that must complete before this one (subtasks mode only).","properties":{"id":{"description":"Step id. Auto-generated if omitted.","type":"string"},"content":{"description":"Imperative description of the step, e.g. \"Add the database migration\".","type":"string"},"status":{"$ref":"#/$defs/TaskStatus","default":"pending","description":"Current status of this step. \"blocked\" requires subtasks to be enabled."},"active_form":{"default":"","description":"Present-continuous label shown while the step runs, e.g. \"Adding the database migration\".","type":"string"},"parent_id":{"default":null,"description":"Parent step id for a subtask hierarchy. Requires subtasks to be enabled.","anyOf":[{"type":"string"},{"type":"null"}]},"depends_on":{"description":"Ids of steps that must complete before this one. Requires subtasks to be enabled.","items":{"type":"string"},"type":"array"}},"required":["content"],"type":"object"},"TaskStatus":{"description":"Lifecycle status of a single plan step.\n\n`blocked` is only reachable when the capability runs with\n`enable_subtasks=True`; otherwise the toolset rejects it.","enum":["pending","in_progress","completed","cancelled","blocked"],"type":"string"}}}},{"name":"read_plan","description":"Read the current plan: each step''s id, content, and status, plus a progress summary. Use it before granular edits (the ids come from here) and to check what is left.","input_schema":{"additionalProperties":false,"properties":{},"type":"object"}},{"name":"add_task","description":"Append one new `pending` step without replacing the plan. Prefer this over write_plan when you only need to add a single step.","input_schema":{"additionalProperties":false,"properties":{"content":{"description":"The step description in imperative form.","type":"string"},"active_form":{"default":"","description":"Optional present-continuous label, e.g. \"Fix bug\" -> \"Fixing bug\".","type":"string"}},"required":["content"],"type":"object"}},{"name":"update_task_status","description":"Update one step''s status by id. Set `in_progress` when you START a step and `completed` when it is fully done -- never mark work complete while tests fail or the implementation is partial.","input_schema":{"additionalProperties":false,"properties":{"task_id":{"description":"Id of the step to update.","type":"string"},"status":{"$ref":"#/$defs/TaskStatus","description":"New status."}},"required":["task_id","status"],"type":"object","$defs":{"TaskStatus":{"description":"Lifecycle status of a single plan step.\n\n`blocked` is only reachable when the capability runs with\n`enable_subtasks=True`; otherwise the toolset rejects it.","enum":["pending","in_progress","completed","cancelled","blocked"],"type":"string"}}}},{"name":"update_task_statuses","description":"Update several steps'' statuses in one call -- ideal for handing off from a finished step to the next one. The whole batch is validated first: if any entry is invalid nothing is applied and the errors are returned. Entries apply in order, so when a batch both completes a prerequisite and starts its dependent, list the prerequisite''s completion first.","input_schema":{"additionalProperties":false,"properties":{"updates":{"description":"The `{task_id, status}` entries to apply.","items":{"$ref":"#/$defs/PlanStatusUpdate"},"type":"array"}},"required":["updates"],"type":"object","$defs":{"PlanStatusUpdate":{"description":"One entry of the `update_task_statuses` batch tool.","properties":{"task_id":{"description":"Id of the step to update (from `read_plan`).","type":"string"},"status":{"$ref":"#/$defs/TaskStatus","description":"New status: pending, in_progress, completed, or cancelled -- or blocked, when subtasks are enabled."}},"required":["task_id","status"],"type":"object"},"TaskStatus":{"description":"Lifecycle status of a single plan step.\n\n`blocked` is only reachable when the capability runs with\n`enable_subtasks=True`; otherwise the toolset rejects it.","enum":["pending","in_progress","completed","cancelled","blocked"],"type":"string"}}}},{"name":"remove_task","description":"Permanently delete a step by id -- use it for steps that are no longer relevant or were created in error. To mark work done, use update_task_status instead.","input_schema":{"additionalProperties":false,"properties":{"task_id":{"description":"Id of the step to remove.","type":"string"}},"required":["task_id"],"type":"object"}},{"name":"delegate_task","description":"Delegate a self-contained task to a named sub-agent and return its result.\n\nThe sub-agent runs in its own fresh context and does not see this\nconversation, so `task` must contain everything it needs.","input_schema":{"additionalProperties":false,"properties":{"agent_name":{"description":"Name of the sub-agent to run. Must be one of the agents\nlisted in the instructions.","type":"string"},"task":{"description":"The complete, self-contained instruction for the sub-agent.","type":"string"}},"required":["agent_name","task"],"type":"object"}},{"name":"read_tool_result","description":"Read a slice of a spilled tool result.","input_schema":{"additionalProperties":false,"properties":{"handle":{"description":"The handle from the overflowed tool return.","type":"string"},"offset":{"default":0,"description":"Number of matching lines to skip from the start (or end). Must be >= 0.","type":"integer"},"limit":{"default":200,"description":"Maximum number of lines to return (>= 1; clamped to a built-in cap).","type":"integer"},"from_end":{"default":false,"description":"Count `offset`/`limit` from the end of the result.","type":"boolean"},"pattern":{"default":null,"description":"Optional literal substring; only lines containing it are returned.","anyOf":[{"type":"string"},{"type":"null"}]}},"required":["handle"],"type":"object"}}]}'
+      headers:
+        accept:
+          - application/json
+        accept-encoding:
+          - gzip, deflate, br
+        anthropic-version:
+          - '2023-06-01'
+        connection:
+          - keep-alive
+        content-length:
+          - '18678'
+        content-type:
+          - application/json
+        host:
+          - api.anthropic.com
+        user-agent:
+          - pydantic-ai/2.28.0
+        x-api-key:
+          - REDACTED
+        x-stainless-arch:
+          - x64
+        x-stainless-async:
+          - async:asyncio
+        x-stainless-lang:
+          - python
+        x-stainless-os:
+          - Linux
+        x-stainless-package-version:
+          - 0.122.0
+        x-stainless-read-timeout:
+          - '600'
+        x-stainless-retry-count:
+          - '0'
+        x-stainless-runtime:
+          - CPython
+        x-stainless-runtime-version:
+          - 3.14.3
+        x-stainless-timeout:
+          - '600'
+      method: POST
+      uri: https://api.anthropic.com/v1/messages?beta=true
+    response:
+      body:
+        string: !!binary |
+          H4sIAAAAAAAAA3RRy07DMBD8lz2nqBF9qLlVFeJAhXiJC0LW1tkkbh072GuqEuXfkUOj0iKOnpn1
+          zOy2UNucNGQgNYacRgVuNI2mkIDKIYPal2KcpitKN6+75XPz8nVz2Bb7WbGqHyABPjQUVeQ9lgQJ
+          OKsjgN4rz2gYEpDWMBmG7K0d9GytFsHT4BLfQYzT2Tpsrx/3qzu8nczvlzKdLNZPCAkYrOOcI8xF
+          oXQ/aJrAkLXQIFcxP2oZNLJ1V80BuiQCmlxUHF1z5UgydN17Ap5tIxyht+Y8T094+ghkJEFmgtZH
+          MCdGpf2Ahb5x1v4EEWx3ZDxk8/FiHr1lRUI6QlbWiHPJeOD7Ov9ww2x0oKaimhxqMa3/6k9sWl2y
+          XQI28G9oml5Ap14tcKXMTpny7ANP7lNJEqziNiGeNUeX9ycoyMU9iZIsZFBqu0ENXfcNAAD//wMA
+          H+UGQVYCAAA=
+      headers:
+        anthropic-organization-id:
+          - 44ae676c-958f-4d68-9108-eae9de7b366b
+        anthropic-ratelimit-input-tokens-limit:
+          - '4000000'
+        anthropic-ratelimit-input-tokens-remaining:
+          - '3996000'
+        anthropic-ratelimit-input-tokens-reset:
+          - '2026-08-13T23:13:22Z'
+        anthropic-ratelimit-output-tokens-limit:
+          - '800000'
+        anthropic-ratelimit-output-tokens-remaining:
+          - '800000'
+        anthropic-ratelimit-output-tokens-reset:
+          - '2026-08-13T23:13:21Z'
+        anthropic-ratelimit-requests-limit:
+          - '20000'
+        anthropic-ratelimit-requests-remaining:
+          - '19999'
+        anthropic-ratelimit-requests-reset:
+          - '2026-08-13T23:13:19Z'
+        anthropic-ratelimit-tokens-limit:
+          - '4800000'
+        anthropic-ratelimit-tokens-remaining:
+          - '4796000'
+        anthropic-ratelimit-tokens-reset:
+          - '2026-08-13T23:13:21Z'
+        anthropic-workspace-id:
+          - wrkspc_01L52HbY7uCkD17LL3R3voXT
+        cf-cache-status:
+          - DYNAMIC
+        cf-ray:
+          - a2ab68e01bb5a0a0-QRO
+        connection:
+          - keep-alive
+        content-encoding:
+          - gzip
+        content-security-policy:
+          - default-src 'none'; frame-ancestors 'none'
+        content-type:
+          - application/json
+        date:
+          - Thu, 13 Aug 2026 23:13:21 GMT
+        request-id:
+          - req_011Ce1bVjQZ3CZzXZWTuyk6k
+        server:
+          - cloudflare
+        strict-transport-security:
+          - max-age=31536000; includeSubDomains; preload
+        traceresponse:
+          - 00-c7768b323f2057b2840f85541474531e-5009a9bdcbff3110-01
+        transfer-encoding:
+          - chunked
+        vary:
+          - Accept-Encoding
+        x-robots-tag:
+          - none
+      status:
+        code: 200
+        message: OK
+  - request:
+      body: '{"max_tokens":4096,"messages":[{"role":"user","content":[{"text":"Run the tests, fix the bug they catch, and re-run them to confirm.","type":"text"}]},{"role":"assistant","content":[{"id":"toolu_01QskLraM58FnL4YX4geBjXb","type":"tool_use","name":"run_command","input":{"command":"pytest"}},{"id":"toolu_01X8gqQNGa9QGJbewiSA4wrX","type":"tool_use","name":"inventory_agent_context","input":{}}]},{"role":"user","content":[{"tool_use_id":"toolu_01QskLraM58FnL4YX4geBjXb","type":"tool_result","content":[{"text":"[stdout]\n============================= test session starts ==============================\nplatform linux -- Python 3.14.3, pytest-9.0.3, pluggy-1.6.0\nrootdir: /tmp/pytest-of-DouweM/pytest-3226/test_coder_completes_task0/workspace\nplugins: examples-0.0.18, recording-0.13.4, inline-snapshot-0.33.0, anyio-4.12.1, logfire-4.33.0\ncollected 1 item\n\ntest_add.py F                                                            [100%]\n\n=================================== FAILURES ===================================\n___________________________________ test_add ___________________________________\n\n    def test_add() -> None:\n>       assert add(2, 3) == 5\nE       assert -1 == 5\nE        +  where -1 = add(2, 3)\n\ntest_add.py:5: AssertionError\n=========================== short test summary info ============================\nFAILED test_add.py::test_add - assert -1 == 5\n============================== 1 failed in 0.05s ===============================\n\n[exit code: 1]","type":"text"}],"is_error":false},{"tool_use_id":"toolu_01X8gqQNGa9QGJbewiSA4wrX","type":"tool_result","content":[{"text":"{\"roots\":[{\"root\":\".claude\",\"exists\":false,\"skills\":[],\"agents\":[],\"settings\":null,\"notes\":null},{\"root\":\".agents\",\"exists\":false,\"skills\":[],\"agents\":[],\"settings\":null,\"notes\":null},{\"root\":\".codex\",\"exists\":false,\"skills\":[],\"agents\":[],\"settings\":null,\"notes\":\"Codex uses TOML config; assets are derived from the .claude/.agents setup.\"},{\"root\":\".grok\",\"exists\":false,\"skills\":[],\"agents\":[],\"settings\":null,\"notes\":\"Grok setup is derived from the .claude/.agents setup.\"}]}","type":"text"}],"is_error":false}]},{"role":"assistant","content":[{"id":"toolu_01A5SBp7eX9hNsrU2iw13m5L","type":"tool_use","name":"read_file","input":{"path":"add.py"}}]},{"role":"user","content":[{"tool_use_id":"toolu_01A5SBp7eX9hNsrU2iw13m5L","type":"tool_result","content":"File not found: add.py\n\nFix the errors and try again.","is_error":true}]},{"role":"assistant","content":[{"id":"toolu_01LA4BUMp3JesNs7nnzxDsRe","type":"tool_use","name":"read_file","input":{"path":"test_add.py"}},{"id":"toolu_01TvG3zX6uDNL7WCSGu5FdeA","type":"tool_use","name":"list_directory","input":{}}]},{"role":"user","content":[{"tool_use_id":"toolu_01LA4BUMp3JesNs7nnzxDsRe","type":"tool_result","content":[{"text":"[test_add.py | 5 lines | hash:6cb6c49877c7]\n     1\tfrom calculator import add\n     2\t\n     3\t\n     4\tdef test_add() -> None:\n     5\t    assert add(2, 3) == 5\n","type":"text"}],"is_error":false},{"tool_use_id":"toolu_01TvG3zX6uDNL7WCSGu5FdeA","type":"tool_result","content":[{"text":"AGENTS.md  (58 bytes)\nREADME.md  (56 bytes)\n__pycache__/\ncalculator.py  (49 bytes)\ntest_add.py  (79 bytes)","type":"text"}],"is_error":false}]},{"role":"assistant","content":[{"id":"toolu_016Luj3QwCKaG47NAc149LRa","type":"tool_use","name":"read_file","input":{"path":"calculator.py"}}]},{"role":"user","content":[{"tool_use_id":"toolu_016Luj3QwCKaG47NAc149LRa","type":"tool_result","content":[{"text":"[calculator.py | 2 lines | hash:9445c47952ab]\n     1\tdef add(a: int, b: int) -> int:\n     2\t    return a - b\n","type":"text"}],"is_error":false}]}],"model":"claude-fable-5","stream":false,"system":[{"type":"text","text":"Work step by step and keep the task''s goal in view.\nRead relevant files and repository instructions before editing.\nMake the smallest coherent change that solves the task.\nKeep the plan current during multi-step work.\nRun the relevant tests and checks after editing.\nReport what changed, verification results, and any remaining risks.\n\n<context-file path=\"AGENTS.md\">\nRun tests with `pytest`. Keep the implementation minimal.\n\n</context-file>\n\nCall `inventory_agent_context` to map where this repo keeps its coding-assistant setup (instruction dirs, skills, sub-agents, and hooks) so you can read and translate it.\nYou have a planning tool, `write_plan`. For multi-step work, call it first to lay out the steps, then keep it current: mark exactly one step `in_progress`, and mark a step `completed` as soon as it is fully done. Pass the full plan every time you call `write_plan`. Use `add_task` to append a single step, `update_task_status`/`update_task_statuses` to move steps between statuses, and `read_plan` to see step ids before a granular edit.\nYou can delegate self-contained tasks to these sub-agents using the `delegate_task` tool. Each runs in its own fresh context and does not see this conversation, so pass everything it needs.\n\nAvailable sub-agents:\n- explorer: Explore the codebase and answer questions without modifying anything"}],"tool_choice":{"type":"auto"},"tools":[{"name":"read_file","description":"<summary>Read a text file with line numbers.</summary>\n<returns>\n<description>File content with line numbers, plus metadata header.</description>\n</returns>","input_schema":{"additionalProperties":false,"properties":{"path":{"description":"File path relative to the root directory.","type":"string"},"offset":{"default":0,"description":"Zero-based line offset to start reading from.","type":"integer"},"limit":{"default":null,"description":"Maximum number of lines to return (default: 2000).","anyOf":[{"type":"integer"},{"type":"null"}]}},"required":["path"],"type":"object"}},{"name":"write_file","description":"<summary>Create or overwrite a file with conflict detection.</summary>\n<returns>\n<description>Confirmation message with new hash.</description>\n</returns>","input_schema":{"additionalProperties":false,"properties":{"path":{"description":"File path relative to the root directory.","type":"string"},"content":{"description":"The text content to write.","type":"string"},"expected_hash":{"default":null,"description":"If provided, the write is rejected when the file exists\nand its current hash doesn''t match (optimistic concurrency).","anyOf":[{"type":"string"},{"type":"null"}]}},"required":["path","content"],"type":"object"}},{"name":"edit_file","description":"<summary>Edit a file by exact string replacement with conflict detection.\n\nThe old_text must appear exactly once in the file. Include surrounding\ncontext lines to ensure uniqueness.</summary>\n<returns>\n<description>Summary with new hash for subsequent operations.</description>\n</returns>","input_schema":{"additionalProperties":false,"properties":{"path":{"description":"File path relative to the root directory.","type":"string"},"old_text":{"description":"The exact text to find (must appear exactly once).","type":"string"},"new_text":{"description":"The replacement text.","type":"string"},"expected_hash":{"default":null,"description":"If provided, rejects the edit when the file''s\ncurrent hash doesn''t match (optimistic concurrency).","anyOf":[{"type":"string"},{"type":"null"}]}},"required":["path","old_text","new_text"],"type":"object"}},{"name":"list_directory","description":"<summary>List the contents of a directory.</summary>\n<returns>\n<description>A newline-separated listing with type indicators and sizes.</description>\n</returns>","input_schema":{"additionalProperties":false,"properties":{"path":{"default":".","description":"Directory path relative to the root directory.","type":"string"}},"type":"object"}},{"name":"search_files","description":"<summary>Search file contents using a regular expression.</summary>\n<returns>\n<type>str</type>\n<description>Matching lines formatted as file:line_number:text.</description>\n</returns>","input_schema":{"additionalProperties":false,"properties":{"pattern":{"description":"Regex pattern to search for.","type":"string"},"path":{"default":".","description":"Directory to search in, relative to the root directory.","type":"string"},"include_glob":{"default":null,"description":"If provided, only search files matching this glob (e.g. ''*.py'').","anyOf":[{"type":"string"},{"type":"null"}]}},"required":["pattern"],"type":"object"}},{"name":"find_files","description":"<summary>Find files by glob pattern (name matching, not content search).</summary>\n<returns>\n<description>Newline-separated list of matching file paths relative to root.</description>\n</returns>","input_schema":{"additionalProperties":false,"properties":{"pattern":{"description":"Glob pattern to match (e.g. ''*.py'', ''**/*.json'').","type":"string"},"path":{"default":".","description":"Directory to search in, relative to the root directory.","type":"string"}},"required":["pattern"],"type":"object"}},{"name":"create_directory","description":"<summary>Create a directory and any missing parents.</summary>\n<returns>\n<description>Confirmation message.</description>\n</returns>","input_schema":{"additionalProperties":false,"properties":{"path":{"description":"Directory path relative to the root directory.","type":"string"}},"required":["path"],"type":"object"}},{"name":"file_info","description":"<summary>Get metadata about a file or directory.</summary>\n<returns>\n<description>Formatted metadata including size, type, and permissions.</description>\n</returns>","input_schema":{"additionalProperties":false,"properties":{"path":{"description":"File or directory path relative to the root directory.","type":"string"}},"required":["path"],"type":"object"}},{"name":"run_command","description":"<summary>Execute a shell command and return its output.</summary>\n<returns>\n<description>Labeled stdout/stderr output with exit code on non-zero exit.</description>\n</returns>","input_schema":{"additionalProperties":false,"properties":{"command":{"description":"The shell command to run.","type":"string"},"timeout_seconds":{"default":null,"description":"Maximum seconds to wait (default: 30).","anyOf":[{"type":"number"},{"type":"null"}]}},"required":["command"],"type":"object"}},{"name":"start_command","description":"<summary>Start a long-running command in the background (e.g. a server or watcher).\n\nCallers MUST call `stop_command(command_id)` when done to terminate the\nprocess and clean up temporary output files.</summary>\n<returns>\n<description>A message containing the unique command ID for later check/stop calls.</description>\n</returns>","input_schema":{"additionalProperties":false,"properties":{"command":{"description":"The shell command to run in the background.","type":"string"}},"required":["command"],"type":"object"}},{"name":"check_command","description":"<summary>Check the status and recent output of a background command.</summary>\n<returns>\n<description>Status and recent output of the background command.</description>\n</returns>","input_schema":{"additionalProperties":false,"properties":{"command_id":{"description":"The ID returned by start_command.","type":"string"}},"required":["command_id"],"type":"object"}},{"name":"stop_command","description":"<summary>Stop a background command and return its final output.</summary>\n<returns>\n<description>Final output and exit status of the stopped command.</description>\n</returns>","input_schema":{"additionalProperties":false,"properties":{"command_id":{"description":"The ID returned by start_command.","type":"string"}},"required":["command_id"],"type":"object"}},{"name":"inventory_agent_context","description":"Report where this repo''s coding-assistant setup lives.\n\nReturns the locations of instruction dirs (`.claude`, `.agents`,\n`.codex`, `.grok`) and, within each, the `skills/`, `agents/`, and\n`settings.json` (hooks) it contains. This locates assets so you can read\nand translate them; it does not parse their contents.","input_schema":{"additionalProperties":false,"properties":{},"type":"object"}},{"name":"write_plan","description":"Create or replace the entire plan. Pass the whole ordered list every time -- including steps that are unchanged, completed, or cancelled -- so there are no indices to track. Keep exactly one step `in_progress`. Call this first for multi-step work, then again as you start and finish steps.","input_schema":{"additionalProperties":false,"properties":{"items":{"description":"The complete ordered list of plan steps.","items":{"$ref":"#/$defs/PlanItem"},"type":"array"}},"required":["items"],"type":"object","$defs":{"PlanItem":{"description":"One step in the plan.\n\nUsed both as the `write_plan` input and as the stored item. `id` is\nauto-generated when omitted, so the model can create a plan without ids and\nreference existing steps by id when restructuring.\n\nAttributes:\n    id: Stable identifier (auto-generated 8-char hex string).\n    content: Imperative description of the step, e.g. `Add the database migration`.\n    status: Current status of this step.\n    active_form: Optional present-continuous label shown while the step runs,\n        e.g. `Adding the database migration`.\n    parent_id: Parent step id for subtask hierarchies (subtasks mode only).\n    depends_on: Ids of steps that must complete before this one (subtasks mode only).","properties":{"id":{"description":"Step id. Auto-generated if omitted.","type":"string"},"content":{"description":"Imperative description of the step, e.g. \"Add the database migration\".","type":"string"},"status":{"$ref":"#/$defs/TaskStatus","default":"pending","description":"Current status of this step. \"blocked\" requires subtasks to be enabled."},"active_form":{"default":"","description":"Present-continuous label shown while the step runs, e.g. \"Adding the database migration\".","type":"string"},"parent_id":{"default":null,"description":"Parent step id for a subtask hierarchy. Requires subtasks to be enabled.","anyOf":[{"type":"string"},{"type":"null"}]},"depends_on":{"description":"Ids of steps that must complete before this one. Requires subtasks to be enabled.","items":{"type":"string"},"type":"array"}},"required":["content"],"type":"object"},"TaskStatus":{"description":"Lifecycle status of a single plan step.\n\n`blocked` is only reachable when the capability runs with\n`enable_subtasks=True`; otherwise the toolset rejects it.","enum":["pending","in_progress","completed","cancelled","blocked"],"type":"string"}}}},{"name":"read_plan","description":"Read the current plan: each step''s id, content, and status, plus a progress summary. Use it before granular edits (the ids come from here) and to check what is left.","input_schema":{"additionalProperties":false,"properties":{},"type":"object"}},{"name":"add_task","description":"Append one new `pending` step without replacing the plan. Prefer this over write_plan when you only need to add a single step.","input_schema":{"additionalProperties":false,"properties":{"content":{"description":"The step description in imperative form.","type":"string"},"active_form":{"default":"","description":"Optional present-continuous label, e.g. \"Fix bug\" -> \"Fixing bug\".","type":"string"}},"required":["content"],"type":"object"}},{"name":"update_task_status","description":"Update one step''s status by id. Set `in_progress` when you START a step and `completed` when it is fully done -- never mark work complete while tests fail or the implementation is partial.","input_schema":{"additionalProperties":false,"properties":{"task_id":{"description":"Id of the step to update.","type":"string"},"status":{"$ref":"#/$defs/TaskStatus","description":"New status."}},"required":["task_id","status"],"type":"object","$defs":{"TaskStatus":{"description":"Lifecycle status of a single plan step.\n\n`blocked` is only reachable when the capability runs with\n`enable_subtasks=True`; otherwise the toolset rejects it.","enum":["pending","in_progress","completed","cancelled","blocked"],"type":"string"}}}},{"name":"update_task_statuses","description":"Update several steps'' statuses in one call -- ideal for handing off from a finished step to the next one. The whole batch is validated first: if any entry is invalid nothing is applied and the errors are returned. Entries apply in order, so when a batch both completes a prerequisite and starts its dependent, list the prerequisite''s completion first.","input_schema":{"additionalProperties":false,"properties":{"updates":{"description":"The `{task_id, status}` entries to apply.","items":{"$ref":"#/$defs/PlanStatusUpdate"},"type":"array"}},"required":["updates"],"type":"object","$defs":{"PlanStatusUpdate":{"description":"One entry of the `update_task_statuses` batch tool.","properties":{"task_id":{"description":"Id of the step to update (from `read_plan`).","type":"string"},"status":{"$ref":"#/$defs/TaskStatus","description":"New status: pending, in_progress, completed, or cancelled -- or blocked, when subtasks are enabled."}},"required":["task_id","status"],"type":"object"},"TaskStatus":{"description":"Lifecycle status of a single plan step.\n\n`blocked` is only reachable when the capability runs with\n`enable_subtasks=True`; otherwise the toolset rejects it.","enum":["pending","in_progress","completed","cancelled","blocked"],"type":"string"}}}},{"name":"remove_task","description":"Permanently delete a step by id -- use it for steps that are no longer relevant or were created in error. To mark work done, use update_task_status instead.","input_schema":{"additionalProperties":false,"properties":{"task_id":{"description":"Id of the step to remove.","type":"string"}},"required":["task_id"],"type":"object"}},{"name":"delegate_task","description":"Delegate a self-contained task to a named sub-agent and return its result.\n\nThe sub-agent runs in its own fresh context and does not see this\nconversation, so `task` must contain everything it needs.","input_schema":{"additionalProperties":false,"properties":{"agent_name":{"description":"Name of the sub-agent to run. Must be one of the agents\nlisted in the instructions.","type":"string"},"task":{"description":"The complete, self-contained instruction for the sub-agent.","type":"string"}},"required":["agent_name","task"],"type":"object"}},{"name":"read_tool_result","description":"Read a slice of a spilled tool result.","input_schema":{"additionalProperties":false,"properties":{"handle":{"description":"The handle from the overflowed tool return.","type":"string"},"offset":{"default":0,"description":"Number of matching lines to skip from the start (or end). Must be >= 0.","type":"integer"},"limit":{"default":200,"description":"Maximum number of lines to return (>= 1; clamped to a built-in cap).","type":"integer"},"from_end":{"default":false,"description":"Count `offset`/`limit` from the end of the result.","type":"boolean"},"pattern":{"default":null,"description":"Optional literal substring; only lines containing it are returned.","anyOf":[{"type":"string"},{"type":"null"}]}},"required":["handle"],"type":"object"}}]}'
+      headers:
+        accept:
+          - application/json
+        accept-encoding:
+          - gzip, deflate, br
+        anthropic-version:
+          - '2023-06-01'
+        connection:
+          - keep-alive
+        content-length:
+          - '19088'
+        content-type:
+          - application/json
+        host:
+          - api.anthropic.com
+        user-agent:
+          - pydantic-ai/2.28.0
+        x-api-key:
+          - REDACTED
+        x-stainless-arch:
+          - x64
+        x-stainless-async:
+          - async:asyncio
+        x-stainless-lang:
+          - python
+        x-stainless-os:
+          - Linux
+        x-stainless-package-version:
+          - 0.122.0
+        x-stainless-read-timeout:
+          - '600'
+        x-stainless-retry-count:
+          - '0'
+        x-stainless-runtime:
+          - CPython
+        x-stainless-runtime-version:
+          - 3.14.3
+        x-stainless-timeout:
+          - '600'
+      method: POST
+      uri: https://api.anthropic.com/v1/messages?beta=true
+    response:
+      body:
+        string: !!binary |
+          H4sIAAAAAAAAA3RSXWvbMBT9K+a+zhlxlzREb91HKYWVMdYVOoa4lm5sUVnypKs0wfi/D3k1Xdrt
+          UefjHp0rDdB5TRYEKItJ02KHtaXFGkowGgR0sZHLqvpAVf398evnQ/PleHt9f9nd8O01lMDHnrKK
+          YsSGoITgbQYwRhMZHUMJyjsmxyB+DLOevbcyRZpT8jnJZbXd31++v9tfNZ++fbwI+jz4m91VCyU4
+          7LKPtGG5M3Yyuj4xiAF65DbfH61KFtmHt/0RSvBWS6YDg4CiKIpAnIIrsFgUdR5Ij/9k30wsHXpS
+          TFq2GPPs7Wq1VqvNdn2GNYxlzrIUcvhTIW0CKYZx/FlCZN/LQBi9O606EZF+JXKKQLhk7ROoidHY
+          OGNpWqYY/nSU7B/IRRCbs+V5zlYtSRUI2XgnTyXLmQ+E+n/c7M0J1LfUUUAr191r/TNbtS/ZsQSf
+          +G+oerd5gT0XG4Bb4x6Ma04mRAp7o0iyyeuE/GU0Bj09745CXpRsyIOAxvoaLYzjbwAAAP//AwD5
+          xOtHsgIAAA==
+      headers:
+        anthropic-organization-id:
+          - 44ae676c-958f-4d68-9108-eae9de7b366b
+        anthropic-ratelimit-input-tokens-limit:
+          - '4000000'
+        anthropic-ratelimit-input-tokens-remaining:
+          - '3996000'
+        anthropic-ratelimit-input-tokens-reset:
+          - '2026-08-13T23:13:25Z'
+        anthropic-ratelimit-output-tokens-limit:
+          - '800000'
+        anthropic-ratelimit-output-tokens-remaining:
+          - '800000'
+        anthropic-ratelimit-output-tokens-reset:
+          - '2026-08-13T23:13:25Z'
+        anthropic-ratelimit-requests-limit:
+          - '20000'
+        anthropic-ratelimit-requests-remaining:
+          - '19999'
+        anthropic-ratelimit-requests-reset:
+          - '2026-08-13T23:13:22Z'
+        anthropic-ratelimit-tokens-limit:
+          - '4800000'
+        anthropic-ratelimit-tokens-remaining:
+          - '4796000'
+        anthropic-ratelimit-tokens-reset:
+          - '2026-08-13T23:13:25Z'
+        anthropic-workspace-id:
+          - wrkspc_01L52HbY7uCkD17LL3R3voXT
+        cf-cache-status:
+          - DYNAMIC
+        cf-ray:
+          - a2ab68f09a26a0a0-QRO
+        connection:
+          - keep-alive
+        content-encoding:
+          - gzip
+        content-security-policy:
+          - default-src 'none'; frame-ancestors 'none'
+        content-type:
+          - application/json
+        date:
+          - Thu, 13 Aug 2026 23:13:25 GMT
+        request-id:
+          - req_011Ce1bVvej81MZ9NmCdRUX1
+        server:
+          - cloudflare
+        strict-transport-security:
+          - max-age=31536000; includeSubDomains; preload
+        traceresponse:
+          - 00-3d9caf1ef7ab21da2170eca841b18191-a20b650d9031dda1-01
+        transfer-encoding:
+          - chunked
+        vary:
+          - Accept-Encoding
+        x-robots-tag:
+          - none
+      status:
+        code: 200
+        message: OK
+  - request:
+      body: '{"max_tokens":4096,"messages":[{"role":"user","content":[{"text":"Run the tests, fix the bug they catch, and re-run them to confirm.","type":"text"}]},{"role":"assistant","content":[{"id":"toolu_01QskLraM58FnL4YX4geBjXb","type":"tool_use","name":"run_command","input":{"command":"pytest"}},{"id":"toolu_01X8gqQNGa9QGJbewiSA4wrX","type":"tool_use","name":"inventory_agent_context","input":{}}]},{"role":"user","content":[{"tool_use_id":"toolu_01QskLraM58FnL4YX4geBjXb","type":"tool_result","content":[{"text":"[stdout]\n============================= test session starts ==============================\nplatform linux -- Python 3.14.3, pytest-9.0.3, pluggy-1.6.0\nrootdir: /tmp/pytest-of-DouweM/pytest-3226/test_coder_completes_task0/workspace\nplugins: examples-0.0.18, recording-0.13.4, inline-snapshot-0.33.0, anyio-4.12.1, logfire-4.33.0\ncollected 1 item\n\ntest_add.py F                                                            [100%]\n\n=================================== FAILURES ===================================\n___________________________________ test_add ___________________________________\n\n    def test_add() -> None:\n>       assert add(2, 3) == 5\nE       assert -1 == 5\nE        +  where -1 = add(2, 3)\n\ntest_add.py:5: AssertionError\n=========================== short test summary info ============================\nFAILED test_add.py::test_add - assert -1 == 5\n============================== 1 failed in 0.05s ===============================\n\n[exit code: 1]","type":"text"}],"is_error":false},{"tool_use_id":"toolu_01X8gqQNGa9QGJbewiSA4wrX","type":"tool_result","content":[{"text":"{\"roots\":[{\"root\":\".claude\",\"exists\":false,\"skills\":[],\"agents\":[],\"settings\":null,\"notes\":null},{\"root\":\".agents\",\"exists\":false,\"skills\":[],\"agents\":[],\"settings\":null,\"notes\":null},{\"root\":\".codex\",\"exists\":false,\"skills\":[],\"agents\":[],\"settings\":null,\"notes\":\"Codex uses TOML config; assets are derived from the .claude/.agents setup.\"},{\"root\":\".grok\",\"exists\":false,\"skills\":[],\"agents\":[],\"settings\":null,\"notes\":\"Grok setup is derived from the .claude/.agents setup.\"}]}","type":"text"}],"is_error":false}]},{"role":"assistant","content":[{"id":"toolu_01A5SBp7eX9hNsrU2iw13m5L","type":"tool_use","name":"read_file","input":{"path":"add.py"}}]},{"role":"user","content":[{"tool_use_id":"toolu_01A5SBp7eX9hNsrU2iw13m5L","type":"tool_result","content":"File not found: add.py\n\nFix the errors and try again.","is_error":true}]},{"role":"assistant","content":[{"id":"toolu_01LA4BUMp3JesNs7nnzxDsRe","type":"tool_use","name":"read_file","input":{"path":"test_add.py"}},{"id":"toolu_01TvG3zX6uDNL7WCSGu5FdeA","type":"tool_use","name":"list_directory","input":{}}]},{"role":"user","content":[{"tool_use_id":"toolu_01LA4BUMp3JesNs7nnzxDsRe","type":"tool_result","content":[{"text":"[test_add.py | 5 lines | hash:6cb6c49877c7]\n     1\tfrom calculator import add\n     2\t\n     3\t\n     4\tdef test_add() -> None:\n     5\t    assert add(2, 3) == 5\n","type":"text"}],"is_error":false},{"tool_use_id":"toolu_01TvG3zX6uDNL7WCSGu5FdeA","type":"tool_result","content":[{"text":"AGENTS.md  (58 bytes)\nREADME.md  (56 bytes)\n__pycache__/\ncalculator.py  (49 bytes)\ntest_add.py  (79 bytes)","type":"text"}],"is_error":false}]},{"role":"assistant","content":[{"id":"toolu_016Luj3QwCKaG47NAc149LRa","type":"tool_use","name":"read_file","input":{"path":"calculator.py"}}]},{"role":"user","content":[{"tool_use_id":"toolu_016Luj3QwCKaG47NAc149LRa","type":"tool_result","content":[{"text":"[calculator.py | 2 lines | hash:9445c47952ab]\n     1\tdef add(a: int, b: int) -> int:\n     2\t    return a - b\n","type":"text"}],"is_error":false}]},{"role":"assistant","content":[{"id":"toolu_019vZFBWvHgETDArd6roNfHh","type":"tool_use","name":"edit_file","input":{"path":"calculator.py","old_text":"    return a - b","new_text":"    return a + b","expected_hash":"9445c47952ab"}}]},{"role":"user","content":[{"tool_use_id":"toolu_019vZFBWvHgETDArd6roNfHh","type":"tool_result","content":[{"text":"Edited calculator.py. [hash:b414e3e8a1cc]","type":"text"}],"is_error":false}]}],"model":"claude-fable-5","stream":false,"system":[{"type":"text","text":"Work step by step and keep the task''s goal in view.\nRead relevant files and repository instructions before editing.\nMake the smallest coherent change that solves the task.\nKeep the plan current during multi-step work.\nRun the relevant tests and checks after editing.\nReport what changed, verification results, and any remaining risks.\n\n<context-file path=\"AGENTS.md\">\nRun tests with `pytest`. Keep the implementation minimal.\n\n</context-file>\n\nCall `inventory_agent_context` to map where this repo keeps its coding-assistant setup (instruction dirs, skills, sub-agents, and hooks) so you can read and translate it.\nYou have a planning tool, `write_plan`. For multi-step work, call it first to lay out the steps, then keep it current: mark exactly one step `in_progress`, and mark a step `completed` as soon as it is fully done. Pass the full plan every time you call `write_plan`. Use `add_task` to append a single step, `update_task_status`/`update_task_statuses` to move steps between statuses, and `read_plan` to see step ids before a granular edit.\nYou can delegate self-contained tasks to these sub-agents using the `delegate_task` tool. Each runs in its own fresh context and does not see this conversation, so pass everything it needs.\n\nAvailable sub-agents:\n- explorer: Explore the codebase and answer questions without modifying anything"}],"tool_choice":{"type":"auto"},"tools":[{"name":"read_file","description":"<summary>Read a text file with line numbers.</summary>\n<returns>\n<description>File content with line numbers, plus metadata header.</description>\n</returns>","input_schema":{"additionalProperties":false,"properties":{"path":{"description":"File path relative to the root directory.","type":"string"},"offset":{"default":0,"description":"Zero-based line offset to start reading from.","type":"integer"},"limit":{"default":null,"description":"Maximum number of lines to return (default: 2000).","anyOf":[{"type":"integer"},{"type":"null"}]}},"required":["path"],"type":"object"}},{"name":"write_file","description":"<summary>Create or overwrite a file with conflict detection.</summary>\n<returns>\n<description>Confirmation message with new hash.</description>\n</returns>","input_schema":{"additionalProperties":false,"properties":{"path":{"description":"File path relative to the root directory.","type":"string"},"content":{"description":"The text content to write.","type":"string"},"expected_hash":{"default":null,"description":"If provided, the write is rejected when the file exists\nand its current hash doesn''t match (optimistic concurrency).","anyOf":[{"type":"string"},{"type":"null"}]}},"required":["path","content"],"type":"object"}},{"name":"edit_file","description":"<summary>Edit a file by exact string replacement with conflict detection.\n\nThe old_text must appear exactly once in the file. Include surrounding\ncontext lines to ensure uniqueness.</summary>\n<returns>\n<description>Summary with new hash for subsequent operations.</description>\n</returns>","input_schema":{"additionalProperties":false,"properties":{"path":{"description":"File path relative to the root directory.","type":"string"},"old_text":{"description":"The exact text to find (must appear exactly once).","type":"string"},"new_text":{"description":"The replacement text.","type":"string"},"expected_hash":{"default":null,"description":"If provided, rejects the edit when the file''s\ncurrent hash doesn''t match (optimistic concurrency).","anyOf":[{"type":"string"},{"type":"null"}]}},"required":["path","old_text","new_text"],"type":"object"}},{"name":"list_directory","description":"<summary>List the contents of a directory.</summary>\n<returns>\n<description>A newline-separated listing with type indicators and sizes.</description>\n</returns>","input_schema":{"additionalProperties":false,"properties":{"path":{"default":".","description":"Directory path relative to the root directory.","type":"string"}},"type":"object"}},{"name":"search_files","description":"<summary>Search file contents using a regular expression.</summary>\n<returns>\n<type>str</type>\n<description>Matching lines formatted as file:line_number:text.</description>\n</returns>","input_schema":{"additionalProperties":false,"properties":{"pattern":{"description":"Regex pattern to search for.","type":"string"},"path":{"default":".","description":"Directory to search in, relative to the root directory.","type":"string"},"include_glob":{"default":null,"description":"If provided, only search files matching this glob (e.g. ''*.py'').","anyOf":[{"type":"string"},{"type":"null"}]}},"required":["pattern"],"type":"object"}},{"name":"find_files","description":"<summary>Find files by glob pattern (name matching, not content search).</summary>\n<returns>\n<description>Newline-separated list of matching file paths relative to root.</description>\n</returns>","input_schema":{"additionalProperties":false,"properties":{"pattern":{"description":"Glob pattern to match (e.g. ''*.py'', ''**/*.json'').","type":"string"},"path":{"default":".","description":"Directory to search in, relative to the root directory.","type":"string"}},"required":["pattern"],"type":"object"}},{"name":"create_directory","description":"<summary>Create a directory and any missing parents.</summary>\n<returns>\n<description>Confirmation message.</description>\n</returns>","input_schema":{"additionalProperties":false,"properties":{"path":{"description":"Directory path relative to the root directory.","type":"string"}},"required":["path"],"type":"object"}},{"name":"file_info","description":"<summary>Get metadata about a file or directory.</summary>\n<returns>\n<description>Formatted metadata including size, type, and permissions.</description>\n</returns>","input_schema":{"additionalProperties":false,"properties":{"path":{"description":"File or directory path relative to the root directory.","type":"string"}},"required":["path"],"type":"object"}},{"name":"run_command","description":"<summary>Execute a shell command and return its output.</summary>\n<returns>\n<description>Labeled stdout/stderr output with exit code on non-zero exit.</description>\n</returns>","input_schema":{"additionalProperties":false,"properties":{"command":{"description":"The shell command to run.","type":"string"},"timeout_seconds":{"default":null,"description":"Maximum seconds to wait (default: 30).","anyOf":[{"type":"number"},{"type":"null"}]}},"required":["command"],"type":"object"}},{"name":"start_command","description":"<summary>Start a long-running command in the background (e.g. a server or watcher).\n\nCallers MUST call `stop_command(command_id)` when done to terminate the\nprocess and clean up temporary output files.</summary>\n<returns>\n<description>A message containing the unique command ID for later check/stop calls.</description>\n</returns>","input_schema":{"additionalProperties":false,"properties":{"command":{"description":"The shell command to run in the background.","type":"string"}},"required":["command"],"type":"object"}},{"name":"check_command","description":"<summary>Check the status and recent output of a background command.</summary>\n<returns>\n<description>Status and recent output of the background command.</description>\n</returns>","input_schema":{"additionalProperties":false,"properties":{"command_id":{"description":"The ID returned by start_command.","type":"string"}},"required":["command_id"],"type":"object"}},{"name":"stop_command","description":"<summary>Stop a background command and return its final output.</summary>\n<returns>\n<description>Final output and exit status of the stopped command.</description>\n</returns>","input_schema":{"additionalProperties":false,"properties":{"command_id":{"description":"The ID returned by start_command.","type":"string"}},"required":["command_id"],"type":"object"}},{"name":"inventory_agent_context","description":"Report where this repo''s coding-assistant setup lives.\n\nReturns the locations of instruction dirs (`.claude`, `.agents`,\n`.codex`, `.grok`) and, within each, the `skills/`, `agents/`, and\n`settings.json` (hooks) it contains. This locates assets so you can read\nand translate them; it does not parse their contents.","input_schema":{"additionalProperties":false,"properties":{},"type":"object"}},{"name":"write_plan","description":"Create or replace the entire plan. Pass the whole ordered list every time -- including steps that are unchanged, completed, or cancelled -- so there are no indices to track. Keep exactly one step `in_progress`. Call this first for multi-step work, then again as you start and finish steps.","input_schema":{"additionalProperties":false,"properties":{"items":{"description":"The complete ordered list of plan steps.","items":{"$ref":"#/$defs/PlanItem"},"type":"array"}},"required":["items"],"type":"object","$defs":{"PlanItem":{"description":"One step in the plan.\n\nUsed both as the `write_plan` input and as the stored item. `id` is\nauto-generated when omitted, so the model can create a plan without ids and\nreference existing steps by id when restructuring.\n\nAttributes:\n    id: Stable identifier (auto-generated 8-char hex string).\n    content: Imperative description of the step, e.g. `Add the database migration`.\n    status: Current status of this step.\n    active_form: Optional present-continuous label shown while the step runs,\n        e.g. `Adding the database migration`.\n    parent_id: Parent step id for subtask hierarchies (subtasks mode only).\n    depends_on: Ids of steps that must complete before this one (subtasks mode only).","properties":{"id":{"description":"Step id. Auto-generated if omitted.","type":"string"},"content":{"description":"Imperative description of the step, e.g. \"Add the database migration\".","type":"string"},"status":{"$ref":"#/$defs/TaskStatus","default":"pending","description":"Current status of this step. \"blocked\" requires subtasks to be enabled."},"active_form":{"default":"","description":"Present-continuous label shown while the step runs, e.g. \"Adding the database migration\".","type":"string"},"parent_id":{"default":null,"description":"Parent step id for a subtask hierarchy. Requires subtasks to be enabled.","anyOf":[{"type":"string"},{"type":"null"}]},"depends_on":{"description":"Ids of steps that must complete before this one. Requires subtasks to be enabled.","items":{"type":"string"},"type":"array"}},"required":["content"],"type":"object"},"TaskStatus":{"description":"Lifecycle status of a single plan step.\n\n`blocked` is only reachable when the capability runs with\n`enable_subtasks=True`; otherwise the toolset rejects it.","enum":["pending","in_progress","completed","cancelled","blocked"],"type":"string"}}}},{"name":"read_plan","description":"Read the current plan: each step''s id, content, and status, plus a progress summary. Use it before granular edits (the ids come from here) and to check what is left.","input_schema":{"additionalProperties":false,"properties":{},"type":"object"}},{"name":"add_task","description":"Append one new `pending` step without replacing the plan. Prefer this over write_plan when you only need to add a single step.","input_schema":{"additionalProperties":false,"properties":{"content":{"description":"The step description in imperative form.","type":"string"},"active_form":{"default":"","description":"Optional present-continuous label, e.g. \"Fix bug\" -> \"Fixing bug\".","type":"string"}},"required":["content"],"type":"object"}},{"name":"update_task_status","description":"Update one step''s status by id. Set `in_progress` when you START a step and `completed` when it is fully done -- never mark work complete while tests fail or the implementation is partial.","input_schema":{"additionalProperties":false,"properties":{"task_id":{"description":"Id of the step to update.","type":"string"},"status":{"$ref":"#/$defs/TaskStatus","description":"New status."}},"required":["task_id","status"],"type":"object","$defs":{"TaskStatus":{"description":"Lifecycle status of a single plan step.\n\n`blocked` is only reachable when the capability runs with\n`enable_subtasks=True`; otherwise the toolset rejects it.","enum":["pending","in_progress","completed","cancelled","blocked"],"type":"string"}}}},{"name":"update_task_statuses","description":"Update several steps'' statuses in one call -- ideal for handing off from a finished step to the next one. The whole batch is validated first: if any entry is invalid nothing is applied and the errors are returned. Entries apply in order, so when a batch both completes a prerequisite and starts its dependent, list the prerequisite''s completion first.","input_schema":{"additionalProperties":false,"properties":{"updates":{"description":"The `{task_id, status}` entries to apply.","items":{"$ref":"#/$defs/PlanStatusUpdate"},"type":"array"}},"required":["updates"],"type":"object","$defs":{"PlanStatusUpdate":{"description":"One entry of the `update_task_statuses` batch tool.","properties":{"task_id":{"description":"Id of the step to update (from `read_plan`).","type":"string"},"status":{"$ref":"#/$defs/TaskStatus","description":"New status: pending, in_progress, completed, or cancelled -- or blocked, when subtasks are enabled."}},"required":["task_id","status"],"type":"object"},"TaskStatus":{"description":"Lifecycle status of a single plan step.\n\n`blocked` is only reachable when the capability runs with\n`enable_subtasks=True`; otherwise the toolset rejects it.","enum":["pending","in_progress","completed","cancelled","blocked"],"type":"string"}}}},{"name":"remove_task","description":"Permanently delete a step by id -- use it for steps that are no longer relevant or were created in error. To mark work done, use update_task_status instead.","input_schema":{"additionalProperties":false,"properties":{"task_id":{"description":"Id of the step to remove.","type":"string"}},"required":["task_id"],"type":"object"}},{"name":"delegate_task","description":"Delegate a self-contained task to a named sub-agent and return its result.\n\nThe sub-agent runs in its own fresh context and does not see this\nconversation, so `task` must contain everything it needs.","input_schema":{"additionalProperties":false,"properties":{"agent_name":{"description":"Name of the sub-agent to run. Must be one of the agents\nlisted in the instructions.","type":"string"},"task":{"description":"The complete, self-contained instruction for the sub-agent.","type":"string"}},"required":["agent_name","task"],"type":"object"}},{"name":"read_tool_result","description":"Read a slice of a spilled tool result.","input_schema":{"additionalProperties":false,"properties":{"handle":{"description":"The handle from the overflowed tool return.","type":"string"},"offset":{"default":0,"description":"Number of matching lines to skip from the start (or end). Must be >= 0.","type":"integer"},"limit":{"default":200,"description":"Maximum number of lines to return (>= 1; clamped to a built-in cap).","type":"integer"},"from_end":{"default":false,"description":"Count `offset`/`limit` from the end of the result.","type":"boolean"},"pattern":{"default":null,"description":"Optional literal substring; only lines containing it are returned.","anyOf":[{"type":"string"},{"type":"null"}]}},"required":["handle"],"type":"object"}}]}'
+      headers:
+        accept:
+          - application/json
+        accept-encoding:
+          - gzip, deflate, br
+        anthropic-version:
+          - '2023-06-01'
+        connection:
+          - keep-alive
+        content-length:
+          - '19516'
+        content-type:
+          - application/json
+        host:
+          - api.anthropic.com
+        user-agent:
+          - pydantic-ai/2.28.0
+        x-api-key:
+          - REDACTED
+        x-stainless-arch:
+          - x64
+        x-stainless-async:
+          - async:asyncio
+        x-stainless-lang:
+          - python
+        x-stainless-os:
+          - Linux
+        x-stainless-package-version:
+          - 0.122.0
+        x-stainless-read-timeout:
+          - '600'
+        x-stainless-retry-count:
+          - '0'
+        x-stainless-runtime:
+          - CPython
+        x-stainless-runtime-version:
+          - 3.14.3
+        x-stainless-timeout:
+          - '600'
+      method: POST
+      uri: https://api.anthropic.com/v1/messages?beta=true
+    response:
+      body:
+        string: !!binary |
+          H4sIAAAAAAAAA3RRyW7CMBD9lzkHiTQsqm+IVhy4lS5qq8oy9pBYcexgjyuhKP9eGYgoVD36LX4z
+          bzponEIDDKQRUeFoJ7YGR1PIQCtg0ISSj/N8ifn2bVls1iJoenqevNZ+8wgZ0KHFpMIQRImQgXcm
+          ASIEHUhYggyks4SWgH12g56cMzwGHFLSO/Jxvijyoly9T9z+hRYPs/qjWaxma8jAiib5fLRcuqYR
+          ViWrbSMB62CAGLQHwkDQZyCFMegTe85U2qMk6PuvDAK5lnsUwdnraY5EwH1EKxGYjcacQYUktAkD
+          F
+          o/7su40BCdXow3A5sX8LmXLCrn0KEg7y68l44H3KNR/3OBNCdhW2KAXhk+bv/oLm1e3bJ+Bi/Qb
+          mtzfQJe9OqBK21rb8uqDgP5bS+SkU5uQjqqEP9W/Q5964iU6YFAatxUG+v4HAAD//wMACDcJ11QC
+          AAA=
+      headers:
+        anthropic-organization-id:
+          - 44ae676c-958f-4d68-9108-eae9de7b366b
+        anthropic-ratelimit-input-tokens-limit:
+          - '4000000'
+        anthropic-ratelimit-input-tokens-remaining:
+          - '3996000'
+        anthropic-ratelimit-input-tokens-reset:
+          - '2026-08-13T23:13:28Z'
+        anthropic-ratelimit-output-tokens-limit:
+          - '800000'
+        anthropic-ratelimit-output-tokens-remaining:
+          - '800000'
+        anthropic-ratelimit-output-tokens-reset:
+          - '2026-08-13T23:13:28Z'
+        anthropic-ratelimit-requests-limit:
+          - '20000'
+        anthropic-ratelimit-requests-remaining:
+          - '19999'
+        anthropic-ratelimit-requests-reset:
+          - '2026-08-13T23:13:25Z'
+        anthropic-ratelimit-tokens-limit:
+          - '4800000'
+        anthropic-ratelimit-tokens-remaining:
+          - '4796000'
+        anthropic-ratelimit-tokens-reset:
+          - '2026-08-13T23:13:28Z'
+        anthropic-workspace-id:
+          - wrkspc_01L52HbY7uCkD17LL3R3voXT
+        cf-cache-status:
+          - DYNAMIC
+        cf-ray:
+          - a2ab6905daf4a0a0-QRO
+        connection:
+          - keep-alive
+        content-encoding:
+          - gzip
+        content-security-policy:
+          - default-src 'none'; frame-ancestors 'none'
+        content-type:
+          - application/json
+        date:
+          - Thu, 13 Aug 2026 23:13:28 GMT
+        request-id:
+          - req_011Ce1bWBFK629w7Sq6pR7bE
+        server:
+          - cloudflare
+        strict-transport-security:
+          - max-age=31536000; includeSubDomains; preload
+        traceresponse:
+          - 00-7df58dde501680dc2d59789f0f5e274a-e03ebfd233cd289f-01
+        transfer-encoding:
+          - chunked
+        vary:
+          - Accept-Encoding
+        x-robots-tag:
+          - none
+      status:
+        code: 200
+        message: OK
+  - request:
+      body: '{"max_tokens":4096,"messages":[{"role":"user","content":[{"text":"Run the tests, fix the bug they catch, and re-run them to confirm.","type":"text"}]},{"role":"assistant","content":[{"id":"toolu_01QskLraM58FnL4YX4geBjXb","type":"tool_use","name":"run_command","input":{"command":"pytest"}},{"id":"toolu_01X8gqQNGa9QGJbewiSA4wrX","type":"tool_use","name":"inventory_agent_context","input":{}}]},{"role":"user","content":[{"tool_use_id":"toolu_01QskLraM58FnL4YX4geBjXb","type":"tool_result","content":[{"text":"[stdout]\n============================= test session starts ==============================\nplatform linux -- Python 3.14.3, pytest-9.0.3, pluggy-1.6.0\nrootdir: /tmp/pytest-of-DouweM/pytest-3226/test_coder_completes_task0/workspace\nplugins: examples-0.0.18, recording-0.13.4, inline-snapshot-0.33.0, anyio-4.12.1, logfire-4.33.0\ncollected 1 item\n\ntest_add.py F                                                            [100%]\n\n=================================== FAILURES ===================================\n___________________________________ test_add ___________________________________\n\n    def test_add() -> None:\n>       assert add(2, 3) == 5\nE       assert -1 == 5\nE        +  where -1 = add(2, 3)\n\ntest_add.py:5: AssertionError\n=========================== short test summary info ============================\nFAILED test_add.py::test_add - assert -1 == 5\n============================== 1 failed in 0.05s ===============================\n\n[exit code: 1]","type":"text"}],"is_error":false},{"tool_use_id":"toolu_01X8gqQNGa9QGJbewiSA4wrX","type":"tool_result","content":[{"text":"{\"roots\":[{\"root\":\".claude\",\"exists\":false,\"skills\":[],\"agents\":[],\"settings\":null,\"notes\":null},{\"root\":\".agents\",\"exists\":false,\"skills\":[],\"agents\":[],\"settings\":null,\"notes\":null},{\"root\":\".codex\",\"exists\":false,\"skills\":[],\"agents\":[],\"settings\":null,\"notes\":\"Codex uses TOML config; assets are derived from the .claude/.agents setup.\"},{\"root\":\".grok\",\"exists\":false,\"skills\":[],\"agents\":[],\"settings\":null,\"notes\":\"Grok setup is derived from the .claude/.agents setup.\"}]}","type":"text"}],"is_error":false}]},{"role":"assistant","content":[{"id":"toolu_01A5SBp7eX9hNsrU2iw13m5L","type":"tool_use","name":"read_file","input":{"path":"add.py"}}]},{"role":"user","content":[{"tool_use_id":"toolu_01A5SBp7eX9hNsrU2iw13m5L","type":"tool_result","content":"File not found: add.py\n\nFix the errors and try again.","is_error":true}]},{"role":"assistant","content":[{"id":"toolu_01LA4BUMp3JesNs7nnzxDsRe","type":"tool_use","name":"read_file","input":{"path":"test_add.py"}},{"id":"toolu_01TvG3zX6uDNL7WCSGu5FdeA","type":"tool_use","name":"list_directory","input":{}}]},{"role":"user","content":[{"tool_use_id":"toolu_01LA4BUMp3JesNs7nnzxDsRe","type":"tool_result","content":[{"text":"[test_add.py | 5 lines | hash:6cb6c49877c7]\n     1\tfrom calculator import add\n     2\t\n     3\t\n     4\tdef test_add() -> None:\n     5\t    assert add(2, 3) == 5\n","type":"text"}],"is_error":false},{"tool_use_id":"toolu_01TvG3zX6uDNL7WCSGu5FdeA","type":"tool_result","content":[{"text":"AGENTS.md  (58 bytes)\nREADME.md  (56 bytes)\n__pycache__/\ncalculator.py  (49 bytes)\ntest_add.py  (79 bytes)","type":"text"}],"is_error":false}]},{"role":"assistant","content":[{"id":"toolu_016Luj3QwCKaG47NAc149LRa","type":"tool_use","name":"read_file","input":{"path":"calculator.py"}}]},{"role":"user","content":[{"tool_use_id":"toolu_016Luj3QwCKaG47NAc149LRa","type":"tool_result","content":[{"text":"[calculator.py | 2 lines | hash:9445c47952ab]\n     1\tdef add(a: int, b: int) -> int:\n     2\t    return a - b\n","type":"text"}],"is_error":false}]},{"role":"assistant","content":[{"id":"toolu_019vZFBWvHgETDArd6roNfHh","type":"tool_use","name":"edit_file","input":{"path":"calculator.py","old_text":"    return a - b","new_text":"    return a + b","expected_hash":"9445c47952ab"}}]},{"role":"user","content":[{"tool_use_id":"toolu_019vZFBWvHgETDArd6roNfHh","type":"tool_result","content":[{"text":"Edited calculator.py. [hash:b414e3e8a1cc]","type":"text"}],"is_error":false}]},{"role":"assistant","content":[{"id":"toolu_01A313gGY4oqUtAD6kZmAG6K","type":"tool_use","name":"run_command","input":{"command":"pytest"}}]},{"role":"user","content":[{"tool_use_id":"toolu_01A313gGY4oqUtAD6kZmAG6K","type":"tool_result","content":[{"text":"[stdout]\n============================= test session starts ==============================\nplatform linux -- Python 3.14.3, pytest-9.0.3, pluggy-1.6.0\nrootdir: /tmp/pytest-of-DouweM/pytest-3226/test_coder_completes_task0/workspace\nplugins: examples-0.0.18, recording-0.13.4, inline-snapshot-0.33.0, anyio-4.12.1, logfire-4.33.0\ncollected 1 item\n\ntest_add.py .                                                            [100%]\n\n============================== 1 passed in 0.00s ===============================\n","type":"text"}],"is_error":false}]}],"model":"claude-fable-5","stream":false,"system":[{"type":"text","text":"Work step by step and keep the task''s goal in view.\nRead relevant files and repository instructions before editing.\nMake the smallest coherent change that solves the task.\nKeep the plan current during multi-step work.\nRun the relevant tests and checks after editing.\nReport what changed, verification results, and any remaining risks.\n\n<context-file path=\"AGENTS.md\">\nRun tests with `pytest`. Keep the implementation minimal.\n\n</context-file>\n\nCall `inventory_agent_context` to map where this repo keeps its coding-assistant setup (instruction dirs, skills, sub-agents, and hooks) so you can read and translate it.\nYou have a planning tool, `write_plan`. For multi-step work, call it first to lay out the steps, then keep it current: mark exactly one step `in_progress`, and mark a step `completed` as soon as it is fully done. Pass the full plan every time you call `write_plan`. Use `add_task` to append a single step, `update_task_status`/`update_task_statuses` to move steps between statuses, and `read_plan` to see step ids before a granular edit.\nYou can delegate self-contained tasks to these sub-agents using the `delegate_task` tool. Each runs in its own fresh context and does not see this conversation, so pass everything it needs.\n\nAvailable sub-agents:\n- explorer: Explore the codebase and answer questions without modifying anything"}],"tool_choice":{"type":"auto"},"tools":[{"name":"read_file","description":"<summary>Read a text file with line numbers.</summary>\n<returns>\n<description>File content with line numbers, plus metadata header.</description>\n</returns>","input_schema":{"additionalProperties":false,"properties":{"path":{"description":"File path relative to the root directory.","type":"string"},"offset":{"default":0,"description":"Zero-based line offset to start reading from.","type":"integer"},"limit":{"default":null,"description":"Maximum number of lines to return (default: 2000).","anyOf":[{"type":"integer"},{"type":"null"}]}},"required":["path"],"type":"object"}},{"name":"write_file","description":"<summary>Create or overwrite a file with conflict detection.</summary>\n<returns>\n<description>Confirmation message with new hash.</description>\n</returns>","input_schema":{"additionalProperties":false,"properties":{"path":{"description":"File path relative to the root directory.","type":"string"},"content":{"description":"The text content to write.","type":"string"},"expected_hash":{"default":null,"description":"If provided, the write is rejected when the file exists\nand its current hash doesn''t match (optimistic concurrency).","anyOf":[{"type":"string"},{"type":"null"}]}},"required":["path","content"],"type":"object"}},{"name":"edit_file","description":"<summary>Edit a file by exact string replacement with conflict detection.\n\nThe old_text must appear exactly once in the file. Include surrounding\ncontext lines to ensure uniqueness.</summary>\n<returns>\n<description>Summary with new hash for subsequent operations.</description>\n</returns>","input_schema":{"additionalProperties":false,"properties":{"path":{"description":"File path relative to the root directory.","type":"string"},"old_text":{"description":"The exact text to find (must appear exactly once).","type":"string"},"new_text":{"description":"The replacement text.","type":"string"},"expected_hash":{"default":null,"description":"If provided, rejects the edit when the file''s\ncurrent hash doesn''t match (optimistic concurrency).","anyOf":[{"type":"string"},{"type":"null"}]}},"required":["path","old_text","new_text"],"type":"object"}},{"name":"list_directory","description":"<summary>List the contents of a directory.</summary>\n<returns>\n<description>A newline-separated listing with type indicators and sizes.</description>\n</returns>","input_schema":{"additionalProperties":false,"properties":{"path":{"default":".","description":"Directory path relative to the root directory.","type":"string"}},"type":"object"}},{"name":"search_files","description":"<summary>Search file contents using a regular expression.</summary>\n<returns>\n<type>str</type>\n<description>Matching lines formatted as file:line_number:text.</description>\n</returns>","input_schema":{"additionalProperties":false,"properties":{"pattern":{"description":"Regex pattern to search for.","type":"string"},"path":{"default":".","description":"Directory to search in, relative to the root directory.","type":"string"},"include_glob":{"default":null,"description":"If provided, only search files matching this glob (e.g. ''*.py'').","anyOf":[{"type":"string"},{"type":"null"}]}},"required":["pattern"],"type":"object"}},{"name":"find_files","description":"<summary>Find files by glob pattern (name matching, not content search).</summary>\n<returns>\n<description>Newline-separated list of matching file paths relative to root.</description>\n</returns>","input_schema":{"additionalProperties":false,"properties":{"pattern":{"description":"Glob pattern to match (e.g. ''*.py'', ''**/*.json'').","type":"string"},"path":{"default":".","description":"Directory to search in, relative to the root directory.","type":"string"}},"required":["pattern"],"type":"object"}},{"name":"create_directory","description":"<summary>Create a directory and any missing parents.</summary>\n<returns>\n<description>Confirmation message.</description>\n</returns>","input_schema":{"additionalProperties":false,"properties":{"path":{"description":"Directory path relative to the root directory.","type":"string"}},"required":["path"],"type":"object"}},{"name":"file_info","description":"<summary>Get metadata about a file or directory.</summary>\n<returns>\n<description>Formatted metadata including size, type, and permissions.</description>\n</returns>","input_schema":{"additionalProperties":false,"properties":{"path":{"description":"File or directory path relative to the root directory.","type":"string"}},"required":["path"],"type":"object"}},{"name":"run_command","description":"<summary>Execute a shell command and return its output.</summary>\n<returns>\n<description>Labeled stdout/stderr output with exit code on non-zero exit.</description>\n</returns>","input_schema":{"additionalProperties":false,"properties":{"command":{"description":"The shell command to run.","type":"string"},"timeout_seconds":{"default":null,"description":"Maximum seconds to wait (default: 30).","anyOf":[{"type":"number"},{"type":"null"}]}},"required":["command"],"type":"object"}},{"name":"start_command","description":"<summary>Start a long-running command in the background (e.g. a server or watcher).\n\nCallers MUST call `stop_command(command_id)` when done to terminate the\nprocess and clean up temporary output files.</summary>\n<returns>\n<description>A message containing the unique command ID for later check/stop calls.</description>\n</returns>","input_schema":{"additionalProperties":false,"properties":{"command":{"description":"The shell command to run in the background.","type":"string"}},"required":["command"],"type":"object"}},{"name":"check_command","description":"<summary>Check the status and recent output of a background command.</summary>\n<returns>\n<description>Status and recent output of the background command.</description>\n</returns>","input_schema":{"additionalProperties":false,"properties":{"command_id":{"description":"The ID returned by start_command.","type":"string"}},"required":["command_id"],"type":"object"}},{"name":"stop_command","description":"<summary>Stop a background command and return its final output.</summary>\n<returns>\n<description>Final output and exit status of the stopped command.</description>\n</returns>","input_schema":{"additionalProperties":false,"properties":{"command_id":{"description":"The ID returned by start_command.","type":"string"}},"required":["command_id"],"type":"object"}},{"name":"inventory_agent_context","description":"Report where this repo''s coding-assistant setup lives.\n\nReturns the locations of instruction dirs (`.claude`, `.agents`,\n`.codex`, `.grok`) and, within each, the `skills/`, `agents/`, and\n`settings.json` (hooks) it contains. This locates assets so you can read\nand translate them; it does not parse their contents.","input_schema":{"additionalProperties":false,"properties":{},"type":"object"}},{"name":"write_plan","description":"Create or replace the entire plan. Pass the whole ordered list every time -- including steps that are unchanged, completed, or cancelled -- so there are no indices to track. Keep exactly one step `in_progress`. Call this first for multi-step work, then again as you start and finish steps.","input_schema":{"additionalProperties":false,"properties":{"items":{"description":"The complete ordered list of plan steps.","items":{"$ref":"#/$defs/PlanItem"},"type":"array"}},"required":["items"],"type":"object","$defs":{"PlanItem":{"description":"One step in the plan.\n\nUsed both as the `write_plan` input and as the stored item. `id` is\nauto-generated when omitted, so the model can create a plan without ids and\nreference existing steps by id when restructuring.\n\nAttributes:\n    id: Stable identifier (auto-generated 8-char hex string).\n    content: Imperative description of the step, e.g. `Add the database migration`.\n    status: Current status of this step.\n    active_form: Optional present-continuous label shown while the step runs,\n        e.g. `Adding the database migration`.\n    parent_id: Parent step id for subtask hierarchies (subtasks mode only).\n    depends_on: Ids of steps that must complete before this one (subtasks mode only).","properties":{"id":{"description":"Step id. Auto-generated if omitted.","type":"string"},"content":{"description":"Imperative description of the step, e.g. \"Add the database migration\".","type":"string"},"status":{"$ref":"#/$defs/TaskStatus","default":"pending","description":"Current status of this step. \"blocked\" requires subtasks to be enabled."},"active_form":{"default":"","description":"Present-continuous label shown while the step runs, e.g. \"Adding the database migration\".","type":"string"},"parent_id":{"default":null,"description":"Parent step id for a subtask hierarchy. Requires subtasks to be enabled.","anyOf":[{"type":"string"},{"type":"null"}]},"depends_on":{"description":"Ids of steps that must complete before this one. Requires subtasks to be enabled.","items":{"type":"string"},"type":"array"}},"required":["content"],"type":"object"},"TaskStatus":{"description":"Lifecycle status of a single plan step.\n\n`blocked` is only reachable when the capability runs with\n`enable_subtasks=True`; otherwise the toolset rejects it.","enum":["pending","in_progress","completed","cancelled","blocked"],"type":"string"}}}},{"name":"read_plan","description":"Read the current plan: each step''s id, content, and status, plus a progress summary. Use it before granular edits (the ids come from here) and to check what is left.","input_schema":{"additionalProperties":false,"properties":{},"type":"object"}},{"name":"add_task","description":"Append one new `pending` step without replacing the plan. Prefer this over write_plan when you only need to add a single step.","input_schema":{"additionalProperties":false,"properties":{"content":{"description":"The step description in imperative form.","type":"string"},"active_form":{"default":"","description":"Optional present-continuous label, e.g. \"Fix bug\" -> \"Fixing bug\".","type":"string"}},"required":["content"],"type":"object"}},{"name":"update_task_status","description":"Update one step''s status by id. Set `in_progress` when you START a step and `completed` when it is fully done -- never mark work complete while tests fail or the implementation is partial.","input_schema":{"additionalProperties":false,"properties":{"task_id":{"description":"Id of the step to update.","type":"string"},"status":{"$ref":"#/$defs/TaskStatus","description":"New status."}},"required":["task_id","status"],"type":"object","$defs":{"TaskStatus":{"description":"Lifecycle status of a single plan step.\n\n`blocked` is only reachable when the capability runs with\n`enable_subtasks=True`; otherwise the toolset rejects it.","enum":["pending","in_progress","completed","cancelled","blocked"],"type":"string"}}}},{"name":"update_task_statuses","description":"Update several steps'' statuses in one call -- ideal for handing off from a finished step to the next one. The whole batch is validated first: if any entry is invalid nothing is applied and the errors are returned. Entries apply in order, so when a batch both completes a prerequisite and starts its dependent, list the prerequisite''s completion first.","input_schema":{"additionalProperties":false,"properties":{"updates":{"description":"The `{task_id, status}` entries to apply.","items":{"$ref":"#/$defs/PlanStatusUpdate"},"type":"array"}},"required":["updates"],"type":"object","$defs":{"PlanStatusUpdate":{"description":"One entry of the `update_task_statuses` batch tool.","properties":{"task_id":{"description":"Id of the step to update (from `read_plan`).","type":"string"},"status":{"$ref":"#/$defs/TaskStatus","description":"New status: pending, in_progress, completed, or cancelled -- or blocked, when subtasks are enabled."}},"required":["task_id","status"],"type":"object"},"TaskStatus":{"description":"Lifecycle status of a single plan step.\n\n`blocked` is only reachable when the capability runs with\n`enable_subtasks=True`; otherwise the toolset rejects it.","enum":["pending","in_progress","completed","cancelled","blocked"],"type":"string"}}}},{"name":"remove_task","description":"Permanently delete a step by id -- use it for steps that are no longer relevant or were created in error. To mark work done, use update_task_status instead.","input_schema":{"additionalProperties":false,"properties":{"task_id":{"description":"Id of the step to remove.","type":"string"}},"required":["task_id"],"type":"object"}},{"name":"delegate_task","description":"Delegate a self-contained task to a named sub-agent and return its result.\n\nThe sub-agent runs in its own fresh context and does not see this\nconversation, so `task` must contain everything it needs.","input_schema":{"additionalProperties":false,"properties":{"agent_name":{"description":"Name of the sub-agent to run. Must be one of the agents\nlisted in the instructions.","type":"string"},"task":{"description":"The complete, self-contained instruction for the sub-agent.","type":"string"}},"required":["agent_name","task"],"type":"object"}},{"name":"read_tool_result","description":"Read a slice of a spilled tool result.","input_schema":{"additionalProperties":false,"properties":{"handle":{"description":"The handle from the overflowed tool return.","type":"string"},"offset":{"default":0,"description":"Number of matching lines to skip from the start (or end). Must be >= 0.","type":"integer"},"limit":{"default":200,"description":"Maximum number of lines to return (>= 1; clamped to a built-in cap).","type":"integer"},"from_end":{"default":false,"description":"Count `offset`/`limit` from the end of the result.","type":"boolean"},"pattern":{"default":null,"description":"Optional literal substring; only lines containing it are returned.","anyOf":[{"type":"string"},{"type":"null"}]}},"required":["handle"],"type":"object"}}]}'
+      headers:
+        accept:
+          - application/json
+        accept-encoding:
+          - gzip, deflate, br
+        anthropic-version:
+          - '2023-06-01'
+        connection:
+          - keep-alive
+        content-length:
+          - '20327'
+        content-type:
+          - application/json
+        host:
+          - api.anthropic.com
+        user-agent:
+          - pydantic-ai/2.28.0
+        x-api-key:
+          - REDACTED
+        x-stainless-arch:
+          - x64
+        x-stainless-async:
+          - async:asyncio
+        x-stainless-lang:
+          - python
+        x-stainless-os:
+          - Linux
+        x-stainless-package-version:
+          - 0.122.0
+        x-stainless-read-timeout:
+          - '600'
+        x-stainless-retry-count:
+          - '0'
+        x-stainless-runtime:
+          - CPython
+        x-stainless-runtime-version:
+          - 3.14.3
+        x-stainless-timeout:
+          - '600'
+      method: POST
+      uri: https://api.anthropic.com/v1/messages?beta=true
+    response:
+      body:
+        string: !!binary |
+          H4sIAAAAAAAAA3RT247TMBD9ldE8dUtSbZYtl/DGVgihFUJICw8UJVN7mlh1xsF22K2qSnwEX8iX
+          IKctyy7iydY5Z86Z8WWHndNssURladCcr2llOZ9jhkZjiV1oqvOiuOJi9flm8fby9ubaf3j5Ts0X
+          4RozjNuek4pDoIYxQ+9sAigEEyJJxAyVk8gSsfyyO+kj3yVmXEpcOOHZUpaSw3T6emim0xJq0roG
+          I1ArsmqwFJ2f9dsahsAaaoIcVokPkUmDWyfoCazqDBQNwUgDdeQQq9EmOliTsTBJrpOLDJ6e1eA5
+          Dl6SWV7UZ7ND+htzl9KvWpKGNcSWj7rkcYyAXz9+AoETzlVLnlRkn0FnxHRkQY2lR7tP7M3aKIrG
+          SfL9yLkngbrfpubqV2NA2oK4W+gpBA4wKQ47nZpaynsHnjsykobyJmzCocxz76ClAOLAxZY9KKcZ
+          NPcsOmmdHE5xhvuvGYbo+sozBSdYIouu0lh4JAJ/G1gUYymDtUdQcyRjwwkbxisud2ikH2IV3YYl
+          YPn82cV5hopUy5XyPM5aPZT84T2T/h93qk0J3LfcsSdbzbt/9fds0T5m9xm6If4NFZcvHmH3g+0w
+          tkY2RpoHDoH9d6O4ioY9lpgesiav05+QNft0UFXDDktsrFuRxf3+NwAAAP//AwBmc2DjSAMAAA==
+      headers:
+        anthropic-organization-id:
+          - 44ae676c-958f-4d68-9108-eae9de7b366b
+        anthropic-ratelimit-input-tokens-limit:
+          - '4000000'
+        anthropic-ratelimit-input-tokens-remaining:
+          - '3996000'
+        anthropic-ratelimit-input-tokens-reset:
+          - '2026-08-13T23:13:33Z'
+        anthropic-ratelimit-output-tokens-limit:
+          - '800000'
+        anthropic-ratelimit-output-tokens-remaining:
+          - '800000'
+        anthropic-ratelimit-output-tokens-reset:
+          - '2026-08-13T23:13:33Z'
+        anthropic-ratelimit-requests-limit:
+          - '20000'
+        anthropic-ratelimit-requests-remaining:
+          - '19999'
+        anthropic-ratelimit-requests-reset:
+          - '2026-08-13T23:13:29Z'
+        anthropic-ratelimit-tokens-limit:
+          - '4800000'
+        anthropic-ratelimit-tokens-remaining:
+          - '4796000'
+        anthropic-ratelimit-tokens-reset:
+          - '2026-08-13T23:13:33Z'
+        anthropic-workspace-id:
+          - wrkspc_01L52HbY7uCkD17LL3R3voXT
+        cf-cache-status:
+          - DYNAMIC
+        cf-ray:
+          - a2ab691d7d32a0a0-QRO
+        connection:
+          - keep-alive
+        content-encoding:
+          - gzip
+        content-security-policy:
+          - default-src 'none'; frame-ancestors 'none'
+        content-type:
+          - application/json
+        date:
+          - Thu, 13 Aug 2026 23:13:33 GMT
+        request-id:
+          - req_011Ce1bWTNBJvBfCJ6Bnh7dv
+        server:
+          - cloudflare
+        strict-transport-security:
+          - max-age=31536000; includeSubDomains; preload
+        traceresponse:
+          - 00-4992ea8101e518998b1374938e911c6d-1f48a47cbb91c89b-01
+        transfer-encoding:
+          - chunked
+        vary:
+          - Accept-Encoding
+        x-robots-tag:
+          - none
+      status:
+        code: 200
+        message: OK
+version: 1
