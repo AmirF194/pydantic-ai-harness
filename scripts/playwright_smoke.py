@@ -183,6 +183,42 @@ async def _check_private_address_block() -> None:
         print('in-page fetch to a private address blocked ok (control reached the server)')
 
 
+async def _serve_page(html: str) -> tuple[asyncio.Server, int]:
+    """Serve one HTML document over HTTP on a loopback port."""
+
+    async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        await reader.readline()
+        body = html.encode()
+        writer.write(
+            b'HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n'
+            b'Content-Length: ' + str(len(body)).encode() + b'\r\n\r\n' + body
+        )
+        await writer.drain()
+        writer.close()
+
+    server = await asyncio.start_server(handle, '127.0.0.1', 0)
+    return server, server.sockets[0].getsockname()[1]
+
+
+async def _check_blocked_redirect_message() -> None:
+    """A click the guard refuses names the destination, not Chromium's error page.
+
+    Only a real browser produces the state this is about: the guard aborts the
+    request mid-navigation and Chromium is left on `chrome-error://chromewebdata/`,
+    a URL the test doubles never generate on their own.
+    """
+    server, port = await _serve_page('<a href="https://example.org/invite">join</a>')
+    async with server:
+        browser = PlaywrightBrowser[object](allowed_domains=['127.0.0.1'], block_private_addresses=False)
+        _, clicked = await _run_tools(
+            browser,
+            [('navigate', {'url': f'http://127.0.0.1:{port}/'}), ('click', {'selector': 'a'})],
+        )
+        assert 'example.org/invite' in clicked, clicked
+        assert 'chrome-error' not in clicked, clicked
+        print('blocked-redirect message names the refused URL ok')
+
+
 async def _capture_storage_state() -> StorageState:
     """Log a cookie into a real context and hand back its storage state."""
     async with async_playwright() as pw:
@@ -498,6 +534,7 @@ async def _main() -> None:
     await _check_navigate()
     await _check_allowlist_bounce()
     await _check_private_address_block()
+    await _check_blocked_redirect_message()
     await _check_storage_state_round_trip()
     await _check_embedded_frame()
     await _check_browser_event_log()
