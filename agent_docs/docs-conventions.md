@@ -14,6 +14,16 @@ Every capability package must, or CI fails:
 4. Appear in `docs/nav.json`, and every nav slug must have a page. Nav groups nest
    (`{label, items: [...]}`); the parity test parses them recursively.
 
+## Sidebar Source Of Truth Lives In pydantic-ai (since 2026-08-12)
+
+Production unified-docs no longer reads this repo's `docs/nav.json`: since unified-docs #179,
+the harness sidebar renders from **pydantic-ai's `docs/navigation.yml`** (the
+"Pydantic AI Harness" section; entries carry `source: "harness"`). `docs/nav.json` here is the
+local ledger of our intended IA — the parity test still enforces it against `docs/` — but
+**adding, renaming, or regrouping a page is not live until the matching entry lands in
+pydantic-ai's `docs/navigation.yml`** (a cross-repo companion change, same as the capability
+index mirroring below). Keep slugs `harness/<page>`; preserve existing `aliases:` when renaming.
+
 ## Page Conventions
 
 - **Purpose-first lead**: the opening paragraph says what the capability is for and when to use
