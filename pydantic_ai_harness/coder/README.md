@@ -25,7 +25,7 @@ uvx --with pydantic-ai-harness clai -a pydantic_ai_harness.coder:coder_agent
 
 It is literally these capabilities combined, in this order:
 
-- `FileSystem` — sandboxed read, write, edit, and search tools rooted at the workspace
+- `FileSystem` — read, write, edit, and search tools rooted at the workspace, path-traversal and symlink safe
 - `Shell` — allowlisted commands rooted at the workspace (`DEFAULT_ALLOWED_COMMANDS` is the default allowlist)
 - `RepoContext` — repository instructions and structure
 - `Planning` — a plan the agent creates and keeps current during multi-step work

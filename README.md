@@ -27,13 +27,13 @@ agent.to_cli_sync()
 
 Or run the exported agent directly: `uvx --with pydantic-ai-harness clai -a pydantic_ai_harness.coder:coder_agent`.
 
-That's a complete coding agent in your terminal: sandboxed file access, allowlisted shell, repo orientation, planning, and context management that survives long sessions.
+That's a complete coding agent in your terminal: workspace-rooted file access, allowlisted shell, repo orientation, planning, and context management that survives long sessions.
 
-Every model works — swap the string for `'openai:gpt-5.6-sol'`, `'google:gemini-3-pro'`, or [any other provider](https://ai.pydantic.dev/models/). Need more? Add capabilities to the list:
+Every model works — swap the string for `'openai:gpt-5.6-sol'`, `'google:gemini-3-pro-preview'`, or [any other provider](https://ai.pydantic.dev/models/). Need more? Add capabilities to the list:
 
 ```python
-from pydantic_ai_harness import Coder
-from pydantic_ai_harness.memory import Memory
+from pydantic_ai import Agent
+from pydantic_ai_harness import Coder, Memory
 
 agent = Agent(
     'anthropic:claude-fable-5',
@@ -51,17 +51,22 @@ And it's an ordinary Pydantic AI agent: run it headless with `agent.run_sync(...
 from pathlib import Path
 
 from pydantic_ai import Agent
-from pydantic_ai_harness import FileSystem, Shell
-from pydantic_ai_harness.compaction import ClearToolResults, WarnNearLimits
-from pydantic_ai_harness.planning import Planning
-from pydantic_ai_harness.repo_context import RepoContext
-from pydantic_ai_harness.tool_output_limits import ToolOutputLimits
+from pydantic_ai_harness import (
+    DEFAULT_ALLOWED_COMMANDS,
+    ClearToolResults,
+    FileSystem,
+    Planning,
+    RepoContext,
+    Shell,
+    ToolOutputLimits,
+    WarnNearLimits,
+)
 
 agent = Agent(
     'anthropic:claude-fable-5',
     capabilities=[
         FileSystem('.'),  # read/write/edit/search, path-traversal safe
-        Shell(),  # allowlisted command execution
+        Shell(cwd='.', allowed_commands=DEFAULT_ALLOWED_COMMANDS),  # allowlisted command execution
         RepoContext(workspace_dir=Path('.')),  # loads AGENTS.md/CLAUDE.md + repo structure
         Planning(),  # structured task plans the model maintains
         ClearToolResults(max_fraction=0.7),  # clears old tool results near the limit
@@ -171,19 +176,18 @@ This index deliberately spans both packages — there's one capability system, a
 
 ## Composing from blocks
 
-A research agent, from three capabilities — the same pattern as `Coder`, different blocks:
+A research agent, from three capabilities — this is literally [`Researcher`](pydantic_ai_harness/researcher/)'s composition, blown out:
 
 ```python
 from pydantic_ai import Agent
 from pydantic_ai.capabilities import WebSearch
-from pydantic_ai_harness import CodeMode
-from pydantic_ai_harness.tool_output_limits import ToolOutputLimits
+from pydantic_ai_harness import CodeMode, ToolOutputLimits
 
 agent = Agent(
     'anthropic:claude-fable-5',
     capabilities=[
         CodeMode(),  # batches searches + filtering into single sandboxed scripts
-        WebSearch(native=False),  # local fallback so CodeMode can wrap it
+        WebSearch(local=True),  # native search where supported, DuckDuckGo fallback CodeMode can wrap
         ToolOutputLimits(),  # big pages don't flood the context
     ],
 )
