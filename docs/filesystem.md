@@ -60,10 +60,12 @@ the root you give it.
 | `file_info` | Metadata for a file or directory (size, type, line count, hash, symlink target). |
 
 Tool errors the model can correct -- a missing file, a denied path, a stale
-edit -- are surfaced as
+edit, a directory that collides with an existing file, a path the filesystem
+won't accept -- are surfaced as
 [`ModelRetry`](/ai/core-concepts/agent/#reflection-and-self-correction),
 so the agent gets the error message back and can adjust rather than aborting
-the run.
+the run. Failures the model can do nothing about, such as a full or read-only
+disk, still abort.
 
 ## Security model
 
