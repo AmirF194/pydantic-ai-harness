@@ -1,5 +1,7 @@
 import os
+import tempfile
 from datetime import datetime
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import pytest
@@ -36,8 +38,15 @@ pytestmark = pytest.mark.anyio
 
 
 @pytest.mark.vcr
-async def test_researcher_completes_task(allow_model_requests: None, monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_researcher_completes_task(
+    tmp_path: Path, allow_model_requests: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
     monkeypatch.setenv('OPENAI_API_KEY', os.environ.get('OPENAI_API_KEY', 'replay-key'))
+    # Replay recomputes tool returns while model responses come from the cassette, and the recorded
+    # `read_tool_result` calls reference spill handles keyed by the recording run's `run_id` — so the
+    # run below pins it. Rooting the overflow store in `tmp_path` keeps spills left behind by earlier
+    # runs out of the lookup.
+    monkeypatch.setattr(tempfile, 'tempdir', str(tmp_path))
     agent = Agent(
         'openai:gpt-5.6-sol',
         capabilities=[Researcher()],
@@ -48,7 +57,8 @@ async def test_researcher_completes_task(allow_model_requests: None, monkeypatch
         'Compare the free-threaded Python support in CPython 3.13 and 3.14 using official sources. '
         'Delegate the 3.13 investigation to the researcher sub-agent while you investigate 3.14, '
         'then synthesize the maturity status and main limitations. Search for and read the sources '
-        'needed for each version, and include direct links.'
+        'needed for each version, and include direct links.',
+        run_id='01a0021a-aa83-7252-8a64-d7108e706f29',
     )
 
     assert result.all_messages() == snapshot(
