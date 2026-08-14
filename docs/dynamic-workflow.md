@@ -7,6 +7,8 @@ description: Let an orchestrator agent coordinate a catalog of sub-agents by wri
 
 `DynamicWorkflow` is for the case where the coordination *between* sub-agents is the actual work. Say you have a few specialists -- one reviews code, one summarizes findings, one writes the final note. Each is easy to call on its own; the hard part is the choreography: review three files at once, keep only the reports that found something, summarize those, and hand the summary to the writer. Reach for this capability when that orchestration involves fan-out, chaining, voting, or retry loops that you do not want to run one model turn at a time, with every intermediate result flowing back through the orchestrator's context.
 
+> While Pydantic AI Harness is on 0.x releases, the API may change between minor releases — and when it does, deprecation warnings and release-note migration guidance tell you (or your agent) exactly how to upgrade. See the [version policy](index.md#version-policy).
+
 ## The idea
 
 The usual way to coordinate sub-agents is one tool call per step. The agent calls the reviewer and waits, reads the result, calls the reviewer again, waits again, and so on. Every intermediate result travels back into the agent's context, and every step that depends on the previous one is a separate model turn.

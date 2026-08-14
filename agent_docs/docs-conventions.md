@@ -39,7 +39,11 @@ PR that updates pydantic-ai's `docs/navigation.yml`. Keep slugs
 - **H1 = the capability's spaced name** (`Code Mode`, not `CodeMode`), matching filename and nav
   label. Allowlisted ClassName exceptions live in the parity test.
 - **Every page links its own source module** on GitHub.
-- **Experimental framing only on ACP.** Everything else uses the README's stability note.
+- **Experimental framing only on ACP.** Every other capability page carries the standard
+  version-promise blockquote ("While Pydantic AI Harness is on 0.x releases, the API may change
+  between minor releases — …") directly before its first `##` heading, linking the
+  [version policy](../docs/index.md#version-policy). Copy it verbatim from an existing page;
+  don't improvise variants.
 - **Example style**: comments one line max; outputs elided (`#> ...`) rather than long canned
   text; models are the current generation (verify against core's `_known_model_names.py` — as of
   2026-08 that means `claude-fable-5` / `gpt-5.6-sol`, not older defaults) unless a page

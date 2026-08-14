@@ -5,7 +5,7 @@
 [![versions](https://img.shields.io/pypi/pyversions/pydantic-ai-harness.svg)](https://github.com/pydantic/pydantic-ai-harness)
 [![license](https://img.shields.io/github/license/pydantic/pydantic-ai-harness.svg)](https://github.com/pydantic/pydantic-ai-harness/blob/main/LICENSE)
 
-**The batteries for your Pydantic AI agent.**
+**How Python does agents**
 
 ---
 
@@ -316,13 +316,7 @@ make testcov   # pytest with 100% branch coverage
 
 ## Version policy
 
-Pydantic AI Harness uses **0.x versioning** to signal that APIs are still stabilizing. During 0.x:
-
-- **Minor releases** (0.1 -> 0.2) may include breaking changes — renamed parameters, changed defaults, restructured APIs — always with deprecation warnings where practical.
-- **Patch releases** (0.1.0 -> 0.1.1) will not intentionally break existing behavior.
-- **All breaking changes** are documented in release notes with migration guidance.
-
-This is why the Harness is a separate package from [Pydantic AI](https://github.com/pydantic/pydantic-ai), which has a [stricter version policy](https://ai.pydantic.dev/version-policy/): capabilities iterate here at the speed the field moves, and graduate into core as they stabilize.
+Pydantic AI Harness uses **0.x versioning**, and that's a statement about API stability, not maturity: these capabilities are tested end-to-end and meant for production use, but their APIs may still move between minor releases (0.1 -> 0.2) — renamed parameters, changed defaults, restructured APIs, always with deprecation warnings where practical. Patch releases will not intentionally break existing behavior, and every breaking change is documented in release notes with migration guidance your agent can follow. Keeping the Harness a separate package from [Pydantic AI](https://github.com/pydantic/pydantic-ai) — which has a [stricter version policy](https://ai.pydantic.dev/version-policy/) — is what lets capabilities iterate at the speed the field moves.
 
 ## Part of the Pydantic Stack
 

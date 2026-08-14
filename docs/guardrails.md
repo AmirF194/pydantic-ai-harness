@@ -9,6 +9,8 @@ Guardrails put a validation layer on the three edges of an agent run: the prompt
 
 > The API may change between releases. Where practical, breaking changes ship with a deprecation warning.
 
+> While Pydantic AI Harness is on 0.x releases, the API may change between minor releases — and when it does, deprecation warnings and release-note migration guidance tell you (or your agent) exactly how to upgrade. See the [version policy](index.md#version-policy).
+
 ## The problem
 
 Agents take unstructured input from users and return unstructured output to callers. On its own the framework does not reason about "this is unsafe to send" or "this is unsafe to show" -- a prompt-injection attempt reaches the model as-is, and any output the model produces is returned untouched. You need a place to inspect the value and decide what happens next.

@@ -11,6 +11,8 @@ description: Give an agent a tool that locates and returns Pydantic AI documenta
 
 > The API may change between releases. Where practical, breaking changes ship with a deprecation warning.
 
+> While Pydantic AI Harness is on 0.x releases, the API may change between minor releases — and when it does, deprecation warnings and release-note migration guidance tell you (or your agent) exactly how to upgrade. See the [version policy](index.md#version-policy).
+
 ## The problem
 
 An agent that authors Pydantic AI capabilities, hooks, tools, or toolsets needs the current docs for those APIs. Preloading the docs into the system prompt spends context the agent rarely needs in full, and pins a snapshot that drifts from `main`.

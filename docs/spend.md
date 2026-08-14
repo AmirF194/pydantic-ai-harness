@@ -9,6 +9,8 @@ Track what an agent costs, and stop it when a budget is gone.
 
 > The API may change between releases. Where practical, breaking changes ship with a deprecation warning.
 
+> While Pydantic AI Harness is on 0.x releases, the API may change between minor releases — and when it does, deprecation warnings and release-note migration guidance tell you (or your agent) exactly how to upgrade. See the [version policy](index.md#version-policy).
+
 ## The problem
 
 A loop that calls a model until a condition it never reaches will keep calling until something stops it. `UsageLimits` in Pydantic AI is that stop for one run: it caps tokens and requests, in token counts, for the duration of a single `run()`. What it does not cover is money, a period longer than one run, a per-tenant share of a shared allowance, or a counter that several worker processes agree on. A daily ceiling spread across a queue's workers is exactly the case where each worker independently believes it has the whole budget.

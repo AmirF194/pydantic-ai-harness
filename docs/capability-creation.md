@@ -13,6 +13,8 @@ Runtime capability creation lets an agent write, validate, and persist Pydantic 
 
 > The API may change between releases. Where practical, breaking changes ship with a deprecation warning.
 
+> While Pydantic AI Harness is on 0.x releases, the API may change between minor releases — and when it does, deprecation warnings and release-note migration guidance tell you (or your agent) exactly how to upgrade. See the [version policy](index.md#version-policy).
+
 ## The problem
 
 A coding agent often discovers, mid-task, that it wants a behavior its host does not yet have: a guardrail, an extra instruction, a tool, a request hook. The capability surface to express that already exists -- but normally only a developer can write a capability class, wire it into the agent, and restart. Without runtime capability creation, the agent cannot author that extension during a run and make it available to the next run.

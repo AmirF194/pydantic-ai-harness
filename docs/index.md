@@ -5,7 +5,7 @@ description: The official capability library and harness for Pydantic AI -- 30+ 
 
 # Pydantic AI Harness
 
-**The batteries for your Pydantic AI agent.**
+**How Python does agents**
 
 An agent is a model plus a harness — everything around the model that turns it into an agent: [tools](/ai/tools-toolsets/toolsets/), [context management](/ai/capabilities/compaction/), [memory](memory.md), [planning](planning.md), [delegation](subagents.md), [safety](guardrails.md), and the [durable execution](/ai/capabilities/durable_execution/overview/) that lets it run for hours. [Pydantic AI](/ai/) ships the typed agent loop, [every model](/ai/models/overview/), the [capability](/ai/capabilities/overview/) primitive, and the fundamentals every agent needs — a bare Pydantic AI agent is already a working one. **Pydantic AI Harness** is the rest of the harness, maintained by the Pydantic AI team: 30+ capabilities — code execution, memory, sub-agents, guardrails, compaction — and complete agents assembled from them. Snap on one capability, compose your own stack from the blocks, or start from a complete [coding agent](coder.md) and take it apart later — it's the same primitive all the way down, 50+ capabilities across the two packages, a range no other Python agent framework ships.
 

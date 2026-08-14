@@ -22,6 +22,8 @@ A conversation that carries images, audio, or other `BinaryContent` inlines thos
 
 > The API may change between releases. Where practical, breaking changes ship with a deprecation warning.
 
+> While Pydantic AI Harness is on 0.x releases, the API may change between minor releases — and when it does, deprecation warnings and release-note migration guidance tell you (or your agent) exactly how to upgrade. See the [version policy](index.md#version-policy).
+
 ## Building blocks, not a capability
 
 These are building blocks. There is no class you add to `Agent(capabilities=[...])` yet. [`StepPersistence`](step-persistence.md) already uses them to keep snapshots small when messages carry `BinaryContent` or large text (e.g. a big tool-return string), and a forthcoming `MediaExternalizer` capability ([#254](https://github.com/pydantic/pydantic-ai-harness/issues/254)) will reuse the same stores to rewrite `BinaryContent` into URL parts before the model sees them.

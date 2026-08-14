@@ -15,6 +15,8 @@ run gets a fresh sandbox created from a container image. The capability requests
 termination when the run ends. You can also attach an existing sandbox or reuse
 one across several runs.
 
+> While Pydantic AI Harness is on 0.x releases, the API may change between minor releases — and when it does, deprecation warnings and release-note migration guidance tell you (or your agent) exactly how to upgrade. See the [version policy](index.md#version-policy).
+
 ## Quick start
 
 Install the `modal` extra and authenticate with the Modal CLI. In CI, set

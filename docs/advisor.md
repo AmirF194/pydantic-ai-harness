@@ -11,6 +11,8 @@ Give an executor model a way to consult a separate advisor model before it answe
 
 > The API may change between releases. Breaking changes ship deprecation warnings where practical.
 
+> While Pydantic AI Harness is on 0.x releases, the API may change between minor releases — and when it does, deprecation warnings and release-note migration guidance tell you (or your agent) exactly how to upgrade. See the [version policy](index.md#version-policy).
+
 ## Usage
 
 Pass the advisor model as the first argument. The model can be any model name or model instance accepted by Pydantic AI:
