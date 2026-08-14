@@ -17,11 +17,9 @@ class InlineSnapshotPlugin:
             return builder.create_call(IsInstance, [RequestUsage])
         if isinstance(value, str) and re.fullmatch(r'01[a-z0-9]{6}(?:-[a-z0-9]{4}){3}-[a-z0-9]{12}', value):
             return builder.create_call(IsStr)
-        if isinstance(value, str) and ('/tmp/pytest-of-' in value or re.search(r'01[a-z0-9]{6}-', value)):
-            normalized = re.sub(r'pytest-\d+', 'PYTEST_RUN', value)
-            normalized = re.sub(r'01[a-z0-9]{6}(?:-[a-z0-9]{4}){3}-[a-z0-9]{12}', 'RUN_ID', normalized)
-            pattern = re.escape(normalized).replace('PYTEST_RUN', r'pytest\-\d+')
-            pattern = pattern.replace('RUN_ID', r'01[a-z0-9]{6}(?:\-[a-z0-9]{4}){3}\-[a-z0-9]{12}')
+        if isinstance(value, str) and re.search(r'01[a-z0-9]{6}-', value):
+            normalized = re.sub(r'01[a-z0-9]{6}(?:-[a-z0-9]{4}){3}-[a-z0-9]{12}', 'RUN_ID', value)
+            pattern = re.escape(normalized).replace('RUN_ID', r'01[a-z0-9]{6}(?:\-[a-z0-9]{4}){3}\-[a-z0-9]{12}')
             return builder.create_call(IsStr, [], {'regex': pattern})
 
 
@@ -32,7 +30,9 @@ def vcr_config() -> dict[str, Any]:
             ('authorization', 'REDACTED'),
             ('x-api-key', 'REDACTED'),
         ],
-        'match_on': ['method', 'uri'],
+        # `safe_download` connects to a resolved IP address, which may differ
+        # between recording and replay for the same URL.
+        'match_on': ['method', 'path', 'query'],
     }
 
 
