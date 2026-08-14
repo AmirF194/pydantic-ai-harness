@@ -12,7 +12,7 @@ from pydantic_ai_harness.compaction import ClearToolResults, WarnNearLimits
 from pydantic_ai_harness.filesystem import FileSystem
 from pydantic_ai_harness.planning import Planning
 from pydantic_ai_harness.repo_context import RepoContext
-from pydantic_ai_harness.shell import Shell
+from pydantic_ai_harness.shell import LLM_API_KEY_ENV_PATTERNS, Shell
 from pydantic_ai_harness.subagents import SubAgents
 from pydantic_ai_harness.tool_output_limits import ToolOutputLimits
 
@@ -27,6 +27,7 @@ def test_coder_agent_is_model_less_and_composed() -> None:
     assert isinstance(coder_agent, Agent)
     assert coder_agent.model is None
     assert coder_agent.name == 'coder'
+    assert coder_agent._instructions == ['You are a coding agent built on Pydantic AI.']
     assert any(isinstance(capability, FileSystem) for capability in coder_agent.root_capability.capabilities)
 
 
@@ -78,6 +79,7 @@ def test_coder_threads_parameters(tmp_path: Path) -> None:
     assert filesystem.root_dir == tmp_path
     assert shell.cwd == tmp_path
     assert shell.allowed_commands == ['git']
+    assert shell.denied_env_patterns == LLM_API_KEY_ENV_PATTERNS
     assert repo_context.workspace_dir == tmp_path
     assert not any(isinstance(capability, SubAgents) for capability in coder.capabilities)
     assert coder.capabilities[0].get_instructions() == ['Custom instructions']

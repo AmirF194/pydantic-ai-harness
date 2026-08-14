@@ -1,8 +1,12 @@
 """Complete research-agent harness assembled from regular capabilities."""
 
+from collections.abc import Sequence
+
+from pydantic_ai import Agent
 from pydantic_ai.capabilities import AbstractCapability, Capability, CombinedCapability, WebFetch, WebSearch
 from pydantic_ai.tools import AgentDepsT
 
+from pydantic_ai_harness.subagents import SubAgent, SubAgents
 from pydantic_ai_harness.tool_output_limits import ToolOutputLimits
 
 DEFAULT_RESEARCHER_INSTRUCTIONS = """\
@@ -15,6 +19,19 @@ Distinguish sourced facts from your own inference.
 """Default instructions for `Researcher`."""
 
 
+def _researcher() -> SubAgent[AgentDepsT]:
+    agent = Agent[AgentDepsT](  # pyright: ignore[reportCallIssue, reportArgumentType]
+        name='researcher',
+        description='Research a focused sub-question on the web and report back with findings and source links',
+        capabilities=[
+            WebSearch[AgentDepsT](local=True),
+            WebFetch[AgentDepsT](local=True),
+            ToolOutputLimits[AgentDepsT](),
+        ],
+    )
+    return SubAgent(agent)
+
+
 class Researcher(CombinedCapability[AgentDepsT]):
     """A complete research-agent harness built as a regular combined capability.
 
@@ -22,7 +39,13 @@ class Researcher(CombinedCapability[AgentDepsT]):
     replace them, or `instructions=None` to run with no default instructions.
     """
 
-    def __init__(self, *, instructions: str | None = DEFAULT_RESEARCHER_INSTRUCTIONS) -> None:
+    def __init__(
+        self,
+        *,
+        instructions: str | None = DEFAULT_RESEARCHER_INSTRUCTIONS,
+        subagents: Sequence[SubAgent[AgentDepsT]] | None = None,
+    ) -> None:
+        delegates = [_researcher()] if subagents is None else subagents
         capabilities: list[AbstractCapability[AgentDepsT]] = []
         if instructions is not None:
             capabilities.append(Capability[AgentDepsT](instructions=instructions))
@@ -30,7 +53,9 @@ class Researcher(CombinedCapability[AgentDepsT]):
             [
                 WebSearch[AgentDepsT](local=True),
                 WebFetch[AgentDepsT](local=True),
-                ToolOutputLimits[AgentDepsT](),
             ]
         )
+        if delegates:
+            capabilities.append(SubAgents[AgentDepsT](agents=delegates, agent_folders=None))
+        capabilities.append(ToolOutputLimits[AgentDepsT]())
         super().__init__(capabilities)

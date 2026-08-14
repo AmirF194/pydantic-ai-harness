@@ -1,7 +1,7 @@
 # Docs Conventions
 
 How the harness's user-facing docs stay correct, consistent, and discoverable. Read this before
-touching `README.md`, `docs/`, a capability README, or `docs/nav.json` — and before adding a
+touching `README.md`, `docs/`, or a capability README — and before adding a
 capability, since every capability lands with docs or fails CI.
 
 ## The Parity Contract (enforced by `tests/test_docs_parity.py`)
@@ -11,18 +11,17 @@ Every capability package must, or CI fails:
 1. Have its own `README.md` (purpose-first lead, source-module link, spaced-words H1).
 2. Be linked from the top-level `README.md` capability tables.
 3. Have a `docs/<slug>.md` page registered in `_CAPABILITY_PAGE_META` (source module + exact H1).
-4. Appear in `docs/nav.json`, and every nav slug must have a page. Nav groups nest
-   (`{label, items: [...]}`); the parity test parses them recursively.
+4. Have a partner PR that adds or updates the page in pydantic-ai's
+   `docs/navigation.yml`.
 
 ## Sidebar Source Of Truth Lives In pydantic-ai (since 2026-08-12)
 
-Production unified-docs no longer reads this repo's `docs/nav.json`: since unified-docs #179,
-the harness sidebar renders from **pydantic-ai's `docs/navigation.yml`** (the
-"Pydantic AI Harness" section; entries carry `source: "harness"`). `docs/nav.json` here is the
-local ledger of our intended IA — the parity test still enforces it against `docs/` — but
-**adding, renaming, or regrouping a page is not live until the matching entry lands in
-pydantic-ai's `docs/navigation.yml`** (a cross-repo companion change, same as the capability
-index mirroring below). Keep slugs `harness/<page>`; preserve existing `aliases:` when renaming.
+Since unified-docs #179, the harness sidebar renders from **pydantic-ai's
+`docs/navigation.yml`** (the "Pydantic AI Harness" section; entries carry
+`source: "harness"`). This repository has no local navigation file. Adding,
+renaming, removing, or regrouping a harness docs page therefore requires a partner
+PR that updates pydantic-ai's `docs/navigation.yml`. Keep slugs
+`harness/<page>` and preserve existing `aliases:` when renaming.
 
 ## Page Conventions
 

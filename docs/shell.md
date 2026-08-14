@@ -95,10 +95,11 @@ A denied command surfaces to the model as a
 the run continues and the model can pick an allowed command instead.
 
 !!! warning "Best-effort, not a security boundary"
-    These command checks are best-effort. A sufficiently motivated agent can
-    defeat them (e.g. `bash -c '...'`, env-var indirection). For hard
-    guarantees, run the agent inside OS-level isolation -- a container or
-    sandbox.
+    `allowed_commands` is a guardrail against accidents, not a security boundary.
+    Validation checks only the first token, and allowlisted commands such as
+    `python`, `git`, `uv`, and `make` can spawn arbitrary processes. A model that
+    wants to work around the allowlist can. For untrusted work, run the agent
+    inside OS-level isolation such as [`ModalSandbox`](modal-sandbox.md) or a container.
 
 ## Environment control
 

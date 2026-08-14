@@ -14,7 +14,7 @@ A harness is everything around the model that turns it into an agent: tools, con
 ## Quick start
 
 ```bash
-uv add pydantic-ai-harness
+uv add pydantic-ai-harness 'pydantic-ai-slim[anthropic,cli]'
 ```
 
 ```python
@@ -34,10 +34,11 @@ Every model works — swap the string for `'openai:gpt-5.6-sol'`, `'google:gemin
 ```python
 from pydantic_ai import Agent
 from pydantic_ai_harness import Coder, Memory
+from pydantic_ai_harness.memory import FileStore
 
 agent = Agent(
     'anthropic:claude-fable-5',
-    capabilities=[Coder(), Memory()],  # remembers across sessions
+    capabilities=[Coder(), Memory(FileStore('.agent-memory'))],  # remembers across sessions
 )
 ```
 
@@ -55,20 +56,37 @@ from pydantic_ai_harness import (
     DEFAULT_ALLOWED_COMMANDS,
     ClearToolResults,
     FileSystem,
+    LLM_API_KEY_ENV_PATTERNS,
     Planning,
     RepoContext,
     Shell,
+    SubAgent,
+    SubAgents,
     ToolOutputLimits,
     WarnNearLimits,
+)
+
+explorer = SubAgent(
+    Agent(
+        name='explorer',
+        description='Explore the codebase and answer questions without modifying anything',
+        instructions='Answer with concrete paths and evidence.',
+        capabilities=[FileSystem('.', read_only=True), RepoContext(workspace_dir=Path('.'))],
+    )
 )
 
 agent = Agent(
     'anthropic:claude-fable-5',
     capabilities=[
         FileSystem('.'),  # read/write/edit/search, path-traversal safe
-        Shell(cwd='.', allowed_commands=DEFAULT_ALLOWED_COMMANDS),  # allowlisted command execution
+        Shell(
+            cwd='.',
+            allowed_commands=DEFAULT_ALLOWED_COMMANDS,
+            denied_env_patterns=LLM_API_KEY_ENV_PATTERNS,
+        ),
         RepoContext(workspace_dir=Path('.')),  # loads AGENTS.md/CLAUDE.md + repo structure
         Planning(),  # structured task plans the model maintains
+        SubAgents(agents=[explorer], agent_folders=None),
         ClearToolResults(max_fraction=0.7),  # clears old tool results near the limit
         WarnNearLimits(max_context_fraction=0.9),  # warns the model before it hits limits
         ToolOutputLimits(),  # bounds oversized tool results
@@ -176,18 +194,27 @@ This index deliberately spans both packages — there's one capability system, a
 
 ## Composing from blocks
 
-A research agent, from three capabilities — this is literally [`Researcher`](pydantic_ai_harness/researcher/)'s composition, minus its short default instructions:
+A research agent from regular capabilities -- this is literally [`Researcher`](pydantic_ai_harness/researcher/)'s composition, minus its short default instructions:
 
 ```python
 from pydantic_ai import Agent
 from pydantic_ai.capabilities import WebFetch, WebSearch
-from pydantic_ai_harness import ToolOutputLimits
+from pydantic_ai_harness import SubAgent, SubAgents, ToolOutputLimits
+
+sub_researcher = SubAgent(
+    Agent(
+        name='researcher',
+        description='Research a focused sub-question on the web and report back with findings and source links',
+        capabilities=[WebSearch(local=True), WebFetch(local=True), ToolOutputLimits()],
+    )
+)
 
 agent = Agent(
     'anthropic:claude-fable-5',
     capabilities=[
         WebSearch(local=True),  # native provider search, DuckDuckGo fallback elsewhere
         WebFetch(local=True),  # read the pages behind the results, native or local
+        SubAgents(agents=[sub_researcher], agent_folders=None),
         ToolOutputLimits(),  # fetched pages don't flood the context
     ],
 )
