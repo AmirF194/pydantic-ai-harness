@@ -44,7 +44,7 @@ ID is not hard-coded. You can pass `api_key=` directly instead, but keep secrets
 import os
 
 from pydantic_ai import Agent
-from pydantic_ai_harness.stackone import StackOne
+from pydantic_ai_harness import StackOne
 
 agent = Agent(
     'openai:gpt-5',
@@ -69,7 +69,7 @@ Use `actions` when you also want to limit which tools the model sees. Patterns u
 the full `{connector}_{action}_{entity}` tool name:
 
 ```python
-from pydantic_ai_harness.stackone import StackOne
+from pydantic_ai_harness import StackOne
 
 StackOne(account_id='your-linked-account-id', actions=['*_list_*'])            # All matching list tools
 StackOne(account_id='your-linked-account-id', actions=['workday_get_worker'])  # One exact tool
@@ -93,7 +93,7 @@ To keep StackOne tools out of the model context until they are needed, pass `def
 multiple StackOne accounts:
 
 ```python
-from pydantic_ai_harness.stackone import StackOne
+from pydantic_ai_harness import StackOne
 
 StackOne(account_id='your-linked-account-id', defer_loading=True)
 ```
@@ -105,8 +105,7 @@ Provider actions can return large exports. Combine StackOne with the
 
 ```python
 from pydantic_ai import Agent
-from pydantic_ai_harness.stackone import StackOne
-from pydantic_ai_harness.tool_output_limits import ToolOutputLimits
+from pydantic_ai_harness import StackOne, ToolOutputLimits
 
 agent = Agent(
     'openai:gpt-5',
@@ -156,7 +155,7 @@ capabilities:
 
 ```python
 from pydantic_ai import Agent
-from pydantic_ai_harness.stackone import StackOne
+from pydantic_ai_harness import StackOne
 
 agent = Agent.from_file('agent.yaml', custom_capability_types=[StackOne])
 ```

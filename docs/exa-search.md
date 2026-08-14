@@ -40,7 +40,7 @@ Then pass `ExaSearch` to an `Agent` via the `capabilities` parameter:
 
 ```python
 from pydantic_ai import Agent
-from pydantic_ai_harness.exa import ExaSearch
+from pydantic_ai_harness import ExaSearch
 
 agent = Agent('anthropic:claude-sonnet-4-6', capabilities=[ExaSearch()])
 
@@ -89,7 +89,7 @@ than `web_search` (Exa's research-grade mode), and the model decides when to
 invoke tools, so the tool is off by default -- enable it explicitly:
 
 ```python
-from pydantic_ai_harness.exa import ExaSearch
+from pydantic_ai_harness import ExaSearch
 
 ExaSearch(include_deep_search=True)
 ```
@@ -108,7 +108,7 @@ summary, or a string describing the desired format (sent as the schema's
 `description`):
 
 ```python
-from pydantic_ai_harness.exa import ExaSearch
+from pydantic_ai_harness import ExaSearch
 
 ExaSearch(text_summary='One concise sentence with the requested facts.')
 ```
@@ -156,7 +156,7 @@ to `''` to contribute no instructions at all.
 Every field of `ExaSearch` with its default:
 
 ```python
-from pydantic_ai_harness.exa import ExaSearch
+from pydantic_ai_harness import ExaSearch
 
 ExaSearch(
     num_results=5,              # results per web_search call (1 to 100)
@@ -186,7 +186,7 @@ deferred call's metadata.
 
 ```python
 from pydantic_ai import Agent
-from pydantic_ai_harness.exa import ExaAgent
+from pydantic_ai_harness import ExaAgent
 
 agent = Agent('anthropic:claude-sonnet-4-6', capabilities=[ExaAgent()])
 ```
@@ -204,7 +204,7 @@ instead of returning the deferred requests:
 from pydantic_ai import Agent
 from pydantic_ai.tools import DeferredToolRequests
 
-from pydantic_ai_harness.exa import ExaAgent
+from pydantic_ai_harness import ExaAgent
 
 agent = Agent(
     'anthropic:claude-sonnet-4-6',
@@ -241,7 +241,7 @@ async def resume(agent, messages, results):
 Every field of `ExaAgent` with its default:
 
 ```python
-from pydantic_ai_harness.exa import ExaAgent
+from pydantic_ai_harness import ExaAgent
 
 ExaAgent(
     effort=None,            # 'low' | 'medium' | 'high' | 'xhigh' | 'auto' -- None = API default
@@ -275,7 +275,7 @@ names:
 from pydantic_ai import Agent
 from pydantic_ai.capabilities import PrefixTools
 
-from pydantic_ai_harness.exa import ExaSearch
+from pydantic_ai_harness import ExaSearch
 
 agent = Agent(
     'anthropic:claude-sonnet-4-6',
@@ -309,7 +309,7 @@ explicitly, or to substitute a fake in tests:
 ```python
 from exa_py import AsyncExa
 
-from pydantic_ai_harness.exa import ExaSearch
+from pydantic_ai_harness import ExaSearch
 
 ExaSearch(client=AsyncExa(api_key='...'))
 ```
@@ -356,7 +356,7 @@ tool names collide with `web_search`, `get_page`, or `deep_search`:
 ```python
 from pydantic_ai import Agent
 from pydantic_ai.capabilities import MCP
-from pydantic_ai_harness.exa import ExaSearch
+from pydantic_ai_harness import ExaSearch
 
 agent = Agent('anthropic:claude-sonnet-4-6', capabilities=[ExaSearch(), MCP('https://mcp.exa.ai/mcp')])
 ```
@@ -380,7 +380,7 @@ capabilities:
 
 ```python
 from pydantic_ai import Agent
-from pydantic_ai_harness.exa import ExaAgent, ExaSearch
+from pydantic_ai_harness import ExaAgent, ExaSearch
 
 agent = Agent.from_file('agent.yaml', custom_capability_types=[ExaSearch, ExaAgent])
 ```

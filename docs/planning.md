@@ -41,7 +41,7 @@ Construct an `Agent` with `Planning()` in its `capabilities`. The tools are regi
 
 ```python
 from pydantic_ai import Agent
-from pydantic_ai_harness.planning import Planning
+from pydantic_ai_harness import Planning
 
 agent = Agent('anthropic:claude-sonnet-4-6', capabilities=[Planning()])
 
@@ -65,7 +65,7 @@ Each step is a `content` string, an optional present-continuous `active_form` la
 All six are registered by default. `tools=` narrows that to an allowlist, and the built-in guidance follows it:
 
 ```python
-from pydantic_ai_harness.planning import Planning
+from pydantic_ai_harness import Planning
 
 planning = Planning(tools=['write_plan'])  # whole-plan replacement only -- one tool, no step ids to track
 ```
@@ -89,7 +89,8 @@ Pass `enable_subtasks=True` to add three more tools, the `blocked` status, and a
 By default the plan is a fresh, isolated in-memory plan per run. Pass a `store` to persist it:
 
 ```python
-from pydantic_ai_harness.planning import Planning, SqlitePlanStore
+from pydantic_ai_harness import Planning
+from pydantic_ai_harness.planning import SqlitePlanStore
 
 planning = Planning(store=SqlitePlanStore('plan.db', session='user-123'))
 ```
@@ -162,7 +163,7 @@ The plan is never injected into the system prompt or instructions. Static usage 
 ## Configuration
 
 ```python
-from pydantic_ai_harness.planning import Planning
+from pydantic_ai_harness import Planning
 
 Planning(
     guidance=None,           # static system-prompt guidance; None = default, '' = omit
@@ -188,7 +189,7 @@ capabilities:
 
 ```python
 from pydantic_ai import Agent
-from pydantic_ai_harness.planning import Planning
+from pydantic_ai_harness import Planning
 
 agent = Agent.from_file('agent.yaml', custom_capability_types=[Planning])
 result = agent.run_sync('...')

@@ -20,7 +20,7 @@ idea the rest of the setup exists, so it can neither honor it nor translate it.
 from pathlib import Path
 
 from pydantic_ai import Agent
-from pydantic_ai_harness.repo_context import RepoContext
+from pydantic_ai_harness import RepoContext
 
 agent = Agent(
     'anthropic:claude-sonnet-4-6',
@@ -60,8 +60,7 @@ opt-in and configurable:
 from pathlib import Path
 
 from pydantic_ai import Agent
-from pydantic_ai_harness import FileSystem
-from pydantic_ai_harness.repo_context import RepoContext
+from pydantic_ai_harness import FileSystem, RepoContext
 
 agent = Agent(
     'anthropic:claude-sonnet-4-6',

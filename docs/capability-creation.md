@@ -35,7 +35,7 @@ Construct `CapabilityCreation` with a `directory` for the authored files, then a
 from pathlib import Path
 
 from pydantic_ai import Agent
-from pydantic_ai_harness.capability_creation import CapabilityCreation
+from pydantic_ai_harness import CapabilityCreation
 
 creation = CapabilityCreation(directory=Path('.authored'))
 agent = Agent('anthropic:claude-sonnet-4-6', capabilities=[creation])
@@ -56,7 +56,7 @@ The orchestrator drives the loop, so it owns the one-line contract: thread the s
 from pathlib import Path
 
 from pydantic_ai import Agent
-from pydantic_ai_harness.capability_creation import CapabilityCreation
+from pydantic_ai_harness import CapabilityCreation
 
 creation = CapabilityCreation(directory=Path('.authored'))
 agent = Agent('anthropic:claude-sonnet-4-6', capabilities=[creation])

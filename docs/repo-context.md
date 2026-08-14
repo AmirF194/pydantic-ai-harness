@@ -23,7 +23,7 @@ A repo accumulates CE for whatever coding assistant worked in it: instruction fi
 from pathlib import Path
 
 from pydantic_ai import Agent
-from pydantic_ai_harness.repo_context import RepoContext
+from pydantic_ai_harness import RepoContext
 
 agent = Agent(
     'anthropic:claude-sonnet-4-6',
@@ -54,8 +54,7 @@ When the model lists or reads a directory, surface that directory's `CLAUDE.md`/
 from pathlib import Path
 
 from pydantic_ai import Agent
-from pydantic_ai_harness import FileSystem
-from pydantic_ai_harness.repo_context import RepoContext
+from pydantic_ai_harness import FileSystem, RepoContext
 
 agent = Agent(
     'anthropic:claude-sonnet-4-6',

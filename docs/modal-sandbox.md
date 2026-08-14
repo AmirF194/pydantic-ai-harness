@@ -32,7 +32,7 @@ Add `ModalSandbox` to the agent:
 
 ```python
 from pydantic_ai import Agent
-from pydantic_ai_harness.modal_sandbox import ModalSandbox
+from pydantic_ai_harness import ModalSandbox
 
 agent = Agent(
     'anthropic:claude-sonnet-4-6',
@@ -74,7 +74,7 @@ model; it does not defer toolset lifecycle.
 Attach to a sandbox managed elsewhere by ID:
 
 ```python
-from pydantic_ai_harness.modal_sandbox import ModalSandbox
+from pydantic_ai_harness import ModalSandbox
 
 ModalSandbox(sandbox_id='sb-abc123')
 ```
@@ -84,7 +84,8 @@ To share a sandbox across runs while controlling its lifetime, create and enter 
 
 ```python
 from pydantic_ai import Agent
-from pydantic_ai_harness.modal_sandbox import ModalSandbox, ModalSandboxSession
+from pydantic_ai_harness import ModalSandbox
+from pydantic_ai_harness.modal_sandbox import ModalSandboxSession
 
 async with ModalSandboxSession(image='python:3.12-slim', sandbox_timeout=1800) as session:
     agent = Agent(
@@ -157,7 +158,7 @@ capability before composing it with another capability that uses the same names:
 ```python
 from pydantic_ai.capabilities import PrefixTools
 
-from pydantic_ai_harness.modal_sandbox import ModalSandbox
+from pydantic_ai_harness import ModalSandbox
 
 sandbox = PrefixTools(
     wrapped=ModalSandbox(
@@ -177,7 +178,7 @@ capability's default instructions, which name the unprefixed tools -- pass
 ## Configuration
 
 ```python
-from pydantic_ai_harness.modal_sandbox import ModalSandbox
+from pydantic_ai_harness import ModalSandbox
 
 ModalSandbox(
     image='python:3.12-slim',
@@ -230,7 +231,7 @@ capabilities:
 
 ```python
 from pydantic_ai import Agent
-from pydantic_ai_harness.modal_sandbox import ModalSandbox
+from pydantic_ai_harness import ModalSandbox
 
 agent = Agent.from_file('agent.yaml', custom_capability_types=[ModalSandbox])
 ```

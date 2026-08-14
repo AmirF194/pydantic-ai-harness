@@ -122,8 +122,7 @@ both unset preserves the inherit-everything default.
 ```python
 import os
 
-from pydantic_ai_harness import Shell
-from pydantic_ai_harness.shell import LLM_API_KEY_ENV_PATTERNS
+from pydantic_ai_harness import LLM_API_KEY_ENV_PATTERNS, Shell
 
 # Strip provider credentials from the inherited environment.
 Shell(cwd='./repo', denied_env_patterns=LLM_API_KEY_ENV_PATTERNS)

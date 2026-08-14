@@ -47,7 +47,8 @@ snapshots, and graph-node resume are out of scope and tracked separately
 
 ```python
 from pydantic_ai import Agent
-from pydantic_ai_harness.step_persistence import StepPersistence, InMemoryStepStore
+from pydantic_ai_harness import StepPersistence
+from pydantic_ai_harness.step_persistence import InMemoryStepStore
 
 store = InMemoryStepStore()
 librarian = Agent(
@@ -450,8 +451,8 @@ markers.
 Override the destination by passing your own `MediaStore`:
 
 ```python
-from pydantic_ai_harness.step_persistence import FileStepStore
 from pydantic_ai_harness.media import S3MediaStore
+from pydantic_ai_harness.step_persistence import FileStepStore
 
 store = FileStepStore(
     'runs',

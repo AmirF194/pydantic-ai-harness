@@ -45,7 +45,7 @@ Then add the library to your agent:
 
 ```python {test="skip"}
 from pydantic_ai import Agent
-from pydantic_ai_harness.skills import Skills
+from pydantic_ai_harness import Skills
 
 agent = Agent(
     'anthropic:claude-sonnet-4-6',
@@ -81,7 +81,7 @@ By default, all discovered skills are included. Use `include` or `exclude` to
 change the catalog for a particular agent:
 
 ```python {test="skip"}
-from pydantic_ai_harness.skills import Skills
+from pydantic_ai_harness import Skills
 
 review_skills = Skills(
     '.agents/skills',
@@ -153,7 +153,7 @@ and child directories without `SKILL.md` are ignored.
 You can pass several libraries:
 
 ```python {test="skip"}
-from pydantic_ai_harness.skills import Skills
+from pydantic_ai_harness import Skills
 
 skills = Skills([
     '.agents/skills',
@@ -215,7 +215,7 @@ Register `Skills` when loading the spec:
 
 ```python {test="skip"}
 from pydantic_ai import Agent
-from pydantic_ai_harness.skills import Skills
+from pydantic_ai_harness import Skills
 
 agent = Agent.from_file('agent.yaml', custom_capability_types=[Skills])
 ```

@@ -23,7 +23,7 @@ give a Pydantic AI agent the same review-and-fix loop from your own code.
 
 ```python
 from pydantic_ai import Agent
-from pydantic_ai_harness.macroscope import Macroscope
+from pydantic_ai_harness import Macroscope
 
 agent = Agent('anthropic:claude-sonnet-5', capabilities=[Macroscope()])
 
@@ -62,7 +62,7 @@ duplicates, and verify each fix.
 Every field of `Macroscope` with its default:
 
 ```python
-from pydantic_ai_harness.macroscope import Macroscope
+from pydantic_ai_harness import Macroscope
 
 Macroscope(
     base=None,             # git ref to diff against -- None lets the CLI auto-detect
@@ -102,7 +102,7 @@ capabilities:
 
 ```python
 from pydantic_ai import Agent
-from pydantic_ai_harness.macroscope import Macroscope
+from pydantic_ai_harness import Macroscope
 
 agent = Agent.from_file('agent.yaml', custom_capability_types=[Macroscope])
 ```

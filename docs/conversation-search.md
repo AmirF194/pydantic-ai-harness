@@ -23,9 +23,9 @@ The shipped source, `SnapshotHistorySource`, reads the snapshots `StepPersistenc
 
 ```python
 from pydantic_ai import Agent
-from pydantic_ai_harness.compaction import SlidingWindowCompaction
-from pydantic_ai_harness.conversation_search import ConversationSearch, SnapshotHistorySource
-from pydantic_ai_harness.step_persistence import SqliteStepStore, StepPersistence
+from pydantic_ai_harness import ConversationSearch, SlidingWindowCompaction, StepPersistence
+from pydantic_ai_harness.conversation_search import SnapshotHistorySource
+from pydantic_ai_harness.step_persistence import SqliteStepStore
 
 store = SqliteStepStore(database='sessions.db')
 agent = Agent(

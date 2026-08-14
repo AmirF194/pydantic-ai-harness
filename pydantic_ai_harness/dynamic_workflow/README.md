@@ -66,7 +66,7 @@ Let's build the smallest thing that works. Two sub-agents, one orchestrator.
 
 ```python
 from pydantic_ai import Agent
-from pydantic_ai_harness.dynamic_workflow import DynamicWorkflow
+from pydantic_ai_harness import DynamicWorkflow
 
 reviewer = Agent('openai:gpt-5', name='reviewer', description='Reviews code for bugs.')
 summarizer = Agent('openai:gpt-5', name='summarizer', description='Summarizes findings.')
@@ -177,7 +177,7 @@ from pydantic import BaseModel
 from pydantic_ai import Agent
 from pydantic_ai.usage import UsageLimits
 
-from pydantic_ai_harness.dynamic_workflow import DynamicWorkflow
+from pydantic_ai_harness import DynamicWorkflow
 
 # With Logfire configured, the trace shows the orchestrator turn, the run_workflow call (including
 # the exact script the model wrote), and every sub-agent run nested underneath it.

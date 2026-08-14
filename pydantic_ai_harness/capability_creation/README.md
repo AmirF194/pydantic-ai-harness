@@ -39,7 +39,7 @@ authoring a hook means authoring a capability that overrides one lifecycle metho
 from pathlib import Path
 
 from pydantic_ai import Agent
-from pydantic_ai_harness.capability_creation import CapabilityCreation
+from pydantic_ai_harness import CapabilityCreation
 
 creation = CapabilityCreation(directory=Path('.authored'))
 agent = Agent('anthropic:claude-sonnet-4-6', capabilities=[creation])
@@ -71,7 +71,7 @@ capability is live on the very next loop iteration -- no process restart.
 from pathlib import Path
 
 from pydantic_ai import Agent
-from pydantic_ai_harness.capability_creation import CapabilityCreation
+from pydantic_ai_harness import CapabilityCreation
 
 creation = CapabilityCreation(directory=Path('.authored'))
 agent = Agent('anthropic:claude-sonnet-4-6', capabilities=[creation])

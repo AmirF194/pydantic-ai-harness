@@ -23,7 +23,7 @@ region, and credentials, and adds a health check for the emulated services.
 
 ```python
 from pydantic_ai import Agent
-from pydantic_ai_harness.localstack import LocalStack
+from pydantic_ai_harness import LocalStack
 
 agent = Agent(
     'anthropic:claude-sonnet-4-6',
@@ -58,7 +58,7 @@ localstack start
 Or let the capability manage a fresh Docker container for each run:
 
 ```python
-from pydantic_ai_harness.localstack import LocalStack
+from pydantic_ai_harness import LocalStack
 
 LocalStack(manage_container=True)
 ```
@@ -103,7 +103,7 @@ container for each run and stops it when the run ends, so the agent always gets
 a fresh, isolated environment. Docker must be installed and running.
 
 ```python
-from pydantic_ai_harness.localstack import LocalStack
+from pydantic_ai_harness import LocalStack
 
 LocalStack(
     manage_container=True,
@@ -146,7 +146,7 @@ Lambda need the Docker socket mounted. Enable those explicitly when the services
 you test require them:
 
 ```python
-from pydantic_ai_harness.localstack import LocalStack
+from pydantic_ai_harness import LocalStack
 
 LocalStack(
     manage_container=True,
@@ -178,7 +178,7 @@ asyncio.run(main())
 ## Configuration
 
 ```python
-from pydantic_ai_harness.localstack import LocalStack
+from pydantic_ai_harness import LocalStack
 
 LocalStack(
     endpoint_url='http://localhost.localstack.cloud:4566',  # edge endpoint (host port is reused when managed)
@@ -255,7 +255,7 @@ capabilities:
 
 ```python
 from pydantic_ai import Agent
-from pydantic_ai_harness.localstack import LocalStack
+from pydantic_ai_harness import LocalStack
 
 agent = Agent.from_file('agent.yaml', custom_capability_types=[LocalStack])
 ```

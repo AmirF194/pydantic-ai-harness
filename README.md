@@ -63,8 +63,8 @@ from pathlib import Path
 
 from pydantic_ai import Agent
 from pydantic_ai_harness import (
-    DEFAULT_ALLOWED_COMMANDS,
     ClearToolResults,
+    DEFAULT_ALLOWED_COMMANDS,
     FileSystem,
     LLM_API_KEY_ENV_PATTERNS,
     Planning,

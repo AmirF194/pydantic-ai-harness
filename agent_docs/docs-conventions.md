@@ -61,13 +61,15 @@ here: a rename PR is not done until both repos agree.
 ## Categories
 
 Capabilities are grouped by what they give the agent, not by implementation detail:
-**Harnesses** (complete combined capabilities like `Coder`) · **Tools & environments** (what the
-agent can touch) · **Web & research** · **Context efficiency** (how it spends the context window
-— Code Mode lives here, not under execution: it changes *how* the agent executes, not *where*) ·
-**Knowledge & memory** · **Delegation & planning** · **Steering & safety** · **Self-extension**.
-A new capability goes in the category matching its user-facing benefit; if none fits, raise it in
-the PR rather than inventing a ninth silently. Keep every table's "Ships in" column and one-line
-description style intact.
+**Harnesses** (complete combined capabilities like `Coder`) · **Execution environments** (the
+workspace the agent acts in) · **Tools & native abilities** · **Web & research** ·
+**Reasoning, planning & delegation** · **Context management** (how the agent spends the context
+window — Code Mode lives here, not under execution: it changes *how* the agent executes, not
+*where*) · **Knowledge & memory** · **Control & safety** · **Self-extension** ·
+**Execution runtime** (durable execution, persistence, observability plumbing). The same scheme
+orders the sidebar in pydantic-ai's `docs/navigation.yml`. A new capability goes in the category
+matching its user-facing benefit; if none fits, raise it in the PR rather than inventing an
+eleventh silently. Keep every table's "Package" column and one-line description style intact.
 
 ## Harness Pages Specifically
 

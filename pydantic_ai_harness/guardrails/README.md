@@ -148,7 +148,7 @@ A tool result guard receives `ToolResultInfo`, not just a value. Use
 `ToolReturn.return_value` string:
 
 ```python
-from pydantic_ai_harness.guardrails import ToolGuardrail
+from pydantic_ai_harness import ToolGuardrail
 from pydantic_ai_harness.guardrails.detectors import for_tool_result_text, redact_secrets
 
 ToolGuardrail(result_guard=for_tool_result_text(redact_secrets))
@@ -250,7 +250,8 @@ from pathlib import Path
 
 import httpx
 from pydantic_ai import Agent
-from pydantic_ai_harness.guardrails import GuardrailResult, ToolCallInfo, ToolGuardrail, ToolResultInfo
+from pydantic_ai_harness import GuardrailResult, ToolGuardrail
+from pydantic_ai_harness.guardrails import ToolCallInfo, ToolResultInfo
 
 WORKSPACE = Path('/workspace')
 
@@ -310,7 +311,8 @@ Pydantic AI already owns the approval round trip: a call raising `ApprovalRequir
 
 ```python
 from pydantic_ai import Agent, DeferredToolRequests, DeferredToolResults, ToolDenied
-from pydantic_ai_harness.guardrails import GuardrailResult, ToolCallInfo, ToolGuardrail
+from pydantic_ai_harness import GuardrailResult, ToolGuardrail
+from pydantic_ai_harness.guardrails import ToolCallInfo
 
 
 def confirm_production(call: ToolCallInfo) -> GuardrailResult:

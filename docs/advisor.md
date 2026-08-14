@@ -17,7 +17,7 @@ Pass the advisor model as the first argument. The model can be any model name or
 
 ```python
 from pydantic_ai import Agent
-from pydantic_ai_harness.advisor import Advisor
+from pydantic_ai_harness import Advisor
 
 agent = Agent(
     'openai:gpt-5.4',
@@ -48,7 +48,7 @@ The executor decides when to consult. Ask it explicitly in the user prompt or th
 In the default `auto` mode, native selection is conservative. The capability only reuses an explicit provider-qualified model name when the executor and advisor share a provider, so it does not guess how an Anthropic model ID maps to an OpenRouter catalog slug. For example:
 
 ```python
-from pydantic_ai_harness.advisor import Advisor
+from pydantic_ai_harness import Advisor
 
 # Native for an Anthropic executor; local for OpenAI, Google, and other executors.
 anthropic_advisor = Advisor('anthropic:claude-opus-4-8')

@@ -24,7 +24,7 @@ Topics: `capabilities`, `hooks`, `tools`, `tools-advanced`, `toolsets`, `agent`.
 from pathlib import Path
 
 from pydantic_ai import Agent
-from pydantic_ai_harness.pydantic_ai_docs import PydanticAIDocs
+from pydantic_ai_harness import PydanticAIDocs
 
 agent = Agent(
     'anthropic:claude-sonnet-4-6',

@@ -29,7 +29,7 @@ Construct an `Agent` with `PydanticAIDocs()` in its `capabilities`. Point `local
 from pathlib import Path
 
 from pydantic_ai import Agent
-from pydantic_ai_harness.pydantic_ai_docs import PydanticAIDocs
+from pydantic_ai_harness import PydanticAIDocs
 
 agent = Agent(
     'anthropic:claude-sonnet-4-6',
@@ -76,7 +76,7 @@ capabilities:
 
 ```python
 from pydantic_ai import Agent
-from pydantic_ai_harness.pydantic_ai_docs import PydanticAIDocs
+from pydantic_ai_harness import PydanticAIDocs
 
 agent = Agent.from_file('agent.yaml', custom_capability_types=[PydanticAIDocs])
 result = agent.run_sync('...')

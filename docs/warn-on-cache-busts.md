@@ -19,7 +19,7 @@ When a request reads back less than `collapse_ratio` of the established prefix, 
 
 ```python
 from pydantic_ai import Agent
-from pydantic_ai_harness.warn_on_cache_busts import WarnOnCacheBusts
+from pydantic_ai_harness import WarnOnCacheBusts
 
 agent = Agent('anthropic:claude-sonnet-4-5', capabilities=[WarnOnCacheBusts()])
 await agent.run('...')  # a CacheBustWarning fires if a cached prefix collapses mid-run

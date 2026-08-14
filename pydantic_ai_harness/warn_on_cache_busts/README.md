@@ -53,7 +53,7 @@ It is the opt-in observe arm of the broader prompt-cache-prefix-stability work.
 
 ```python
 from pydantic_ai import Agent
-from pydantic_ai_harness.warn_on_cache_busts import WarnOnCacheBusts
+from pydantic_ai_harness import WarnOnCacheBusts
 
 agent = Agent('anthropic:claude-sonnet-4-5', capabilities=[WarnOnCacheBusts()])
 await agent.run('...')  # a CacheBustWarning fires if a cached prefix collapses mid-run
