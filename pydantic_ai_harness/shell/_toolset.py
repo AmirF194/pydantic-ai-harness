@@ -252,9 +252,13 @@ class ShellToolset(FunctionToolset[AgentDepsT]):
         if '\x00' in command:
             raise ModelRetry('The command contains a NUL byte, which cannot be passed to a process.')
         try:
-            command.encode('utf-8')
+            # `os.fsencode`, not `str.encode`: the spawn encodes with the
+            # filesystem encoding and `surrogateescape`, which accepts the
+            # \udc80-\udcff range as the raw bytes it round-trips from. Encoding
+            # as plain UTF-8 here would reject commands the OS runs happily.
+            os.fsencode(command)
         except UnicodeEncodeError as e:
-            raise ModelRetry('The command contains characters that cannot be encoded as UTF-8.') from e
+            raise ModelRetry('The command contains characters that cannot be encoded for the operating system.') from e
 
         if not self._allow_interactive and _is_interactive_command(command):
             raise PermissionError(f'Interactive commands are not allowed. Command: {command!r}')

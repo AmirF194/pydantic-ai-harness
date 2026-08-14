@@ -520,7 +520,7 @@ class TestSpawnFailures:
 
     @pytest.mark.parametrize(
         ('command', 'expected'),
-        [('echo hi\x00there', 'NUL byte'), ('echo \ud800', 'cannot be encoded as UTF-8')],
+        [('echo hi\x00there', 'NUL byte'), ('echo \ud800', 'cannot be encoded for the operating system')],
     )
     async def test_unspawnable_command_string(self, toolset: ShellToolset[None], command: str, expected: str) -> None:
         with pytest.raises(ModelRetry, match=expected):
@@ -529,6 +529,14 @@ class TestSpawnFailures:
     async def test_unspawnable_command_string_start_command(self, toolset: ShellToolset[None]) -> None:
         with pytest.raises(ModelRetry, match='NUL byte'):
             await toolset.start_command('echo \x00')
+
+    @pytest.mark.parametrize('escaped', ['\udc80', '\udcff'])
+    async def test_surrogateescape_command_still_runs(self, toolset: ShellToolset[None], escaped: str) -> None:
+        # The spawn encodes with `surrogateescape`, which round-trips this range
+        # back to the raw byte it came from. Screening the command as plain
+        # UTF-8 would reject a command the OS runs.
+        result = await toolset.run_command(f'echo {escaped}')
+        assert '[exit code' not in result
 
     @pytest.mark.parametrize('env', [{'FOO': 'bar\x00baz'}, {'FO\x00O': 'bar'}, {'FOO': 'bar\ud800'}])
     async def test_unspawnable_env_aborts(self, shell_dir: Path, env: dict[str, str]) -> None:
