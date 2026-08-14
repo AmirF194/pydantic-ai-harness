@@ -518,17 +518,37 @@ class TestSpawnFailures:
             await ts.run_command('echo hello')
         assert str(target) not in str(exc_info.value)
 
-    @pytest.mark.parametrize('command', ['echo hi\x00there', 'echo \ud800'])
-    async def test_unspawnable_command_string(self, toolset: ShellToolset[None], command: str) -> None:
-        # A NUL byte raises `ValueError`, a lone surrogate `UnicodeEncodeError`
-        # (also a `ValueError`); neither is an `OSError`, so `_RECOVERABLE_ERRNOS`
-        # can't reach them.
-        with pytest.raises(ModelRetry):
+    @pytest.mark.parametrize(
+        ('command', 'expected'),
+        [('echo hi\x00there', 'NUL byte'), ('echo \ud800', 'cannot be encoded as UTF-8')],
+    )
+    async def test_unspawnable_command_string(self, toolset: ShellToolset[None], command: str, expected: str) -> None:
+        with pytest.raises(ModelRetry, match=expected):
             await toolset.run_command(command)
 
     async def test_unspawnable_command_string_start_command(self, toolset: ShellToolset[None]) -> None:
-        with pytest.raises(ModelRetry, match='null byte'):
+        with pytest.raises(ModelRetry, match='NUL byte'):
             await toolset.start_command('echo \x00')
+
+    @pytest.mark.parametrize('env', [{'FOO': 'bar\x00baz'}, {'FO\x00O': 'bar'}, {'FOO': 'bar\ud800'}])
+    async def test_unspawnable_env_aborts(self, shell_dir: Path, env: dict[str, str]) -> None:
+        # The spawn reports a NUL or a lone surrogate as the same `ValueError`
+        # wherever it came from. This one came from the application's `env`, so
+        # the model cannot fix it and must not be asked to retry.
+        ts = ShellToolset(
+            cwd=shell_dir,
+            allowed_commands=[],
+            denied_commands=[],
+            denied_operators=[],
+            default_timeout=10.0,
+            max_output_chars=50_000,
+            persist_cwd=False,
+            allow_interactive=False,
+            env=env,
+        )
+        with pytest.raises(ValueError) as exc_info:
+            await ts.run_command('echo hello')
+        assert not isinstance(exc_info.value, ModelRetry)
 
     async def test_command_too_long(self, toolset: ShellToolset[None], monkeypatch: pytest.MonkeyPatch) -> None:
         # The real threshold is the platform's argv limit, which differs per OS,

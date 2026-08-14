@@ -96,8 +96,9 @@ the run continues and the model can pick an allowed command instead. So does
 every other failure the model can act on: a working directory an earlier command
 deleted or replaced with a file, and a command the operating system refuses to
 spawn because it is too long or holds a NUL byte or a lone surrogate. Failures
-the model can do nothing about, such as a host that cannot allocate a process,
-still abort the run.
+the model can do nothing about still abort the run: a host that cannot allocate
+a process, and a NUL byte or lone surrogate in an application-supplied `env`,
+which is a configuration error rather than something the model can rewrite.
 
 !!! warning "Best-effort, not a security boundary"
     These command checks are best-effort. A sufficiently motivated agent can

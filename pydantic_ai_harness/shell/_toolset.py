@@ -67,10 +67,6 @@ def _recoverable(
             return await fn(self, *args, **kwargs)
         except PermissionError as e:
             raise ModelRetry(str(e)) from e
-        except ValueError as e:
-            # A NUL byte or a lone surrogate in `command`; the message names the
-            # defect without quoting a host path.
-            raise ModelRetry(str(e)) from e
         except OSError as e:
             reason = _RECOVERABLE_ERRNOS.get(e.errno)
             if reason is None:
@@ -246,7 +242,20 @@ class ShellToolset(FunctionToolset[AgentDepsT]):
         These checks are best-effort and are not a security boundary -- a
         sufficiently motivated agent can bypass them. Use OS-level isolation
         (containers, sandboxes) for hard enforcement.
+
+        Rejecting a command the OS could not accept belongs here rather than in
+        `_recoverable`: `anyio.open_process` reports a NUL byte or a lone
+        surrogate as the same `ValueError` whether it came from `command`, the
+        working directory, or a configured `env`, and only the first of those is
+        the model's to fix.
         """
+        if '\x00' in command:
+            raise ModelRetry('The command contains a NUL byte, which cannot be passed to a process.')
+        try:
+            command.encode('utf-8')
+        except UnicodeEncodeError as e:
+            raise ModelRetry('The command contains characters that cannot be encoded as UTF-8.') from e
+
         if not self._allow_interactive and _is_interactive_command(command):
             raise PermissionError(f'Interactive commands are not allowed. Command: {command!r}')
 
