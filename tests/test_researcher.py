@@ -1,3 +1,8 @@
+import pytest
+
+pytest.importorskip('ddgs')
+pytest.importorskip('markdownify')
+
 from pydantic_ai import Agent
 from pydantic_ai.capabilities import Capability, WebFetch, WebSearch
 from pydantic_ai.models.test import TestModel
@@ -21,8 +26,6 @@ def test_researcher_agent_is_model_less_and_composed() -> None:
 
 
 def test_researcher_unknown_export() -> None:
-    import pytest
-
     import pydantic_ai_harness.researcher
 
     with pytest.raises(AttributeError, match='has no attribute'):
