@@ -796,9 +796,9 @@ class TestCodeMode:
             """Return a long list."""
             return list(range(50))
 
-        def many_mapping() -> dict[int, int]:
+        def many_mapping() -> dict[str, int]:
             """Return a mapping whose preview must not materialize every item."""
-            return {item: item for item in range(10_000)}
+            return {str(item): item for item in range(10_000)}
 
         wrapper = CodeMode[object](max_tool_calls=3).get_wrapper_toolset(
             _build_function_toolset(shapes, many_rows, many_mapping)
