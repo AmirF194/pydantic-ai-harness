@@ -31,6 +31,13 @@ def _is_deprecation_shim(package: Path) -> bool:
     return 'warn_moved(' in source or 'warn_module_renamed(' in source
 
 
+# Packages that are supporting infrastructure rather than capabilities, kept out of the README
+# capability tables per review. `media` exports the content-addressed stores Step Persistence
+# uses; its docs placement is being reworked in
+# https://github.com/pydantic/pydantic-ai-harness/issues/625.
+_NOT_A_CAPABILITY = frozenset({'media'})
+
+
 def _capability_packages() -> list[Path]:
     """Directories that are importable packages and represent a capability's public surface."""
     candidates: list[Path] = []
@@ -41,7 +48,7 @@ def _capability_packages() -> list[Path]:
             # A non-package dir under the capability roots does not occur in a clean tree, so this guard stays uncovered.
             if not (child / '__init__.py').exists():  # pragma: no cover
                 continue
-            if child in _NAMESPACE_PACKAGES or _is_deprecation_shim(child):
+            if child.name in _NOT_A_CAPABILITY or child in _NAMESPACE_PACKAGES or _is_deprecation_shim(child):
                 continue
             candidates.append(child)
     return candidates

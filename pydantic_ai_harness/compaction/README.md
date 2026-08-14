@@ -8,6 +8,10 @@ steps (it is not recomputed from the full history every turn).
 All strategies preserve tool-call / tool-return **pairing** -- core does not validate this, and a
 provider rejects an orphaned pair. The zero-LLM strategies never call a model.
 
+On OpenAI and Anthropic, core also ships [provider-native compaction](https://pydantic.dev/docs/ai/capabilities/compaction/) --
+the provider summarizes history server-side. The strategies here are the model-agnostic
+alternative: they work with every model and keep the compaction logic (and its costs) under your control.
+
 [Source](https://github.com/pydantic/pydantic-ai-harness/tree/main/pydantic_ai_harness/compaction/)
 
 ## The menu

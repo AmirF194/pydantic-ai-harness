@@ -59,11 +59,29 @@ The command allowlist is a guardrail against accidents, not a security boundary.
 
 Other capabilities pair well with `Coder` — add them alongside it in `capabilities`:
 
+- [Web Search](https://pydantic.dev/docs/ai/capabilities/web-search/) and [Web Fetch](https://pydantic.dev/docs/ai/capabilities/web-fetch/) (core) — look up docs and error messages on the web
 - [Skills](skills.md) — reusable procedure documents the agent loads on demand
 - [Memory](memory.md) — persistent memory across conversations
 - [Conversation Search](conversation-search.md) — let the agent search earlier sessions
 - [Guardrails](guardrails.md) — validate what the agent does before and after it acts
 - [Dynamic Workflow](dynamic-workflow.md) — let the agent author multi-step workflows; best activated on demand
+
+```python
+from pydantic_ai import Agent
+from pydantic_ai.capabilities import WebSearch
+from pydantic_ai_harness import Coder, Memory, Skills
+from pydantic_ai_harness.memory import FileStore
+
+agent = Agent(
+    'anthropic:claude-fable-5',
+    capabilities=[
+        Coder(),
+        WebSearch(),  # look up docs and error messages on the web
+        Memory(FileStore('.agent-memory')),  # remembers across sessions
+        Skills('skills'),  # loads your SKILL.md procedures on demand
+    ],
+)
+```
 
 To remove or replace one of the built-in components instead, start from the blown-out form below and adjust the list.
 

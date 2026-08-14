@@ -4,6 +4,14 @@ How the harness's user-facing docs stay correct, consistent, and discoverable. R
 touching `README.md`, `docs/`, or a capability README — and before adding a
 capability, since every capability lands with docs or fails CI.
 
+## Writing Style
+
+Follow Samuel's [writing-style skill](https://github.com/pydantic/monty/blob/main/.agents/skills/writing-style/SKILL.md)
+(in the Monty repo). The short version: the reader is an engineer looking for a fact — state
+mechanism, not significance; no throat-clearing, no "powerful"/"seamless"-class adjectives, no
+"not just X, but Y" reveals; plain verbs over industry metaphors; lead with the fact; one idea
+per sentence.
+
 ## The Parity Contract (enforced by `tests/test_docs_parity.py`)
 
 Every capability package must, or CI fails:

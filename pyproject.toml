@@ -40,6 +40,15 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+# Provider/CLI pass-throughs so `uv add "pydantic-ai-harness[anthropic,cli]"` works standalone,
+# without separately naming pydantic-ai-slim. (No openai/google pass-throughs: browser-use pins
+# provider SDKs that conflict with slim's floors when the workspace resolves all extras together.)
+anthropic = [
+    "pydantic-ai-slim[anthropic]>=2.28.0",
+]
+cli = [
+    "pydantic-ai-slim[cli]>=2.28.0",
+]
 code-mode = [
     "pydantic-ai-slim[duckduckgo]>=2.28.0",
     "pydantic-monty>=0.0.19",
