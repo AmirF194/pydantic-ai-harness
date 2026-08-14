@@ -794,7 +794,7 @@ class TestCreateDirectory:
             await toolset.create_directory('hello.txt')
 
     async def test_create_under_existing_file(self, toolset: FileSystemToolset[None]) -> None:
-        with pytest.raises(ModelRetry, match='hello.txt'):
+        with pytest.raises(ModelRetry, match="'hello.txt/nested' has a parent that is not a directory"):
             await toolset.create_directory('hello.txt/nested')
 
 

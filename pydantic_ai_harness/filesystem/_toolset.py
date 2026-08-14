@@ -162,8 +162,10 @@ class FileSystemToolset(FunctionToolset[AgentDepsT]):
         try:
             candidate = (self._root / path).resolve()
         except RuntimeError as e:
-            # Python 3.10-3.12 signal a symlink loop this way; 3.13+ resolve
-            # the path without complaint and fail later at the syscall.
+            # Python 3.10-3.12 signal a symlink loop this way. On 3.13+ `resolve`
+            # returns without complaint, so only operations that go on to touch
+            # the path reach `ELOOP`; `exists`/`is_file` report a loop as absent,
+            # so the read operations answer "not found" there instead. See #617.
             raise ModelRetry(f'Path {path!r} resolves through a symlink loop.') from e
         real = Path(os.path.realpath(candidate))
         if not real.is_relative_to(self._real_root):
@@ -467,7 +469,8 @@ class FileSystemToolset(FunctionToolset[AgentDepsT]):
             raise ModelRetry(f'Pattern {pattern!r} must be relative to {path!r}, not an absolute path.') from e
         except IndexError as e:
             # Python 3.10 through 3.12 raise this for a pattern whose last
-            # component is a bare `.`, which 3.13+ accept.
+            # component is a bare `.`. On 3.13+ the same pattern raises
+            # `ValueError`, which the recoverable tuple already covers.
             raise ModelRetry(f'Pattern {pattern!r} is not a valid glob pattern.') from e
 
         matches: list[str] = []
@@ -510,6 +513,9 @@ class FileSystemToolset(FunctionToolset[AgentDepsT]):
             # `exist_ok` only suppresses the error when the existing path is a
             # directory. Re-raising `str(e)` would leak the absolute host path.
             raise ModelRetry(f'Path {path!r} exists and is not a directory.') from e
+        except NotADirectoryError as e:
+            # Same leak, one level up: a parent component that exists as a file.
+            raise ModelRetry(f'Path {path!r} has a parent that is not a directory.') from e
         return f'Created directory: {path}'
 
     @_recoverable
