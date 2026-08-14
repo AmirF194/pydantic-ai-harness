@@ -10,7 +10,7 @@ from pydantic_ai.usage import RequestUsage
 
 class InlineSnapshotPlugin:
     @customize(tryfirst=True)
-    def nondeterministic_values(self, value: object, builder: Any) -> Any:
+    def nondeterministic_values(self, value: object, builder: Any) -> Any:  # pragma: no cover
         if isinstance(value, datetime):
             return builder.create_call(IsDatetime)
         if isinstance(value, RequestUsage):

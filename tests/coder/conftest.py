@@ -10,13 +10,17 @@ from pydantic_ai.usage import RequestUsage
 
 class InlineSnapshotPlugin:
     @customize(tryfirst=True)
-    def nondeterministic_values(self, value: object, builder: Any) -> Any:
+    def nondeterministic_values(self, value: object, builder: Any) -> Any:  # pragma: no cover
         if isinstance(value, datetime):
             return builder.create_call(IsDatetime)
         if isinstance(value, RequestUsage):
             return builder.create_call(IsInstance, [RequestUsage])
         if isinstance(value, str) and re.fullmatch(r'01[a-z0-9]{6}(?:-[a-z0-9]{4}){3}-[a-z0-9]{12}', value):
             return builder.create_call(IsStr)
+        # `run_command` output is environment-dependent beyond timing (warnings, CI banners, stderr
+        # sections), so only pin the part that matters: the nested test suite ran and passed.
+        if isinstance(value, str) and value.startswith('[stdout]') and (m := re.search(r'\b(\d+) passed\b', value)):
+            return builder.create_call(IsStr, [], {'regex': rf'(?s)\[stdout\].*\b{m.group(1)} passed\b.*'})
         if isinstance(value, str) and (
             '/tmp/pytest-of-' in value
             or re.search(r'01[a-z0-9]{6}-', value)

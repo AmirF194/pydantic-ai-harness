@@ -1167,13 +1167,7 @@ Available sub-agents:
                 parts=[
                     ToolReturnPart(
                         tool_name='run_command',
-                        content=IsStr(
-                            regex="""\
-\\[stdout\\]\\
-\\.\\.\\.\\.\\.\\.\\.\\ \\ \\ \\ \\ \\ \\ \\ \\ \\ \\ \\ \\ \\ \\ \\ \\ \\ \\ \\ \\ \\ \\ \\ \\ \\ \\ \\ \\ \\ \\ \\ \\ \\ \\ \\ \\ \\ \\ \\ \\ \\ \\ \\ \\ \\ \\ \\ \\ \\ \\ \\ \\ \\ \\ \\ \\ \\ \\ \\ \\ \\ \\ \\ \\ \\ \\[100%\\]\\
-7\\ passed\\ in\\ \\d+(?:\\.\\d+)?s\\
-"""
-                        ),
+                        content=IsStr(regex=r'(?s)\[stdout\].*\b7 passed\b.*'),
                         tool_call_id='toolu_01PmYMa2AQarjAbNa9s5gh6U',
                         timestamp=IsDatetime(),
                     )
