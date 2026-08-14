@@ -32,13 +32,11 @@ print(result.output)
 
 The same agent works with every Pydantic AI interface: [`agent.to_cli_sync()`](https://pydantic.dev/docs/ai/cli/) for terminal chat, [`agent.to_web()`](https://pydantic.dev/docs/ai/web/) for a browser chat UI.
 
-Or skip the file entirely and run the exported [`researcher_agent`](#api-reference) with [Pydantic AI's CLI](https://pydantic.dev/docs/ai/cli/#custom-agents), via [`uvx`](https://docs.astral.sh/uv/guides/tools/):
+Or skip the file entirely and run the exported [`researcher_agent`](#api-reference) with [`clai`](https://pydantic.dev/docs/ai/cli/#custom-agents) (the Pydantic AI CLI), via [`uvx`](https://docs.astral.sh/uv/guides/tools/):
 
 ```bash
-uvx --with 'pydantic-ai-harness[researcher]' clai -a pydantic_ai_harness.researcher:researcher_agent
+uvx --with 'pydantic-ai-harness[researcher]' clai -a pydantic_ai_harness.researcher:researcher_agent -m openai:gpt-5.6-sol
 ```
-
-`clai` installs the full `pydantic-ai` package, so every major provider is ready to use; it defaults to `openai:gpt-5` when `-m` is omitted — pass `-m provider:model` to override.
 
 ## What's inside
 

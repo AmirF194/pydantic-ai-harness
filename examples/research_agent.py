@@ -2,7 +2,7 @@
 
 Run the packaged equivalent without assembling the blocks:
 
-    uvx --with 'pydantic-ai-harness[researcher]' clai -a pydantic_ai_harness.researcher:researcher_agent
+    uvx --with 'pydantic-ai-harness[researcher]' clai -a pydantic_ai_harness.researcher:researcher_agent -m openai:gpt-5.6-sol
 """
 
 import os

@@ -2,7 +2,7 @@
 
 Run the packaged equivalent without assembling the blocks:
 
-    uvx --with pydantic-ai-harness clai -a pydantic_ai_harness.coder:coder_agent
+    uvx --with pydantic-ai-harness clai -a pydantic_ai_harness.coder:coder_agent -m anthropic:claude-fable-5
 """
 
 import os
