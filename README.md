@@ -14,7 +14,7 @@ An agent is a model plus a harness — everything around the model that turns it
 ## Quick start
 
 ```bash
-uv add "pydantic-ai-harness[anthropic,cli,skills]"
+uv add "pydantic-ai-harness[anthropic,cli]"
 ```
 
 ```python
@@ -39,7 +39,7 @@ Every model works — swap the string for `'openai:gpt-5.6-sol'` or [any other p
 ```python
 from pydantic_ai import Agent
 from pydantic_ai.capabilities import WebSearch
-from pydantic_ai_harness import Coder, Memory, Skills
+from pydantic_ai_harness import Coder, Memory
 from pydantic_ai_harness.memory import FileStore
 
 agent = Agent(
@@ -48,12 +48,11 @@ agent = Agent(
         Coder(),
         WebSearch(),  # look up docs and error messages on the web
         Memory(FileStore('.agent-memory')),  # remembers across sessions
-        Skills('skills'),  # loads your SKILL.md procedures on demand
     ],
 )
 ```
 
-[Web Fetch](https://ai.pydantic.dev/capabilities/web-fetch/), [Guardrails](pydantic_ai_harness/guardrails/), and [Dynamic Workflow](pydantic_ai_harness/dynamic_workflow/) slot in the same way — the [Coder README](pydantic_ai_harness/coder/) lists what pairs well.
+[Skills](pydantic_ai_harness/skills/) (your `SKILL.md` procedures, loaded on demand — point it at a `skills/` directory and add the `skills` extra), [Web Fetch](https://ai.pydantic.dev/capabilities/web-fetch/), [Guardrails](pydantic_ai_harness/guardrails/), and [Dynamic Workflow](pydantic_ai_harness/dynamic_workflow/) slot in the same way — the [Coder README](pydantic_ai_harness/coder/) lists what pairs well.
 
 ## No magic: it's capabilities all the way down
 

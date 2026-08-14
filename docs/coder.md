@@ -69,7 +69,7 @@ Other capabilities pair well with `Coder` — add them alongside it in `capabili
 ```python
 from pydantic_ai import Agent
 from pydantic_ai.capabilities import WebSearch
-from pydantic_ai_harness import Coder, Memory, Skills
+from pydantic_ai_harness import Coder, Memory
 from pydantic_ai_harness.memory import FileStore
 
 agent = Agent(
@@ -78,10 +78,11 @@ agent = Agent(
         Coder(),
         WebSearch(),  # look up docs and error messages on the web
         Memory(FileStore('.agent-memory')),  # remembers across sessions
-        Skills('skills'),  # loads your SKILL.md procedures on demand
     ],
 )
 ```
+
+Add [`Skills('skills')`](skills.md) to the list once you have a `skills/` directory of `SKILL.md` procedures to point it at (it validates the directory eagerly, and needs the `skills` extra).
 
 To remove or replace one of the built-in components instead, start from the blown-out form below and adjust the list.
 
