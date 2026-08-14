@@ -92,7 +92,12 @@ denylist. Pass `denied_commands=[]` to disable command-name filtering.
 
 A denied command surfaces to the model as a
 [`ModelRetry`](/ai/tools-toolsets/tools-advanced/#tool-retries), not a hard error:
-the run continues and the model can pick an allowed command instead.
+the run continues and the model can pick an allowed command instead. So does
+every other failure the model can act on: a working directory an earlier command
+deleted or replaced with a file, and a command the operating system refuses to
+spawn because it is too long or holds a NUL byte or a lone surrogate. Failures
+the model can do nothing about, such as a host that cannot allocate a process,
+still abort the run.
 
 !!! warning "Best-effort, not a security boundary"
     These command checks are best-effort. A sufficiently motivated agent can

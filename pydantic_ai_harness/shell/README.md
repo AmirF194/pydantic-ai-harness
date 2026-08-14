@@ -66,7 +66,12 @@ configured `denied_commands` remain active; when omitted, this is the built-in
 denylist. Pass `denied_commands=[]` to disable command-name filtering.
 
 A denied or blocked command surfaces to the model as a `ModelRetry` (the model
-can retry with an allowed command) rather than aborting the run.
+can retry with an allowed command) rather than aborting the run. So does every
+other failure the model can act on: a working directory an earlier command
+deleted or replaced with a file, and a command the operating system refuses to
+spawn because it is too long or holds a NUL byte or a lone surrogate. Failures
+the model can do nothing about, such as a host that cannot allocate a process,
+still abort the run.
 
 > **These checks are best-effort, not a security boundary.** A sufficiently
 > motivated agent can defeat them (e.g. `bash -c '...'`, env-var indirection).

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import errno
 import fnmatch
 import functools
 import os
@@ -29,6 +30,24 @@ _KILL_GRACE_PERIOD: float = 2.0
 
 _P = ParamSpec('_P')
 
+# Spawning a command fails with a bare `OSError` for causes that have no
+# dedicated subclass, and with `FileNotFoundError`/`NotADirectoryError` for
+# causes that do. The errno says whose fault it is: these are the model's, and
+# it can act on them. Every other errno (EMFILE, ENOMEM) is the host's, and must
+# keep aborting the run rather than sending the model into a retry loop it
+# can't win.
+#
+# ENOENT and ENOTDIR reach here only from the working directory, since the
+# command string is handed to a shell that always exists -- a command whose own
+# executable is missing is reported by that shell on stderr, not by the spawn.
+#
+# Keyed by `OSError.errno`, which the stdlib types as `int | None`.
+_RECOVERABLE_ERRNOS: dict[int | None, str] = {
+    errno.ENOENT: 'The working directory no longer exists.',
+    errno.ENOTDIR: 'The working directory is no longer a directory.',
+    errno.E2BIG: 'The command is too long for the operating system to run. Shorten it or split it up.',
+}
+
 
 def _recoverable(
     fn: Callable[Concatenate[ShellToolset, _P], Awaitable[str]],
@@ -36,9 +55,10 @@ def _recoverable(
     """Convert model-correctable errors into `ModelRetry`.
 
     pyai only feeds `ModelRetry` back to the model as a retry prompt; any other
-    exception propagates and aborts the whole run. A denied command is something
-    the model can recover from (pick an allowed one), so surface it as a retry
-    instead of crashing the agent.
+    exception propagates and aborts the whole run. A denied command, a command
+    the OS refuses to spawn, and a working directory the model's own earlier
+    command destroyed are all things the model can recover from, so surface them
+    as a retry instead of crashing the agent.
     """
 
     @functools.wraps(fn)
@@ -47,6 +67,16 @@ def _recoverable(
             return await fn(self, *args, **kwargs)
         except PermissionError as e:
             raise ModelRetry(str(e)) from e
+        except ValueError as e:
+            # A NUL byte or a lone surrogate in `command`; the message names the
+            # defect without quoting a host path.
+            raise ModelRetry(str(e)) from e
+        except OSError as e:
+            reason = _RECOVERABLE_ERRNOS.get(e.errno)
+            if reason is None:
+                raise
+            # `str(e)` embeds the absolute host path; the reason alone doesn't.
+            raise ModelRetry(reason) from e
 
     return wrapper
 
@@ -255,16 +285,24 @@ class ShellToolset(FunctionToolset[AgentDepsT]):
         return wrapped, Path(name)
 
     def _apply_captured_cwd(self, cwd_file: Path) -> None:
-        """Update the persistent cwd from the capture file, ignoring junk."""
+        """Update the persistent cwd from the capture file, ignoring junk.
+
+        The whole read-and-check is guarded, not just the read: the command it
+        belongs to already succeeded, so a capture that isn't UTF-8 (a
+        `UnicodeDecodeError`, which is a `ValueError` rather than an `OSError`)
+        or a recorded path the OS refuses to stat (`ENAMETOOLONG`, which
+        `Path.is_dir` propagates before 3.14 and swallows from 3.14 on) is
+        bookkeeping the toolset can drop, not a tool failure to report.
+        """
         try:
             recorded = cwd_file.read_text(encoding='utf-8').strip()
-        except OSError:  # pragma: no cover
+            if not recorded:
+                return
+            candidate = Path(recorded)
+            if candidate.is_dir():
+                self._cwd = candidate
+        except (OSError, ValueError):
             return
-        if not recorded:
-            return
-        candidate = Path(recorded)
-        if candidate.is_dir():
-            self._cwd = candidate
 
     async def _kill_process_group(self, proc: anyio.abc.Process) -> None:
         """SIGTERM the process group, escalating to SIGKILL after the grace period."""
