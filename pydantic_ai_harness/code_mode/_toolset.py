@@ -87,8 +87,7 @@ _SANDBOX_LIMIT_MARKERS = {
 class _TemporalDurability(Protocol):
     """The part of Temporal's public durability capability CodeMode needs."""
 
-    @property
-    def in_durable_context(self) -> bool: ...
+    in_durable_context: bool
 
 
 def _in_temporal_workflow(ctx: RunContext[object]) -> bool:
