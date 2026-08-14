@@ -29,10 +29,15 @@ _RECOVERABLE_ERRORS = (PermissionError, FileNotFoundError, NotADirectoryError, I
 # whose fault it is: these two are the model's, and it can pick another path and
 # retry. Every other errno (ENOSPC, EROFS) is the host's, and must keep aborting
 # the run rather than sending the model into a retry loop it can't win.
+#
+# Which operations reach these depends on the Python version. `Path.is_file`
+# and friends stopped propagating `ENAMETOOLONG` in 3.14, so on 3.10 through
+# 3.13 the read operations surface it too, not just the write path.
+#
 # Keyed by `OSError.errno`, which the stdlib types as `int | None`.
 _RECOVERABLE_ERRNOS: dict[int | None, str] = {
-    errno.ENAMETOOLONG: 'the name is too long',
-    errno.ELOOP: 'it resolves through a symlink loop',
+    errno.ENAMETOOLONG: 'The path name is too long.',
+    errno.ELOOP: 'The path resolves through a symlink loop.',
 }
 
 
@@ -47,6 +52,12 @@ def _recoverable(
             return await fn(self, *args, **kwargs)
         except _RECOVERABLE_ERRORS as e:
             raise ModelRetry(str(e)) from e
+        except OSError as e:
+            reason = _RECOVERABLE_ERRNOS.get(e.errno)
+            if reason is None:
+                raise
+            # `str(e)` embeds the absolute host path; the reason alone doesn't.
+            raise ModelRetry(reason) from e
 
     return wrapper
 
@@ -278,13 +289,7 @@ class FileSystemToolset(FunctionToolset[AgentDepsT]):
         if not resolved.parent.exists():
             parent_rel = str(resolved.parent.relative_to(self._root))
             raise FileNotFoundError(f"Parent directory '{parent_rel}' does not exist. Use create_directory first.")
-        try:
-            resolved.write_text(content, encoding='utf-8')
-        except OSError as e:
-            reason = _RECOVERABLE_ERRNOS.get(e.errno)
-            if reason is None:
-                raise
-            raise ModelRetry(f'Could not write {path!r}: {reason}.') from e
+        resolved.write_text(content, encoding='utf-8')
         new_hash = _content_hash(content)
         lines = len(content.splitlines())
         return f'Wrote {len(content)} chars ({lines} lines) to {path}. [hash:{new_hash}]'
@@ -460,6 +465,10 @@ class FileSystemToolset(FunctionToolset[AgentDepsT]):
             # `Path.glob` rejects rooted patterns outright, and it is not an
             # `OSError`, so the recoverable tuple can't reach it.
             raise ModelRetry(f'Pattern {pattern!r} must be relative to {path!r}, not an absolute path.') from e
+        except IndexError as e:
+            # Python 3.10 through 3.12 raise this for a pattern whose last
+            # component is a bare `.`, which 3.13+ accept.
+            raise ModelRetry(f'Pattern {pattern!r} is not a valid glob pattern.') from e
 
         matches: list[str] = []
         real_root = Path(os.path.realpath(self._root))
@@ -501,11 +510,6 @@ class FileSystemToolset(FunctionToolset[AgentDepsT]):
             # `exist_ok` only suppresses the error when the existing path is a
             # directory. Re-raising `str(e)` would leak the absolute host path.
             raise ModelRetry(f'Path {path!r} exists and is not a directory.') from e
-        except OSError as e:
-            reason = _RECOVERABLE_ERRNOS.get(e.errno)
-            if reason is None:
-                raise
-            raise ModelRetry(f'Could not create directory {path!r}: {reason}.') from e
         return f'Created directory: {path}'
 
     @_recoverable

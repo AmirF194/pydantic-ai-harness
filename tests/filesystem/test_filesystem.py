@@ -705,9 +705,39 @@ class TestResolveSymlinkLoop:
             await toolset.read_file('hello.txt')
 
 
+class TestReadSideOSErrors:
+    # `Path.is_file`/`exists` propagate ENAMETOOLONG on 3.10 through 3.13 and
+    # swallow it on 3.14, so the message differs by version. What must hold
+    # everywhere is that the run survives.
+    @pytest.mark.parametrize('op', ['read_file', 'edit_file', 'list_directory', 'file_info'])
+    async def test_long_name_is_recoverable(self, toolset: FileSystemToolset[None], op: str) -> None:
+        long = 'x' * 300
+        calls = {
+            'read_file': lambda: toolset.read_file(long),
+            'edit_file': lambda: toolset.edit_file(long, 'a', 'b'),
+            'list_directory': lambda: toolset.list_directory(long),
+            'file_info': lambda: toolset.file_info(long),
+        }
+        with pytest.raises(ModelRetry):
+            await calls[op]()
+
+    async def test_walker_long_path_is_recoverable(
+        self, toolset: FileSystemToolset[None], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # The walkers reach the syscall only on 3.10 through 3.13; on 3.14 a
+        # long path yields no matches instead. Inject so the conversion is
+        # pinned on every version.
+        def raise_name_too_long(*args: object, **kwargs: object) -> None:
+            raise OSError(errno.ENAMETOOLONG, 'File name too long')
+
+        monkeypatch.setattr(Path, 'is_file', raise_name_too_long)
+        with pytest.raises(ModelRetry, match='name is too long'):
+            await toolset.search_files('hello', path='x' * 300)
+
+
 class TestWriteFileOSErrors:
     async def test_write_name_too_long(self, toolset: FileSystemToolset[None]) -> None:
-        with pytest.raises(ModelRetry, match='Could not write'):
+        with pytest.raises(ModelRetry, match='name is too long'):
             await toolset.write_file('x' * 300, 'content')
 
     async def test_write_through_symlink_loop(self, toolset: FileSystemToolset[None], fs_root: Path) -> None:
@@ -746,7 +776,7 @@ class TestCreateDirectory:
             await toolset.create_directory('.git/hooks')
 
     async def test_create_name_too_long(self, toolset: FileSystemToolset[None]) -> None:
-        with pytest.raises(ModelRetry, match='Could not create directory'):
+        with pytest.raises(ModelRetry, match='name is too long'):
             await toolset.create_directory('x' * 300)
 
     async def test_create_non_recoverable_errno_propagates(
@@ -1047,6 +1077,18 @@ class TestMutationKillers:
     async def test_find_files_absolute_pattern(self, toolset: FileSystemToolset[None]) -> None:
         with pytest.raises(ModelRetry, match='must be relative'):
             await toolset.find_files('/etc/*.conf')
+
+    async def test_find_files_invalid_pattern(
+        self, toolset: FileSystemToolset[None], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Only Python 3.10 through 3.12 raise this, for a pattern ending in a
+        # bare `.`, so drive it directly to pin it on every supported version.
+        def raise_index_error(*args: object, **kwargs: object) -> None:
+            raise IndexError('tuple index out of range')
+
+        monkeypatch.setattr(Path, 'glob', raise_index_error)
+        with pytest.raises(ModelRetry, match='not a valid glob pattern'):
+            await toolset.find_files('.')
 
     async def test_find_files_no_suffix_on_files(self, toolset: FileSystemToolset[None]) -> None:
         result = await toolset.find_files('*')
