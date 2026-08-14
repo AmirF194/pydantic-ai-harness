@@ -14,6 +14,7 @@ from types import ModuleType
 
 import pytest
 from pydantic_ai import Agent
+from pydantic_ai.exceptions import UserError
 from pydantic_ai.models.test import TestModel
 
 EXAMPLES_DIR = Path(__file__).parent.parent / 'examples'
@@ -37,10 +38,33 @@ def test_examples_present():
 
 
 @pytest.mark.parametrize('path', EXAMPLE_FILES, ids=lambda p: p.stem)
-def test_example_builds_agent(path: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+@pytest.mark.parametrize(
+    'optional_dependency_error',
+    [
+        None,
+        ImportError("Install 'pydantic-ai-harness[example]'"),
+        UserError("Install 'pydantic-ai-slim[example]'"),
+    ],
+)
+def test_example_builds_agent(
+    path: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    optional_dependency_error: ImportError | UserError | None,
+):
     # Keep any filesystem-scoped capabilities and memory stores inside tmp_path.
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv('SUPPORT_MEMORY_DIR', str(tmp_path / 'memory'))
-    module = _load(path)
-    agent = module.build_agent(model=TestModel())
+    try:
+        module = _load(path)
+        if optional_dependency_error is not None:
+
+            def raise_optional_dependency_error(*, model: TestModel) -> None:
+                raise optional_dependency_error
+
+            monkeypatch.setattr(module, 'build_agent', raise_optional_dependency_error)
+        agent = module.build_agent(model=TestModel())
+    except (ImportError, UserError) as exc:
+        assert 'pydantic-ai-harness[' in str(exc) or 'pydantic-ai-slim[' in str(exc)
+        pytest.skip(str(exc))
     assert isinstance(agent, Agent)
