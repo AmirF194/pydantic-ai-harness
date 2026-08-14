@@ -87,7 +87,7 @@ These harnesses are regular combined capabilities: one import gives you a workin
 | Harness | Ships in | What it provides |
 |---|---|---|
 | [Coder](coder.md) | Harness | A complete coding-agent stack: files, shell, repo context, planning, a read-only explorer sub-agent, and context controls |
-| [Researcher](researcher.md) | Harness | A complete web-research stack: Code Mode, web search, and bounded tool output |
+| [Researcher](researcher.md) | Harness | A complete web-research stack: web search and page fetching — native or local — with bounded tool output |
 
 ### Tools & environments
 
@@ -174,19 +174,19 @@ This index deliberately spans both packages — there's one capability system, a
 
 ## Composing from blocks
 
-A research agent, from three capabilities — this is literally [`Researcher`](researcher.md)'s composition, blown out:
+A research agent, from three capabilities — this is literally [`Researcher`](researcher.md)'s composition, minus its short default instructions:
 
 ```python
 from pydantic_ai import Agent
-from pydantic_ai.capabilities import WebSearch
-from pydantic_ai_harness import CodeMode, ToolOutputLimits
+from pydantic_ai.capabilities import WebFetch, WebSearch
+from pydantic_ai_harness import ToolOutputLimits
 
 agent = Agent(
     'anthropic:claude-fable-5',
     capabilities=[
-        CodeMode(),  # batches searches + filtering into single sandboxed scripts
-        WebSearch(local=True),  # native search where supported, DuckDuckGo fallback CodeMode can wrap
-        ToolOutputLimits(),  # big pages don't flood the context
+        WebSearch(local=True),  # native provider search, DuckDuckGo fallback elsewhere
+        WebFetch(local=True),  # read the pages behind the results, native or local
+        ToolOutputLimits(),  # fetched pages don't flood the context
     ],
 )
 
@@ -212,6 +212,7 @@ Some capabilities need an extra for their optional dependencies:
 ```bash
 uv add "pydantic-ai-harness[codemode]"          # Code Mode (adds the Monty sandbox)
 uv add "pydantic-ai-harness[dynamic-workflow]"  # Dynamic Workflow (adds the Monty sandbox)
+uv add "pydantic-ai-harness[researcher]"        # Researcher (local search + page-fetch fallbacks)
 uv add "pydantic-ai-harness[modal]"             # Modal Sandbox (adds the Modal SDK)
 uv add "pydantic-ai-harness[logfire]"           # Managed Prompt (Logfire-managed prompts)
 uv add "pydantic-ai-harness[exa]"               # Exa Search + Exa Agent (web research via the Exa API)
@@ -226,7 +227,7 @@ The `code-mode` extra is also supported as an alias. Requires Python 3.10+ and `
 
 ## Observability
 
-Everything the harness does is observable: `logfire.instrument_pydantic_ai()` gives you [a full trace of every run](https://logfire-us.pydantic.dev/public-trace/84bcf123-2106-49da-9f6f-5c26395339bb?spanId=7650806a0785b946) — each `run_code` span fans out into the tool calls the model made inside the sandbox. It's standard OpenTelemetry, so any OTLP backend works; [Logfire](https://pydantic.dev/logfire) is the easiest way to see it during development.
+Everything the harness does is observable: `logfire.instrument_pydantic_ai()` gives you [a full trace of every run](https://logfire-us.pydantic.dev/public-trace/84bcf123-2106-49da-9f6f-5c26395339bb?spanId=7650806a0785b946) — every model call and tool call, with token and cost tracking. It's standard OpenTelemetry, so any OTLP backend works; [Logfire](https://pydantic.dev/logfire) is the easiest way to see it during development.
 
 ## Build your own
 

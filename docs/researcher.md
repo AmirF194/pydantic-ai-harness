@@ -12,10 +12,10 @@ It is a regular [combined capability](https://pydantic.dev/docs/ai/capabilities/
 
 ## Usage
 
-Install the Code Mode dependencies, which also provide the local DuckDuckGo search fallback:
+Install the local search and fetch fallbacks (DuckDuckGo search, page-to-Markdown fetching):
 
 ```bash
-uv add "pydantic-ai-harness[codemode]"
+uv add "pydantic-ai-harness[researcher]"
 ```
 
 Then ask it a question:
@@ -35,7 +35,7 @@ The same agent works with every Pydantic AI interface: [`agent.to_cli_sync()`](h
 Or skip the file entirely and run the exported [`researcher_agent`](#api-reference) with [Pydantic AI's CLI](https://pydantic.dev/docs/ai/cli/#custom-agents):
 
 ```bash
-uvx --with 'pydantic-ai-harness[codemode]' clai -a pydantic_ai_harness.researcher:researcher_agent
+uvx --with 'pydantic-ai-harness[researcher]' clai -a pydantic_ai_harness.researcher:researcher_agent
 ```
 
 `clai` supplies its default model when `-m` is omitted; pass `-m provider:model` to select or override it.
@@ -45,11 +45,9 @@ uvx --with 'pydantic-ai-harness[codemode]' clai -a pydantic_ai_harness.researche
 It is literally these capabilities combined, in this order:
 
 - Concise default research instructions — see [Instructions](#instructions) below
-- [`CodeMode`](code-mode.md) — the model orchestrates search-and-read loops from sandboxed Python instead of one tool call per turn
 - Core [`WebSearch(local=True)`](https://pydantic.dev/docs/ai/capabilities/web-search/) — the provider's native web search when the model supports it, with a local DuckDuckGo fallback when it doesn't
+- Core [`WebFetch(local=True)`](https://pydantic.dev/docs/ai/capabilities/web-fetch/) — read the pages behind the results, native where supported with a local fallback, so claims can be checked against their sources
 - [`ToolOutputLimits`](tool-output-limits.md) — bounds how much context any single tool result can consume
-
-Core places `CodeMode` outermost when it normalizes capability ordering.
 
 ### Instructions
 
@@ -58,8 +56,8 @@ Core places `CodeMode` outermost when it normalizes capability ordering.
 ### Making it more powerful
 
 - **Research in a specific format**: give the agent a typed [`output_type`](https://pydantic.dev/docs/ai/output/) — a Pydantic model of findings, each with its source link — and the researcher returns structured data instead of prose.
-- **Read whole pages, not just results**: add core [`WebFetch`](https://pydantic.dev/docs/ai/capabilities/web-fetch/) so the agent can pull the full content behind a search hit.
 - **Higher-quality search**: swap in [`Exa Search`](exa-search.md) as the search backend.
+- **Fan out**: add [`Dynamic Workflow`](dynamic-workflow.md) so the agent can spawn typed researcher sub-agents in parallel and combine their structured results.
 
 ## Blown-out equivalent
 
@@ -67,8 +65,8 @@ Core places `CodeMode` outermost when it normalizes capability ordering.
 
 ```python
 from pydantic_ai import Agent
-from pydantic_ai.capabilities import WebSearch
-from pydantic_ai_harness import CodeMode, ToolOutputLimits
+from pydantic_ai.capabilities import WebFetch, WebSearch
+from pydantic_ai_harness import ToolOutputLimits
 
 instructions = """\
 Search broadly before drawing conclusions.
@@ -82,8 +80,8 @@ agent = Agent(
     'openai:gpt-5.6-sol',
     instructions=instructions,
     capabilities=[
-        CodeMode(),
         WebSearch(local=True),  # native provider search, DuckDuckGo fallback on models without it
+        WebFetch(local=True),  # read the pages behind the results, native or local
         ToolOutputLimits(),
     ],
 )
