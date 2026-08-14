@@ -2,13 +2,6 @@
 
 Let one agent coordinate a whole team of sub-agents by writing a small Python script.
 
-> [!NOTE]
-> Import this capability from its submodule -- there is no top-level `pydantic_ai_harness` re-export:
->
-> ```python
-> from pydantic_ai_harness.dynamic_workflow import DynamicWorkflow
-> ```
-
 [Source](https://github.com/pydantic/pydantic-ai-harness/tree/main/pydantic_ai_harness/dynamic_workflow/)
 
 ## The idea

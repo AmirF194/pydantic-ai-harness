@@ -1,14 +1,5 @@
 # LocalStack
 
-> [!NOTE]
-> Import this capability from its submodule -- there is no top-level `pydantic_ai_harness` re-export:
->
-> ```python
-> from pydantic_ai_harness.localstack import LocalStack
-> ```
->
-> The API may change between releases. Where practical, breaking changes ship with a deprecation warning.
-
 Give an agent access to an emulated AWS environment, so it can provision and
 exercise AWS services without touching a real account.
 

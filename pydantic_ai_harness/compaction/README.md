@@ -1,14 +1,5 @@
 # Compaction
 
-> [!NOTE]
-> Import these capabilities from their submodule -- there is no top-level `pydantic_ai_harness` re-export:
->
-> ```python
-> from pydantic_ai_harness.compaction import TieredCompaction
-> ```
->
-> The API may change between releases. Where practical, breaking changes ship with a deprecation warning.
-
 A menu of strategies for keeping an agent's conversation history within a model's context
 window. Each is a Pydantic AI `Capability` that edits the message history just before each
 request goes out; edits **persist** into the run's message history, so a trim/clear/summary carries forward to later

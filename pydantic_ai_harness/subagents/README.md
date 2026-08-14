@@ -1,14 +1,5 @@
 # Subagents
 
-> [!NOTE]
-> Import this capability from its submodule -- there is no top-level `pydantic_ai_harness` re-export:
->
-> ```python
-> from pydantic_ai_harness.subagents import SubAgent, SubAgents
-> ```
->
-> The API may change between releases. Where practical, breaking changes ship with a deprecation warning.
-
 Let an agent delegate self-contained tasks to named child agents.
 
 [Source](https://github.com/pydantic/pydantic-ai-harness/tree/main/pydantic_ai_harness/subagents/)

@@ -1,10 +1,11 @@
 # System Reminders
 
 > [!NOTE]
-> Import this capability from its submodule -- there is no top-level `pydantic_ai_harness` re-export:
+> The `Reminder` helper is not re-exported at the top level -- import it from the submodule:
 >
 > ```python
-> from pydantic_ai_harness.system_reminders import SystemReminders, Reminder
+> from pydantic_ai_harness import SystemReminders
+> from pydantic_ai_harness.system_reminders import Reminder
 > ```
 >
 > The API may change between releases. Where practical, breaking changes ship with a deprecation warning.

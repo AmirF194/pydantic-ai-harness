@@ -1,14 +1,5 @@
 # Tool Output Limits
 
-> [!NOTE]
-> Import this capability from its submodule -- there is no top-level `pydantic_ai_harness` re-export:
->
-> ```python
-> from pydantic_ai_harness.tool_output_limits import ToolOutputLimits
-> ```
->
-> The API may change between releases. Where practical, breaking changes ship with a deprecation warning.
-
 A tool can return a payload large enough to dominate the context window. Tool returns
 persist in history as `ToolReturnPart`s, so an oversized one is re-sent on every later
 model request -- paying its token cost for the rest of the run. `ToolOutputLimits`

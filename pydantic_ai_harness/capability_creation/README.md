@@ -1,14 +1,5 @@
 # Runtime Capability Creation
 
-> [!NOTE]
-> Import this capability from its submodule -- there is no top-level `pydantic_ai_harness` re-export:
->
-> ```python
-> from pydantic_ai_harness.capability_creation import CapabilityCreation
-> ```
->
-> The API may change between releases. Where practical, breaking changes ship with a deprecation warning.
-
 Runtime capability creation lets an agent write, validate, and persist Pydantic AI
 capabilities during one run for activation on the next.
 

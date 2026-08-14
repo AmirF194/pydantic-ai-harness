@@ -1,11 +1,10 @@
 # Step Persistence
 
 > [!NOTE]
-> Import `StepPersistence` and the `media` stores from their submodules -- there is no top-level
-> `pydantic_ai_harness` re-export:
+> The `media` stores are not re-exported at the top level -- import them from their submodule:
 >
 > ```python
-> from pydantic_ai_harness.step_persistence import StepPersistence
+> from pydantic_ai_harness import StepPersistence
 > from pydantic_ai_harness.media import S3MediaStore
 > ```
 >

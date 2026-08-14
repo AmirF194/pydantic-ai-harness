@@ -1,14 +1,5 @@
 # Repo Context
 
-> [!NOTE]
-> Import this capability from its submodule -- there is no top-level `pydantic_ai_harness` re-export:
->
-> ```python
-> from pydantic_ai_harness.repo_context import RepoContext
-> ```
->
-> The API may change between releases. Where practical, breaking changes ship with a deprecation warning.
-
 Discover and load a repo's accumulated coding-assistant context engineering (CE).
 
 [Source](https://github.com/pydantic/pydantic-ai-harness/tree/main/pydantic_ai_harness/repo_context/)
