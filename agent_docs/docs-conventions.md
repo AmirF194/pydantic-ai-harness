@@ -84,7 +84,17 @@ they create (`Coder`), not like capabilities; the word "preset" is not used.
 
 The blown-out equivalent — on the docs page and in the harness's `examples/` counterpart — writes
 the harness's defaults out literally (instructions, command allowlists) instead of importing the
-constants: the reader is meant to see the entire picture and copy-tweak it. That makes it a
-**three-way sync contract**: implementation, docs page, and example must change together in the
-same PR whenever a harness's composition or defaults change. Each written-out block carries a
-keep-in-sync comment; the review checklist enforces the parity.
+constants: the reader is meant to see the entire picture and copy-tweak it. It mirrors the
+exported agent (`coder_agent`, …) exactly, including its `name=` and identity `instructions=`.
+
+The Coder blown-out block lives on **five surfaces** that must stay identical:
+`docs/coder.md`, `docs/index.md`, `README.md`, `pydantic_ai_harness/coder/README.md`, and (as a
+parameterized module) `examples/coding_agent.py`. `tests/test_docs_parity.py` compares the four
+markdown copies byte-for-byte and checks the written-out allowlist against
+`DEFAULT_ALLOWED_COMMANDS`, so a change to any one of them fails CI until all move together —
+change the implementation, the pages, and the example in the same PR. Each block carries a
+keep-in-sync comment naming the surfaces.
+
+Style inside blown-out blocks: `capabilities=[...]` lists are always written one entry per line
+(never collapsed to a single line, including sub-agents'), and every entry in the main agent's
+list carries a short trailing comment saying what it contributes.

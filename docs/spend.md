@@ -7,8 +7,6 @@ description: Track what an agent costs and refuse the next request once a budget
 
 Track what an agent costs, and stop it when a budget is gone.
 
-> The API may change between releases. Where practical, breaking changes ship with a deprecation warning.
-
 > While Pydantic AI Harness is on 0.x releases, the API may change between minor releases — and when it does, deprecation warnings and release-note migration guidance tell you (or your agent) exactly how to upgrade. See the [version policy](index.md#version-policy).
 
 ## The problem

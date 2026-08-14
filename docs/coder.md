@@ -22,6 +22,7 @@ agent = Agent('anthropic:claude-fable-5', capabilities=[Coder('.')])
 
 result = agent.run_sync('Find out why tests/test_parser.py fails and fix the bug it caught.')
 print(result.output)
+#> Found it: `parse()` returned None on empty input instead of raising. Fixed in src/parser.py; tests pass now.
 ```
 
 The same agent works with every Pydantic AI interface: [`agent.to_cli_sync()`](https://pydantic.dev/docs/ai/cli/) starts an interactive chat in your terminal, and [`agent.to_web()`](https://pydantic.dev/docs/ai/web/) serves a browser chat UI.
@@ -88,7 +89,9 @@ To remove or replace one of the built-in components instead, start from the blow
 
 ## Blown-out equivalent
 
-<!-- Keep this in sync with pydantic_ai_harness/coder — it intentionally shows the complete picture. -->
+This is the exact agent the exported `coder_agent` gives you (plus an explicit model), written out block by block:
+
+<!-- Keep this blown-out example in sync across docs/coder.md, docs/index.md, README.md, pydantic_ai_harness/coder/README.md, and examples/coding_agent.py. -->
 
 ```python
 from pathlib import Path
@@ -117,25 +120,30 @@ explorer = SubAgent(
         name='explorer',
         description='Explore the codebase and answer questions without modifying anything',
         instructions='Answer with concrete paths and evidence.',
-        capabilities=[FileSystem('.', read_only=True), RepoContext(workspace_dir=Path('.'))],
+        capabilities=[
+            FileSystem('.', read_only=True),
+            RepoContext(workspace_dir=Path('.')),
+        ],
     )
 )
 
 agent = Agent(
     'anthropic:claude-fable-5',
+    name='coder',
+    instructions='You are a coding agent built on Pydantic AI.',
     capabilities=[
-        FileSystem('.'),
-        Shell(
+        FileSystem('.'),  # read/write/edit/search, path-traversal safe
+        Shell(  # allowlisted commands, LLM API keys stripped from their environment
             cwd='.',
             allowed_commands=allowed_commands,
             denied_env_patterns=LLM_API_KEY_ENV_PATTERNS,
         ),
-        RepoContext(workspace_dir=Path('.')),
-        Planning(),
-        SubAgents(agents=[explorer], agent_folders=None),
-        ClearToolResults(max_fraction=0.7),
-        WarnNearLimits(max_context_fraction=0.9),
-        ToolOutputLimits(),
+        RepoContext(workspace_dir=Path('.')),  # loads AGENTS.md/CLAUDE.md + repo structure
+        Planning(),  # structured task plans the model maintains
+        SubAgents(agents=[explorer], agent_folders=None),  # delegate exploration off the main context
+        ClearToolResults(max_fraction=0.7),  # clears old tool results near the limit
+        WarnNearLimits(max_context_fraction=0.9),  # warns the model before it hits limits
+        ToolOutputLimits(),  # bounds oversized tool results
     ],
 )
 ```

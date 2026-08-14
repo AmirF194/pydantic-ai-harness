@@ -8,7 +8,7 @@
 > from pydantic_ai_harness.media import S3MediaStore
 > ```
 >
-> The API may change between releases. Where practical, breaking changes ship with a deprecation warning.
+> While Pydantic AI Harness is on 0.x releases, the API may change between minor releases — and when it does, deprecation warnings and release-note migration guidance tell you (or your agent) exactly how to upgrade. See the [version policy](https://github.com/pydantic/pydantic-ai-harness#version-policy).
 
 `StepPersistence` records what an agent did at each boundary, separate from
 whether the run can be safely resumed. It is the persistence substrate for

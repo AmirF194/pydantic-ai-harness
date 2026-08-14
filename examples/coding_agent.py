@@ -12,6 +12,7 @@ from pydantic_ai import Agent
 from pydantic_ai.models import Model
 
 from pydantic_ai_harness import (
+    LLM_API_KEY_ENV_PATTERNS,
     ClearToolResults,
     FileSystem,
     Planning,
@@ -25,7 +26,8 @@ from pydantic_ai_harness import (
 
 DEFAULT_MODEL = os.environ.get('PYDANTIC_AI_MODEL', 'anthropic:claude-fable-5')
 
-# Keep this written-out allowlist in sync with the default in `pydantic_ai_harness.coder`.
+# Keep this blown-out composition in sync across docs/coder.md, docs/index.md, README.md,
+# pydantic_ai_harness/coder/README.md, and examples/coding_agent.py.
 ALLOWED_COMMANDS = (
     'git',
     'rg',
@@ -52,20 +54,29 @@ def build_agent(model: Model | str = DEFAULT_MODEL, workspace: Path | None = Non
             name='explorer',
             description='Explore the codebase and answer questions without modifying anything',
             instructions='Answer with concrete paths and evidence.',
-            capabilities=[FileSystem(workspace, read_only=True), RepoContext(workspace_dir=workspace)],
+            capabilities=[
+                FileSystem(workspace, read_only=True),
+                RepoContext(workspace_dir=workspace),
+            ],
         )
     )
     return Agent(
         model,
+        name='coder',
+        instructions='You are a coding agent built on Pydantic AI.',
         capabilities=[
-            FileSystem(root_dir=workspace),  # Provide workspace-scoped file operations.
-            Shell(cwd=workspace, allowed_commands=ALLOWED_COMMANDS),  # Run common development commands.
-            RepoContext(workspace_dir=workspace),  # Add repository metadata to the context.
-            Planning(),  # Track progress through multi-step work.
-            SubAgents(agents=[explorer], agent_folders=None),  # Delegate read-only exploration.
-            ClearToolResults(max_fraction=0.7),  # Reclaim context from old tool results.
-            WarnNearLimits(max_context_fraction=0.9),  # Warn before the context window fills.
-            ToolOutputLimits(),  # Bound large tool responses.
+            FileSystem(workspace),  # read/write/edit/search, path-traversal safe
+            Shell(  # allowlisted commands, LLM API keys stripped from their environment
+                cwd=workspace,
+                allowed_commands=ALLOWED_COMMANDS,
+                denied_env_patterns=LLM_API_KEY_ENV_PATTERNS,
+            ),
+            RepoContext(workspace_dir=workspace),  # loads AGENTS.md/CLAUDE.md + repo structure
+            Planning(),  # structured task plans the model maintains
+            SubAgents(agents=[explorer], agent_folders=None),  # delegate exploration off the main context
+            ClearToolResults(max_fraction=0.7),  # clears old tool results near the limit
+            WarnNearLimits(max_context_fraction=0.9),  # warns the model before it hits limits
+            ToolOutputLimits(),  # bounds oversized tool results
         ],
     )
 

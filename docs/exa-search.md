@@ -316,8 +316,6 @@ from pydantic_ai_harness import ExaSearch
 ExaSearch(client=AsyncExa(api_key='...'))
 ```
 
-The API may change between releases while the capability settles; breaking
-changes ship deprecation warnings where practical.
 
 ## ExaSearch vs core WebSearch
 

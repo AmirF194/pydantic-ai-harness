@@ -9,8 +9,6 @@ description: Give an agent a structured, self-updating task list -- with a cache
 
 [Source](https://github.com/pydantic/pydantic-ai-harness/tree/main/pydantic_ai_harness/planning/)
 
-> The API may change between releases. Where practical, breaking changes ship with a deprecation warning.
-
 > This capability incorporates the task-list features of the standalone [`pydantic-ai-todo`](https://github.com/vstorm-co/pydantic-ai-todo) library -- persistent stores, subtasks, dependencies, and events -- which it supersedes. If you are migrating from `pydantic-ai-todo`, the tools are renamed:
 >
 > | `pydantic-ai-todo` | `Planning` |

@@ -293,6 +293,3 @@ agent = Agent.from_file('agent.yaml', custom_capability_types=[ModalSandbox])
 - [Pydantic AI toolsets](https://pydantic.dev/docs/ai/tools-toolsets/toolsets/)
 - [Modal Sandbox source code](https://github.com/pydantic/pydantic-ai-harness/tree/main/pydantic_ai_harness/modal_sandbox/)
 - [Pydantic AI Harness version policy](https://github.com/pydantic/pydantic-ai-harness#version-policy)
-
-The API may change between releases while Pydantic AI Harness is on 0.x
-versions.

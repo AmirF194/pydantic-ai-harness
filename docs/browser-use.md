@@ -393,8 +393,6 @@ The `llm`, `browser_profile`, `output_schema`, `agent_settings`, and
 browser-use's own default model selection and browser and agent configuration,
 prose output, and the default agent factory.
 
-The API may change between releases while the capability settles; breaking
-changes ship deprecation warnings where practical.
 
 ## Further reading
 

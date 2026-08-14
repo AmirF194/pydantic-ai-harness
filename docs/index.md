@@ -7,12 +7,12 @@ description: The official capability library and harness for Pydantic AI -- 30+ 
 
 **How Python does agents**
 
-An agent is a model plus a harness — everything around the model that turns it into an agent: [tools](/ai/tools-toolsets/toolsets/), [context management](/ai/capabilities/compaction/), [memory](memory.md), [planning](planning.md), [delegation](subagents.md), [safety](guardrails.md), and the [durable execution](/ai/capabilities/durable_execution/overview/) that lets it run for hours. [Pydantic AI](/ai/) ships the typed agent loop, [every model](/ai/models/overview/), the [capability](/ai/capabilities/overview/) primitive, and the fundamentals every agent needs — a bare Pydantic AI agent is already a working one. **Pydantic AI Harness** is the rest of the harness, maintained by the Pydantic AI team: 30+ capabilities — code execution, memory, sub-agents, guardrails, compaction — and complete agents assembled from them. Snap on one capability, compose your own stack from the blocks, or start from a complete [coding agent](coder.md) and take it apart later — it's the same primitive all the way down, 50+ capabilities across the two packages, a range no other Python agent framework ships.
+A [Pydantic AI](/ai/) agent is complete out of the box: model, tools, typed output, and the loop that runs them. What separates that quick agent from one that works autonomously for hours is the harness around the model — [execution environments](shell.md), [context management](compaction.md), [memory](memory.md), [planning](planning.md), [delegation](subagents.md), [safety](guardrails.md), and the [durable execution](/ai/capabilities/durable_execution/overview/) that keeps long runs alive. **Pydantic AI Harness** is that harness: 30+ capabilities — code execution, memory, sub-agents, guardrails, compaction — and complete agents assembled from them. Snap on one capability, compose your own stack from the blocks, or start from a complete [coding agent](coder.md) and take it apart later — it's the same [capability](/ai/capabilities/overview/) primitive all the way down.
 
 ## Quick start
 
 ```bash
-uv add "pydantic-ai-harness[anthropic,cli]"
+uv add "pydantic-ai-harness[anthropic]"
 ```
 
 ```python
@@ -23,16 +23,16 @@ agent = Agent('anthropic:claude-fable-5', capabilities=[Coder()])
 
 result = agent.run_sync('Find out why tests/test_parser.py fails and fix the bug it caught.')
 print(result.output)
-#> ...
+#> Found it: `parse()` returned None on empty input instead of raising. Fixed in src/parser.py; tests pass now.
 ```
 
-That's a complete [coding agent](coder.md): [workspace-rooted file access](filesystem.md), [allowlisted shell](shell.md), [repo orientation](repo-context.md), [planning](planning.md), a read-only [explorer sub-agent](subagents.md), and [context management](compaction.md) that survives long sessions — and it runs anywhere a Pydantic AI agent runs. `agent.to_cli_sync()` opens it as a chat in your terminal, [`agent.to_web()`](/ai/web/) in the browser, and [`Coder`](coder.md)'s exported [`coder_agent`](coder.md#api-reference) runs without writing a file at all:
+That's a complete [coding agent](coder.md): [workspace-rooted file access](filesystem.md), [allowlisted shell](shell.md), [repo orientation](repo-context.md), [planning](planning.md), a read-only [explorer sub-agent](subagents.md), and [context management](compaction.md) that survives long sessions — and it runs anywhere a Pydantic AI agent runs. [`agent.to_cli_sync()`](/ai/cli/) opens it as a chat in your terminal, [`agent.to_web()`](/ai/web/) in the browser, and [`Coder`](coder.md)'s exported [`coder_agent`](coder.md#api-reference) runs without writing a file at all:
 
 ```bash
 uvx --with pydantic-ai-harness clai -a pydantic_ai_harness.coder:coder_agent
 ```
 
-Every model works — swap the string for `'openai:gpt-5.6-sol'` or [any other provider](/ai/models/overview/). Need more? Add capabilities to the list:
+Every model works — swap the string for [any provider's](/ai/models/overview/). Need more? Add capabilities to the list — here's the same coder on `gpt-5.6-sol`, with web search and cross-session memory:
 
 ```python
 from pydantic_ai import Agent
@@ -41,7 +41,7 @@ from pydantic_ai_harness import Coder, Memory
 from pydantic_ai_harness.memory import FileStore
 
 agent = Agent(
-    'anthropic:claude-fable-5',
+    'openai:gpt-5.6-sol',
     capabilities=[
         Coder(),
         WebSearch(),  # look up docs and error messages on the web
@@ -54,7 +54,9 @@ agent = Agent(
 
 ## No magic: it's capabilities all the way down
 
-`Coder` is not a framework inside the framework — it's a [`CombinedCapability`](/ai/capabilities/custom/) bundling the same blocks you can use directly. The main blocks are spelled out below; the [Coder page](coder.md) includes the read-only explorer and exact equivalent:
+`Coder` is not a framework inside the framework — it's a [`CombinedCapability`](/ai/capabilities/custom/) bundling the same blocks you can use directly. This is the exact agent the [Coder page](coder.md)'s exported `coder_agent` gives you, written out block by block:
+
+<!-- Keep this blown-out example in sync across docs/coder.md, docs/index.md, README.md, pydantic_ai_harness/coder/README.md, and examples/coding_agent.py. -->
 
 ```python
 from pathlib import Path
@@ -62,7 +64,6 @@ from pathlib import Path
 from pydantic_ai import Agent
 from pydantic_ai_harness import (
     ClearToolResults,
-    DEFAULT_ALLOWED_COMMANDS,
     FileSystem,
     LLM_API_KEY_ENV_PATTERNS,
     Planning,
@@ -74,27 +75,37 @@ from pydantic_ai_harness import (
     WarnNearLimits,
 )
 
+allowed_commands = [
+    'git', 'rg', 'grep', 'find', 'ls', 'cat', 'sed', 'head', 'tail',
+    'python', 'uv', 'pytest', 'ruff', 'make',
+]
+
 explorer = SubAgent(
     Agent(
         name='explorer',
         description='Explore the codebase and answer questions without modifying anything',
         instructions='Answer with concrete paths and evidence.',
-        capabilities=[FileSystem('.', read_only=True), RepoContext(workspace_dir=Path('.'))],
+        capabilities=[
+            FileSystem('.', read_only=True),
+            RepoContext(workspace_dir=Path('.')),
+        ],
     )
 )
 
 agent = Agent(
     'anthropic:claude-fable-5',
+    name='coder',
+    instructions='You are a coding agent built on Pydantic AI.',
     capabilities=[
         FileSystem('.'),  # read/write/edit/search, path-traversal safe
-        Shell(
+        Shell(  # allowlisted commands, LLM API keys stripped from their environment
             cwd='.',
-            allowed_commands=DEFAULT_ALLOWED_COMMANDS,
+            allowed_commands=allowed_commands,
             denied_env_patterns=LLM_API_KEY_ENV_PATTERNS,
         ),
         RepoContext(workspace_dir=Path('.')),  # loads AGENTS.md/CLAUDE.md + repo structure
         Planning(),  # structured task plans the model maintains
-        SubAgents(agents=[explorer], agent_folders=None),
+        SubAgents(agents=[explorer], agent_folders=None),  # delegate exploration off the main context
         ClearToolResults(max_fraction=0.7),  # clears old tool results near the limit
         WarnNearLimits(max_context_fraction=0.9),  # warns the model before it hits limits
         ToolOutputLimits(),  # bounds oversized tool results

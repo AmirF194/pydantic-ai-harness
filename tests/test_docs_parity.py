@@ -327,3 +327,52 @@ def test_capability_readme_links_source(package: Path) -> None:
         f'{package.relative_to(_ROOT) / "README.md"} must link its own source module '
         f'(a Markdown link containing `{expected}`), so parity tooling can find the implementation.'
     )
+
+
+# The Coder blown-out example is repeated on four markdown surfaces (plus, parameterized,
+# in examples/coding_agent.py). They must stay byte-identical so no page drifts from what
+# `coder_agent` actually is; see agent_docs/docs-conventions.md.
+_BLOWN_OUT_MARKER = '<!-- Keep this blown-out example in sync across'
+_BLOWN_OUT_SURFACES = (
+    'docs/coder.md',
+    'docs/index.md',
+    'README.md',
+    'pydantic_ai_harness/coder/README.md',
+)
+
+
+def _blown_out_block(path: Path) -> str:
+    text = path.read_text(encoding='utf-8')
+    assert _BLOWN_OUT_MARKER in text, f'{path.relative_to(_ROOT)} lost its blown-out keep-in-sync marker'
+    after = text.split(_BLOWN_OUT_MARKER, 1)[1]
+    match = re.search(r'```python\n(.*?)```', after, flags=re.DOTALL)
+    assert match, f'{path.relative_to(_ROOT)} has no python block after the blown-out marker'
+    return match.group(1)
+
+
+@pytest.mark.parametrize('surface', _BLOWN_OUT_SURFACES[1:])
+def test_blown_out_example_is_identical_across_surfaces(surface: str) -> None:
+    canonical = _blown_out_block(_ROOT / _BLOWN_OUT_SURFACES[0])
+    assert _blown_out_block(_ROOT / surface) == canonical, (
+        f'{surface} blown-out example differs from {_BLOWN_OUT_SURFACES[0]}; '
+        'update all surfaces named in the keep-in-sync comment together.'
+    )
+
+
+def test_blown_out_example_matches_coder_defaults() -> None:
+    from pydantic_ai_harness.coder import DEFAULT_ALLOWED_COMMANDS
+
+    block = _blown_out_block(_ROOT / _BLOWN_OUT_SURFACES[0])
+    listed = re.findall(r"'([a-z]+)'", block.split('allowed_commands = [', 1)[1].split(']', 1)[0])
+    assert tuple(listed) == tuple(DEFAULT_ALLOWED_COMMANDS), (
+        'the written-out allowlist no longer matches pydantic_ai_harness.coder.DEFAULT_ALLOWED_COMMANDS'
+    )
+    agent_source = (_PACKAGE / 'coder' / '_agent.py').read_text(encoding='utf-8')
+    identity_match = re.search(r"instructions='([^']+)'", agent_source)
+    assert identity_match, 'coder/_agent.py no longer defines an identity instruction'
+    identity = f"instructions='{identity_match.group(1)}'"
+    assert identity in block, "the blown-out example must carry coder_agent's identity instruction verbatim"
+    example = (_ROOT / 'examples/coding_agent.py').read_text(encoding='utf-8')
+    assert identity in example and 'denied_env_patterns=LLM_API_KEY_ENV_PATTERNS' in example, (
+        'examples/coding_agent.py drifted from the coder_agent composition'
+    )
