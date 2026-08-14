@@ -5,7 +5,7 @@ build-backend = 'hatchling.build'
 [project]
 name = 'pydantic-ai-harness'
 dynamic = ['version']
-description = 'How Python does agents — the official capability library and harness for Pydantic AI'
+description = 'The official capability library and harness for Pydantic AI'
 readme = 'README.md'
 requires-python = '>=3.10'
 license = 'MIT'

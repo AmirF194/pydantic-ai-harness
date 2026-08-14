@@ -5,9 +5,9 @@ description: The official capability library and harness for Pydantic AI -- 30+ 
 
 # Pydantic AI Harness
 
-**How Python does agents**
+**The official capability library and harness for Pydantic AI**
 
-A [Pydantic AI](/ai/) agent is complete out of the box: model, tools, typed output, and the loop that runs them. What separates that quick agent from one that works autonomously for hours is the harness around the model — [execution environments](shell.md), [context management](compaction.md), [memory](memory.md), [planning](planning.md), [delegation](subagents.md), [safety](guardrails.md), and the [durable execution](/ai/capabilities/durable_execution/overview/) that keeps long runs alive. **Pydantic AI Harness** is that harness: 30+ capabilities — code execution, memory, sub-agents, guardrails, compaction — and complete agents assembled from them. Snap on one capability, compose your own stack from the blocks, or start from a complete [coding agent](coder.md) and take it apart later — it's the same [capability](/ai/capabilities/overview/) primitive all the way down.
+A [Pydantic AI](/ai/) agent is complete out of the box: model, tools, typed output, and the loop that runs them. What separates that quick agent from one that works autonomously for hours is the harness around the model — [execution environments](shell.md), [context management](compaction.md), [memory](memory.md), [planning](planning.md), [delegation](subagents.md), [safety](guardrails.md), and the [durable execution](/ai/capabilities/durable_execution/overview/) that keeps long runs alive. **Pydantic AI Harness** is that harness: 30+ capabilities — [code execution](#execution-environments), [memory](#knowledge--memory), [sub-agents](#reasoning-planning--delegation), [guardrails](#control--safety), [compaction](#context-management) — and complete agents assembled from them. Snap on one capability, compose your own stack from the blocks, or start from a complete [coding agent](coder.md) and take it apart later — it's the same [capability](/ai/capabilities/overview/) primitive all the way down.
 
 ## Quick start
 
@@ -33,6 +33,10 @@ uvx --with pydantic-ai-harness clai -a pydantic_ai_harness.coder:coder_agent
 ```
 
 Every model works — swap the string for [any provider's](/ai/models/overview/). Need more? Add capabilities to the list — here's the same coder on `gpt-5.6-sol`, with web search and cross-session memory:
+
+```bash
+uv add "pydantic-ai-slim[openai]"
+```
 
 ```python
 from pydantic_ai import Agent

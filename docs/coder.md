@@ -33,7 +33,7 @@ Or skip the file entirely and run the exported [`coder_agent`](#api-reference) w
 uvx --with pydantic-ai-harness clai -a pydantic_ai_harness.coder:coder_agent
 ```
 
-`clai` supplies its default model when `-m` is omitted; pass `-m provider:model` to select or override it.
+`clai` installs the full `pydantic-ai` package, so every major provider is ready to use; it defaults to `openai:gpt-5` when `-m` is omitted — pass `-m provider:model` to override.
 
 ## What's inside
 

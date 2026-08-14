@@ -5,11 +5,11 @@
 [![versions](https://img.shields.io/pypi/pyversions/pydantic-ai-harness.svg)](https://github.com/pydantic/pydantic-ai-harness)
 [![license](https://img.shields.io/github/license/pydantic/pydantic-ai-harness.svg)](https://github.com/pydantic/pydantic-ai-harness/blob/main/LICENSE)
 
-**How Python does agents**
+**The official capability library and harness for Pydantic AI**
 
 ---
 
-A [Pydantic AI](https://ai.pydantic.dev/) agent is complete out of the box: model, tools, typed output, and the loop that runs them. What separates that quick agent from one that works autonomously for hours is the harness around the model — [execution environments](pydantic_ai_harness/shell/), [context management](pydantic_ai_harness/compaction/), [memory](pydantic_ai_harness/memory/), [planning](pydantic_ai_harness/planning/), [delegation](pydantic_ai_harness/subagents/), [safety](pydantic_ai_harness/guardrails/), and the [durable execution](https://ai.pydantic.dev/capabilities/durable_execution/overview/) that keeps long runs alive. **Pydantic AI Harness** is that harness: 30+ capabilities — code execution, memory, sub-agents, guardrails, compaction — and complete agents assembled from them. Snap on one capability, compose your own stack from the blocks, or start from a complete [coding agent](pydantic_ai_harness/coder/) and take it apart later — it's the same [capability](https://ai.pydantic.dev/capabilities/) primitive all the way down.
+A [Pydantic AI](https://ai.pydantic.dev/) agent is complete out of the box: model, tools, typed output, and the loop that runs them. What separates that quick agent from one that works autonomously for hours is the harness around the model — [execution environments](pydantic_ai_harness/shell/), [context management](pydantic_ai_harness/compaction/), [memory](pydantic_ai_harness/memory/), [planning](pydantic_ai_harness/planning/), [delegation](pydantic_ai_harness/subagents/), [safety](pydantic_ai_harness/guardrails/), and the [durable execution](https://ai.pydantic.dev/capabilities/durable_execution/overview/) that keeps long runs alive. **Pydantic AI Harness** is that harness: 30+ capabilities — [code execution](#execution-environments), [memory](#knowledge--memory), [sub-agents](#reasoning-planning--delegation), [guardrails](#control--safety), [compaction](#context-management) — and complete agents assembled from them. Snap on one capability, compose your own stack from the blocks, or start from a complete [coding agent](pydantic_ai_harness/coder/) and take it apart later — it's the same [capability](https://ai.pydantic.dev/capabilities/) primitive all the way down.
 
 ## Quick start
 
@@ -35,6 +35,10 @@ uvx --with pydantic-ai-harness clai -a pydantic_ai_harness.coder:coder_agent
 ```
 
 Every model works — swap the string for [any provider's](https://ai.pydantic.dev/models/). Need more? Add capabilities to the list — here's the same coder on `gpt-5.6-sol`, with web search and cross-session memory:
+
+```bash
+uv add "pydantic-ai-slim[openai]"
+```
 
 ```python
 from pydantic_ai import Agent

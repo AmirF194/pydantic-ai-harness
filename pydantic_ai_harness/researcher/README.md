@@ -27,7 +27,7 @@ Or skip the file entirely and run the exported `researcher_agent` with [Pydantic
 uvx --with 'pydantic-ai-harness[researcher]' clai -a pydantic_ai_harness.researcher:researcher_agent
 ```
 
-`clai` supplies its default model when `-m` is omitted; pass `-m provider:model` to select or override it.
+`clai` installs the full `pydantic-ai` package, so every major provider is ready to use; it defaults to `openai:gpt-5` when `-m` is omitted — pass `-m provider:model` to override.
 
 It is literally these capabilities combined, in this order:
 
