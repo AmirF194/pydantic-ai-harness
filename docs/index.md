@@ -1,18 +1,18 @@
 ---
 title: Pydantic AI Harness
-description: The official agent harness for Pydantic AI -- everything around the model that turns it into an agent, as 30+ composable capabilities and complete agents built from them.
+description: The official capability library and harness for Pydantic AI -- 30+ capabilities and complete agents assembled from them, from a coding agent to your own custom stack.
 ---
 
 # Pydantic AI Harness
 
-**Agent = model + harness. This is the harness.**
+**The batteries for your Pydantic AI agent.**
 
-A harness is everything around the model that turns it into an agent: [tools](/ai/tools-toolsets/toolsets/), [context management](/ai/capabilities/compaction/), [memory](memory.md), [planning](planning.md), [delegation](subagents.md), [safety](guardrails.md), and the [durable execution](/ai/capabilities/durable_execution/overview/) that lets it run for hours. [Pydantic AI](/ai/) ships the typed agent loop, [every model](/ai/models/overview/), the fundamentals every agent needs, and the [capability](/ai/capabilities/overview/) primitive; **Pydantic AI Harness** is its official harness — 30+ capabilities, and complete agents assembled from them, maintained by the Pydantic AI team. Snap on one capability, compose your own stack from the blocks, or start from a complete [coding agent](coder.md) and take it apart later — it's the same primitive all the way down.
+An agent is a model plus a harness — everything around the model that turns it into an agent: [tools](/ai/tools-toolsets/toolsets/), [context management](/ai/capabilities/compaction/), [memory](memory.md), [planning](planning.md), [delegation](subagents.md), [safety](guardrails.md), and the [durable execution](/ai/capabilities/durable_execution/overview/) that lets it run for hours. [Pydantic AI](/ai/) ships the typed agent loop, [every model](/ai/models/overview/), the [capability](/ai/capabilities/overview/) primitive, and the fundamentals every agent needs — a bare Pydantic AI agent is already a working one. **Pydantic AI Harness** is the rest of the harness, maintained by the Pydantic AI team: 30+ capabilities — code execution, memory, sub-agents, guardrails, compaction — and complete agents assembled from them. Snap on one capability, compose your own stack from the blocks, or start from a complete [coding agent](coder.md) and take it apart later — it's the same primitive all the way down, 50+ capabilities across the two packages, a range no other Python agent framework ships.
 
 ## Quick start
 
 ```bash
-uv add "pydantic-ai-harness[anthropic,cli]"
+uv add "pydantic-ai-harness[anthropic,cli,skills]"
 ```
 
 ```python
@@ -103,11 +103,11 @@ agent = Agent(
 )
 ```
 
-Start from the harness and remove what you don't want, or start from the blocks and build up — both work. Constructor arguments (working directory, command allowlist, window sizes) pass through to the underlying capabilities.
+Start from the harness and remove what you don't want, or start from the blocks and build up — both are first-class. Constructor arguments (working directory, command allowlist, window sizes) thread through to the underlying capabilities.
 
 ## Capabilities
 
-Every capability is a self-contained unit you drop into `capabilities=[...]`, and they all compose — with each other and with your own. Some come with [`pydantic-ai`](/ai/) itself, the rest with this package; the **Package** column says which, and they're grouped by what they give your agent:
+Every capability is a self-contained unit you drop into `capabilities=[...]`, and they all compose — with each other and with your own. Some come with [`pydantic-ai`](/ai/) itself, the rest with this package; the **Package** column says which. 50+ in all, grouped by what they give your agent:
 
 ### Harnesses
 
@@ -171,7 +171,7 @@ How the agent spends its context window — the difference between an agent that
 
 | Capability | Package | What it does |
 |---|---|---|
-| [Code Mode](code-mode.md) | Harness | The model writes one Python script that calls many tools inside a [Monty](https://github.com/pydantic/monty) sandbox — one round-trip instead of N, and intermediate results never enter the context window |
+| [Code Mode](code-mode.md) | Harness | The model writes one Python script that calls many tools inside a [Monty](https://github.com/pydantic/monty) sandbox — one round-trip instead of N, and intermediate results never enter the context window. The answer to tool-call token bloat |
 | [Tool Search](/ai/capabilities/tool-search/) | Core | Load tool definitions on demand instead of carrying hundreds in every prompt |
 | [Compaction](/ai/capabilities/compaction/) | Core | Provider-native compaction on OpenAI and Anthropic — the provider summarizes history server-side |
 | [Compaction](compaction.md) | Harness | Model-agnostic strategies: tool-result clearing, sliding-window trimming, LLM summarization, tiered — all window-relative, with live usage reporting |
@@ -189,7 +189,6 @@ What the agent knows and remembers — loaded when relevant instead of carried i
 | [Skills](skills.md) | Harness | Load [Agent Skill](/ai/capabilities/on-demand/) (`SKILL.md`) instructions on demand |
 | [Repo Context](repo-context.md) | Harness | Start runs oriented: `AGENTS.md`/`CLAUDE.md` + repository structure |
 | [Pydantic AI Docs](pydantic-ai-docs.md) | Harness | On-demand Pydantic AI documentation lookup |
-| [Embeddings](/ai/embeddings/) | Core | Embed queries and documents for search and retrieval (a core feature used via `Embedder`, not a `capabilities=[...]` unit) |
 
 ### Control & safety
 
@@ -221,7 +220,7 @@ Outside the loop: how runs persist, survive failures, and get observed and confi
 | [Managed Prompt](managed-prompt.md) | Harness | Back instructions with a [Logfire](https://pydantic.dev/logfire)-managed prompt — version and roll out without redeploying |
 | [Thread Executor](/ai/capabilities/thread-executor/) | Core | Run sync tools on a shared thread pool |
 
-Core also ships loop-customization capabilities for production servers: [Select Model](/ai/capabilities/select-model/), [Resolve Model ID](/ai/capabilities/resolve-model-id/), [Prepare Tools](/ai/capabilities/prepare-tools/), [Prefix Tools](/ai/capabilities/prefix-tools/), [Set Tool Metadata](/ai/capabilities/set-tool-metadata/), [Include Tool Return Schemas](/ai/capabilities/include-tool-return-schemas/), [Process History](/ai/capabilities/process-history/), [Process Event Stream](/ai/capabilities/process-event-stream/), [Reinject System Prompt](/ai/capabilities/reinject-system-prompt/), and [Raise Content Filter Error](/ai/capabilities/raise-content-filter-error/).
+Core also ships loop-customization capabilities for production servers: [Select Model](/ai/capabilities/select-model/), [Resolve Model ID](/ai/capabilities/resolve-model-id/), [Prepare Tools / Prepare Output Tools](/ai/capabilities/prepare-tools/), [Prefix Tools](/ai/capabilities/prefix-tools/), [Set Tool Metadata](/ai/capabilities/set-tool-metadata/), [Include Tool Return Schemas](/ai/capabilities/include-tool-return-schemas/), [Process History](/ai/capabilities/process-history/), [Process Event Stream](/ai/capabilities/process-event-stream/), [Reinject System Prompt](/ai/capabilities/reinject-system-prompt/), and [Raise Content Filter Error](/ai/capabilities/raise-content-filter-error/).
 
 And the agent plugs into any interface: [ACP](acp.md) *(experimental, Harness)* serves it to editors like Zed over the [Agent Client Protocol](https://agentclientprotocol.com), and core ships the [web chat UI](/ai/web/), [CLI](/ai/cli/), [frontend adapters](/ai/ui/overview/) (AG-UI, Vercel AI), and [realtime voice](/ai/realtime/overview/).
 
