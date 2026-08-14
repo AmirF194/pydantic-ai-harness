@@ -13,7 +13,7 @@ import functools
 from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any, Literal, TypeVar
-from unittest.mock import MagicMock, PropertyMock
+from unittest.mock import MagicMock
 
 import pytest
 from pydantic_ai import (
@@ -23,6 +23,7 @@ from pydantic_ai import (
     Tool,
     ToolDefinition,
 )
+from pydantic_ai.capabilities import AbstractCapability
 from pydantic_ai.exceptions import ModelRetry, UserError
 from pydantic_ai.messages import ToolCallPart
 from pydantic_ai.models.test import TestModel
@@ -832,11 +833,13 @@ class TestCodeMode:
         assert '(50 items total)' in message  # long list cut to its first few
         assert '(10000 items total)' in message  # mapping items are cut before rendering
 
-    async def test_temporal_disables_elapsed_time_limits(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    async def test_temporal_disables_elapsed_time_limits(self) -> None:
         """Temporal replays `run_code`, so its elapsed timer cannot decide workflow control flow."""
-        from pydantic_ai.durable_exec.temporal import TemporalDurability
 
-        monkeypatch.setattr(TemporalDurability, 'in_durable_context', PropertyMock(return_value=True))
+        class TemporalDurability(AbstractCapability[None]):
+            in_durable_context = True
+
+        TemporalDurability.__module__ = 'pydantic_ai.durable_exec.temporal'
         options: tuple[CodeModeResourceLimits | None, ...] = (None, {'max_duration_secs': 0.001})
         for limits in options:
             wrapper = CodeMode[object](resource_limits=limits).get_wrapper_toolset(_build_function_toolset(add))
