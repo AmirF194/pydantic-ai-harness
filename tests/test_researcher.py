@@ -1,9 +1,8 @@
 from pydantic_ai import Agent
-from pydantic_ai.capabilities import Capability, WebSearch
+from pydantic_ai.capabilities import Capability, WebFetch, WebSearch
 from pydantic_ai.models.test import TestModel
-from pydantic_ai.native_tools import WebSearchTool
+from pydantic_ai.native_tools import WebFetchTool, WebSearchTool
 
-from pydantic_ai_harness.code_mode import CodeMode
 from pydantic_ai_harness.researcher import DEFAULT_RESEARCHER_INSTRUCTIONS, Researcher, researcher_agent
 from pydantic_ai_harness.tool_output_limits import ToolOutputLimits
 
@@ -18,7 +17,7 @@ def test_researcher_agent_is_model_less_and_composed() -> None:
     assert isinstance(researcher_agent, Agent)
     assert researcher_agent.model is None
     assert researcher_agent.name == 'researcher'
-    assert any(isinstance(capability, CodeMode) for capability in researcher_agent.root_capability.capabilities)
+    assert any(isinstance(capability, WebFetch) for capability in researcher_agent.root_capability.capabilities)
 
 
 def test_researcher_unknown_export() -> None:
@@ -34,9 +33,9 @@ def test_researcher_members_are_transparent() -> None:
     researcher = Researcher()
 
     assert [type(capability) for capability in researcher.capabilities] == [
-        CodeMode,
         Capability,
         WebSearch,
+        WebFetch,
         ToolOutputLimits,
     ]
     capability = next(capability for capability in researcher.capabilities if isinstance(capability, Capability))
@@ -44,6 +43,9 @@ def test_researcher_members_are_transparent() -> None:
     web_search = next(capability for capability in researcher.capabilities if isinstance(capability, WebSearch))
     assert isinstance(web_search.native, WebSearchTool)
     assert web_search.local is not None
+    web_fetch = next(capability for capability in researcher.capabilities if isinstance(capability, WebFetch))
+    assert isinstance(web_fetch.native, WebFetchTool)
+    assert web_fetch.local is not None
 
 
 def test_researcher_threads_instructions() -> None:

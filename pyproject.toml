@@ -49,6 +49,9 @@ codemode = [
     "pydantic-ai-slim[duckduckgo]>=2.28.0",
     "pydantic-monty>=0.0.19",
 ]
+researcher = [
+    "pydantic-ai-slim[duckduckgo,web-fetch]>=2.28.0",
+]
 temporal = [
     'pydantic-ai-slim[temporal]',
 ]

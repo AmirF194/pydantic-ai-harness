@@ -1,9 +1,8 @@
 """Complete research-agent harness assembled from regular capabilities."""
 
-from pydantic_ai.capabilities import AbstractCapability, Capability, CombinedCapability, WebSearch
+from pydantic_ai.capabilities import AbstractCapability, Capability, CombinedCapability, WebFetch, WebSearch
 from pydantic_ai.tools import AgentDepsT
 
-from pydantic_ai_harness.code_mode import CodeMode
 from pydantic_ai_harness.tool_output_limits import ToolOutputLimits
 
 DEFAULT_RESEARCHER_INSTRUCTIONS = """\
@@ -19,8 +18,6 @@ Distinguish sourced facts from your own inference.
 class Researcher(CombinedCapability[AgentDepsT]):
     """A complete research-agent harness built as a regular combined capability.
 
-    See the class definition and [Researcher docs](https://pydantic.dev/docs/ai/harness/researcher/) for the exact composition.
-
     It comes with concise default instructions. Pass `instructions=` to
     replace them, or `instructions=None` to run with no default instructions.
     """
@@ -31,8 +28,8 @@ class Researcher(CombinedCapability[AgentDepsT]):
             capabilities.append(Capability[AgentDepsT](instructions=instructions))
         capabilities.extend(
             [
-                CodeMode[AgentDepsT](),
                 WebSearch[AgentDepsT](local=True),
+                WebFetch[AgentDepsT](local=True),
                 ToolOutputLimits[AgentDepsT](),
             ]
         )
