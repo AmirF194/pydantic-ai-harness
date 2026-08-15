@@ -116,6 +116,7 @@ from urllib.parse import urlparse
 
 import idna
 from opentelemetry import trace
+from pydantic_ai.exceptions import UserError
 from pydantic_ai.messages import BinaryContent, ToolReturn
 from pydantic_ai.tools import AgentDepsT
 from pydantic_ai.toolsets import FunctionToolset
@@ -388,29 +389,6 @@ def _url_host(url: str) -> str | None:
         return None
 
 
-def check_allowed_domain(url: str, allowed_domains: list[str] | None) -> bool:
-    """Return whether `url`'s host is permitted by the allowlist.
-
-    `allowed_domains=None` means every domain is allowed (open egress). A host
-    matches when it equals an allowed entry or is a subdomain of one. `hostname`
-    strips the port and brackets, so bracketed IPv6 literals compare correctly.
-    Host and entries are normalized to their IDNA/ASCII form before comparison,
-    so a Unicode host and its `xn--` spelling get the same verdict. A URL without
-    a host (e.g. `about:blank`, `mailto:`) is rejected.
-    """
-    host = _url_host(url)
-    if host is None:
-        return False
-    if allowed_domains is None:
-        return True
-    host = _to_idna(host)
-    for entry in allowed_domains:
-        domain = _to_idna(entry.strip().lower())
-        if domain and (host == domain or host.endswith('.' + domain)):
-            return True
-    return False
-
-
 def is_blocked_address(host: str) -> bool:
     """Return whether `host` names an address that is not globally routable.
 
@@ -469,71 +447,140 @@ def _scroll_position(reported: object) -> str:
     return f'{after} of {furthest} px down.'
 
 
-def blocked_navigation_reason(url: str, allowed_domains: list[str] | None, block_private_addresses: bool) -> str | None:
-    """Return why navigating to `url` is denied, or `None` when it is permitted.
+RequestKind = Literal['navigation', 'subframe', 'data', 'subresource']
+"""What a request is for, which is what an egress rule is usually about.
 
-    The two policies are orthogonal: `check_allowed_domain` applies the opt-in
-    allowlist, and `is_blocked_address` refuses private/link-local/metadata IP
-    literals even when the allowlist permits the host or no allowlist is set, so
-    open egress still cannot reach `http://169.254.169.254/`. The returned phrase
-    names which policy denied the URL, so the model and logs can tell an
-    allowlist miss from a private-address block.
+`navigation` is the top-level document, `subframe` a document loaded into an
+embedded frame, `data` anything a script uses to move data (`fetch`, XHR,
+EventSource, WebSocket, `sendBeacon`), and `subresource` the passive assets that
+render a page (images, stylesheets, scripts, fonts, media).
+"""
 
-    `about:blank` is permitted: it is the state a context starts in and the target
-    this module bounces to, so denying it would refuse every tool call made before
-    the first navigation. Every other hostless URL (`file:`, `mailto:`, `data:`)
-    stays denied, under a phrase that does not blame an allowlist that may not exist.
+DEFAULT_ALLOWLIST_REACH: frozenset[RequestKind] = frozenset({'navigation', 'data'})
+"""Which request kinds `allowed_domains` bounds unless the policy says otherwise.
+
+Navigation, so the agent stays on the sites it was given, and data requests, so a
+script on one of those pages cannot read from or post to somewhere else. Passive
+subresources are left alone because a page whose images, fonts and scripts are
+aborted renders as a broken page, and sub-frame documents because a permitted
+page's identity-provider and payment steps live in them.
+"""
+
+_DATA_RESOURCE_TYPES = frozenset({'fetch', 'xhr', 'eventsource', 'websocket', 'ping', 'preflight'})
+"""Playwright resource types that carry data rather than render the page.
+
+`ping` is `navigator.sendBeacon`, which is a send channel like the rest of them.
+"""
+
+
+def _request_kind(request: PlaywrightRequest, top_level: bool) -> RequestKind:
+    """Classify a Playwright request for the policy.
+
+    A document is a navigation only in the main frame; the same type inside an
+    embedded frame is what loads an identity provider or a payment step, which a
+    policy usually treats differently.
     """
-    if url == _BLANK_PAGE:
-        return None
-    host = _url_host(url)
-    if host is None:
-        return 'URL with no host'
-    if not check_allowed_domain(url, allowed_domains):
-        return 'domain not in allowed_domains'
-    if block_private_addresses and is_blocked_address(host):
-        return _PRIVATE_ADDRESS_REASON
-    return None
-
-
-def refused_in_every_frame(url: str, block_private_addresses: bool) -> bool:
-    """Whether `url` must be refused in any frame, not just the top-level document.
-
-    The private-address block is absolute: `snapshot()` reads the ARIA tree of
-    cross-origin child frames, so letting a subframe load
-    `http://169.254.169.254/` would hand the model the very response body the
-    block exists to withhold. The allowlist stays top-level, where a page's own
-    third-party frames (identity providers, payment steps) keep working.
-    """
-    host = _url_host(url)
-    return block_private_addresses and host is not None and is_blocked_address(host)
+    if request.resource_type in _DATA_RESOURCE_TYPES:
+        return 'data'
+    if request.is_navigation_request():
+        return 'navigation' if top_level else 'subframe'
+    return 'subresource'
 
 
 @dataclass(frozen=True)
-class NavigationPolicy:
-    """What the agent is allowed to reach, and how to say so to the model.
+class EgressRequest:
+    """One request the browser is about to make, as the policy sees it.
 
-    The two axes are independent and deny wins: an allowlisted private address is
-    still refused until `block_private_addresses` is turned off. Holding them
-    together keeps enforcement and description from drifting apart -- the failure
-    mode being that the instructions promise the model a reach the guards do not
-    grant.
+    Everything the guard knows is passed through, including the raw Playwright
+    `resource_type`, so a policy that needs a distinction this module never
+    anticipated can make it without waiting for a new field here.
+    """
+
+    url: str
+    kind: RequestKind
+    resource_type: str = 'document'
+    """Playwright's own classification, e.g. `document`, `xhr`, `image`, `font`."""
+    method: str = 'GET'
+    top_level: bool = True
+    """Whether this is the main frame's own document rather than something inside the page."""
+
+
+@dataclass(frozen=True)
+class EgressPolicy:
+    """Where the browser may go, and what a page loaded there may talk to.
+
+    The axes are independent and deny wins: a blocked address is refused even when
+    the allowlist names it, and `blocked_domains` beats `allowed_domains`. Holding
+    them in one object keeps enforcement and the description given to the model
+    from drifting apart -- the failure mode being instructions that promise a reach
+    the guards do not grant.
+
+    The fields cover the rules we expect; `refuse` covers the rest. Subclass and
+    override it for anything else -- per-path rules, a CDN allowed only for fonts,
+    a method-dependent rule -- calling `super().refuse(request)` for the default
+    verdict.
     """
 
     allowed_domains: list[str] | None = None
+    """Hosts the reachable kinds are limited to. `None` allows every public host."""
+    blocked_domains: list[str] | None = None
+    """Hosts refused whatever else permits them, for every kind of request."""
     block_private_addresses: bool = True
+    """Refuse addresses that are not globally routable, in every frame and for every kind."""
+    include_subdomains: bool = True
+    """Whether an entry also covers its subdomains, so `example.com` reaches `api.example.com`."""
+    allowlist_reach: frozenset[RequestKind] = DEFAULT_ALLOWLIST_REACH
+    """Which kinds `allowed_domains` bounds. `frozenset(get_args(RequestKind))` locks down everything."""
 
-    def blocked_reason(self, url: str) -> str | None:
-        """Why navigating to `url` is denied, or `None` when it is permitted."""
-        return blocked_navigation_reason(url, self.allowed_domains, self.block_private_addresses)
+    def __post_init__(self) -> None:
+        for field_name in ('allowed_domains', 'blocked_domains'):
+            for entry in getattr(self, field_name) or ():
+                if '*' in entry:
+                    raise UserError(
+                        f'{field_name} entry {entry!r} contains a wildcard, which never matches a host. '
+                        'Write the bare domain: subdomains are included unless include_subdomains=False.'
+                    )
 
-    def refused_in_every_frame(self, url: str) -> bool:
-        """Whether `url` must be refused in any frame and for any resource type."""
-        return refused_in_every_frame(url, self.block_private_addresses)
+    def refuse(self, request: EgressRequest) -> str | None:
+        """Why the browser must not make this request, or `None` to allow it.
+
+        `about:blank` is permitted: it is the state a context starts in and the
+        target a refused navigation is bounced to, so denying it would refuse every
+        tool call made before the first navigation. Other hostless URLs (`data:`,
+        `blob:`) are refused as navigation and allowed as page content, where they
+        are ordinary inline assets.
+        """
+        if request.url == _BLANK_PAGE:
+            return None
+        host = _url_host(request.url)
+        if host is not None and self.block_private_addresses and is_blocked_address(host):
+            return _PRIVATE_ADDRESS_REASON
+        if host is None:
+            return None if request.kind in ('data', 'subresource') else 'URL with no host'
+        if self._matches(host, self.blocked_domains):
+            return 'domain in blocked_domains'
+        if request.kind in self.allowlist_reach and not self._permitted(host):
+            return 'domain not in allowed_domains'
+        return None
+
+    def _permitted(self, host: str) -> bool:
+        """Whether the allowlist admits `host`, with `None` meaning every public host."""
+        return self.allowed_domains is None or self._matches(host, self.allowed_domains)
+
+    def _matches(self, host: str, domains: list[str] | None) -> bool:
+        """Whether `host` equals an entry, or sits under one when subdomains count."""
+        if not domains:
+            return False
+        host = _to_idna(host)
+        for entry in domains:
+            domain = _to_idna(entry.strip().lower())
+            if domain and (host == domain or (self.include_subdomains and host.endswith('.' + domain))):
+                return True
+        return False
 
     def enforced(self) -> bool:
-        """Whether either axis restricts anything, i.e. whether a route guard is worth installing."""
-        return self.allowed_domains is not None or self.block_private_addresses
+        """Whether anything is restricted, i.e. whether a route guard is worth installing."""
+        return self.allowed_domains is not None or bool(self.blocked_domains) or self.block_private_addresses
 
     def describe(self) -> str:
         """The reach, phrased for the model's instructions."""
@@ -541,8 +588,12 @@ class NavigationPolicy:
             domains = 'all'
         elif self.allowed_domains:
             domains = ', '.join(self.allowed_domains)
+            if self.include_subdomains:
+                domains += ' (and their subdomains)'
         else:
             domains = 'none'
+        if self.blocked_domains:
+            domains += f', except {", ".join(self.blocked_domains)}'
         if self.block_private_addresses:
             domains += ' (private/internal addresses blocked)'
         return domains
@@ -836,7 +887,7 @@ class PlaywrightBrowserSession:
     never share a page. It can also be driven directly:
 
     ```python
-    async with PlaywrightBrowserSession(policy=NavigationPolicy()) as session:
+    async with PlaywrightBrowserSession(policy=EgressPolicy()) as session:
         page = await session.ensure_page()
     ```
     """
@@ -844,7 +895,7 @@ class PlaywrightBrowserSession:
     def __init__(
         self,
         *,
-        policy: NavigationPolicy | None = None,
+        policy: EgressPolicy | None = None,
         headless: bool = True,
         storage_state: StorageState | None = None,
         cdp_url: str | None = None,
@@ -852,7 +903,7 @@ class PlaywrightBrowserSession:
         chromium_sandbox: bool = True,
         launch_timeout_ms: int = DEFAULT_NAVIGATION_TIMEOUT_MS,
     ) -> None:
-        self.policy = policy if policy is not None else NavigationPolicy()
+        self.policy = policy if policy is not None else EgressPolicy()
         """Egress policy the route guard enforces, and the default for a toolset built on this session."""
         self._headless = headless
         self._storage_state = storage_state
@@ -1100,30 +1151,33 @@ class PlaywrightBrowserSession:
         return None
 
     async def _route_guard(self, route: PlaywrightRoute, request: PlaywrightRequest) -> None:
-        """Network-layer egress policy: abort what the configuration refuses, pass the rest.
+        """Network-layer egress policy: abort what the policy refuses, pass the rest.
 
-        The two policies have different reach. The private-address block covers
-        every request of every resource type in every frame, because a page can
-        read a subresource it fetched itself and hand the body to the model. The
-        allowlist covers top-level navigation only, so a permitted page keeps its
-        own CDN assets, identity-provider frames, and payment steps.
+        Every request reaches here, whatever its type and whichever frame made it,
+        so the policy is asked about all of them and decides which distinctions
+        matter. The frame lookup can raise for a request whose frame is already
+        gone; that request is treated as a top-level navigation, which is the
+        strictest reading.
         """
-        if self.policy.refused_in_every_frame(request.url):
-            await self._abort(route, request.url, _PRIVATE_ADDRESS_REASON)
-            return
-        reason = self.policy.blocked_reason(request.url)
-        if not request.is_navigation_request() or reason is None:
-            await route.continue_()
-            return
         try:
             frame = request.frame
+            top_level = frame == frame.page.main_frame
         except PlaywrightError:
-            await self._abort(route, request.url, reason)
+            top_level = True
+        kind = _request_kind(request, top_level)
+        reason = self.policy.refuse(
+            EgressRequest(
+                url=request.url,
+                kind=kind,
+                resource_type=request.resource_type,
+                method=request.method,
+                top_level=top_level and kind == 'navigation',
+            )
+        )
+        if reason is None:
+            await route.continue_()
             return
-        if frame == frame.page.main_frame:
-            await self._abort(route, request.url, reason)
-            return
-        await route.continue_()
+        await self._abort(route, request.url, reason)
 
     async def _websocket_guard(self, websocket: PlaywrightWebSocketRoute) -> None:
         """Apply the private-address block to WebSocket connections.
@@ -1138,12 +1192,11 @@ class PlaywrightBrowserSession:
         A socket that is permitted has to be connected explicitly: registering a
         handler at all takes Playwright out of its pass-through mode.
         """
-        if self.policy.refused_in_every_frame(websocket.url):
-            self.record(
-                BrowserEvent(
-                    kind='request_blocked', level='warning', message=_PRIVATE_ADDRESS_REASON, url=websocket.url
-                )
-            )
+        reason = self.policy.refuse(
+            EgressRequest(url=websocket.url, kind='data', resource_type='websocket', top_level=False)
+        )
+        if reason is not None:
+            self.record(BrowserEvent(kind='request_blocked', level='warning', message=reason, url=websocket.url))
             await websocket.close()
             return
         websocket.connect_to_server()
@@ -1561,7 +1614,7 @@ class PlaywrightBrowserToolset(FunctionToolset[AgentDepsT]):
             failure = self._session.failure_since_operation_start()
             cause = 'the navigation did not complete' if failure is None else f'{failure.message}: {failure.url}'
             return self._error(f'Error: {action} loaded no page ({cause}); the browser is back at about:blank.')
-        reason = self._policy.blocked_reason(page.url)
+        reason = self._policy.refuse(EgressRequest(url=page.url, kind='navigation'))
         if reason is None:
             return None
         blocked = _without_credentials(page.url)
@@ -1666,7 +1719,7 @@ class PlaywrightBrowserToolset(FunctionToolset[AgentDepsT]):
             embedded frames. When `screenshot_on_navigate` is set, a screenshot is
             attached as image content for vision models.
         """
-        reason = self._policy.blocked_reason(url)
+        reason = self._policy.refuse(EgressRequest(url=url, kind='navigation'))
         if reason is not None:
             # Refused before `_in_operation`, so a disallowed URL never launches Chromium.
             # Not redacted, unlike the URLs below: this one is the argument the model

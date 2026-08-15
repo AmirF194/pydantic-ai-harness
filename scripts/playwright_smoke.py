@@ -58,7 +58,7 @@ from pydantic_ai.messages import (
 )
 from pydantic_ai.models.function import AgentInfo, FunctionModel
 
-from pydantic_ai_harness.playwright import PlaywrightBrowser
+from pydantic_ai_harness.playwright import EgressPolicy, PlaywrightBrowser
 
 _COOKIE = 'smoke_session=abc123'
 _SECRET = 'private-address-smoke-secret'
@@ -217,6 +217,50 @@ async def _check_blocked_redirect_message() -> None:
         assert 'example.org/invite' in clicked, clicked
         assert 'chrome-error' not in clicked, clicked
         print('blocked-redirect message names the refused URL ok')
+
+
+_NO_CORS_FETCH = "fetch('https://example.com/', {mode: 'no-cors'}).then(() => 'sent').catch(e => 'failed: ' + e)"
+
+
+async def _check_page_request_egress() -> None:
+    """A page's own fetch answers to the allowlist; its images do not.
+
+    The mocked suite drives the guard with synthetic requests, so only a real
+    Chromium proves the resource types it reports line up with the policy's kinds
+    -- and that a page whose assets come from elsewhere still renders.
+    """
+    page = b'<html><body><h1>Local page</h1><img src="https://example.com/favicon.ico"></body></html>'
+    page_server, page_port = await _serve_html(page)
+    async with page_server:
+        browser = PlaywrightBrowser[object](
+            policy=EgressPolicy(allowed_domains=['127.0.0.1'], block_private_addresses=False)
+        )
+        _, fetched, refusals = await _run_tools(
+            browser,
+            [
+                ('navigate', {'url': f'http://127.0.0.1:{page_port}/'}),
+                ('execute_js', {'script': _NO_CORS_FETCH}),
+                ('network_requests', {'errors_only': True}),
+            ],
+        )
+        # A cross-origin fetch is opaque either way, so the verdict is whether it left at all.
+        assert 'sent' not in fetched, fetched
+        assert 'request_blocked' in refusals, refusals
+        print('page fetch to a non-allowlisted host refused ok')
+
+        # The control: the same host is reachable once the allowlist names it.
+        allowed = PlaywrightBrowser[object](
+            policy=EgressPolicy(allowed_domains=['127.0.0.1', 'example.com'], block_private_addresses=False)
+        )
+        _, reachable = await _run_tools(
+            allowed,
+            [
+                ('navigate', {'url': f'http://127.0.0.1:{page_port}/'}),
+                ('execute_js', {'script': _NO_CORS_FETCH}),
+            ],
+        )
+        assert 'sent' in reachable, f'control failed, the allowlisted fetch did not complete: {reachable}'
+        print('page fetch to an allowlisted host still completes ok')
 
 
 async def _capture_storage_state() -> StorageState:
@@ -535,6 +579,7 @@ async def _main() -> None:
     await _check_allowlist_bounce()
     await _check_private_address_block()
     await _check_blocked_redirect_message()
+    await _check_page_request_egress()
     await _check_storage_state_round_trip()
     await _check_embedded_frame()
     await _check_browser_event_log()

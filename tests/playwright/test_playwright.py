@@ -13,7 +13,7 @@ import inspect
 import sys
 from collections.abc import AsyncGenerator, Awaitable, Callable, Sequence
 from contextlib import asynccontextmanager
-from typing import Protocol
+from typing import Protocol, get_args
 
 import pytest
 from opentelemetry.sdk.trace import TracerProvider
@@ -37,14 +37,18 @@ from pydantic_ai.usage import RunUsage
 import pydantic_ai_harness.playwright._toolset as toolset_module
 from pydantic_ai_harness.playwright import (
     DEFAULT_ACTION_TIMEOUT_MS,
+    DEFAULT_ALLOWLIST_REACH,
     DEFAULT_MAX_CONTENT_TOKENS,
     DEFAULT_NAVIGATION_TIMEOUT_MS,
     BrowserEvent,
     BrowserUnavailableError,
     BrowserUnavailableWarning,
+    EgressPolicy,
+    EgressRequest,
     PlaywrightBrowser,
     PlaywrightBrowserSession,
     PlaywrightBrowserToolset,
+    RequestKind,
 )
 
 pytestmark = pytest.mark.anyio
@@ -209,11 +213,15 @@ class _FakeRequest:
         navigation: bool,
         frame: _FakeFrame | None = None,
         frame_error: PlaywrightError | None = None,
+        resource_type: str | None = None,
+        method: str = 'GET',
     ) -> None:
         self.url = url
         self._navigation = navigation
         self._frame = frame
         self._frame_error = frame_error
+        self.resource_type = resource_type if resource_type is not None else ('document' if navigation else 'image')
+        self.method = method
 
     def is_navigation_request(self) -> bool:
         return self._navigation
@@ -710,6 +718,12 @@ class _ScriptedSession(PlaywrightBrowserSession):
         await self._on_launch(self)
 
 
+def _allows(url: str, allowed_domains: list[str] | None, **policy_options: object) -> bool:
+    """Whether the egress policy admits `url` as a top-level navigation."""
+    policy = toolset_module.EgressPolicy(allowed_domains=allowed_domains, **policy_options)  # pyright: ignore[reportArgumentType]
+    return policy.refuse(toolset_module.EgressRequest(url=url, kind='navigation')) is None
+
+
 def _toolset(
     page: _FakePage,
     *,
@@ -726,7 +740,7 @@ def _toolset(
         session
         if session is not None
         else PlaywrightBrowserSession(
-            policy=toolset_module.NavigationPolicy(
+            policy=toolset_module.EgressPolicy(
                 allowed_domains=allowed_domains, block_private_addresses=block_private_addresses
             )
         )
@@ -779,40 +793,45 @@ def _install_fake_driver(
 
 class TestPlaywrightBrowserTools:
     def test_check_allowed_domain_rejects_malformed_url(self) -> None:
-        assert toolset_module.check_allowed_domain('https://[::1', None) is False
-        assert toolset_module.check_allowed_domain('https://[::1', ['::1']) is False
+        assert _allows('https://[::1', None) is False
+        assert _allows('https://[::1', ['::1']) is False
 
-    @pytest.mark.parametrize('url', ['mailto:a@b.com', 'about:blank'])
-    def test_check_allowed_domain_rejects_hostless_url_with_open_egress(self, url: str) -> None:
-        assert toolset_module.check_allowed_domain(url, None) is False
+    def test_hostless_navigation_is_rejected_under_open_egress(self) -> None:
+        assert _allows('mailto:a@b.com', None) is False
+
+    def test_about_blank_stays_navigable(self) -> None:
+        # Where a context starts and where a refused navigation is bounced to, so
+        # denying it would refuse every tool call made before the first navigate.
+        assert _allows('about:blank', None) is True
+        assert _allows('about:blank', ['example.com']) is True
 
     def test_check_allowed_domain_rejects_trailing_dot_host_for_blank_entries(self) -> None:
         url = 'https://169.254.169.254./'
-        assert toolset_module.check_allowed_domain(url, ['']) is False
-        assert toolset_module.check_allowed_domain(url, [' \t ']) is False
+        assert _allows(url, ['']) is False
+        assert _allows(url, [' \t ']) is False
 
     def test_check_allowed_domain_rejects_userinfo_host_spoof(self) -> None:
         # CVE-2025-47241 class: the real host is `evil.com`; `allowed.com` is only
         # the userinfo, so `.hostname` resolves it correctly and the match fails.
-        assert toolset_module.check_allowed_domain('https://allowed.com:pass@evil.com/', ['allowed.com']) is False
+        assert _allows('https://allowed.com:pass@evil.com/', ['allowed.com']) is False
 
     def test_check_allowed_domain_rejects_backslash_before_url_parsing(self) -> None:
-        assert toolset_module.check_allowed_domain(r'https://evil.com\@example.com/', ['example.com']) is False
+        assert _allows(r'https://evil.com\@example.com/', ['example.com']) is False
 
     @pytest.mark.parametrize('host', ['evil-example.com', 'example.com.attacker.com'])
     def test_check_allowed_domain_rejects_sibling_domain_tricks(self, host: str) -> None:
-        assert toolset_module.check_allowed_domain(f'https://{host}/', ['example.com']) is False
+        assert _allows(f'https://{host}/', ['example.com']) is False
 
     def test_check_allowed_domain_matches_idn_against_punycode_allowlist(self) -> None:
         # A Unicode host and its `xn--` spelling get the same verdict against an
         # ASCII allowlist entry, in both directions.
-        assert toolset_module.check_allowed_domain('https://пример.рф/path', ['xn--e1afmkfd.xn--p1ai']) is True
-        assert toolset_module.check_allowed_domain('https://xn--e1afmkfd.xn--p1ai/path', ['пример.рф']) is True
+        assert _allows('https://пример.рф/path', ['xn--e1afmkfd.xn--p1ai']) is True
+        assert _allows('https://xn--e1afmkfd.xn--p1ai/path', ['пример.рф']) is True
 
     def test_check_allowed_domain_falls_back_when_entry_not_idna_encodable(self) -> None:
         # An over-long label cannot be IDNA-encoded; the entry falls back to its
         # lowercased form rather than crashing, and simply does not match.
-        assert toolset_module.check_allowed_domain('https://example.com/', ['a' * 64]) is False
+        assert _allows('https://example.com/', ['a' * 64]) is False
 
     async def test_navigate_returns_url_title_and_text(self) -> None:
         toolset = _toolset(_FakePage(title='Docs', body='Page text here'))
@@ -865,15 +884,15 @@ class TestPlaywrightBrowserTools:
         # The stdlib 'idna' codec maps the deviation characters the IDNA-2003 way
         # ('faß.de' -> 'fass.de'), where Chromium connects to 'xn--fa-hia.de'. An
         # allowlist that disagrees with the browser blocks the host it means to allow.
-        assert toolset_module.check_allowed_domain('https://faß.de/', ['faß.de']) is True
-        assert toolset_module.check_allowed_domain('https://xn--fa-hia.de/', ['faß.de']) is True
-        assert toolset_module.check_allowed_domain('https://faß.de/', ['fass.de']) is False
+        assert _allows('https://faß.de/', ['faß.de']) is True
+        assert _allows('https://xn--fa-hia.de/', ['faß.de']) is True
+        assert _allows('https://faß.de/', ['fass.de']) is False
 
     def test_undecodable_host_falls_back_to_the_original(self) -> None:
         # An over-long label cannot be encoded; the comparison still has to return a
         # verdict rather than raise, and an unencodable host matches nothing.
-        assert toolset_module.check_allowed_domain(f'https://{"a" * 64}.example.com/', ['example.com']) is True
-        assert toolset_module.check_allowed_domain('https://example.com/', [f'{"a" * 64}.com']) is False
+        assert _allows(f'https://{"a" * 64}.example.com/', ['example.com']) is True
+        assert _allows('https://example.com/', [f'{"a" * 64}.com']) is False
 
     async def test_navigate_allows_trailing_dot_spelling_of_an_allowlisted_host(self) -> None:
         # The trailing dot names the DNS root, so the absolute spelling is the same host.
@@ -1004,7 +1023,7 @@ class TestPlaywrightBrowserTools:
 
     async def test_a_blocked_redirect_names_the_refused_url_not_the_error_page(self) -> None:
         session = PlaywrightBrowserSession(
-            policy=toolset_module.NavigationPolicy(allowed_domains=['example.com'], block_private_addresses=False)
+            policy=toolset_module.EgressPolicy(allowed_domains=['example.com'], block_private_addresses=False)
         )
 
         class _RefusedRedirectPage(_FakePage):
@@ -1037,7 +1056,7 @@ class TestPlaywrightBrowserTools:
 
     async def test_an_earlier_refusal_is_not_reported_as_this_failures_cause(self) -> None:
         page = _FakePage(url='chrome-error://chromewebdata/')
-        session = PlaywrightBrowserSession(policy=toolset_module.NavigationPolicy(allowed_domains=['example.com']))
+        session = PlaywrightBrowserSession(policy=toolset_module.EgressPolicy(allowed_domains=['example.com']))
         session.record(
             toolset_module.BrowserEvent(
                 kind='request_blocked', level='warning', message='domain not in allowed_domains', url='https://old/'
@@ -1324,15 +1343,18 @@ class TestPrivateAddressBlocking:
     def test_is_blocked_address_allows_public_hosts(self, host: str) -> None:
         assert toolset_module.is_blocked_address(host) is False
 
-    def test_blocked_navigation_reason_names_the_denying_policy(self) -> None:
-        reason = toolset_module.blocked_navigation_reason
+    def test_refuse_names_the_denying_rule(self) -> None:
+        def reason(url: str, allowed: list[str] | None, block: bool) -> str | None:
+            policy = toolset_module.EgressPolicy(allowed_domains=allowed, block_private_addresses=block)
+            return policy.refuse(toolset_module.EgressRequest(url=url, kind='navigation'))
+
         assert reason('https://example.com/', None, True) is None
         assert reason('http://127.0.0.1/', None, True) == 'blocked private or link-local address'
         assert reason('http://127.0.0.1/', None, False) is None
-        # An allowlist miss wins the message even for a private address...
-        assert reason('http://127.0.0.1/', ['example.com'], True) == 'domain not in allowed_domains'
-        # ...but an allowlisted private address is still blocked (deny over allow).
+        # Deny beats allow whichever way the two rules point.
+        assert reason('http://127.0.0.1/', ['example.com'], True) == 'blocked private or link-local address'
         assert reason('http://127.0.0.1/', ['127.0.0.1'], True) == 'blocked private or link-local address'
+        assert reason('https://other.com/', ['example.com'], True) == 'domain not in allowed_domains'
         # about:blank is the context's own starting state, not a destination to deny.
         assert reason('about:blank', None, True) is None
         assert reason('file:///etc/passwd', None, True) == 'URL with no host'
@@ -2402,6 +2424,9 @@ def test_public_exports() -> None:
     assert PlaywrightBrowserSession is not None
     assert issubclass(BrowserUnavailableError, RuntimeError)
     assert issubclass(BrowserUnavailableWarning, UserWarning)
+    assert EgressPolicy().refuse(EgressRequest(url='https://example.com/', kind='navigation')) is None
+    assert DEFAULT_ALLOWLIST_REACH == frozenset({'navigation', 'data'})
+    assert set(get_args(RequestKind)) == {'navigation', 'subframe', 'data', 'subresource'}
 
 
 # --- Embedded frames --------------------------------------------------------
@@ -2592,7 +2617,7 @@ class TestBrowserEvents:
     async def test_guard_abort_is_recorded_once_with_its_reason(self, monkeypatch: pytest.MonkeyPatch) -> None:
         page = _FakePage()
         _install_fake_driver(monkeypatch, page)
-        session = PlaywrightBrowserSession(policy=toolset_module.NavigationPolicy(allowed_domains=['example.com']))
+        session = PlaywrightBrowserSession(policy=toolset_module.EgressPolicy(allowed_domains=['example.com']))
         async with session:
             await session.ensure_page()
             request_page = _FakeRequestPage()
@@ -2725,7 +2750,7 @@ class TestSessionAndToolsetAgree:
         # A session built to allow a local app must not be second-guessed by a
         # toolset holding a policy of its own.
         page = _FakePage(url='http://127.0.0.1:8000/admin')
-        session = PlaywrightBrowserSession(policy=toolset_module.NavigationPolicy(block_private_addresses=False))
+        session = PlaywrightBrowserSession(policy=toolset_module.EgressPolicy(block_private_addresses=False))
         session.page = page
         toolset = PlaywrightBrowserToolset[None](session=session)
         result = await toolset.navigate('http://127.0.0.1:8000/admin')
@@ -2737,7 +2762,7 @@ class TestSessionAndToolsetAgree:
         # request leaves, the tool check after the page settled -- so a toolset
         # with its own stricter policy would let the guard send what the tools
         # would have refused. There is no parameter to create that split.
-        session = PlaywrightBrowserSession(policy=toolset_module.NavigationPolicy(allowed_domains=['example.com']))
+        session = PlaywrightBrowserSession(policy=toolset_module.EgressPolicy(allowed_domains=['example.com']))
         session.page = _FakePage()
         toolset = PlaywrightBrowserToolset[None](session=session)
         assert 'policy' not in inspect.signature(PlaywrightBrowserToolset.__init__).parameters
@@ -2847,13 +2872,13 @@ class TestWebSocketEgress:
         assert websocket.connected is True
         assert websocket.closed is False
 
-    async def test_the_allowlist_does_not_reach_sockets(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        # The allowlist governs top-level navigation; cutting a permitted page off
-        # from its own realtime API would be a different policy than the one
-        # documented.
+    async def test_the_allowlist_reaches_sockets(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # A socket moves data like `fetch` does, so it answers to the same list.
         page = await self._context(monkeypatch, PlaywrightBrowser[object](allowed_domains=['example.com']))
-        websocket = await page.context.dispatch_websocket('wss://realtime.other.com/live')
-        assert websocket.connected is True
+        refused = await page.context.dispatch_websocket('wss://realtime.other.com/live')
+        assert refused.connected is False
+        permitted = await page.context.dispatch_websocket('wss://realtime.example.com/live')
+        assert permitted.connected is True
 
     async def test_no_socket_guard_when_the_block_is_off(self, monkeypatch: pytest.MonkeyPatch) -> None:
         page = await self._context(monkeypatch, PlaywrightBrowser[object](block_private_addresses=False))
@@ -2932,6 +2957,150 @@ class TestOperationDeadline:
 
         result = await _toolset(_SlowClickPage()).click('button#go', timeout_ms=1000)
         assert result.startswith('Error: click timed out after 1000ms.')
+
+
+class TestEgressPolicy:
+    """The policy's own decisions, and the guard asking it about real request kinds."""
+
+    def _refuse(self, policy: toolset_module.EgressPolicy, url: str, kind: str, resource_type: str = '') -> str | None:
+        request = toolset_module.EgressRequest(
+            url=url,
+            kind=kind,  # pyright: ignore[reportArgumentType]
+            resource_type=resource_type or ('document' if kind == 'navigation' else 'fetch'),
+        )
+        return policy.refuse(request)
+
+    def test_data_requests_answer_to_the_allowlist_and_assets_do_not(self) -> None:
+        policy = toolset_module.EgressPolicy(allowed_domains=['example.com'])
+        assert self._refuse(policy, 'https://evil.test/?stolen=1', 'data') == 'domain not in allowed_domains'
+        assert self._refuse(policy, 'https://cdn.other.net/app.js', 'subresource', 'script') is None
+        assert self._refuse(policy, 'https://idp.other.net/login', 'subframe', 'document') is None
+
+    def test_a_subdomain_of_an_allowed_domain_is_reachable(self) -> None:
+        policy = toolset_module.EgressPolicy(allowed_domains=['example.com'])
+        assert self._refuse(policy, 'https://api.example.com/v1/items', 'data') is None
+        assert self._refuse(policy, 'https://example.com/', 'navigation') is None
+
+    def test_subdomains_can_be_turned_off(self) -> None:
+        policy = toolset_module.EgressPolicy(allowed_domains=['example.com'], include_subdomains=False)
+        assert self._refuse(policy, 'https://api.example.com/v1', 'data') == 'domain not in allowed_domains'
+        assert self._refuse(policy, 'https://example.com/', 'navigation') is None
+
+    def test_the_reach_can_cover_every_kind(self) -> None:
+        policy = toolset_module.EgressPolicy(
+            allowed_domains=['example.com'], allowlist_reach=frozenset(get_args(toolset_module.RequestKind))
+        )
+        assert self._refuse(policy, 'https://cdn.other.net/app.js', 'subresource', 'script') is not None
+        assert self._refuse(policy, 'https://idp.other.net/login', 'subframe', 'document') is not None
+
+    def test_blocked_domains_win_over_the_allowlist(self) -> None:
+        policy = toolset_module.EgressPolicy(allowed_domains=['example.com'], blocked_domains=['ads.example.com'])
+        assert self._refuse(policy, 'https://ads.example.com/beacon', 'data') == 'domain in blocked_domains'
+        # And they reach the kinds the allowlist deliberately does not.
+        assert self._refuse(policy, 'https://ads.example.com/px.gif', 'subresource', 'image') is not None
+
+    def test_blocked_domains_apply_without_an_allowlist(self) -> None:
+        policy = toolset_module.EgressPolicy(blocked_domains=['tracker.test'])
+        assert self._refuse(policy, 'https://tracker.test/px', 'data') == 'domain in blocked_domains'
+        assert self._refuse(policy, 'https://anything.test/', 'navigation') is None
+        assert policy.enforced() is True
+
+    def test_inline_assets_load_while_hostless_navigation_does_not(self) -> None:
+        policy = toolset_module.EgressPolicy(allowed_domains=['example.com'])
+        assert self._refuse(policy, 'data:image/png;base64,AAAA', 'subresource', 'image') is None
+        assert self._refuse(policy, 'data:text/html,<h1>x', 'navigation') == 'URL with no host'
+
+    def test_a_private_address_is_refused_for_every_kind(self) -> None:
+        policy = toolset_module.EgressPolicy(allowed_domains=['example.com'])
+        for kind, resource_type in (('data', 'fetch'), ('subresource', 'image'), ('subframe', 'document')):
+            reason = self._refuse(policy, 'http://169.254.169.254/latest/meta-data/', kind, resource_type)
+            assert reason == 'blocked private or link-local address'
+
+    def test_a_wildcard_entry_is_refused_at_construction(self) -> None:
+        # It would match nothing and read as a configured allowlist.
+        with pytest.raises(UserError, match='wildcard'):
+            toolset_module.EgressPolicy(allowed_domains=['*.example.com'])
+        with pytest.raises(UserError, match='wildcard'):
+            toolset_module.EgressPolicy(blocked_domains=['*.ads.example.com'])
+
+    def test_a_subclass_decides_what_the_fields_cannot(self) -> None:
+        class FontsFromAnywhere(toolset_module.EgressPolicy):
+            def refuse(self, request: toolset_module.EgressRequest) -> str | None:
+                if request.resource_type == 'font':
+                    return None
+                return super().refuse(request)
+
+        policy = FontsFromAnywhere(
+            allowed_domains=['example.com'], allowlist_reach=frozenset(get_args(toolset_module.RequestKind))
+        )
+        assert self._refuse(policy, 'https://fonts.other.net/x.woff2', 'subresource', 'font') is None
+        assert self._refuse(policy, 'https://fonts.other.net/x.css', 'subresource', 'stylesheet') is not None
+
+    def test_describe_drops_the_subdomain_phrase_when_they_are_off(self) -> None:
+        policy = toolset_module.EgressPolicy(allowed_domains=['example.com'], include_subdomains=False)
+        assert 'subdomains' not in policy.describe()
+
+    def test_describe_names_what_the_model_may_reach(self) -> None:
+        policy = toolset_module.EgressPolicy(allowed_domains=['example.com'], blocked_domains=['ads.example.com'])
+        described = policy.describe()
+        assert 'example.com (and their subdomains)' in described
+        assert 'except ads.example.com' in described
+        assert 'private/internal addresses blocked' in described
+
+    async def test_the_guard_refuses_a_page_fetch_to_another_host(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        session = PlaywrightBrowserSession(policy=toolset_module.EgressPolicy(allowed_domains=['example.com']))
+        page = _FakePage()
+        _install_fake_driver(monkeypatch, page)
+        async with session:
+            await session.ensure_page()
+            assert page.context is not None
+            frame = _FakeFrame(_FakeRequestPage())
+            route = await page.context.dispatch(
+                _FakeRequest('https://evil.test/?stolen=1', navigation=False, frame=frame, resource_type='fetch')
+            )
+            assert route.aborted is True
+            assert any(event.kind == 'request_blocked' for event in session.events)
+
+    async def test_the_guard_lets_an_image_from_anywhere_through(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        session = PlaywrightBrowserSession(policy=toolset_module.EgressPolicy(allowed_domains=['example.com']))
+        page = _FakePage()
+        _install_fake_driver(monkeypatch, page)
+        async with session:
+            await session.ensure_page()
+            assert page.context is not None
+            frame = _FakeFrame(_FakeRequestPage())
+            route = await page.context.dispatch(
+                _FakeRequest('https://cdn.other.net/hero.png', navigation=False, frame=frame, resource_type='image')
+            )
+            assert route.aborted is False
+            assert route.continued is True
+
+    async def test_a_beacon_counts_as_data(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # `navigator.sendBeacon` is a send channel, not an asset the page renders.
+        session = PlaywrightBrowserSession(policy=toolset_module.EgressPolicy(allowed_domains=['example.com']))
+        page = _FakePage()
+        _install_fake_driver(monkeypatch, page)
+        async with session:
+            await session.ensure_page()
+            assert page.context is not None
+            frame = _FakeFrame(_FakeRequestPage())
+            route = await page.context.dispatch(
+                _FakeRequest('https://evil.test/collect', navigation=False, frame=frame, resource_type='ping')
+            )
+            assert route.aborted is True
+
+    def test_the_capability_refuses_a_policy_and_a_shorthand_together(self) -> None:
+        with pytest.raises(UserError, match='not both'):
+            PlaywrightBrowser[object](
+                allowed_domains=['example.com'], policy=toolset_module.EgressPolicy(allowed_domains=['other.com'])
+            )
+        with pytest.raises(UserError, match='not both'):
+            PlaywrightBrowser[object](block_private_addresses=False, policy=toolset_module.EgressPolicy())
+
+    def test_the_capability_uses_the_policy_it_is_given(self) -> None:
+        policy = toolset_module.EgressPolicy(allowed_domains=['example.com'], include_subdomains=False)
+        browser = PlaywrightBrowser[object](policy=policy)
+        assert browser._session.policy is policy  # pyright: ignore[reportPrivateUsage]
 
 
 class TestSpanOutcome:
@@ -3084,7 +3253,7 @@ class TestTabs:
     async def test_selecting_a_tab_outside_the_allowlist_bounces_it(self) -> None:
         page = _FakePage()
         popup = _FakePage(url='https://evil.example/')
-        session = PlaywrightBrowserSession(policy=toolset_module.NavigationPolicy(allowed_domains=['example.com']))
+        session = PlaywrightBrowserSession(policy=toolset_module.EgressPolicy(allowed_domains=['example.com']))
         session.page = page
         session.pages = [page, popup]
         result = await _toolset(page, session=session).tabs('select', 1)

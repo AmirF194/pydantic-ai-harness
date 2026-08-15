@@ -142,7 +142,8 @@ not raised to abort the agent run.
 | Option | Default | Purpose |
 |---|---|---|
 | `headless` | `True` | Run Chromium without a visible window (suits servers and CI). |
-| `allowed_domains` | `None` | Navigation allowlist; `None` allows all domains (see [Egress](#egress-and-ssrf)). |
+| `allowed_domains` | `None` | Egress allowlist for navigation and data requests; `None` allows every public host (see [Egress](#egress-and-ssrf)). |
+| `policy` | `None` | Full `EgressPolicy`, for rules the two shorthands cannot express. Mutually exclusive with them. |
 | `block_private_addresses` | `True` | Refuse navigation to private, loopback, link-local, and other reserved IP literals (see [Egress](#egress-and-ssrf)). |
 | `screenshot_on_navigate` | `False` | Attach a screenshot to every `navigate` result. |
 | `max_content_tokens` | `4000` | Approximate token budget for every textual tool result. |
@@ -382,33 +383,82 @@ should reach a local app or an internal dashboard.
 
 With `allowed_domains=None` (the default) the agent can reach any public URL.
 When the agent may act on untrusted input, set `allowed_domains` to an explicit
-allowlist. Each entry matches its exact host and any subdomain, compared in the
-ASCII form Chromium itself uses, so an internationalized host and its `xn--`
-spelling get the same verdict. The two
-policies are independent: an allowlisted private address is still refused until
-you opt out of `block_private_addresses`. Both are enforced at two layers: a
-network route guard aborts disallowed requests before they leave (covering
-clicks, `execute_js`, and history moves, not just `navigate`), and each tool
-re-checks the resulting URL and bounces to `about:blank` so disallowed content
-never reaches the model. Service workers are blocked in the browser context so their
-traffic cannot slip past the route guard.
+allowlist. Each entry matches its exact host and any subdomain -- `example.com`
+reaches `api.example.com` -- compared in the ASCII form Chromium itself uses, so
+an internationalized host and its `xn--` spelling get the same verdict. An entry
+written as a wildcard (`*.example.com`) raises at construction: it would match no
+host at all, while reading like a configured allowlist.
 
-The two policies differ in how far they reach. The allowlist governs top-level
-navigation only, so a page's own subresources and third-party frames (identity
-providers, payment steps) still load. The private-address block applies to
-**every** frame and **every** resource type, including a `fetch` or XHR issued
-by `execute_js`, and WebSocket connections, which a network route never sees, get
-their own guard that refuses a socket to a private address and records why. Both channels end at the model: `snapshot()` reads the ARIA
-tree of cross-origin child frames, and a page can read back a subresource it
-fetched itself, so either would otherwise hand over the response body the block
-exists to withhold.
+How far the allowlist reaches depends on what the request is for:
+
+| Request | Bounded by `allowed_domains` |
+|---|---|
+| Top-level navigation | yes |
+| `fetch`, XHR, EventSource, WebSocket, `sendBeacon` | yes |
+| Images, stylesheets, scripts, fonts, media | no |
+| Sub-frame documents | no |
+
+Data requests are included because a script on a permitted page can otherwise
+read from, or post to, anywhere; passive subresources and sub-frame documents are
+not, because a page whose assets are aborted renders as a broken page and a
+permitted site's identity-provider and payment steps live in frames. The
+private-address block ignores that split entirely: it applies to every frame and
+every resource type, and WebSocket connections, which a network route never sees,
+get their own guard. The policies are independent and deny wins -- an allowlisted
+private address is still refused until you opt out of `block_private_addresses`.
+
+Enforcement is at two layers: a network route guard aborts a refused request
+before it leaves (covering clicks, `execute_js`, and history moves, not just
+`navigate`), and each tool re-checks the resulting URL and bounces to
+`about:blank` so disallowed content never reaches the model. Service workers are
+blocked in the browser context so their traffic cannot slip past the route guard.
+
+### Rules the two fields cannot express
+
+`EgressPolicy` is the whole policy, and `PlaywrightBrowser(policy=...)` takes one
+instead of the `allowed_domains` / `block_private_addresses` shorthands. Its
+fields cover a denylist (`blocked_domains`, which wins over everything and reaches
+every request kind), apex-only matching (`include_subdomains=False`), and which
+kinds the allowlist bounds (`allowlist_reach`).
+
+```python {test="skip"}
+from typing import get_args
+
+from pydantic_ai_harness.playwright import EgressPolicy, PlaywrightBrowser, RequestKind
+
+# Nothing leaves for a host outside the list, whatever the request is for.
+locked_down = EgressPolicy(
+    allowed_domains=['example.com'],
+    allowlist_reach=frozenset(get_args(RequestKind)),
+)
+
+browser = PlaywrightBrowser(policy=locked_down)
+```
+
+For a decision the fields do not describe, subclass and override `refuse`. It is
+given the URL, the kind, Playwright's own `resource_type`, the method, and whether
+the request is the main frame's own document:
+
+```python {test="skip"}
+from pydantic_ai_harness.playwright import EgressPolicy, EgressRequest
+
+
+class FontsFromAnywhere(EgressPolicy):
+    def refuse(self, request: EgressRequest) -> str | None:
+        if request.resource_type == 'font':
+            return None
+        return super().refuse(request)
+```
+
+Returning `None` allows the request; returning a string refuses it and records
+that string as the reason, which the model can read through `network_requests`.
 
 Neither policy is a general security boundary. Microsoft's own playwright-mcp
-disclaims its origin filter the same way. The allowlist governs navigation, not
-requests initiated by in-page JavaScript (`fetch`/XHR via `execute_js`); both
-policies match IP literals and `localhost` names, not hostnames that resolve to
-private addresses (DNS rebinding). Constraining in-page requests against the allowlist and
-resolution-based blocking are tracked in
+disclaims its origin filter the same way. A page can still signal outward through
+the request kinds the allowlist leaves alone -- an image or script URL carries
+whatever the page puts in it -- and both policies match IP literals and
+`localhost` names, not hostnames that resolve to private addresses (DNS
+rebinding). Those, and a proxy-based enforcement mode, are tracked in
 [#415](https://github.com/pydantic/pydantic-ai-harness/issues/415).
 
 For untrusted-input scenarios, run the browser in a container or VM with an

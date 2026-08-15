@@ -20,7 +20,7 @@ from pydantic_ai_harness.playwright._toolset import (
     DEFAULT_ACTION_TIMEOUT_MS,
     DEFAULT_MAX_CONTENT_TOKENS,
     DEFAULT_NAVIGATION_TIMEOUT_MS,
-    NavigationPolicy,
+    EgressPolicy,
     PlaywrightBrowserSession,
     PlaywrightBrowserToolset,
 )
@@ -140,13 +140,29 @@ class PlaywrightBrowser(AbstractCapability[AgentDepsT]):
     """Run Chromium without a visible window. `True` suits servers and CI."""
 
     allowed_domains: list[str] | None = None
-    """Navigation allowlist. `None` (default) allows all domains -- see the egress note above.
+    """Egress allowlist. `None` (default) allows every public host -- see the egress note above.
 
-    Each entry matches its exact host and any subdomain. Enforced at two layers:
-    a network route guard aborts disallowed top-level navigations (covering
-    clicks, `execute_js`, and history moves, not just `navigate`), and each
-    tool re-checks the resulting URL and bounces to `about:blank` so disallowed
-    content never reaches the model.
+    Each entry matches its exact host and any subdomain, so `example.com` reaches
+    `api.example.com`. It bounds top-level navigation and the requests a page's
+    scripts use to move data (`fetch`, XHR, EventSource, WebSocket, `sendBeacon`);
+    passive subresources and sub-frame documents are left alone, so a permitted
+    page keeps its CDN assets and its identity-provider frames. Enforced at two
+    layers: a network route guard aborts a refused request before it leaves, and
+    each tool re-checks the resulting URL and bounces to `about:blank` so
+    disallowed content never reaches the model.
+
+    For anything this does not express -- a denylist, apex-only matching, locking
+    down every request type, a rule of your own -- pass an `EgressPolicy` as
+    `policy` instead.
+    """
+
+    policy: EgressPolicy | None = None
+    """Full egress policy, for rules the two shorthands above cannot express.
+
+    Mutually exclusive with `allowed_domains` and `block_private_addresses`, which
+    build the default policy when this is unset. Subclass `EgressPolicy` and
+    override `refuse` for a decision the fields do not cover. Absent from
+    `from_spec`, since a policy can carry arbitrary code.
     """
 
     block_private_addresses: bool = True
@@ -230,10 +246,15 @@ class PlaywrightBrowser(AbstractCapability[AgentDepsT]):
 
     _session: PlaywrightBrowserSession = field(init=False, repr=False)
     _toolset: PlaywrightBrowserToolset[AgentDepsT] = field(init=False, repr=False)
-    _policy: NavigationPolicy = field(init=False, repr=False)
+    _policy: EgressPolicy = field(init=False, repr=False)
 
     def __post_init__(self) -> None:
-        self._policy = NavigationPolicy(
+        if self.policy is not None and (self.allowed_domains is not None or not self.block_private_addresses):
+            raise UserError(
+                'Pass either policy or the allowed_domains/block_private_addresses shorthands, not both: '
+                'set those fields on the policy instead, so one object decides.'
+            )
+        self._policy = self.policy or EgressPolicy(
             allowed_domains=self.allowed_domains, block_private_addresses=self.block_private_addresses
         )
         self._session = PlaywrightBrowserSession(
