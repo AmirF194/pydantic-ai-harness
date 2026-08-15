@@ -779,6 +779,16 @@ class TestWriteFileOSErrors:
         with pytest.raises(OSError, match='Invalid argument'):
             await toolset.write_file('new.txt', 'content')
 
+    async def test_write_illegal_byte_sequence_is_recoverable(
+        self, toolset: FileSystemToolset[None], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        def raise_illegal_byte_sequence(*args: object, **kwargs: object) -> None:
+            raise OSError(errno.EILSEQ, 'Illegal byte sequence')
+
+        monkeypatch.setattr(Path, 'write_text', raise_illegal_byte_sequence)
+        with pytest.raises(ModelRetry, match='filesystem cannot represent'):
+            await toolset.write_file('bad-name', 'content')
+
 
 class TestCreateDirectory:
     async def test_create_basic(self, toolset: FileSystemToolset[None], fs_root: Path) -> None:
@@ -801,6 +811,16 @@ class TestCreateDirectory:
     async def test_create_name_too_long(self, toolset: FileSystemToolset[None]) -> None:
         with pytest.raises(ModelRetry, match='name is too long'):
             await toolset.create_directory('x' * 300)
+
+    async def test_create_illegal_byte_sequence_is_recoverable(
+        self, toolset: FileSystemToolset[None], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        def raise_illegal_byte_sequence(*args: object, **kwargs: object) -> None:
+            raise OSError(errno.EILSEQ, 'Illegal byte sequence')
+
+        monkeypatch.setattr(Path, 'mkdir', raise_illegal_byte_sequence)
+        with pytest.raises(ModelRetry, match='filesystem cannot represent'):
+            await toolset.create_directory('bad-name')
 
     async def test_create_non_recoverable_errno_propagates(
         self, toolset: FileSystemToolset[None], monkeypatch: pytest.MonkeyPatch

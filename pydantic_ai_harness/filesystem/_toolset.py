@@ -37,6 +37,7 @@ _RECOVERABLE_ERRORS = (PermissionError, FileNotFoundError, NotADirectoryError, I
 _RECOVERABLE_ERRNOS: dict[int | None, str] = {
     errno.ENAMETOOLONG: 'The path name is too long.',
     errno.ELOOP: 'The path resolves through a symlink loop.',
+    errno.EILSEQ: 'The path name contains a byte sequence the filesystem cannot represent.',
 }
 _WINDOWS_ERROR_INVALID_NAME = 123
 
