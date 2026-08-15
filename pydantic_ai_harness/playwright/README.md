@@ -321,21 +321,30 @@ as `[Scrubbed due to 'session']`, and a pricing page as
 selectively:
 
 ```python {test="skip"}
+import re
+
 import logfire
+
+# The words Logfire redacts on that are ordinary vocabulary on a public page.
+page_words = {'session', 'cookie', 'credit card', 'auth'}
 
 
 def keep_browser_results(match: logfire.ScrubMatch) -> str | None:
     # 'tool_response' is the same attribute under instrumentation version 2
-    if match.path[:2] in {('attributes', 'gen_ai.tool.call.result'), ('attributes', 'tool_response')}:
-        return match.value
-    return None
+    if match.path[:2] not in {('attributes', 'gen_ai.tool.call.result'), ('attributes', 'tool_response')}:
+        return None
+    matched = re.sub(r'[._\- ]+', ' ', match.pattern_match.group(0)).strip().lower()
+    return match.value if matched in page_words else None
 
 
 logfire.configure(scrubbing=logfire.ScrubbingOptions(callback=keep_browser_results))
 ```
 
 Returning `match.value` keeps the original text; returning `None` leaves the
-redaction in place.
+redaction in place. The callback is given the attribute, not the tool that
+produced it, so it cannot be limited to the browser's results -- narrowing on the
+word that triggered the redaction is what keeps `password`, `api_key` and `jwt`
+redacted whichever tool returned them.
 
 ## Limitations
 
