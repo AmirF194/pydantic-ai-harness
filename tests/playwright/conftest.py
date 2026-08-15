@@ -9,3 +9,26 @@ import importlib.util
 # than an `if` statement: branch coverage traces statement arcs, and no single
 # environment can take both arms of an install-dependent branch.
 collect_ignore = ['test_playwright.py'] if importlib.util.find_spec('playwright') is None else []
+
+
+if not collect_ignore:  # pragma: no branch
+    import pytest
+
+    from pydantic_ai_harness.playwright import _toolset as toolset_module
+
+    @pytest.fixture(autouse=True)
+    def no_real_dns(monkeypatch: pytest.MonkeyPatch) -> None:
+        """Keep the private-address block from resolving test hostnames for real.
+
+        `decide` resolves any host that is not already an address, so without this
+        every navigation in the suite would issue a live DNS query. The lookup is
+        stubbed rather than the caching wrapper around it, so the cache still runs
+        in every test and the tests that care about it can count lookups. The cache
+        is module-level, so it is emptied between tests.
+        """
+        toolset_module._resolution_cache.clear()
+
+        async def unresolved(host: str) -> tuple[str, ...]:
+            return ()
+
+        monkeypatch.setattr(toolset_module, '_getaddrinfo', unresolved)

@@ -105,6 +105,7 @@ import ipaddress
 import json
 import os
 import re
+import socket
 import sys
 import warnings
 from collections import deque
@@ -393,11 +394,12 @@ def is_blocked_address(host: str) -> bool:
     """Return whether `host` names an address that is not globally routable.
 
     Covers private (RFC 1918), loopback, link-local (including the cloud
-    metadata endpoint), carrier-grade NAT, reserved, and multicast ranges. Only
-    IP literals and the loopback hostnames `localhost` / `*.localhost` are
-    detected; a public hostname that resolves to a private address is not (DNS
-    resolution happens in Chromium after this check -- resolution-based blocking
-    is tracked in https://github.com/pydantic/pydantic-ai-harness/issues/415).
+    metadata endpoint), carrier-grade NAT, reserved, and multicast ranges. This
+    classifies a host string, so it sees IP literals and the loopback hostnames
+    `localhost` / `*.localhost`; a name pointing at a private address is caught by
+    `EgressPolicy.decide` resolving it first and passing the answers to `refuse`.
+    Neither is rebinding-proof, since Chromium resolves the name again before it
+    connects (https://github.com/pydantic/pydantic-ai-harness/issues/415).
     A trailing dot is stripped so the fully-qualified spelling gets the same
     verdict, and an IPv4-mapped IPv6 literal is classified by its embedded IPv4
     address. The named category flags are checked alongside `is_global` because
@@ -413,6 +415,53 @@ def is_blocked_address(host: str) -> bool:
     if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped is not None:
         ip = ip.ipv4_mapped
     return not ip.is_global or ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved or ip.is_multicast
+
+
+def _is_ip_literal(host: str) -> bool:
+    """Whether `host` is already an address, so no name resolution is needed."""
+    try:
+        ipaddress.ip_address(host.rstrip('.'))
+    except ValueError:
+        return False
+    return True
+
+
+_RESOLUTION_TTL_SECONDS = 30.0
+_RESOLUTION_CACHE_MAX = 256
+_resolution_cache: dict[str, tuple[float, tuple[str, ...]]] = {}
+
+
+async def _resolve_host(host: str) -> tuple[str, ...]:
+    """Return the addresses `host` resolves to, cached for `_RESOLUTION_TTL_SECONDS`.
+
+    A lookup that fails returns no addresses rather than a refusal: the request is
+    about to fail in the browser for the same reason, and reporting a blocked
+    private address for what is actually a DNS outage would send the model looking
+    for a policy problem that is not there.
+
+    The cache is a duplicate of one Chromium keeps anyway, so it is kept short and
+    small. It cannot make the block airtight: Chromium resolves the name a second
+    time, and a record that changes between the two lookups is the DNS-rebinding
+    case that only a proxy or pinned resolver closes.
+    """
+    now = monotonic()
+    cached = _resolution_cache.get(host)
+    if cached is not None and cached[0] > now:
+        return cached[1]
+    try:
+        addresses = await _getaddrinfo(host)
+    except OSError:
+        return ()
+    if len(_resolution_cache) >= _RESOLUTION_CACHE_MAX:
+        _resolution_cache.clear()
+    _resolution_cache[host] = (now + _RESOLUTION_TTL_SECONDS, addresses)
+    return addresses
+
+
+async def _getaddrinfo(host: str) -> tuple[str, ...]:
+    """Ask the system resolver what `host` points at, off the event loop thread."""
+    infos = await asyncio.get_running_loop().getaddrinfo(host, None, type=socket.SOCK_STREAM)
+    return tuple(sorted({str(info[4][0]) for info in infos}))
 
 
 def _scroll_script(move: str) -> str:
@@ -503,6 +552,20 @@ class EgressRequest:
     method: str = 'GET'
     top_level: bool = True
     """Whether this is the main frame's own document rather than something inside the page."""
+    resolved_addresses: tuple[str, ...] = ()
+    """What the host resolved to, when the caller resolved it. Empty when it did not."""
+
+
+DEFAULT_RESOLVED_KINDS: frozenset[RequestKind] = frozenset({'navigation', 'data', 'subframe'})
+"""Which kinds have their host resolved before the private-address block classifies it.
+
+A name is not an IP literal, so `is_blocked_address` cannot see that it points at a
+private address; resolving first is what closes that. The passive `subresource`
+kind is left out because it is the bulk of a page's requests and the weakest way
+back to the model: an image or a font that loads from an internal address returns
+its bytes to the renderer, not to a tool result. Documents do return: a navigation
+becomes the page text, and a sub-frame's text is appended to it.
+"""
 
 
 @dataclass(frozen=True)
@@ -531,6 +594,8 @@ class EgressPolicy:
     """Whether an entry also covers its subdomains, so `example.com` reaches `api.example.com`."""
     allowlist_reach: frozenset[RequestKind] = DEFAULT_ALLOWLIST_REACH
     """Which kinds `allowed_domains` bounds. `frozenset(get_args(RequestKind))` locks down everything."""
+    resolved_kinds: frozenset[RequestKind] = DEFAULT_RESOLVED_KINDS
+    """Which kinds have their host resolved so `block_private_addresses` can see where a name points."""
 
     def __post_init__(self) -> None:
         for field_name in ('allowed_domains', 'blocked_domains'):
@@ -555,6 +620,8 @@ class EgressPolicy:
         host = _url_host(request.url)
         if host is not None and self.block_private_addresses and is_blocked_address(host):
             return _PRIVATE_ADDRESS_REASON
+        if self.block_private_addresses and any(is_blocked_address(a) for a in request.resolved_addresses):
+            return _PRIVATE_ADDRESS_REASON
         if host is None:
             return None if request.kind in ('data', 'subresource') else 'URL with no host'
         if self._matches(host, self.blocked_domains):
@@ -577,6 +644,18 @@ class EgressPolicy:
             if domain and (host == domain or (self.include_subdomains and host.endswith('.' + domain))):
                 return True
         return False
+
+    def needs_resolution(self, request: EgressRequest) -> bool:
+        """Whether the caller must resolve this host before `refuse` can classify it.
+
+        Asked before `refuse` so that `refuse` stays synchronous: an override needs
+        no async machinery, and the lookup a name-based private address requires
+        happens outside it. A host that is already an address needs none.
+        """
+        if not self.block_private_addresses or request.kind not in self.resolved_kinds:
+            return False
+        host = _url_host(request.url)
+        return host is not None and not _is_ip_literal(host)
 
     def enforced(self) -> bool:
         """Whether anything is restricted, i.e. whether a route guard is worth installing."""
@@ -1157,6 +1236,20 @@ class PlaywrightBrowserSession:
         self.launch_error = f'{_CHROMIUM_MISSING_MESSAGE}\nAuto-install failed:\n{install_output[-300:]}'
         return None
 
+    async def decide(self, request: EgressRequest) -> str | None:
+        """Why the policy refuses `request`, or `None` to allow it, resolving the host first if needed.
+
+        Every enforcement point goes through here rather than calling `refuse`
+        directly, so a name that points at a private address is caught wherever it
+        is asked about: the route guard, the socket guard, the `navigate`
+        pre-check, and the post-action re-check.
+        """
+        if self.policy.needs_resolution(request):
+            host = _url_host(request.url)
+            if host is not None:
+                request = replace(request, resolved_addresses=await _resolve_host(host))
+        return self.policy.refuse(request)
+
     async def _route_guard(self, route: PlaywrightRoute, request: PlaywrightRequest) -> None:
         """Network-layer egress policy: abort what the policy refuses, pass the rest.
 
@@ -1172,7 +1265,7 @@ class PlaywrightBrowserSession:
         except PlaywrightError:
             top_level = True
         kind = _request_kind(request, top_level)
-        reason = self.policy.refuse(
+        reason = await self.decide(
             EgressRequest(
                 url=request.url,
                 kind=kind,
@@ -1198,7 +1291,7 @@ class PlaywrightBrowserSession:
         A socket that is permitted has to be connected explicitly: registering a
         handler at all takes Playwright out of its pass-through mode.
         """
-        reason = self.policy.refuse(
+        reason = await self.decide(
             EgressRequest(url=websocket.url, kind='data', resource_type='websocket', top_level=False)
         )
         if reason is not None:
@@ -1422,7 +1515,7 @@ class PlaywrightBrowserToolset(FunctionToolset[AgentDepsT]):
         # holding its own policy could refuse what the guard allows, or -- worse --
         # let the guard send a request the tools would have refused, since the
         # guard acts first and the tool check only bounces the page afterwards.
-        self._policy = session.policy
+        # Both layers therefore ask the session, which owns the policy.
         self._screenshot_on_navigate = screenshot_on_navigate
         self._max_content_tokens = max_content_tokens
         self._action_timeout_ms = action_timeout_ms
@@ -1620,7 +1713,7 @@ class PlaywrightBrowserToolset(FunctionToolset[AgentDepsT]):
             failure = self._session.failure_since_operation_start()
             cause = 'the navigation did not complete' if failure is None else f'{failure.message}: {failure.url}'
             return self._error(f'Error: {action} loaded no page ({cause}); the browser is back at about:blank.')
-        reason = self._policy.refuse(EgressRequest(url=page.url, kind='navigation'))
+        reason = await self._session.decide(EgressRequest(url=page.url, kind='navigation'))
         if reason is None:
             return None
         blocked = _without_credentials(page.url)
@@ -1725,7 +1818,7 @@ class PlaywrightBrowserToolset(FunctionToolset[AgentDepsT]):
             embedded frames. When `screenshot_on_navigate` is set, a screenshot is
             attached as image content for vision models.
         """
-        reason = self._policy.refuse(EgressRequest(url=url, kind='navigation'))
+        reason = await self._session.decide(EgressRequest(url=url, kind='navigation'))
         if reason is not None:
             # Refused before `_in_operation`, so a disallowed URL never launches Chromium.
             # Not redacted, unlike the URLs below: this one is the argument the model

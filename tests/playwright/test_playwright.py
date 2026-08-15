@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import socket
 import sys
 from collections.abc import AsyncGenerator, Awaitable, Callable, Sequence
 from contextlib import asynccontextmanager
@@ -40,6 +41,7 @@ from pydantic_ai_harness.playwright import (
     DEFAULT_ALLOWLIST_REACH,
     DEFAULT_MAX_CONTENT_TOKENS,
     DEFAULT_NAVIGATION_TIMEOUT_MS,
+    DEFAULT_RESOLVED_KINDS,
     BrowserEvent,
     BrowserUnavailableError,
     BrowserUnavailableWarning,
@@ -1404,6 +1406,119 @@ class TestPrivateAddressBlocking:
         assert result == 'Error: execute_js reached a blocked private or link-local address: http://169.254.169.254/'
 
 
+class TestNameResolutionBlocking:
+    """A hostname is not an IP literal, so where it points is only knowable by resolving it."""
+
+    @staticmethod
+    def _pointing_at(monkeypatch: pytest.MonkeyPatch, address: str) -> list[str]:
+        """Make every name resolve to `address`, recording which names were looked up."""
+        looked_up: list[str] = []
+
+        async def resolve(host: str) -> tuple[str, ...]:
+            looked_up.append(host)
+            return (address,)
+
+        monkeypatch.setattr(toolset_module, '_getaddrinfo', resolve)
+        return looked_up
+
+    async def test_navigate_refuses_a_name_that_resolves_private(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # The literal check passes this host: wildcard DNS services make the spelling
+        # ordinary while the address behind it is the metadata endpoint.
+        self._pointing_at(monkeypatch, '169.254.169.254')
+        page = _FakePage()
+        result = await _toolset(page).navigate('http://169-254-169-254.nip.example/')
+        assert result == 'Error: blocked private or link-local address: http://169-254-169-254.nip.example/'
+        assert page.goto_calls == []
+
+    async def test_a_name_that_resolves_public_is_allowed(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        self._pointing_at(monkeypatch, '93.184.216.34')
+        result = await _toolset(_FakePage()).navigate('https://example.com/')
+        assert isinstance(result, str) and not result.startswith('Error:')
+
+    async def test_opting_out_skips_the_lookup(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        looked_up = self._pointing_at(monkeypatch, '169.254.169.254')
+        result = await _toolset(_FakePage(), block_private_addresses=False).navigate('http://internal.example/')
+        assert isinstance(result, str) and not result.startswith('Error:')
+        assert looked_up == []
+
+    async def test_an_address_is_not_resolved(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # The literal already answers the question; a lookup would be wasted.
+        looked_up = self._pointing_at(monkeypatch, '93.184.216.34')
+        await _toolset(_FakePage()).navigate('https://93.184.216.34/')
+        assert looked_up == []
+
+    async def _guarded_page(self, monkeypatch: pytest.MonkeyPatch) -> _FakePage:
+        """Run one agent turn so the session installs its route guard on the context."""
+        page = _FakePage()
+        _install_fake_driver(monkeypatch, page)
+        agent = Agent(TestModel(call_tools=['screenshot']), capabilities=[PlaywrightBrowser[object]()])
+        await agent.run('use the browser')
+        return page
+
+    async def test_the_route_guard_refuses_a_private_name(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        self._pointing_at(monkeypatch, '127.0.0.1')
+        page = await self._guarded_page(monkeypatch)
+        host_page = _FakeRequestPage()
+        route = await page.context.dispatch(
+            _FakeRequest('http://data.example/api', navigation=False, resource_type='fetch', frame=host_page.main_frame)
+        )
+        assert route.aborted is True
+
+    async def test_a_passive_subresource_is_not_resolved(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # Images and fonts are the bulk of a page's requests and return their bytes
+        # to the renderer, not to a tool result, so they stay off the lookup path.
+        looked_up = self._pointing_at(monkeypatch, '127.0.0.1')
+        page = await self._guarded_page(monkeypatch)
+        host_page = _FakeRequestPage()
+        route = await page.context.dispatch(
+            _FakeRequest(
+                'http://cdn.example/logo.png', navigation=False, resource_type='image', frame=host_page.main_frame
+            )
+        )
+        assert route.continued is True
+        assert looked_up == []
+
+    async def test_a_subframe_document_is_resolved(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # A child frame's text is appended to the page text, so a frame pointed at
+        # an internal address is a way back to the model.
+        self._pointing_at(monkeypatch, '169.254.169.254')
+        page = await self._guarded_page(monkeypatch)
+        subframe = _FakeFrame(_FakeRequestPage())  # not `host_page.main_frame`
+        route = await page.context.dispatch(_FakeRequest('http://embed.example/', navigation=True, frame=subframe))
+        assert route.aborted is True
+
+    async def test_a_failed_lookup_is_not_a_refusal(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # The request is about to fail in the browser anyway; reporting a blocked
+        # private address would send the model after a policy problem that is not there.
+        async def unresolvable(host: str) -> tuple[str, ...]:
+            raise socket.gaierror('Name or service not known')
+
+        monkeypatch.setattr(toolset_module, '_getaddrinfo', unresolvable)
+        result = await _toolset(_FakePage()).navigate('https://nope.invalid/')
+        assert isinstance(result, str) and not result.startswith('Error:')
+
+
+class TestResolutionCaching:
+    """The lookup is a duplicate of one Chromium already makes, so it is cached briefly."""
+
+    async def test_a_repeated_host_is_looked_up_once(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        looked_up = TestNameResolutionBlocking._pointing_at(monkeypatch, '93.184.216.34')
+        toolset = _toolset(_FakePage())
+        await toolset.navigate('https://example.com/one')
+        await toolset.navigate('https://example.com/two')
+        assert looked_up == ['example.com']
+
+    async def test_a_full_cache_is_emptied_rather_than_grown(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(toolset_module, '_RESOLUTION_CACHE_MAX', 1)
+        looked_up = TestNameResolutionBlocking._pointing_at(monkeypatch, '93.184.216.34')
+        toolset = _toolset(_FakePage())
+        await toolset.navigate('https://one.example/')
+        await toolset.navigate('https://two.example/')
+        # The first entry was evicted with the rest, so its host is looked up again.
+        await toolset.navigate('https://one.example/')
+        assert looked_up == ['one.example', 'two.example', 'one.example']
+
+
 class TestPlaywrightErrorHandling:
     async def test_navigate_timeout_returns_bounded_error(self) -> None:
         page = _FakePage(goto_error=PlaywrightTimeoutError('Timeout 60000ms exceeded.'))
@@ -2461,6 +2576,7 @@ def test_public_exports() -> None:
     assert issubclass(BrowserUnavailableWarning, UserWarning)
     assert EgressPolicy().refuse(EgressRequest(url='https://example.com/', kind='navigation')) is None
     assert DEFAULT_ALLOWLIST_REACH == frozenset({'navigation', 'data'})
+    assert DEFAULT_RESOLVED_KINDS == frozenset({'navigation', 'data', 'subframe'})
     assert set(get_args(RequestKind)) == {'navigation', 'subframe', 'data', 'subresource'}
 
 

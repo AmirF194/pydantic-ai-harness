@@ -14,6 +14,9 @@ It exercises the public `PlaywrightBrowser` surface and checks twelve things:
 - the private-address block against a real local server, including the decimal
   spelling of an IP (which only Chromium's canonicalization resolves) and an
   in-page `fetch`, each with an opt-out control proving the server is reachable,
+- the private-name block: a hostname resolving to loopback through a public
+  wildcard DNS service is refused, which needs real DNS and so cannot be checked
+  by the mocked suite,
 - a `storage_state` round-trip: a cookie captured from a real context is visible
   to the agent after relaunching the capability with that state,
 - embedded content: text inside a real cross-origin iframe reaches the model, a
@@ -148,39 +151,71 @@ async def _serve_secret() -> tuple[asyncio.Server, int]:
 async def _check_private_address_block() -> None:
     """The block must survive both an exotic IP spelling and an in-page fetch.
 
-    Neither is decided by the pre-check: `2130706433` is not parseable as an
-    address until Chromium canonicalizes it, and a `fetch` never goes through
-    `navigate` at all. Both therefore rest on the route guard, and the mocked
-    suite feeds that guard already-canonical URLs. Each assertion is paired with
-    a `block_private_addresses=False` control, so a server that simply failed to
-    start could not pass the check by accident.
+    `2130706433` is not parseable as an address by `ipaddress`, so it reaches the
+    block only because something canonicalizes it: the system resolver, which
+    answers `127.0.0.1` and so decides it at the pre-check, or failing that
+    Chromium, which is why the route guard sees a canonical URL. The `fetch` never
+    goes through `navigate` at all, so it rests on the route guard alone, and the
+    mocked suite feeds that guard already-canonical URLs. Each assertion is paired
+    with a `block_private_addresses=False` control, so a server that simply failed
+    to start could not pass the check by accident.
     """
     server, port = await _serve_secret()
     async with server:
         decimal_url = f'http://2130706433:{port}/'
         fetch = f"fetch('http://127.0.0.1:{port}/').then(r => r.text())"
 
-        blocked_nav, refusals = await _run_tools(
-            PlaywrightBrowser[object](), [('navigate', {'url': decimal_url}), ('network_requests', {})]
-        )
+        (blocked_nav,) = await _run_tools(PlaywrightBrowser[object](), [('navigate', {'url': decimal_url})])
         assert _SECRET not in blocked_nav, blocked_nav
-        # The refusal is the route guard's, so it carries the reason rather than
-        # arriving as a bare network failure.
-        assert 'request_blocked' in refusals and 'private or link-local' in refusals, refusals
+        # Refused with the reason rather than as a bare network failure, whichever
+        # layer canonicalized the spelling first.
+        assert 'private or link-local' in blocked_nav, blocked_nav
         (open_nav,) = await _run_tools(
             PlaywrightBrowser[object](block_private_addresses=False), [('navigate', {'url': decimal_url})]
         )
         assert _SECRET in open_nav, f'control failed, server unreachable: {open_nav}'
         print('decimal-IP navigation blocked ok (control reached the server)')
 
-        (blocked_fetch,) = await _run_tools(PlaywrightBrowser[object](), [('execute_js', {'script': fetch})])
+        blocked_fetch, refusals = await _run_tools(
+            PlaywrightBrowser[object](), [('execute_js', {'script': fetch}), ('network_requests', {})]
+        )
         assert _SECRET not in blocked_fetch, blocked_fetch
+        # This one has no pre-check to reach it, so the route guard is what refuses
+        # it, and the refusal is recorded with its reason.
+        assert 'request_blocked' in refusals and 'private or link-local' in refusals, refusals
         open_fetch = await _run_tools(
             PlaywrightBrowser[object](block_private_addresses=False),
             [('navigate', {'url': f'http://127.0.0.1:{port}/'}), ('execute_js', {'script': fetch})],
         )
         assert _SECRET in open_fetch[-1], f'control failed, fetch never reached the server: {open_fetch}'
         print('in-page fetch to a private address blocked ok (control reached the server)')
+
+
+async def _check_private_name_block() -> None:
+    """A hostname pointing at a private address must be refused, not followed.
+
+    The host is an ordinary name, so nothing in the URL says where it goes; only
+    resolving it does. `nip.io` is a public wildcard resolver that answers with the
+    address embedded in the name, which is the same shape as an attacker pointing a
+    record they control at the metadata endpoint. This check therefore needs real
+    DNS, which is exactly why the mocked suite cannot make it.
+    """
+    server, port = await _serve_secret()
+    async with server:
+        name_url = f'http://127.0.0.1.nip.io:{port}/'
+        try:
+            await asyncio.get_running_loop().getaddrinfo('127.0.0.1.nip.io', None)
+        except OSError:  # pragma: no cover - network-dependent
+            print('private-name block SKIPPED (127.0.0.1.nip.io did not resolve)')
+            return
+
+        (blocked,) = await _run_tools(PlaywrightBrowser[object](), [('navigate', {'url': name_url})])
+        assert _SECRET not in blocked, blocked
+        (open_nav,) = await _run_tools(
+            PlaywrightBrowser[object](block_private_addresses=False), [('navigate', {'url': name_url})]
+        )
+        assert _SECRET in open_nav, f'control failed, server unreachable: {open_nav}'
+        print('private-name navigation blocked ok (control reached the server)')
 
 
 async def _serve_page(html: str) -> tuple[asyncio.Server, int]:
@@ -578,6 +613,7 @@ async def _main() -> None:
     await _check_navigate()
     await _check_allowlist_bounce()
     await _check_private_address_block()
+    await _check_private_name_block()
     await _check_blocked_redirect_message()
     await _check_page_request_egress()
     await _check_storage_state_round_trip()

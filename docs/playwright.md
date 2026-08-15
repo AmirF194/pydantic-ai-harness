@@ -146,7 +146,7 @@ not raised to abort the agent run.
 | `headless` | `True` | Run Chromium without a visible window (suits servers and CI). |
 | `allowed_domains` | `None` | Egress allowlist for navigation and data requests; `None` allows every public host (see [Egress](#egress-and-ssrf)). |
 | `policy` | `None` | Full `EgressPolicy`, for rules the two shorthands cannot express. Mutually exclusive with them. |
-| `block_private_addresses` | `True` | Refuse navigation to private, loopback, link-local, and other reserved IP literals (see [Egress](#egress-and-ssrf)). |
+| `block_private_addresses` | `True` | Refuse private, loopback, link-local and other reserved addresses, whether written as an IP or reached through a hostname that resolves to one (see [Egress](#egress-and-ssrf)). |
 | `screenshot_on_navigate` | `False` | Attach a screenshot to every `navigate` result. |
 | `max_content_tokens` | `4000` | Approximate token budget for every textual tool result. |
 | `action_timeout_ms` | `5000` | Default deadline for element actions (click, type, read, wait). `0` disables it. |
@@ -377,11 +377,12 @@ redacted whichever tool returned them.
 
 ## Egress and SSRF
 
-By default the browser refuses navigation to IP literals that are not globally
-routable -- `169.254.169.254` (the cloud metadata endpoint), `127.0.0.1`, `::1`,
-`localhost` and `*.localhost` names, and the RFC 1918 private ranges -- even
-when no allowlist is set. Set `block_private_addresses=False` when the agent
-should reach a local app or an internal dashboard.
+By default the browser refuses addresses that are not globally routable --
+`169.254.169.254` (the cloud metadata endpoint), `127.0.0.1`, `::1`, `localhost`
+and `*.localhost` names, and the RFC 1918 private ranges -- even when no
+allowlist is set. A hostname is resolved first, so pointing a name at one of
+those addresses does not get past it. Set `block_private_addresses=False` when
+the agent should reach a local app or an internal dashboard.
 
 With `allowed_domains=None` (the default) the agent can reach any public URL.
 When the agent may act on untrusted input, set `allowed_domains` to an explicit
@@ -406,7 +407,16 @@ not, because a page whose assets are aborted renders as a broken page and a
 permitted site's identity-provider and payment steps live in frames. The
 private-address block ignores that split entirely: it applies to every frame and
 every resource type. WebSocket connections, which a network route never sees, get
-their own guard, applying the same policy the table above describes. The policies
+their own guard, applying the same policy the table above describes.
+
+A host that is not already an address is resolved before the private-address block
+classifies it, so a name pointing at an internal address (`169.254.169.254.nip.io`
+and similar wildcard DNS services) is refused rather than followed. That lookup runs
+for navigation, data requests and sub-frame documents -- the kinds whose content
+comes back to the model -- and not for passive subresources, which are the bulk of
+a page's requests. It is not proof against DNS rebinding: Chromium resolves the name
+a second time before it connects, and a record that changes in between defeats it.
+`resolved_kinds` sets which kinds are looked up. The policies
 are independent and deny wins -- an allowlisted
 private address is still refused until you opt out of `block_private_addresses`.
 
