@@ -6,10 +6,11 @@ from ._warn import HarnessDeprecationWarning
 
 if TYPE_CHECKING:
     from .advisor import Advisor
+    from .agents.coder import DEFAULT_ALLOWED_COMMANDS, Coder
+    from .agents.researcher import DEFAULT_RESEARCHER_INSTRUCTIONS, Researcher
     from .browser_use import BrowserUse
     from .capability_creation import CapabilityCreation
     from .code_mode import CodeMode
-    from .coder import DEFAULT_ALLOWED_COMMANDS, Coder
     from .compaction import (
         ClampOversizedMessages,
         ClearToolResults,
@@ -43,7 +44,6 @@ if TYPE_CHECKING:
     from .planning import Planning
     from .pydantic_ai_docs import PydanticAIDocs
     from .repo_context import RepoContext
-    from .researcher import DEFAULT_RESEARCHER_INSTRUCTIONS, Researcher
     from .shell import LLM_API_KEY_ENV_PATTERNS, Shell
     from .skills import Skills
     from .spend import SpendLimits
@@ -115,7 +115,7 @@ _CAPABILITY_EXPORTS = {
     'ClampOversizedMessages': 'compaction',
     'ClearToolResults': 'compaction',
     'CodeMode': 'code_mode',
-    'Coder': 'coder',
+    'Coder': 'agents.coder',
     'ConversationSearch': 'conversation_search',
     'DeduplicateFileReads': 'compaction',
     'DynamicWorkflow': 'dynamic_workflow',
@@ -131,7 +131,7 @@ _CAPABILITY_EXPORTS = {
     'PydanticAIDocs': 'pydantic_ai_docs',
     'ReportContextUsage': 'compaction',
     'RepoContext': 'repo_context',
-    'Researcher': 'researcher',
+    'Researcher': 'agents.researcher',
     'Shell': 'shell',
     'Skills': 'skills',
     'SlidingWindowCompaction': 'compaction',
@@ -149,8 +149,8 @@ _CAPABILITY_EXPORTS = {
 }
 
 _CONSTANT_EXPORTS = {
-    'DEFAULT_ALLOWED_COMMANDS': 'coder',
-    'DEFAULT_RESEARCHER_INSTRUCTIONS': 'researcher',
+    'DEFAULT_ALLOWED_COMMANDS': 'agents.coder',
+    'DEFAULT_RESEARCHER_INSTRUCTIONS': 'agents.researcher',
     'LLM_API_KEY_ENV_PATTERNS': 'shell',
     'READ_ONLY_TOOL_NAMES': 'filesystem',
     'SubAgent': 'subagents',
