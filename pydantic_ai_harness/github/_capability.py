@@ -14,6 +14,10 @@ from pydantic_ai.toolsets import AbstractToolset, AgentToolset
 _DEFAULT_IMAGE = 'ghcr.io/github/github-mcp-server'
 _TOKEN_ENV_VARS = ('GITHUB_PERSONAL_ACCESS_TOKEN', 'GITHUB_TOKEN')
 _PAT_ENV_VAR = 'GITHUB_PERSONAL_ACCESS_TOKEN'
+_RESERVED_ENV = frozenset(
+    {_PAT_ENV_VAR, 'GITHUB_TOOLSETS', 'GITHUB_READ_ONLY', 'GITHUB_DYNAMIC_TOOLSETS', 'GITHUB_HOST'}
+)
+"""Environment keys owned by first-class fields; `env` may not set them (see `_build_environment`)."""
 
 
 @dataclass
@@ -48,7 +52,8 @@ class GitHub(AbstractCapability[AgentDepsT]):
     """
 
     token: str | None = None
-    """GitHub personal access token. Falls back to `GITHUB_PERSONAL_ACCESS_TOKEN` then `GITHUB_TOKEN`."""
+    """GitHub personal access token. An empty value is treated as unset and falls back to the
+    `GITHUB_PERSONAL_ACCESS_TOKEN` then `GITHUB_TOKEN` environment variables."""
 
     toolsets: Sequence[str] | None = None
     """Server-side toolset groups to enable (e.g. `['repos', 'issues', 'pull_requests']`).
@@ -91,7 +96,12 @@ class GitHub(AbstractCapability[AgentDepsT]):
     """Extra arguments inserted into `docker run` before the image (e.g. extra `-e`/`-v` flags)."""
 
     env: Mapping[str, str] | None = None
-    """Extra environment variables to set in the server process and forward into the container."""
+    """Extra environment variables to set in the server process and forward into the container.
+
+    Keys owned by the first-class fields (`GITHUB_PERSONAL_ACCESS_TOKEN`, `GITHUB_TOOLSETS`,
+    `GITHUB_READ_ONLY`, `GITHUB_DYNAMIC_TOOLSETS`, `GITHUB_HOST`) are rejected here so `env`
+    cannot silently override a safety setting -- use the matching field instead.
+    """
 
     init_timeout: float = 30.0
     """Seconds to wait for the server to initialize (a cold `docker run` may pull the image first)."""
@@ -109,7 +119,7 @@ class GitHub(AbstractCapability[AgentDepsT]):
     """
 
     def _resolve_token(self) -> str:
-        if self.token is not None:
+        if self.token:
             return self.token
         for name in _TOKEN_ENV_VARS:
             value = os.environ.get(name)
@@ -131,6 +141,12 @@ class GitHub(AbstractCapability[AgentDepsT]):
         if self.host is not None:
             environment['GITHUB_HOST'] = self.host
         if self.env is not None:
+            reserved = _RESERVED_ENV.intersection(self.env)
+            if reserved:
+                raise UserError(
+                    f'GitHub(env=...) cannot set reserved keys ({", ".join(sorted(reserved))}); '
+                    'use the matching GitHub() fields (token, toolsets, read_only, dynamic_toolsets, host) instead.'
+                )
             environment.update(self.env)
         return environment
 

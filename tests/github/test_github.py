@@ -93,6 +93,15 @@ class TestTokenResolution:
         monkeypatch.setenv('GITHUB_TOKEN', 'real')
         assert _server(GitHub[None]()).env == {PAT: 'real'}
 
+    def test_empty_explicit_token_falls_back_to_env(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # An explicit '' is treated as unset, consistent with a blank env var.
+        monkeypatch.setenv('GITHUB_TOKEN', 'from-env')
+        assert _server(GitHub[None](token='')).env == {PAT: 'from-env'}
+
+    def test_empty_explicit_token_with_no_env_raises(self) -> None:
+        with pytest.raises(UserError, match='needs a token'):
+            GitHub[None](token='').get_toolset()
+
     def test_missing_token_raises(self) -> None:
         with pytest.raises(UserError, match='needs a token'):
             GitHub[None]().get_toolset()
@@ -132,6 +141,11 @@ class TestServerInvocation:
             assert f'{name}=' not in ' '.join(server.args)
             i = server.args.index(name)
             assert server.args[i - 1] == '-e'
+
+    def test_env_cannot_override_reserved_keys(self) -> None:
+        # A user must not be able to silently flip a safety setting through `env`.
+        with pytest.raises(UserError, match='reserved keys'):
+            GitHub[None](token='t', read_only=True, env={'GITHUB_READ_ONLY': '0'}).get_toolset()
 
     def test_extra_env_merged_and_forwarded(self) -> None:
         server = _server(GitHub[None](token='t', env={'HTTP_PROXY': 'http://proxy:3128'}))
