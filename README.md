@@ -291,7 +291,7 @@ Everything is observable: `logfire.instrument_pydantic_ai()` gives you [a full t
 uv add pydantic-ai-harness
 ```
 
-This installs [`pydantic-ai-slim`](https://ai.pydantic.dev/install/) with it, so it works on its own — you don't need to install Pydantic AI separately. Model providers and the CLI come via extras that pass through to Pydantic AI: `pydantic-ai-harness[anthropic]`, `[cli]`. Some capabilities need their own extra for optional dependencies — each capability's page gives its exact install line. Requires Python 3.10+.
+This installs [`pydantic-ai-slim`](https://ai.pydantic.dev/install/) with it, so it works on its own; you don't need to install Pydantic AI separately. Model providers and the CLI come via extras that pass through to Pydantic AI: `pydantic-ai-harness[anthropic]`, `[cli]`. Some capabilities need their own extra for optional dependencies; each capability's page gives its exact install line. Requires Python 3.10+.
 
 ## Build your own
 
