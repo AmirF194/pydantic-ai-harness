@@ -1,11 +1,11 @@
 ---
 title: Pydantic AI Harness
-description: "How Python does agents: 30+ capabilities and complete agents assembled from them, from a coding agent to your own custom stack."
+description: "Your agent's favorite harness, built on Pydantic AI: 30+ capabilities and complete agents assembled from them, from a coding agent to your own custom stack."
 ---
 
 # Pydantic AI Harness
 
-*How Python does agents*
+*Your agent's favorite harness, built on Pydantic AI*
 
 [![Join Slack](https://img.shields.io/badge/Slack-Join%20Slack-4A154B?logo=slack)](https://logfire.pydantic.dev/docs/join-slack/)
 

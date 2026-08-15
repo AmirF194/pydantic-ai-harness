@@ -6,7 +6,7 @@
 [![license](https://img.shields.io/github/license/pydantic/pydantic-ai-harness.svg)](https://github.com/pydantic/pydantic-ai-harness/blob/main/LICENSE)
 [![Join Slack](https://img.shields.io/badge/Slack-Join%20Slack-4A154B?logo=slack)](https://logfire.pydantic.dev/docs/join-slack/)
 
-**How Python does agents**
+**Your agent's favorite harness, built on Pydantic AI**
 
 ---
 
