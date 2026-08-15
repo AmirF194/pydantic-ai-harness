@@ -405,8 +405,9 @@ read from, or post to, anywhere; passive subresources and sub-frame documents ar
 not, because a page whose assets are aborted renders as a broken page and a
 permitted site's identity-provider and payment steps live in frames. The
 private-address block ignores that split entirely: it applies to every frame and
-every resource type, and WebSocket connections, which a network route never sees,
-get their own guard. The policies are independent and deny wins -- an allowlisted
+every resource type. WebSocket connections, which a network route never sees, get
+their own guard, applying the same policy the table above describes. The policies
+are independent and deny wins -- an allowlisted
 private address is still refused until you opt out of `block_private_addresses`.
 
 Enforcement is at two layers: a network route guard aborts a refused request

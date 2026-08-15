@@ -1074,6 +1074,13 @@ class PlaywrightBrowserSession:
         if self._driver is None:
             self._driver = await self._driver_cm.__aenter__()
             self._driver_entered = True
+        # An attempt that connected and then failed to build its context left a browser
+        # behind. It is closed before another is started, since teardown holds only the
+        # latest handle; a close that fails keeps the handle so teardown can try again.
+        if self._browser is not None:
+            stale = self._browser
+            await stale.close()
+            self._browser = None
         browser = await self._connect(self._driver)
         if browser is None:
             return
@@ -1093,7 +1100,7 @@ class PlaywrightBrowserSession:
         page = await context.new_page()
         if self.policy.enforced():
             await context.route('**/*', self._route_guard)
-        if self.policy.block_private_addresses:
+            # A network route never sees a WebSocket, so sockets get a guard of their own.
             await context.route_web_socket('**/*', self._websocket_guard)
         self._wire_page(page)
         self.pages.append(page)
@@ -1180,14 +1187,13 @@ class PlaywrightBrowserSession:
         await self._abort(route, request.url, reason)
 
     async def _websocket_guard(self, websocket: PlaywrightWebSocketRoute) -> None:
-        """Apply the private-address block to WebSocket connections.
+        """Apply the egress policy to WebSocket connections.
 
         `context.route` never sees a WebSocket, so without this a page could open
         `ws://127.0.0.1:<port>` and talk to an internal service the HTTP guard
-        refuses. Only the private-address block applies, matching how the two
-        policies already differ elsewhere: it covers every resource type, while
-        the allowlist governs top-level navigation and would otherwise cut a
-        permitted page off from its own realtime API.
+        refuses. A socket is asked about as `data`, the kind it belongs to, so the
+        allowlist bounds it exactly as it bounds `fetch`; the guard is therefore
+        installed whenever anything is enforced, not only for the address block.
 
         A socket that is permitted has to be connected explicitly: registering a
         handler at all takes Playwright out of its pass-through mode.
@@ -1461,7 +1467,7 @@ class PlaywrightBrowserToolset(FunctionToolset[AgentDepsT]):
                 except PlaywrightError:
                     continue
                 if text.strip():
-                    texts.append(f'[frame {frame.url}]\n{text}')
+                    texts.append(f'[frame {_without_credentials(frame.url)}]\n{text}')
 
         try:
             await asyncio.wait_for(sweep(), budget_ms / 1000)

@@ -657,6 +657,7 @@ class _FakeChromium:
         self.connected: list[str] = []
         self.launch_timeouts: list[int] = []
         self.browser: _FakePlaywrightBrowser | None = None
+        self.browsers: list[_FakePlaywrightBrowser] = []
 
     @property
     def executable_path(self) -> str:
@@ -671,6 +672,7 @@ class _FakeChromium:
         if self._launch_error is not None:
             raise self._launch_error
         self.browser = _FakePlaywrightBrowser(self._page, close_error=self._close_error)
+        self.browsers.append(self.browser)
         return self.browser
 
     async def connect_over_cdp(self, endpoint_url: str, *, timeout: int | None = None) -> _FakePlaywrightBrowser:
@@ -679,6 +681,7 @@ class _FakeChromium:
         if self._launch_error is not None:
             raise self._launch_error
         self.browser = _FakePlaywrightBrowser(self._page, close_error=self._close_error)
+        self.browsers.append(self.browser)
         return self.browser
 
 
@@ -1941,6 +1944,38 @@ class TestPlaywrightBrowserLifecycle:
         assert chromium.browser is not None and chromium.browser.closed is True
         assert cm.exited is True
 
+    async def test_a_failed_setup_closes_its_browser_before_the_next_attempt(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # The connect succeeded and the context build raised, so the next tool call
+        # starts a second Chromium. Teardown holds only the latest handle, so the
+        # first one is closed on the way into the retry or it outlives the session.
+        page = _FakePage()
+        cm = _install_fake_driver(monkeypatch, page)
+        chromium = cm._driver.chromium
+        working_context = _FakePlaywrightBrowser.new_context
+
+        async def failing_context(
+            self: _FakePlaywrightBrowser,
+            *,
+            storage_state: StorageState | None = None,
+            service_workers: str | None = None,
+            accept_downloads: bool | None = None,
+        ) -> _FakeBrowserContext:
+            raise PlaywrightError('context creation failed')
+
+        session = PlaywrightBrowserSession()
+        async with session:
+            monkeypatch.setattr(_FakePlaywrightBrowser, 'new_context', failing_context)
+            with pytest.raises(PlaywrightError):
+                await session.ensure_page()
+            monkeypatch.setattr(_FakePlaywrightBrowser, 'new_context', working_context)
+            await session.ensure_page()
+            assert len(chromium.browsers) == 2
+            assert chromium.browsers[0].closed is True
+            assert chromium.browsers[1].closed is False
+        assert chromium.browsers[1].closed is True
+
     async def test_storage_state_reaches_new_context(self, monkeypatch: pytest.MonkeyPatch) -> None:
         page = _FakePage()
         cm = _install_fake_driver(monkeypatch, page)
@@ -2448,6 +2483,16 @@ class TestEmbeddedFrames:
         assert isinstance(result, str)
         assert 'Deep dive on agents' in result
 
+    async def test_frame_url_loses_its_credentials(self) -> None:
+        # An OAuth or payment step is exactly the kind of thing a page embeds, and its
+        # frame URL carries the code the model must not be handed.
+        page = _FakePage(body='Checkout')
+        page.frames.append(
+            _FakeFrameContent(url='https://idp.example.com/callback?code=secret-code', text='Signing you in')
+        )
+        result = await _toolset(page).get_text()
+        assert result == 'Checkout\n\n[frame https://idp.example.com/callback?code=REDACTED]\nSigning you in'
+
     async def test_blank_frame_is_left_out(self) -> None:
         page = _FakePage(body='Conference')
         page.frames.append(_FakeFrameContent(text='   \n '))
@@ -2880,7 +2925,23 @@ class TestWebSocketEgress:
         permitted = await page.context.dispatch_websocket('wss://realtime.example.com/live')
         assert permitted.connected is True
 
-    async def test_no_socket_guard_when_the_block_is_off(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    async def test_the_allowlist_reaches_sockets_without_the_address_block(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # The two axes are independent: turning the address block off must not take
+        # the allowlist off the sockets it bounds.
+        page = await self._context(
+            monkeypatch,
+            PlaywrightBrowser[object](allowed_domains=['example.com'], block_private_addresses=False),
+        )
+        assert page.context.websocket_routes == ['**/*']
+        refused = await page.context.dispatch_websocket('wss://evil.test/live')
+        assert refused.connected is False
+        assert refused.closed is True
+        permitted = await page.context.dispatch_websocket('wss://realtime.example.com/live')
+        assert permitted.connected is True
+
+    async def test_no_socket_guard_when_nothing_is_enforced(self, monkeypatch: pytest.MonkeyPatch) -> None:
         page = await self._context(monkeypatch, PlaywrightBrowser[object](block_private_addresses=False))
         assert page.context.websocket_routes == []
 
