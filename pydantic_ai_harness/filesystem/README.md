@@ -46,7 +46,8 @@ print(result.output)
 
 Tool errors the model can correct -- a missing file, a denied path, a stale
 edit, a directory that collides with an existing file, an invalid glob pattern,
-an over-long path name, a symlink loop -- are surfaced as
+a path name rejected by Windows, an over-long path name, a symlink loop -- are
+surfaced as
 [`ModelRetry`](https://ai.pydantic.dev/agents/#reflection-and-self-correction),
 so the agent gets the error message back and can adjust rather than aborting
 the run. Failures the model can do nothing about, such as a full or read-only

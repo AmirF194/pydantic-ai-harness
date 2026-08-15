@@ -756,6 +756,29 @@ class TestWriteFileOSErrors:
         with pytest.raises(OSError, match='No space left on device'):
             await toolset.write_file('new.txt', 'content')
 
+    async def test_write_windows_invalid_name_is_recoverable(
+        self, toolset: FileSystemToolset[None], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        class WindowsInvalidNameError(OSError):
+            winerror = 123
+
+        def raise_invalid_name(*args: object, **kwargs: object) -> None:
+            raise WindowsInvalidNameError(errno.EINVAL, 'The filename, directory name, or volume label is incorrect')
+
+        monkeypatch.setattr(Path, 'write_text', raise_invalid_name)
+        with pytest.raises(ModelRetry, match='path name is invalid'):
+            await toolset.write_file('bad<name', 'content')
+
+    async def test_write_einval_without_windows_invalid_name_propagates(
+        self, toolset: FileSystemToolset[None], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        def raise_einval(*args: object, **kwargs: object) -> None:
+            raise OSError(errno.EINVAL, 'Invalid argument')
+
+        monkeypatch.setattr(Path, 'write_text', raise_einval)
+        with pytest.raises(OSError, match='Invalid argument'):
+            await toolset.write_file('new.txt', 'content')
+
 
 class TestCreateDirectory:
     async def test_create_basic(self, toolset: FileSystemToolset[None], fs_root: Path) -> None:

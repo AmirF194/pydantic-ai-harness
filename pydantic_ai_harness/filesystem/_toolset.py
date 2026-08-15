@@ -25,10 +25,9 @@ _P = ParamSpec('_P')
 _RECOVERABLE_ERRORS = (PermissionError, FileNotFoundError, NotADirectoryError, IsADirectoryError, ValueError)
 
 # The same idea one level down, for failures Python raises as a bare `OSError`
-# with no dedicated subclass for `_RECOVERABLE_ERRORS` to name. The errno says
-# whose fault it is: these two are the model's, and it can pick another path and
-# retry. Every other errno (ENOSPC, EROFS) is the host's, and must keep aborting
-# the run rather than sending the model into a retry loop it can't win.
+# with no dedicated subclass for `_RECOVERABLE_ERRORS` to name. Entries are
+# explicit so other errors keep aborting the run; for example, retrying cannot
+# fix `ENOSPC` or `EROFS`.
 #
 # Which operations reach these depends on the Python version. `Path.is_file`
 # and friends stopped propagating `ENAMETOOLONG` in 3.14, so on 3.10 through
@@ -39,6 +38,7 @@ _RECOVERABLE_ERRNOS: dict[int | None, str] = {
     errno.ENAMETOOLONG: 'The path name is too long.',
     errno.ELOOP: 'The path resolves through a symlink loop.',
 }
+_WINDOWS_ERROR_INVALID_NAME = 123
 
 
 def _recoverable(
@@ -54,6 +54,8 @@ def _recoverable(
             raise ModelRetry(str(e)) from e
         except OSError as e:
             reason = _RECOVERABLE_ERRNOS.get(e.errno)
+            if reason is None and getattr(e, 'winerror', None) == _WINDOWS_ERROR_INVALID_NAME:
+                reason = 'The path name is invalid.'
             if reason is None:
                 raise
             # `str(e)` embeds the absolute host path; the reason alone doesn't.
