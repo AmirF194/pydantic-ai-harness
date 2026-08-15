@@ -49,7 +49,7 @@ sub-agent does the browsing and reports back.
 ```python
 from pydantic_ai import Agent
 
-from pydantic_ai_harness.browser_use import BrowserUse
+from pydantic_ai_harness import BrowserUse
 
 agent = Agent(
     'anthropic:claude-sonnet-4-6',
@@ -115,7 +115,8 @@ policy. Use a custom factory to introduce uploads only with controls appropriate
 to your application.
 
 ```python
-from pydantic_ai_harness.browser_use import BrowserAgentSettings, BrowserUse
+from pydantic_ai_harness import BrowserUse
+from pydantic_ai_harness.browser_use import BrowserAgentSettings
 
 BrowserUse(
     llm='anthropic:claude-sonnet-4-6',
@@ -141,7 +142,7 @@ output:
 ```python
 from pydantic import BaseModel
 
-from pydantic_ai_harness.browser_use import BrowserUse
+from pydantic_ai_harness import BrowserUse
 
 
 class Product(BaseModel):
@@ -166,7 +167,7 @@ browser. Scope entries to a domain with the nested form, and combine with
 `allowed_domains` so the values cannot be typed anywhere else:
 
 ```python
-from pydantic_ai_harness.browser_use import BrowserUse
+from pydantic_ai_harness import BrowserUse
 
 BrowserUse(
     allowed_domains=['travel.example.com'],
@@ -249,7 +250,7 @@ origin.
 ```python
 from pydantic_ai import Agent
 
-from pydantic_ai_harness.browser_use import BrowserUse
+from pydantic_ai_harness import BrowserUse
 
 
 async def main():
@@ -285,7 +286,7 @@ below, or to `''` to contribute no instructions at all. (`guidance` steers the
 Every field of `BrowserUse` with its default:
 
 ```python
-from pydantic_ai_harness.browser_use import BrowserUse
+from pydantic_ai_harness import BrowserUse
 
 BrowserUse(
     llm=None,                    # Pydantic AI model/string or browser-use chat model; None = browser-use's default
@@ -319,7 +320,8 @@ resolved `settings`, and returns the agent to run:
 ```python
 from browser_use import Agent as BrowserUseAgent
 
-from pydantic_ai_harness.browser_use import BrowserAgent, BrowserTask, BrowserUse
+from pydantic_ai_harness import BrowserUse
+from pydantic_ai_harness.browser_use import BrowserAgent, BrowserTask
 
 
 def factory(request: BrowserTask) -> BrowserAgent:
@@ -380,7 +382,7 @@ capabilities:
 ```python
 from pydantic_ai import Agent
 
-from pydantic_ai_harness.browser_use import BrowserUse
+from pydantic_ai_harness import BrowserUse
 
 agent = Agent.from_file('agent.yaml', custom_capability_types=[BrowserUse])
 ```
@@ -390,8 +392,6 @@ The `llm`, `browser_profile`, `output_schema`, `agent_settings`, and
 browser-use's own default model selection and browser and agent configuration,
 prose output, and the default agent factory.
 
-The API may change between releases while the capability settles; breaking
-changes ship deprecation warnings where practical.
 
 ## Further reading
 
