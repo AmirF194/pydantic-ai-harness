@@ -458,8 +458,13 @@ async def _resolve_host(host: str) -> tuple[str, ...]:
     return addresses
 
 
-async def _getaddrinfo(host: str) -> tuple[str, ...]:
-    """Ask the system resolver what `host` points at, off the event loop thread."""
+async def _getaddrinfo(host: str) -> tuple[str, ...]:  # pragma: no cover
+    """Ask the system resolver what `host` points at, off the event loop thread.
+
+    The one place the capability performs a real lookup, and therefore the seam the
+    test suite replaces so that no test depends on a resolver. What it does is
+    checked against live DNS in `scripts/playwright_smoke.py::_check_private_name_block`.
+    """
     infos = await asyncio.get_running_loop().getaddrinfo(host, None, type=socket.SOCK_STREAM)
     return tuple(sorted({str(info[4][0]) for info in infos}))
 
@@ -1244,10 +1249,9 @@ class PlaywrightBrowserSession:
         is asked about: the route guard, the socket guard, the `navigate`
         pre-check, and the post-action re-check.
         """
-        if self.policy.needs_resolution(request):
-            host = _url_host(request.url)
-            if host is not None:
-                request = replace(request, resolved_addresses=await _resolve_host(host))
+        host = _url_host(request.url)
+        if host is not None and self.policy.needs_resolution(request):
+            request = replace(request, resolved_addresses=await _resolve_host(host))
         return self.policy.refuse(request)
 
     async def _route_guard(self, route: PlaywrightRoute, request: PlaywrightRequest) -> None:
