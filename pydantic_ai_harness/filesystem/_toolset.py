@@ -200,7 +200,7 @@ class FileSystemToolset(FunctionToolset[AgentDepsT]):
         """Authorize one entry of a directory walk, or return `None` to skip it.
 
         Callers must do their I/O on the returned path. Resolving once means the
-        entry that was authorized is the entry that gets read, and matching the
+        path that was authorized is the path that gets read, and matching the
         patterns against the resolved location keeps the walkers in step with
         direct access: a symlink can neither escape the root nor alias a file
         past a rule its own name would trip.
