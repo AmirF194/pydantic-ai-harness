@@ -1436,6 +1436,8 @@ class TestNameResolutionBlocking:
         assert isinstance(result, str) and not result.startswith('Error:')
 
     async def test_opting_out_skips_the_lookup(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # No lookup means no verdict from one either, so an opted-out session reaches
+        # a host whose name would not have resolved.
         looked_up = self._pointing_at(monkeypatch, '169.254.169.254')
         result = await _toolset(_FakePage(), block_private_addresses=False).navigate('http://internal.example/')
         assert isinstance(result, str) and not result.startswith('Error:')
@@ -1500,14 +1502,6 @@ class TestNameResolutionBlocking:
             'Error: host that did not resolve, so the private-address block could not clear it: https://nope.invalid/'
         )
         assert page.goto_calls == []
-
-    async def test_a_failed_lookup_is_allowed_once_the_block_is_off(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        async def unresolvable(host: str) -> tuple[str, ...]:
-            raise socket.gaierror('Name or service not known')
-
-        monkeypatch.setattr(toolset_module, '_getaddrinfo', unresolvable)
-        result = await _toolset(_FakePage(), block_private_addresses=False).navigate('https://nope.invalid/')
-        assert isinstance(result, str) and not result.startswith('Error:')
 
 
 class TestResolutionIsBounded:
