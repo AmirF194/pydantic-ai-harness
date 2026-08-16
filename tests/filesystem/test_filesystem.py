@@ -410,6 +410,17 @@ class TestListDirectory:
         result = await toolset.list_directory('subdir')
         assert 'nested.py' in result
 
+    async def test_list_skips_symlink_escaping_root(self, toolset: FileSystemToolset[None], fs_root: Path) -> None:
+        """An out-of-root symlink target isn't listed, so its size stays hidden."""
+        target = fs_root.parent / 'list-escape-target'
+        target.write_text('escaped!\n')
+        try:
+            (fs_root / 'escape_link.txt').symlink_to(target)
+            result = await toolset.list_directory('.')
+            assert 'escape_link.txt' not in result
+        finally:
+            target.unlink(missing_ok=True)
+
     async def test_list_not_a_dir(self, toolset: FileSystemToolset[None]) -> None:
         with pytest.raises(ModelRetry):
             await toolset.list_directory('hello.txt')
@@ -630,6 +641,17 @@ class TestFindFiles:
         result = await toolset.find_files('*')
         assert '.hidden' not in result
         assert '.git' not in result
+
+    async def test_find_skips_symlink_escaping_root(self, toolset: FileSystemToolset[None], fs_root: Path) -> None:
+        target = fs_root.parent / 'find-escape-target'
+        target.write_text('escaped!\n')
+        try:
+            (fs_root / 'escape_link.txt').symlink_to(target)
+            result = await toolset.find_files('*.txt')
+            assert 'escape_link.txt' not in result
+            assert 'hello.txt' in result
+        finally:
+            target.unlink(missing_ok=True)
 
     async def test_find_not_a_dir(self, toolset: FileSystemToolset[None]) -> None:
         with pytest.raises(ModelRetry):

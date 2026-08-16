@@ -199,6 +199,16 @@ class FileSystemToolset(FunctionToolset[AgentDepsT]):
             return False
         return True
 
+    def _is_within_root(self, path: Path) -> bool:
+        """Containment check for entries produced by a directory walk.
+
+        `_is_accessible` matches patterns against the lexical path, so an
+        in-root symlink to an external target passes it. Resolving keeps the
+        walkers in step with direct access, which rejects escapes in
+        `_resolve_path`.
+        """
+        return Path(os.path.realpath(path)).is_relative_to(self._real_root)
+
     def _relative_to_root(self, resolved: Path) -> str:
         """Canonical path of a resolved location relative to the real root."""
         return str(resolved.relative_to(self._real_root))
@@ -352,7 +362,7 @@ class FileSystemToolset(FunctionToolset[AgentDepsT]):
             if any(part.startswith('.') for part in rel_path.parts):
                 continue
             rel = str(rel_path)
-            if not self._is_accessible(rel):
+            if not self._is_accessible(rel) or not self._is_within_root(entry):
                 continue
             if entry.is_dir():
                 entries.append(f'{rel}/')
@@ -406,10 +416,7 @@ class FileSystemToolset(FunctionToolset[AgentDepsT]):
                 continue
             if include_glob and not fnmatch.fnmatch(rel_str, include_glob):
                 continue
-            # `_is_accessible` matches patterns against the lexical path, so an
-            # in-root symlink to an external file passes it. Reading it would
-            # return content `read_file` rejects via `_resolve_path`.
-            if not Path(os.path.realpath(file_path)).is_relative_to(real_root):
+            if not self._is_within_root(file_path):
                 continue
             try:
                 raw = file_path.read_bytes()
@@ -453,7 +460,7 @@ class FileSystemToolset(FunctionToolset[AgentDepsT]):
             if any(part.startswith('.') for part in rel_parts):
                 continue
             rel = str(match.relative_to(real_root))
-            if not self._is_accessible(rel):
+            if not self._is_accessible(rel) or not self._is_within_root(match):
                 continue
             suffix = '/' if match.is_dir() else ''
             matches.append(f'{rel}{suffix}')

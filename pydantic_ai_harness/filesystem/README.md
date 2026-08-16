@@ -49,7 +49,9 @@ print(result.output)
 - **Containment.** Paths resolve relative to `root_dir`; anything resolving
   outside -- via `..`, an absolute path, or a symlink -- is rejected. Symlinks
   are resolved with `os.path.realpath` *before* the containment check, closing
-  the TOCTTOU window.
+  the TOCTTOU window. Directory walks (`list_directory`, `search_files`,
+  `find_files`) resolve each entry the same way, so a symlink out of the tree
+  is neither listed nor read.
 - **Binary detection.** `read_file` returns a placeholder instead of dumping
   binary bytes into the model context.
 - **Optimistic concurrency.** `write_file`/`edit_file` accept an
