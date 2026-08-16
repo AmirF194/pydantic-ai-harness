@@ -68,6 +68,21 @@ def _is_binary(data: bytes, sample_size: int = 8192) -> bool:
     return b'\x00' in data[:sample_size]
 
 
+def _matching_lines(text: str, compiled: re.Pattern[str], rel_str: str, limit: int) -> tuple[list[str], bool]:
+    """Match one file's lines, stopping at `limit`.
+
+    Returns the formatted matches and whether the limit was reached, so the
+    caller can cap total output on a single file with many matches.
+    """
+    matches: list[str] = []
+    for line_num, line in enumerate(text.splitlines(), start=1):
+        if compiled.search(line):
+            matches.append(f'{rel_str}:{line_num}:{line}')
+            if len(matches) >= limit:
+                return matches, True
+    return matches, False
+
+
 def _content_hash(content: str) -> str:
     """Compute a short content hash for conflict detection."""
     return hashlib.sha256(content.encode('utf-8')).hexdigest()[:12]
@@ -391,6 +406,11 @@ class FileSystemToolset(FunctionToolset[AgentDepsT]):
                 continue
             if include_glob and not fnmatch.fnmatch(rel_str, include_glob):
                 continue
+            # `_is_accessible` matches patterns against the lexical path, so an
+            # in-root symlink to an external file passes it. Reading it would
+            # return content `read_file` rejects via `_resolve_path`.
+            if not Path(os.path.realpath(file_path)).is_relative_to(real_root):
+                continue
             try:
                 raw = file_path.read_bytes()
             except OSError:  # pragma: no cover
@@ -398,10 +418,9 @@ class FileSystemToolset(FunctionToolset[AgentDepsT]):
             if _is_binary(raw):
                 continue
             text = raw.decode('utf-8', errors='replace')
-            for line_num, line in enumerate(text.splitlines(), start=1):
-                if compiled.search(line):
-                    results.append(f'{rel_str}:{line_num}:{line}')
-            if len(results) >= self._max_search_results:
+            matches, truncated = _matching_lines(text, compiled, rel_str, self._max_search_results - len(results))
+            results.extend(matches)
+            if truncated:
                 results.append(f'[... truncated at {self._max_search_results} matches]')
                 break
 

@@ -584,6 +584,33 @@ class TestSearchFiles:
         assert 'keep.py' in result
         assert 'skip.md' not in result
 
+    async def test_search_truncates_within_a_single_file(self, fs_root: Path) -> None:
+        (fs_root / 'many.txt').write_text('findme\n' * 100)
+        ts = FileSystemToolset(
+            root_dir=fs_root,
+            allowed_patterns=[],
+            denied_patterns=[],
+            protected_patterns=[],
+            max_read_lines=2000,
+            max_search_results=5,
+            max_find_results=1000,
+        )
+        result = await ts.search_files('findme')
+        lines = result.splitlines()
+        assert len(lines) == 6
+        assert lines[-1] == '[... truncated at 5 matches]'
+
+    async def test_search_skips_symlink_escaping_root(self, toolset: FileSystemToolset[None], fs_root: Path) -> None:
+        """A symlink to an out-of-root file is skipped, matching `read_file`."""
+        target = fs_root.parent / 'search-escape-target'
+        target.write_text('escaped marker\n')
+        try:
+            (fs_root / 'escape_link.txt').symlink_to(target)
+            result = await toolset.search_files('escaped marker')
+            assert result == 'No matches found.'
+        finally:
+            target.unlink(missing_ok=True)
+
 
 class TestFindFiles:
     async def test_find_glob(self, toolset: FileSystemToolset[None]) -> None:
