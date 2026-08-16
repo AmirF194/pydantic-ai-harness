@@ -1487,14 +1487,26 @@ class TestNameResolutionBlocking:
         route = await page.context.dispatch(_FakeRequest('http://embed.example/', navigation=True, frame=subframe))
         assert route.aborted is True
 
-    async def test_a_failed_lookup_is_not_a_refusal(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        # The request is about to fail in the browser anyway; reporting a blocked
-        # private address would send the model after a policy problem that is not there.
+    async def test_a_failed_lookup_is_a_refusal(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # Whoever controls the name controls whether the lookup answers, so an
+        # unanswered one cannot mean "allowed": it would be the way past the block.
         async def unresolvable(host: str) -> tuple[str, ...]:
             raise socket.gaierror('Name or service not known')
 
         monkeypatch.setattr(toolset_module, '_getaddrinfo', unresolvable)
-        result = await _toolset(_FakePage()).navigate('https://nope.invalid/')
+        page = _FakePage()
+        result = await _toolset(page).navigate('https://nope.invalid/')
+        assert result == (
+            'Error: host that did not resolve, so the private-address block could not clear it: https://nope.invalid/'
+        )
+        assert page.goto_calls == []
+
+    async def test_a_failed_lookup_is_allowed_once_the_block_is_off(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        async def unresolvable(host: str) -> tuple[str, ...]:
+            raise socket.gaierror('Name or service not known')
+
+        monkeypatch.setattr(toolset_module, '_getaddrinfo', unresolvable)
+        result = await _toolset(_FakePage(), block_private_addresses=False).navigate('https://nope.invalid/')
         assert isinstance(result, str) and not result.startswith('Error:')
 
 
@@ -1510,10 +1522,11 @@ class TestResolutionIsBounded:
 
         monkeypatch.setattr(toolset_module, '_getaddrinfo', never_answers)
         result = await _toolset(_FakePage()).navigate('https://example.com/')
-        # A resolver that never answers is treated like one that failed: the request
-        # is about to fail in the browser too, and refusing here would report a
-        # private address where there is a DNS outage.
-        assert isinstance(result, str) and not result.startswith('Error:')
+        # Bounded, and refused rather than allowed: an attacker who controls the name
+        # controls how long its lookup takes, so a stall must not be a way through.
+        assert result == (
+            'Error: host that did not resolve, so the private-address block could not clear it: https://example.com/'
+        )
 
 
 class TestResolutionCaching:

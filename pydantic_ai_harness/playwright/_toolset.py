@@ -184,6 +184,7 @@ _CHARS_PER_TOKEN = 4
 """Characters-per-token estimate used to turn a token budget into a character cap."""
 
 _PRIVATE_ADDRESS_REASON = 'blocked private or link-local address'
+_UNRESOLVED_REASON = 'host that did not resolve, so the private-address block could not clear it'
 """Why the private-address block refused a URL, shared by the pre-check and the route guard."""
 
 _BLANK_PAGE = 'about:blank'
@@ -432,13 +433,16 @@ _RESOLUTION_TIMEOUT_SECONDS = 2.0
 _resolution_cache: dict[str, tuple[float, tuple[str, ...]]] = {}
 
 
-async def _resolve_host(host: str) -> tuple[str, ...]:
-    """Return the addresses `host` resolves to, cached for `_RESOLUTION_TTL_SECONDS`.
+async def _resolve_host(host: str) -> tuple[str, ...] | None:
+    """Return the addresses `host` resolves to, or `None` when the lookup did not answer.
 
-    A lookup that fails returns no addresses rather than a refusal: the request is
-    about to fail in the browser for the same reason, and reporting a blocked
-    private address for what is actually a DNS outage would send the model looking
-    for a policy problem that is not there.
+    The two are distinguished because they lead to opposite verdicts. A host that
+    resolved is classified on its addresses; one that did not cannot be cleared, and
+    whoever controls the name controls whether the lookup answers -- stalling this
+    one and then handing Chromium a private address would otherwise be a way past
+    the block. So an unanswered lookup is a refusal, which also costs little when
+    the failure is honest: a name this process cannot resolve is one the browser is
+    about to fail on too.
 
     The cache is a duplicate of one Chromium keeps anyway, so it is kept short and
     small. It cannot make the block airtight: Chromium resolves the name a second
@@ -457,7 +461,7 @@ async def _resolve_host(host: str) -> tuple[str, ...]:
     try:
         addresses = await asyncio.wait_for(_getaddrinfo(host), _RESOLUTION_TIMEOUT_SECONDS)
     except (OSError, asyncio.TimeoutError):
-        return ()
+        return None
     if len(_resolution_cache) >= _RESOLUTION_CACHE_MAX:
         _resolution_cache.clear()
     _resolution_cache[host] = (now + _RESOLUTION_TTL_SECONDS, addresses)
@@ -565,6 +569,8 @@ class EgressRequest:
     """Whether this is the main frame's own document rather than something inside the page."""
     resolved_addresses: tuple[str, ...] = ()
     """What the host resolved to, when the caller resolved it. Empty when it did not."""
+    resolution_failed: bool = False
+    """Whether a lookup the policy asked for did not answer, leaving the host unclassifiable."""
 
 
 DEFAULT_RESOLVED_KINDS: frozenset[RequestKind] = frozenset({'navigation', 'data', 'subframe'})
@@ -631,6 +637,8 @@ class EgressPolicy:
         host = _url_host(request.url)
         if host is not None and self.block_private_addresses and is_blocked_address(host):
             return _PRIVATE_ADDRESS_REASON
+        if self.block_private_addresses and request.resolution_failed:
+            return _UNRESOLVED_REASON
         if self.block_private_addresses and any(is_blocked_address(a) for a in request.resolved_addresses):
             return _PRIVATE_ADDRESS_REASON
         if host is None:
@@ -1257,7 +1265,8 @@ class PlaywrightBrowserSession:
         """
         host = _url_host(request.url)
         if host is not None and self.policy.needs_resolution(request):
-            request = replace(request, resolved_addresses=await _resolve_host(host))
+            addresses = await _resolve_host(host)
+            request = replace(request, resolved_addresses=addresses or (), resolution_failed=addresses is None)
         return self.policy.refuse(request)
 
     async def _route_guard(self, route: PlaywrightRoute, request: PlaywrightRequest) -> None:

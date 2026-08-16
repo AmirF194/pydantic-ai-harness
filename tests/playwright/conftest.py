@@ -21,14 +21,17 @@ if not collect_ignore:  # pragma: no branch
         """Keep the private-address block from resolving test hostnames for real.
 
         `decide` resolves any host that is not already an address, so without this
-        every navigation in the suite would issue a live DNS query. The lookup is
-        stubbed rather than the caching wrapper around it, so the cache still runs
-        in every test and the tests that care about it can count lookups. The cache
-        is module-level, so it is emptied between tests.
+        every navigation in the suite would issue a live DNS query. The stub answers
+        with a public address, which is the case that changes nothing: a lookup that
+        does not answer is a refusal, so returning nothing here would block every
+        navigation in the suite. The lookup is stubbed rather than the caching
+        wrapper around it, so the cache still runs in every test and the tests that
+        care about it can count lookups. The cache is module-level, so it is emptied
+        between tests.
         """
         toolset_module._resolution_cache.clear()
 
-        async def unresolved(host: str) -> tuple[str, ...]:
-            return ()
+        async def public_address(host: str) -> tuple[str, ...]:
+            return ('93.184.216.34',)
 
-        monkeypatch.setattr(toolset_module, '_getaddrinfo', unresolved)
+        monkeypatch.setattr(toolset_module, '_getaddrinfo', public_address)
