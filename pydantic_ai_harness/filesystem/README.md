@@ -57,8 +57,13 @@ disk, still abort.
 
 - **Containment.** Paths resolve relative to `root_dir`; anything resolving
   outside -- via `..`, an absolute path, or a symlink -- is rejected. Symlinks
-  are resolved with `os.path.realpath` *before* the containment check, closing
-  the TOCTTOU window.
+  are resolved with `os.path.realpath` *before* the containment check, and I/O
+  then uses the resolved path. Directory walks (`list_directory`,
+  `search_files`, `find_files`) resolve each entry the same way and match the
+  patterns against that resolved target, so a symlink cannot name a file
+  outside the tree or present a denied file under a permitted name. These
+  checks are pathname-based: if another process mutates the tree between
+  resolution and I/O, the path read can differ from the path checked.
 - **Binary detection.** `read_file` returns a placeholder instead of dumping
   binary bytes into the model context.
 - **Optimistic concurrency.** `write_file`/`edit_file` accept an
@@ -88,19 +93,20 @@ The three rules apply at two different granularities:
   `create_directory`) gates the operation's target path. You must name a path
   that the patterns permit.
 - **Walkers** (`list_directory`, `search_files`, `find_files`) gate their root
-  by deny/protected patterns, but **not** by `allowed_patterns` -- a directory
-  root like `.` never matches a file pattern such as `src/*.py`, so requiring
-  it to would make every listing fail. Instead, the root is always walked and
-  each **entry** is filtered against all three lists. A directory listing can
-  never surface a path the agent couldn't otherwise read or write.
+  by denied patterns, but **not** by `allowed_patterns` -- a directory root
+  like `.` never matches a file pattern such as `src/*.py`, so requiring it to
+  would make every listing fail. Instead, the root is walked and each
+  **entry** is filtered with read-level access against `allowed_patterns` and
+  `denied_patterns`. A directory listing cannot surface a path the agent
+  couldn't otherwise read.
 
 So with `allowed_patterns=['*.py']`, `list_directory('.')` succeeds and shows
 only the `.py` entries; `read_file('notes.md')` is rejected.
 
-Note that the walkers filter entries with write-level access, so
-`protected_patterns` matches are omitted from `list_directory`, `search_files`,
-and `find_files` output even though those exact paths remain directly readable
-via `read_file`/`file_info`.
+Matching `protected_patterns` alone does not hide an entry. Protected paths
+that pass the allowed, denied, and dotfile filters remain visible to all three
+walkers and directly readable via `read_file`/`file_info`; write operations
+reject them.
 
 > Dotfiles and dot-directories (`.git`, `.env`, `.github`, ...) are skipped by
 > all three walkers -- `list_directory`, `search_files`, and `find_files` --
@@ -117,12 +123,15 @@ FileSystem(
     denied_patterns=[],            # denylist globs
     protected_patterns=[...],      # read-only globs (defaults to secrets/.git)
     max_read_lines=2000,           # cap for a single read_file
+    max_list_results=1000,         # cap for list_directory
     max_search_results=1000,       # cap for search_files
     max_find_results=1000,         # cap for find_files
 )
 ```
 
-The integer limits must be positive; they are validated at construction.
+The integer limits must be positive; they are validated at construction. A
+walker that hits its cap ends its output with a `[... truncated at N ...]`
+marker, and only when a further entry was actually dropped.
 
 ## Agent spec (YAML/JSON)
 
