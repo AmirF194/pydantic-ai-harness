@@ -40,7 +40,7 @@ print(result.output)
 | `edit_file` | Exact-string replacement; `old_text` must match exactly once. Optional `expected_hash`. |
 | `list_directory` | List a directory's entries with type indicators and sizes. |
 | `search_files` | Regex search over file contents, optionally narrowed by an `include_glob`. |
-| `find_files` | Glob search over file names (e.g. `*.py`, `**/*.json`). |
+| `find_files` | Glob search over file names (e.g. `*.py`, `**/*.json`). The pattern must be relative to the searched directory. |
 | `create_directory` | Create a directory and any missing parents. |
 | `file_info` | Metadata for a file or directory (size, type, line count, hash, symlink target). |
 
@@ -50,8 +50,9 @@ print(result.output)
   outside -- via `..`, an absolute path, or a symlink -- is rejected. Symlinks
   are resolved with `os.path.realpath` *before* the containment check, closing
   the TOCTTOU window. Directory walks (`list_directory`, `search_files`,
-  `find_files`) resolve each entry the same way, so a symlink out of the tree
-  is neither listed nor read.
+  `find_files`) resolve each entry the same way and match the patterns against
+  that resolved target, so a symlink out of the tree is neither listed nor
+  read, and a symlink cannot present a denied file under a permitted name.
 - **Binary detection.** `read_file` returns a placeholder instead of dumping
   binary bytes into the model context.
 - **Optimistic concurrency.** `write_file`/`edit_file` accept an

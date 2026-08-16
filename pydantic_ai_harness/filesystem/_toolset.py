@@ -69,17 +69,18 @@ def _is_binary(data: bytes, sample_size: int = 8192) -> bool:
 
 
 def _matching_lines(text: str, compiled: re.Pattern[str], rel_str: str, limit: int) -> tuple[list[str], bool]:
-    """Match one file's lines, stopping at `limit`.
+    """Match one file's lines, keeping at most `limit` of them.
 
-    Returns the formatted matches and whether the limit was reached, so the
-    caller can cap total output on a single file with many matches.
+    Returns the formatted matches and whether a further match had to be
+    dropped, so the caller reports truncation only when output was cut. A
+    `limit` of zero or less keeps nothing.
     """
     matches: list[str] = []
     for line_num, line in enumerate(text.splitlines(), start=1):
         if compiled.search(line):
-            matches.append(f'{rel_str}:{line_num}:{line}')
             if len(matches) >= limit:
                 return matches, True
+            matches.append(f'{rel_str}:{line_num}:{line}')
     return matches, False
 
 
@@ -166,7 +167,7 @@ class FileSystemToolset(FunctionToolset[AgentDepsT]):
         directory isn't required to match `allowed_patterns` itself -- `.` or
         `src` would never match a file pattern like `src/*.py`. The walk's
         entries are still filtered against `allowed_patterns` per-entry via
-        `_is_accessible`. Denied patterns continue to gate the root.
+        `_resolve_walk_entry`. Denied patterns continue to gate the root.
         """
         if write and self._protected_patterns:
             matched = self._first_matching_pattern(path, self._protected_patterns)
@@ -182,16 +183,12 @@ class FileSystemToolset(FunctionToolset[AgentDepsT]):
             if not any(self._matches(path, p) for p in self._allowed_patterns):
                 raise PermissionError(f'Path {path!r} does not match any allowed pattern.')
 
-    def _is_accessible(self, path: str, *, write: bool = False) -> bool:
-        """Predicate form of `_check_access` for filtering recursive walkers.
+    def _is_accessible(self, path: str) -> bool:
+        """Predicate form of the read-level `_check_access` checks.
 
-        Used by `list_directory`, `search_files`, and `find_files` to skip
-        children that would be rejected if accessed directly. Note this only
-        checks the relative path against patterns; it does not resolve symlinks.
+        Protected patterns are not consulted: they gate writes, and the walkers
+        only read.
         """
-        if write and self._protected_patterns:
-            if self._first_matching_pattern(path, self._protected_patterns) is not None:
-                return False
         if self._denied_patterns:
             if self._first_matching_pattern(path, self._denied_patterns) is not None:
                 return False
@@ -199,15 +196,21 @@ class FileSystemToolset(FunctionToolset[AgentDepsT]):
             return False
         return True
 
-    def _is_within_root(self, path: Path) -> bool:
-        """Containment check for entries produced by a directory walk.
+    def _resolve_walk_entry(self, entry: Path) -> Path | None:
+        """Authorize one entry of a directory walk, or return `None` to skip it.
 
-        `_is_accessible` matches patterns against the lexical path, so an
-        in-root symlink to an external target passes it. Resolving keeps the
-        walkers in step with direct access, which rejects escapes in
-        `_resolve_path`.
+        Callers must do their I/O on the returned path. Resolving once means the
+        entry that was authorized is the entry that gets read, and matching the
+        patterns against the resolved location keeps the walkers in step with
+        direct access: a symlink can neither escape the root nor alias a file
+        past a rule its own name would trip.
         """
-        return Path(os.path.realpath(path)).is_relative_to(self._real_root)
+        target = Path(os.path.realpath(entry))
+        if not target.is_relative_to(self._real_root):
+            return None
+        if not self._is_accessible(self._relative_to_root(target)):
+            return None
+        return target
 
     def _relative_to_root(self, resolved: Path) -> str:
         """Canonical path of a resolved location relative to the real root."""
@@ -361,16 +364,19 @@ class FileSystemToolset(FunctionToolset[AgentDepsT]):
             # find_files so the three walkers agree on what exists.
             if any(part.startswith('.') for part in rel_path.parts):
                 continue
-            rel = str(rel_path)
-            if not self._is_accessible(rel) or not self._is_within_root(entry):
+            target = self._resolve_walk_entry(entry)
+            if target is None:
                 continue
-            if entry.is_dir():
+            rel = str(rel_path)
+            if target.is_dir():
                 entries.append(f'{rel}/')
             else:
                 try:
-                    size = entry.stat().st_size
-                except OSError:  # pragma: no cover  # file deleted between iterdir and stat
-                    size = 0
+                    size = target.stat().st_size
+                except OSError:
+                    # A dangling symlink, or an entry deleted mid-walk: it has
+                    # no size to report, so leave it out of the listing.
+                    continue
                 entries.append(f'{rel}  ({size} bytes)')
         return '\n'.join(entries) if entries else '(empty directory)'
 
@@ -401,25 +407,23 @@ class FileSystemToolset(FunctionToolset[AgentDepsT]):
         else:
             files = sorted(resolved.rglob('*'))
 
-        real_root = Path(os.path.realpath(self._root))
         for file_path in files:
-            if not file_path.is_file():
-                continue
             try:
-                rel_parts = file_path.relative_to(real_root).parts
+                rel_path = file_path.relative_to(self._real_root)
             except ValueError:  # pragma: no cover
                 continue
-            if any(part.startswith('.') for part in rel_parts):
+            if any(part.startswith('.') for part in rel_path.parts):
                 continue
-            rel_str = str(file_path.relative_to(real_root))
-            if not self._is_accessible(rel_str):
-                continue
+            rel_str = str(rel_path)
             if include_glob and not fnmatch.fnmatch(rel_str, include_glob):
                 continue
-            if not self._is_within_root(file_path):
+            target = self._resolve_walk_entry(file_path)
+            if target is None:
+                continue
+            if not target.is_file():
                 continue
             try:
-                raw = file_path.read_bytes()
+                raw = target.read_bytes()
             except OSError:  # pragma: no cover
                 continue
             if _is_binary(raw):
@@ -438,12 +442,16 @@ class FileSystemToolset(FunctionToolset[AgentDepsT]):
         """Find files by glob pattern (name matching, not content search).
 
         Args:
-            pattern: Glob pattern to match (e.g. '*.py', '**/*.json').
+            pattern: Glob pattern to match, relative to `path` (e.g. '*.py',
+                '**/*.json'). Absolute patterns are rejected.
             path: Directory to search in, relative to the root directory.
 
         Returns:
             Newline-separated list of matching file paths relative to root.
         """
+        if os.path.isabs(pattern):
+            raise ValueError(f'Pattern {pattern!r} must be relative to the search path, not absolute.')
+
         # See list_directory: the find root isn't gated by allowed_patterns;
         # matched entries are filtered per-entry below.
         resolved = self._safe_resolve(path, check_allowed=False)
@@ -451,22 +459,25 @@ class FileSystemToolset(FunctionToolset[AgentDepsT]):
             raise NotADirectoryError(f'Not a directory: {path}')
 
         matches: list[str] = []
-        real_root = Path(os.path.realpath(self._root))
         for match in sorted(resolved.glob(pattern)):
             try:
-                rel_parts = match.relative_to(real_root).parts
+                rel_path = match.relative_to(self._real_root)
             except ValueError:  # pragma: no cover
                 continue
-            if any(part.startswith('.') for part in rel_parts):
+            if any(part.startswith('.') for part in rel_path.parts):
                 continue
-            rel = str(match.relative_to(real_root))
-            if not self._is_accessible(rel) or not self._is_within_root(match):
+            target = self._resolve_walk_entry(match)
+            if target is None:
                 continue
-            suffix = '/' if match.is_dir() else ''
-            matches.append(f'{rel}{suffix}')
+            if not target.exists():
+                # A dangling symlink resolves inside the root but names nothing.
+                continue
             if len(matches) >= self._max_find_results:
                 matches.append(f'[... truncated at {self._max_find_results} matches]')
                 break
+            rel = str(rel_path)
+            suffix = '/' if target.is_dir() else ''
+            matches.append(f'{rel}{suffix}')
 
         return '\n'.join(matches) if matches else 'No matches found.'
 
