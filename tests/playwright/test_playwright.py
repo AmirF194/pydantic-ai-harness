@@ -1498,6 +1498,24 @@ class TestNameResolutionBlocking:
         assert isinstance(result, str) and not result.startswith('Error:')
 
 
+class TestResolutionIsBounded:
+    """The lookup runs before an operation's deadline exists, so it carries its own."""
+
+    async def test_a_stalled_resolver_does_not_hold_the_call(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(toolset_module, '_RESOLUTION_TIMEOUT_SECONDS', 0.01)
+
+        async def never_answers(host: str) -> tuple[str, ...]:
+            await asyncio.Event().wait()
+            raise AssertionError('unreachable')  # pragma: no cover
+
+        monkeypatch.setattr(toolset_module, '_getaddrinfo', never_answers)
+        result = await _toolset(_FakePage()).navigate('https://example.com/')
+        # A resolver that never answers is treated like one that failed: the request
+        # is about to fail in the browser too, and refusing here would report a
+        # private address where there is a DNS outage.
+        assert isinstance(result, str) and not result.startswith('Error:')
+
+
 class TestResolutionCaching:
     """The lookup is a duplicate of one Chromium already makes, so it is cached briefly."""
 
@@ -3478,6 +3496,17 @@ class TestTabs:
         assert result == 'Error: tabs failed: page is busy'
         assert session.pages == [page, popup]
 
+    async def test_a_tool_on_a_closed_last_tab_names_the_recovery(self) -> None:
+        # The active pointer stays on the closed page on purpose, so the tools that
+        # act on it have to say what reopens one.
+        session = PlaywrightBrowserSession()
+        page = _FakePage(inner_text_error=TargetClosedError('Target page closed'))
+        toolset = _toolset(page, session=session)
+        # What `_on_page_closed` leaves behind when the page that closed was the last.
+        session.pages = []
+        result = await toolset.get_text()
+        assert result == "Error: get_text failed: the active tab has closed. Open one with tabs('new')."
+
     async def test_the_last_tab_cannot_be_closed(self) -> None:
         page = _FakePage()
         assert await _toolset(page).tabs('close') == 'Error: the last tab cannot be closed.'
@@ -3571,6 +3600,21 @@ class TestDialogs:
             assert result == 'The next dialog will be accepted.'
             await self._open(session, page, dialog)
         assert dialog.accepted_with == '42'
+
+    async def test_an_armed_decision_does_not_survive_into_the_next_use(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # Arming says what to do about the dialog this run is expecting; a dialog in
+        # a later use of the session is not that one.
+        page = _FakePage()
+        _install_fake_driver(monkeypatch, page)
+        session = PlaywrightBrowserSession()
+        async with session:
+            await session.ensure_page()
+            await _toolset(page, session=session).handle_next_dialog(accept=True)
+        dialog = _FakeDialog()
+        async with session:
+            await session.ensure_page()
+            await self._open(session, page, dialog)
+        assert dialog.answer == 'dismiss'
 
     async def test_arming_a_dismissal_reports_it(self) -> None:
         page = _FakePage()

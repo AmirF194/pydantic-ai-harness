@@ -428,6 +428,7 @@ def _is_ip_literal(host: str) -> bool:
 
 _RESOLUTION_TTL_SECONDS = 30.0
 _RESOLUTION_CACHE_MAX = 256
+_RESOLUTION_TIMEOUT_SECONDS = 2.0
 _resolution_cache: dict[str, tuple[float, tuple[str, ...]]] = {}
 
 
@@ -443,14 +444,19 @@ async def _resolve_host(host: str) -> tuple[str, ...]:
     small. It cannot make the block airtight: Chromium resolves the name a second
     time, and a record that changes between the two lookups is the DNS-rebinding
     case that only a proxy or pinned resolver closes.
+
+    The lookup is bounded because of where it runs: ahead of the operation whose
+    deadline it would otherwise escape, and inside the route guard, which holds the
+    request until it returns. A stalled resolver therefore costs a bounded wait
+    rather than the run.
     """
     now = monotonic()
     cached = _resolution_cache.get(host)
     if cached is not None and cached[0] > now:
         return cached[1]
     try:
-        addresses = await _getaddrinfo(host)
-    except OSError:
+        addresses = await asyncio.wait_for(_getaddrinfo(host), _RESOLUTION_TIMEOUT_SECONDS)
+    except (OSError, asyncio.TimeoutError):
         return ()
     if len(_resolution_cache) >= _RESOLUTION_CACHE_MAX:
         _resolution_cache.clear()
@@ -1434,12 +1440,15 @@ class PlaywrightBrowserSession:
         first use would have teardown exit a driver that was never started. A
         recorded launch failure is cleared for the same reason: it described the
         previous use, and keeping it would refuse every tool call of this one
-        without ever trying to start a browser.
+        without ever trying to start a browser. So is an armed dialog decision,
+        which would otherwise answer the first dialog of this use with an intent
+        expressed during the last one.
         """
         self._driver_cm = async_playwright()
         self._driver = None
         self._driver_entered = False
         self.launch_error = None
+        self.dialog_decision = None
         return self
 
     async def __aexit__(self, exc_type: type[BaseException] | None, *_: object) -> None:
@@ -1643,6 +1652,11 @@ class PlaywrightBrowserToolset(FunctionToolset[AgentDepsT]):
                 'Content inside an iframe needs an `aria-ref=` handle from `snapshot`, not a CSS selector.'
             )
         if isinstance(exc, TargetClosedError):
+            if not self._session.pages:
+                # The active pointer deliberately stays on the closed page rather than
+                # falling back to a fresh browser, which would drop the session's
+                # cookies and history without saying so.
+                return self._error(f"Error: {action} failed: the active tab has closed. Open one with tabs('new').")
             return (
                 f'Error: {action} failed: the browser or page was closed unexpectedly. '
                 'Browser tools may be unavailable for the rest of this run.'
