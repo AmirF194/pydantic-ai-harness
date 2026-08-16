@@ -103,16 +103,17 @@ class PlaywrightBrowser(AbstractCapability[AgentDepsT]):
     ```
 
     Egress: `allowed_domains=None` (the default) places no domain restriction on
-    the URLs the agent can reach; pass `allowed_domains=[...]` to restrict
-    navigation to an allowlist. Independently, `block_private_addresses=True`
-    (the default) refuses navigation to private, loopback, link-local, and other
-    reserved IP literals (for example `169.254.169.254`, `127.0.0.1`, or
-    `localhost`), even under open egress -- and unlike the allowlist, which
-    governs top-level navigation only, the private-address block applies to every
-    frame, since `snapshot` reads cross-origin child frames. Both policies govern
-    navigation, not requests made by in-page JavaScript
-    (`fetch`/XHR via `execute_js`), and the private-address block matches IP
-    literals rather than resolving hostnames; those gaps are tracked in
+    the URLs the agent can reach; pass `allowed_domains=[...]` to bound navigation
+    and the request kinds that move data (`fetch`, XHR, EventSource, WebSocket,
+    `sendBeacon`) in any frame, leaving passive subresources and sub-frame
+    documents unbounded so a permitted page keeps its assets and its
+    identity-provider frames. Independently, `block_private_addresses=True` (the
+    default) refuses private, loopback, link-local and other reserved addresses
+    for every request kind in every frame, even under open egress, resolving a
+    hostname first so a name pointing at one of those addresses is refused too.
+    Neither is a general security boundary: an unanswered DNS lookup is refused
+    but Chromium resolves the name again before it connects, so rebinding is not
+    closed, and a proxy-based enforcement mode is tracked in
     https://github.com/pydantic/pydantic-ai-harness/issues/415. Set
     `allowed_domains` when the agent may act on untrusted input.
 

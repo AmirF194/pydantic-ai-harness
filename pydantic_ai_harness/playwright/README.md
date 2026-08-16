@@ -463,9 +463,10 @@ that string as the reason, which the model can read through `network_requests`.
 Neither policy is a general security boundary. Microsoft's own playwright-mcp
 disclaims its origin filter the same way. A page can still signal outward through
 the request kinds the allowlist leaves alone -- an image or script URL carries
-whatever the page puts in it -- and both policies match IP literals and
-`localhost` names, not hostnames that resolve to private addresses (DNS
-rebinding). Those, and a proxy-based enforcement mode, are tracked in
+whatever the page puts in it -- and a hostname is classified on the answer this
+process gets, while Chromium resolves it again before connecting, so a record
+that changes in between (DNS rebinding) still wins. That, and the proxy-based
+enforcement mode which is what closes it, are tracked in
 [#415](https://github.com/pydantic/pydantic-ai-harness/issues/415).
 
 For untrusted-input scenarios, run the browser in a container or VM with an
