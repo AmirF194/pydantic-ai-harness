@@ -1466,9 +1466,10 @@ class TestNameResolutionBlocking:
         )
         assert route.aborted is True
 
-    async def test_a_passive_subresource_is_not_resolved(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        # Images and fonts are the bulk of a page's requests and return their bytes
-        # to the renderer, not to a tool result, so they stay off the lookup path.
+    async def test_a_passive_subresource_is_resolved_too(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # The literal check already covers every kind, so a spelling must not decide
+        # the verdict: an image pointed at an address and one pointed at a name
+        # answering with it are the same request.
         looked_up = self._pointing_at(monkeypatch, '127.0.0.1')
         page = await self._guarded_page(monkeypatch)
         host_page = _FakeRequestPage()
@@ -1477,8 +1478,19 @@ class TestNameResolutionBlocking:
                 'http://cdn.example/logo.png', navigation=False, resource_type='image', frame=host_page.main_frame
             )
         )
+        assert route.aborted is True
+        assert looked_up == ['cdn.example']
+
+    async def test_a_public_subresource_still_loads(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        self._pointing_at(monkeypatch, '93.184.216.34')
+        page = await self._guarded_page(monkeypatch)
+        host_page = _FakeRequestPage()
+        route = await page.context.dispatch(
+            _FakeRequest(
+                'http://cdn.example/logo.png', navigation=False, resource_type='image', frame=host_page.main_frame
+            )
+        )
         assert route.continued is True
-        assert looked_up == []
 
     async def test_a_subframe_document_is_resolved(self, monkeypatch: pytest.MonkeyPatch) -> None:
         # A child frame's text is appended to the page text, so a frame pointed at
@@ -2601,7 +2613,7 @@ def test_public_exports() -> None:
     assert issubclass(BrowserUnavailableWarning, UserWarning)
     assert EgressPolicy().refuse(EgressRequest(url='https://example.com/', kind='navigation')) is None
     assert DEFAULT_ALLOWLIST_REACH == frozenset({'navigation', 'data'})
-    assert DEFAULT_RESOLVED_KINDS == frozenset({'navigation', 'data', 'subframe'})
+    assert DEFAULT_RESOLVED_KINDS == frozenset(get_args(RequestKind))
     assert set(get_args(RequestKind)) == {'navigation', 'subframe', 'data', 'subresource'}
 
 

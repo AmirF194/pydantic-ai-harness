@@ -112,7 +112,7 @@ from collections import deque
 from contextlib import AbstractAsyncContextManager
 from dataclasses import dataclass, replace
 from time import monotonic
-from typing import TYPE_CHECKING, Literal, Protocol, TypeVar
+from typing import TYPE_CHECKING, Literal, Protocol, TypeVar, get_args
 from urllib.parse import urlparse
 
 import idna
@@ -573,15 +573,19 @@ class EgressRequest:
     """Whether a lookup the policy asked for did not answer, leaving the host unclassifiable."""
 
 
-DEFAULT_RESOLVED_KINDS: frozenset[RequestKind] = frozenset({'navigation', 'data', 'subframe'})
+DEFAULT_RESOLVED_KINDS: frozenset[RequestKind] = frozenset(get_args(RequestKind))
 """Which kinds have their host resolved before the private-address block classifies it.
 
 A name is not an IP literal, so `is_blocked_address` cannot see that it points at a
-private address; resolving first is what closes that. The passive `subresource`
-kind is left out because it is the bulk of a page's requests and the weakest way
-back to the model: an image or a font that loads from an internal address returns
-its bytes to the renderer, not to a tool result. Documents do return: a navigation
-becomes the page text, and a sub-frame's text is appended to it.
+private address; resolving first is what closes that. Every kind is resolved,
+because the literal check already covers every kind and a spelling should not
+decide the verdict: an `img` pointed at `169.254.169.254` and one pointed at a name
+answering with that address are the same request. Passive subresources do not
+return content to the model, but a page can still time their loads to map what is
+listening inside the network.
+
+The cost is bounded by the resolution cache, which makes this a lookup per distinct
+host rather than per request, and a page draws on few hosts.
 """
 
 

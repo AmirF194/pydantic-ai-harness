@@ -400,9 +400,9 @@ their own guard, applying the same policy the table above describes.
 A host that is not already an address is resolved before the private-address block
 classifies it, so a name pointing at an internal address (`169.254.169.254.nip.io`
 and similar wildcard DNS services) is refused rather than followed. That lookup runs
-for navigation, data requests and sub-frame documents -- the kinds whose content
-comes back to the model -- and not for passive subresources, which are the bulk of
-a page's requests. `resolved_kinds` sets which kinds are looked up.
+for every kind, matching the literal check, so a spelling does not decide the
+verdict; answers are cached, which makes it a lookup per distinct host rather than
+per request. `resolved_kinds` sets which kinds are looked up.
 
 A lookup that does not answer within two seconds is a refusal, not an allow:
 whoever controls a name controls whether its lookup answers, so a stall would
