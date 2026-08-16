@@ -152,13 +152,16 @@ FileSystem(
     denied_patterns=[],            # denylist globs
     protected_patterns=[...],      # read-only globs (defaults to secrets/.git)
     max_read_lines=2000,           # cap for a single read_file
+    max_list_results=1000,         # cap for list_directory
     max_search_results=1000,       # cap for search_files
     max_find_results=1000,         # cap for find_files
 )
 ```
 
-The three integer limits must be positive; they are validated at construction
-and raise `ValueError` otherwise.
+The integer limits must be positive; they are validated at construction and
+raise `ValueError` otherwise. A walker that hits its cap ends its output with a
+`[... truncated at N ...]` marker, and only when a further entry was actually
+dropped.
 
 ## Agent spec (YAML/JSON)
 

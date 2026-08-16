@@ -108,6 +108,7 @@ class FileSystemToolset(FunctionToolset[AgentDepsT]):
         denied_patterns: Sequence[str],
         protected_patterns: Sequence[str],
         max_read_lines: int,
+        max_list_results: int,
         max_search_results: int,
         max_find_results: int,
     ) -> None:
@@ -118,6 +119,7 @@ class FileSystemToolset(FunctionToolset[AgentDepsT]):
         self._denied_patterns = list(denied_patterns)
         self._protected_patterns = list(protected_patterns)
         self._max_read_lines = max_read_lines
+        self._max_list_results = max_list_results
         self._max_search_results = max_search_results
         self._max_find_results = max_find_results
 
@@ -369,7 +371,7 @@ class FileSystemToolset(FunctionToolset[AgentDepsT]):
                 continue
             rel = str(rel_path)
             if target.is_dir():
-                entries.append(f'{rel}/')
+                line = f'{rel}/'
             else:
                 try:
                     size = target.stat().st_size
@@ -377,7 +379,13 @@ class FileSystemToolset(FunctionToolset[AgentDepsT]):
                     # A dangling symlink, or an entry deleted mid-walk: it has
                     # no size to report, so leave it out of the listing.
                     continue
-                entries.append(f'{rel}  ({size} bytes)')
+                line = f'{rel}  ({size} bytes)'
+            # Only a listing that actually dropped an entry is marked truncated,
+            # so one that merely fills the cap reads as complete.
+            if len(entries) >= self._max_list_results:
+                entries.append(f'[... truncated at {self._max_list_results} entries]')
+                break
+            entries.append(line)
         return '\n'.join(entries) if entries else '(empty directory)'
 
     @_recoverable

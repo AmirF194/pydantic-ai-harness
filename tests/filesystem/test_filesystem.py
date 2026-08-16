@@ -100,6 +100,7 @@ def toolset(fs_root: Path) -> FileSystemToolset[None]:
         denied_patterns=[],
         protected_patterns=['.git/*', '.env', '.env.*'],
         max_read_lines=2000,
+        max_list_results=1000,
         max_search_results=1000,
         max_find_results=1000,
     )
@@ -159,6 +160,7 @@ class TestAccessPatterns:
             denied_patterns=['*.secret'],
             protected_patterns=[],
             max_read_lines=2000,
+            max_list_results=1000,
             max_search_results=1000,
             max_find_results=1000,
         )
@@ -172,6 +174,7 @@ class TestAccessPatterns:
             denied_patterns=['*.secret'],
             protected_patterns=[],
             max_read_lines=2000,
+            max_list_results=1000,
             max_search_results=1000,
             max_find_results=1000,
         )
@@ -185,6 +188,7 @@ class TestAccessPatterns:
             denied_patterns=[],
             protected_patterns=[],
             max_read_lines=2000,
+            max_list_results=1000,
             max_search_results=1000,
             max_find_results=1000,
         )
@@ -198,6 +202,7 @@ class TestAccessPatterns:
             denied_patterns=[],
             protected_patterns=[],
             max_read_lines=2000,
+            max_list_results=1000,
             max_search_results=1000,
             max_find_results=1000,
         )
@@ -227,6 +232,7 @@ class TestAccessPatterns:
             denied_patterns=[],
             protected_patterns=[],
             max_read_lines=2000,
+            max_list_results=1000,
             max_search_results=1000,
             max_find_results=1000,
         )
@@ -240,6 +246,7 @@ class TestAccessPatterns:
             denied_patterns=[],
             protected_patterns=[],
             max_read_lines=2000,
+            max_list_results=1000,
             max_search_results=1000,
             max_find_results=1000,
         )
@@ -254,6 +261,7 @@ class TestAccessPatterns:
             denied_patterns=[],
             protected_patterns=['*.pem'],
             max_read_lines=2000,
+            max_list_results=1000,
             max_search_results=1000,
             max_find_results=1000,
         )
@@ -269,6 +277,7 @@ class TestAccessPatterns:
             denied_patterns=['*.secret'],
             protected_patterns=[],
             max_read_lines=2000,
+            max_list_results=1000,
             max_search_results=1000,
             max_find_results=1000,
         )
@@ -284,6 +293,7 @@ class TestAccessPatterns:
             denied_patterns=[],
             protected_patterns=[],
             max_read_lines=2000,
+            max_list_results=1000,
             max_search_results=1000,
             max_find_results=1000,
         )
@@ -462,6 +472,7 @@ class TestListDirectory:
             denied_patterns=[],
             protected_patterns=['*'],
             max_read_lines=2000,
+            max_list_results=1000,
             max_search_results=1000,
             max_find_results=1000,
         )
@@ -479,6 +490,7 @@ class TestListDirectory:
             denied_patterns=[],
             protected_patterns=[],
             max_read_lines=2000,
+            max_list_results=1000,
             max_search_results=1000,
             max_find_results=1000,
         )
@@ -495,12 +507,47 @@ class TestListDirectory:
             denied_patterns=['*.secret'],
             protected_patterns=[],
             max_read_lines=2000,
+            max_list_results=1000,
             max_search_results=1000,
             max_find_results=1000,
         )
         result = await ts.list_directory('.')
         assert 'visible.txt' in result
         assert 'creds.secret' not in result
+
+    async def test_list_truncation(self, fs_root: Path) -> None:
+        for i in range(20):
+            (fs_root / f'file{i}.dat').write_text(f'{i}\n')
+        ts = FileSystemToolset(
+            root_dir=fs_root,
+            allowed_patterns=[],
+            denied_patterns=[],
+            protected_patterns=[],
+            max_read_lines=2000,
+            max_list_results=5,
+            max_search_results=1000,
+            max_find_results=1000,
+        )
+        result = await ts.list_directory('.')
+        lines = result.splitlines()
+        assert len(lines) == 6
+        assert lines[-1] == '[... truncated at 5 entries]'
+
+    async def test_list_at_cap_is_not_marked_truncated(self, tmp_path: Path) -> None:
+        for i in range(3):
+            (tmp_path / f'cap{i}.dat').write_text('x\n')
+        ts = FileSystemToolset(
+            root_dir=tmp_path,
+            allowed_patterns=[],
+            denied_patterns=[],
+            protected_patterns=[],
+            max_read_lines=2000,
+            max_list_results=3,
+            max_search_results=1000,
+            max_find_results=1000,
+        )
+        result = await ts.list_directory('.')
+        assert [line.split(' ')[0] for line in result.splitlines()] == ['cap0.dat', 'cap1.dat', 'cap2.dat']
 
 
 class TestSearchFiles:
@@ -550,6 +597,7 @@ class TestSearchFiles:
             denied_patterns=[],
             protected_patterns=[],
             max_read_lines=2000,
+            max_list_results=1000,
             max_search_results=50,
             max_find_results=1000,
         )
@@ -564,6 +612,7 @@ class TestSearchFiles:
             denied_patterns=[],
             protected_patterns=['*'],
             max_read_lines=2000,
+            max_list_results=1000,
             max_search_results=1000,
             max_find_results=1000,
         )
@@ -579,6 +628,7 @@ class TestSearchFiles:
             denied_patterns=['*.secret'],
             protected_patterns=[],
             max_read_lines=2000,
+            max_list_results=1000,
             max_search_results=1000,
             max_find_results=1000,
         )
@@ -597,6 +647,7 @@ class TestSearchFiles:
             denied_patterns=[],
             protected_patterns=[],
             max_read_lines=2000,
+            max_list_results=1000,
             max_search_results=1000,
             max_find_results=1000,
         )
@@ -612,6 +663,7 @@ class TestSearchFiles:
             denied_patterns=[],
             protected_patterns=[],
             max_read_lines=2000,
+            max_list_results=1000,
             max_search_results=5,
             max_find_results=1000,
         )
@@ -628,6 +680,7 @@ class TestSearchFiles:
             denied_patterns=[],
             protected_patterns=[],
             max_read_lines=2000,
+            max_list_results=1000,
             max_search_results=2,
             max_find_results=1000,
         )
@@ -643,6 +696,7 @@ class TestSearchFiles:
             denied_patterns=[],
             protected_patterns=[],
             max_read_lines=2000,
+            max_list_results=1000,
             max_search_results=2,
             max_find_results=1000,
         )
@@ -658,6 +712,7 @@ class TestSearchFiles:
             denied_patterns=[],
             protected_patterns=[],
             max_read_lines=2000,
+            max_list_results=1000,
             max_search_results=0,
             max_find_results=1000,
         )
@@ -725,6 +780,7 @@ class TestFindFiles:
             denied_patterns=[],
             protected_patterns=[],
             max_read_lines=2000,
+            max_list_results=1000,
             max_search_results=1000,
             max_find_results=3,
         )
@@ -752,6 +808,7 @@ class TestFindFiles:
             denied_patterns=[],
             protected_patterns=[],
             max_read_lines=2000,
+            max_list_results=1000,
             max_search_results=1000,
             max_find_results=5,
         )
@@ -766,6 +823,7 @@ class TestFindFiles:
             denied_patterns=[],
             protected_patterns=['*'],
             max_read_lines=2000,
+            max_list_results=1000,
             max_search_results=1000,
             max_find_results=1000,
         )
@@ -781,6 +839,7 @@ class TestFindFiles:
             denied_patterns=['*.secret'],
             protected_patterns=[],
             max_read_lines=2000,
+            max_list_results=1000,
             max_search_results=1000,
             max_find_results=1000,
         )
@@ -799,6 +858,7 @@ class TestFindFiles:
             denied_patterns=[],
             protected_patterns=[],
             max_read_lines=2000,
+            max_list_results=1000,
             max_search_results=1000,
             max_find_results=1000,
         )
@@ -819,6 +879,7 @@ class TestWalkerEntryResolution:
             denied_patterns=['*.secret'],
             protected_patterns=[],
             max_read_lines=2000,
+            max_list_results=1000,
             max_search_results=1000,
             max_find_results=1000,
         )
@@ -837,6 +898,7 @@ class TestWalkerEntryResolution:
             denied_patterns=[],
             protected_patterns=[],
             max_read_lines=2000,
+            max_list_results=1000,
             max_search_results=1000,
             max_find_results=1000,
         )
@@ -854,6 +916,7 @@ class TestWalkerEntryResolution:
             denied_patterns=['*.secret'],
             protected_patterns=[],
             max_read_lines=2000,
+            max_list_results=1000,
             max_search_results=1000,
             max_find_results=1000,
         )
@@ -986,6 +1049,7 @@ class TestMutationKillers:
             denied_patterns=[],
             protected_patterns=[],
             max_read_lines=2000,
+            max_list_results=1000,
             max_search_results=5,
             max_find_results=1000,
         )
@@ -1006,6 +1070,7 @@ class TestMutationKillers:
             denied_patterns=[],
             protected_patterns=[],
             max_read_lines=2000,
+            max_list_results=1000,
             max_search_results=1000,
             max_find_results=3,
         )
@@ -1244,6 +1309,10 @@ class TestFileSystemCapability:
         with pytest.raises(ValueError, match='max_read_lines must be a positive integer'):
             FileSystem(max_read_lines=-1)
 
+    def test_non_positive_max_list_results_rejected(self) -> None:
+        with pytest.raises(ValueError, match='max_list_results must be a positive integer'):
+            FileSystem(max_list_results=0)
+
     def test_non_positive_max_search_results_rejected(self) -> None:
         with pytest.raises(ValueError, match='max_search_results must be a positive integer'):
             FileSystem(max_search_results=0)
@@ -1282,6 +1351,7 @@ class TestPatternCanonicalization:
             denied_patterns=['config/secret.txt'],
             protected_patterns=[],
             max_read_lines=2000,
+            max_list_results=1000,
             max_search_results=1000,
             max_find_results=1000,
         )
@@ -1297,6 +1367,7 @@ class TestPatternCanonicalization:
             denied_patterns=[],
             protected_patterns=['**/secrets*'],
             max_read_lines=2000,
+            max_list_results=1000,
             max_search_results=1000,
             max_find_results=1000,
         )
