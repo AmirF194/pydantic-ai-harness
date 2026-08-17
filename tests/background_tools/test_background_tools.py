@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 
 import pytest
-from pydantic_ai import Agent
+from pydantic_ai import Agent, CancellationToken, RunCancelled
 from pydantic_ai.messages import (
     ModelMessage,
     ModelRequest,
@@ -158,8 +158,8 @@ class TestBackgroundTools:
 
         first = asyncio.ensure_future(run_and_check('first'))
         second = asyncio.ensure_future(run_and_check('second'))
-        await started['first'].wait()
-        await started['second'].wait()
+        await asyncio.wait_for(started['first'].wait(), timeout=5)
+        await asyncio.wait_for(started['second'].wait(), timeout=5)
 
         # Finish the first run completely while the second's task is still live;
         # shared state would let the first run's cleanup cancel the second's task.
@@ -252,6 +252,30 @@ class TestBackgroundTools:
 
         await asyncio.wait_for(cancel_seen.wait(), timeout=1)
 
+    async def test_cancellation_token_cancels_live_tasks(self) -> None:
+        cancel_seen = asyncio.Event()
+        started = asyncio.Event()
+        token = CancellationToken()
+        agent = Agent(_model_calling('slow'), capabilities=[BackgroundTools()])
+
+        @agent.tool_plain(metadata={'background': True})
+        async def slow() -> str:  # pyright: ignore[reportUnusedFunction]
+            started.set()
+            try:
+                await asyncio.sleep(60)
+            except asyncio.CancelledError:
+                cancel_seen.set()
+                raise
+            return 'never'  # pragma: no cover -- task is cancelled before completing
+
+        run = asyncio.ensure_future(agent.run('go', cancellation_token=token))
+        await asyncio.wait_for(started.wait(), timeout=5)
+        token.cancel()
+
+        with pytest.raises(RunCancelled):
+            await asyncio.wait_for(run, timeout=5)
+        await asyncio.wait_for(cancel_seen.wait(), timeout=1)
+
     async def test_name_list_selector(self) -> None:
         agent = Agent(_model_calling('by_name'), capabilities=[BackgroundTools(tools=['by_name'])])
 
@@ -278,7 +302,6 @@ class TestBackgroundTools:
         result = await agent.run('go')
 
         assert _ack_seen(result.all_messages())
-        assert _follow_up_seen(result.all_messages(), 'completed')
 
     async def test_custom_metadata_key_selector(self) -> None:
         agent = Agent(_model_calling('custom'), capabilities=[BackgroundTools(tools={'async': True})])

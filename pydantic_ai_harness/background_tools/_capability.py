@@ -6,6 +6,7 @@ import asyncio
 from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Any
 
+import anyio
 from pydantic_ai.capabilities import AbstractCapability
 from pydantic_ai.messages import ToolCallPart
 from pydantic_ai.tools import (
@@ -42,11 +43,13 @@ class BackgroundTools(AbstractCapability[AgentDepsT]):
     tool's handler in an `asyncio.Task` and immediately returns an acknowledgment
     string to the agent. When the task completes, its result (or error) is enqueued
     via [`RunContext.enqueue`][pydantic_ai.tools.RunContext.enqueue] as an `'asap'`
-    message — Pydantic AI's pending message queue delivers it on the next model
+    message -- Pydantic AI's pending message queue delivers it on the next model
     request, or redirects the agent to a fresh request if it would otherwise end,
     so the model receives the result and can act on it.
 
     ```python
+    import asyncio
+
     from pydantic_ai import Agent
     from pydantic_ai_harness import BackgroundTools
 
@@ -55,7 +58,8 @@ class BackgroundTools(AbstractCapability[AgentDepsT]):
 
     @agent.tool_plain(metadata={'background': True})
     async def slow_research(query: str) -> str:
-        return await do_expensive_research(query)
+        await asyncio.sleep(60)  # stand-in for a long-running job
+        return f'Research findings for {query!r}'
     ```
 
     Combine with [`SetToolMetadata`][pydantic_ai.capabilities.SetToolMetadata] to mark
@@ -73,15 +77,13 @@ class BackgroundTools(AbstractCapability[AgentDepsT]):
     - Callable `(ctx, tool_def) -> bool | Awaitable[bool]`: custom predicate.
     """
 
-    _tasks: dict[str, asyncio.Task[None]] = field(
-        default_factory=dict[str, 'asyncio.Task[None]'], init=False, repr=False
-    )
+    _tasks: set[asyncio.Task[None]] = field(default_factory=set[asyncio.Task[None]], init=False, repr=False)
 
     def get_instructions(self) -> AgentInstructions[AgentDepsT] | None:
         return _INSTRUCTIONS
 
     async def for_run(self, ctx: RunContext[AgentDepsT]) -> BackgroundTools[AgentDepsT]:
-        # `_tasks` is init=False, so `replace` gives the copy a fresh dict:
+        # `_tasks` is init=False, so `replace` gives the copy a fresh set:
         # concurrent runs don't share tasks.
         return replace(self)
 
@@ -106,10 +108,10 @@ class BackgroundTools(AbstractCapability[AgentDepsT]):
                 ctx.enqueue(f"Background tool '{tool_name}' (task {task_id}) completed.\nResult: {result}")
             except Exception as e:
                 ctx.enqueue(f"Background tool '{tool_name}' (task {task_id}) failed: {e}")
-            finally:
-                self._tasks.pop(task_id, None)
 
-        self._tasks[task_id] = asyncio.create_task(_run())
+        task = asyncio.create_task(_run())
+        self._tasks.add(task)
+        task.add_done_callback(self._tasks.discard)
         return (
             f"Tool '{tool_name}' is running in background (task {task_id}). "
             f'You will receive the result automatically when it completes. '
@@ -135,7 +137,7 @@ class BackgroundTools(AbstractCapability[AgentDepsT]):
         # without enqueueing (e.g. it was cancelled); the queue check skips waiting
         # when a result is already pending delivery.
         while self._tasks and not ctx.pending_messages:
-            await asyncio.wait(list(self._tasks.values()), return_when=asyncio.FIRST_COMPLETED)
+            await asyncio.wait(self._tasks, return_when=asyncio.FIRST_COMPLETED)
         return result
 
     async def wrap_run(
@@ -147,6 +149,10 @@ class BackgroundTools(AbstractCapability[AgentDepsT]):
         try:
             return await handler()
         finally:
-            for task in self._tasks.values():
-                task.cancel()
-            await asyncio.gather(*self._tasks.values(), return_exceptions=True)
+            # The shield holds the drain open under anyio-scope cancellation of
+            # the run. A raw second `task.cancel()` still pierces it and abandons
+            # the drain, which is accepted: every task is already cancelled here.
+            with anyio.CancelScope(shield=True):
+                for task in self._tasks:
+                    task.cancel()
+                await asyncio.gather(*self._tasks, return_exceptions=True)

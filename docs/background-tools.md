@@ -19,11 +19,13 @@ Some tools take seconds to minutes -- deep research, big aggregations, sub-agent
 
 ## The solution
 
-`BackgroundTools` spawns the matching tool calls as `asyncio.Task`s. The agent receives an immediate acknowledgment string and continues planning. When the task finishes, its result is enqueued as a follow-up message via [`RunContext.enqueue`](https://ai.pydantic.dev/api/tools/#pydantic_ai.tools.RunContext.enqueue); Pydantic AI's [pending message queue](https://ai.pydantic.dev/message-history/#injecting-messages-mid-run) delivers it on the next model request, or redirects the agent into a fresh request instead of ending, so the model sees the result and can use it.
+`BackgroundTools` runs the matching tool calls as background tasks. The agent receives an immediate acknowledgment and keeps working. When the work finishes, the result (or error) comes back into the conversation as a follow-up message: the model sees it on its next request, and an agent that was about to finish takes one more turn so the result still arrives.
 
 ## Usage
 
 ```python
+import asyncio
+
 from pydantic_ai import Agent
 from pydantic_ai_harness import BackgroundTools
 
@@ -32,7 +34,8 @@ agent = Agent('openai:gpt-5', capabilities=[BackgroundTools()])
 @agent.tool_plain(metadata={'background': True})
 async def slow_research(query: str) -> str:
     """Research a topic thoroughly. Runs in the background."""
-    return await do_expensive_research(query)
+    await asyncio.sleep(60)  # stand-in for a long-running job
+    return f'Research findings for {query!r}'
 ```
 
 By default any tool with `metadata={'background': True}` runs in the background. The agent's instructions are augmented automatically so the model knows it shouldn't block waiting for the result.
@@ -72,26 +75,24 @@ agent = Agent('openai:gpt-5', capabilities=[
 
 ## Result delivery
 
-Results are enqueued as `'asap'` priority messages on Pydantic AI's pending message queue. The next time the agent makes a model request, the result is delivered alongside it; if the agent would otherwise terminate before another request, the queue redirects it through a fresh `ModelRequest` so the model still receives the result.
-
-The message format is a plain string (wrapped in a `UserPromptPart` by `enqueue`):
+When a background tool finishes, the model receives a follow-up message:
 
 - On success: `Background tool 'X' (task <id>) completed.\nResult: <return value>`
 - On failure: `Background tool 'X' (task <id>) failed: <error message>`
 
-The model sees the task ID alongside the result so it can correlate against the ack string it received earlier.
+The task ID matches the one in the acknowledgment, so the model can tell which call each result belongs to.
 
 ## Lifecycle and cancellation
 
 - Each agent run gets fresh task state, so concurrent runs do not share tasks
 - The run does not finish while a background task is still live: a would-be final answer is held until the task delivers its follow-up, so total run duration still includes every background task
 - A run that pauses for [deferred tools](https://ai.pydantic.dev/deferred-tools/) (human-in-the-loop approval, external execution) is never held behind background work; remaining background tasks are cancelled when the run pauses
-- When the run ends for any other reason with tasks still live (caller cancellation, a usage limit, an unexpected error), those tasks are cancelled and their results are dropped
-- `asyncio.CancelledError` from a cancelled task does not produce a result message; it propagates as a normal task cancellation
+- When the run ends for any other reason with tasks still live (caller cancellation, a usage limit, an unexpected error), those tasks are cancelled and their results are dropped; a cancelled task is not reported to the model as a failure
 
 ## Limitations
 
 - **Streaming**: `run_stream()` completes on the model's final response and does not take the extra model turn that delivers late results, so background results are only guaranteed with `agent.run()` or a driven `agent.iter()` loop.
+- **Result screening**: capabilities that inspect tool results, such as a [Guardrails](guardrails.md) result guard, see the immediate acknowledgment, not the eventual result. A background tool's result is delivered without passing through them, so screen sensitive output inside the tool itself.
 - **Durable execution (Temporal / DBOS)**: spawning asyncio tasks inside a durable workflow is not replay-safe and this capability is untested there; don't combine them yet.
 
 ## API
