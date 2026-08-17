@@ -180,6 +180,29 @@ class TestFunctionTool:
         assert first.output == second.output == 'done'
         assert replay.invoked == []
 
+    @pytest.mark.parametrize(('operation', 'error_name'), [('enqueue', r'ctx\.enqueue\(\)'), ('cancel', 'cancel')])
+    async def test_checkpointed_tool_rejects_run_context_mutation(self, operation: str, error_name: str) -> None:
+        toolset = FunctionToolset(id='mutating')
+
+        @toolset.tool
+        def mutate_run(ctx: RunContext[object]) -> str:
+            if operation == 'enqueue':
+                ctx.enqueue('security instruction')
+            else:
+                ctx.cancel()
+            return 'mutated'
+
+        agent = Agent(
+            _tool_then_done_model('mutate_run', {}),
+            name='guarded',
+            toolsets=[toolset],
+            capabilities=[AbsurdDurability()],
+        )
+
+        with absurd_task_context(FakeAsyncTaskContext()):
+            with pytest.raises(UserError, match=rf'`{error_name}` is not supported inside a durable step'):
+                await agent.run('mutate the run')
+
 
 class TestModelRetry:
     async def test_model_retry_crosses_checkpoint_and_replays(self) -> None:

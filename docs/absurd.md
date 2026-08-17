@@ -17,6 +17,8 @@ task the capability is transparent and the run is a normal, non-durable agent ru
 
 [Source](https://github.com/pydantic/pydantic-ai-harness/tree/main/pydantic_ai_harness/absurd/)
 
+> While Pydantic AI Harness is on 0.x releases, the API may change between minor releases; when it does, deprecation warnings and release-note migration guidance tell you (or your agent) exactly how to upgrade. See the [version policy](index.md#version-policy).
+
 ## Installation
 
 ```bash
@@ -46,7 +48,7 @@ from pydantic_ai import Agent
 from pydantic_ai_harness.absurd import AbsurdDurability
 
 absurd = AsyncAbsurd('postgresql://localhost/absurd', queue_name='agents')
-agent = Agent('openai:gpt-5', name='analyst', capabilities=[AbsurdDurability()])
+agent = Agent('openai:gpt-5.6-sol', name='analyst', capabilities=[AbsurdDurability()])
 
 
 @absurd.register_task(name='analyse')
@@ -81,8 +83,9 @@ and served from the checkpoint on replay rather than being recomputed:
   `.call_tool:{tool_name}`. A `DynamicToolset` built at construction time is re-resolved inside the
   step (its factory runs there, not in task code), so its resolution and inner tool calls are
   checkpointed and not re-run on recovery;
-- **event-stream handler calls** -- `{name}__event_stream_handler`, when an `event_stream_handler`
-  is set.
+- **event-stream handler calls for tool events** -- `{name}__event_stream_handler`, when an
+  `event_stream_handler` is set. Model-stream events run inside the
+  `{name}__model.request_stream` step instead.
 
 Replay means: after a crash, Absurd re-runs the task handler from the top. Plain Python in the
 handler body runs again, but each checkpointed step returns its stored result instead of re-issuing
@@ -109,16 +112,27 @@ checkpoint and lines up on replay.
   contain `#`, the character Absurd uses to disambiguate repeated step names. A `#` in a model id
   is rejected with a `UserError`.
 - A checkpointed tool's return value is stored in Postgres as JSON, so it must be JSON-serializable.
+- Code running inside a checkpointed step cannot call `RunContext.enqueue()` or `RunContext.cancel()`.
+  Those mutations would be missing when Absurd replays the stored result, so the capability raises
+  a `UserError`. Enqueue from non-checkpointed task code, or cancel the Absurd task instead.
 - The executing toolsets are fixed when the agent is constructed. Passing an executing toolset
   per-run via `run(toolsets=...)` inside a task raises a `UserError`, because a runtime toolset has
   no registered steps and would re-run its side effects on recovery. Non-executing toolsets such as
   `ExternalToolset` are allowed at runtime.
 - Streaming inside a task is a replay, not a live wire: the model stream is consumed and captured
   inside the step, and the run-side stream replays the captured events.
-- An `event_stream_handler` runs live inside the model-request step, and its call is itself
-  checkpointed. The handler may run more than once if the run recovers before that step is
-  checkpointed, so keep its side effects idempotent.
+- An `event_stream_handler` handles model-stream events live inside the model-request step and tool
+  events in their own steps. The handler may run more than once if the enclosing step has not been
+  checkpointed before recovery, so keep its side effects idempotent.
 - Do not use `run_sync` inside a task handler. The handler is async; use `await agent.run(...)`.
+
+## Parallel tool calls
+
+`parallel_execution_mode` defaults to `'sequential'`. Set it to `'parallel_ordered_events'` to run
+tool calls concurrently while emitting their result events in model-call order. Plain `'parallel'`
+is not supported: it emits tool-result and event-handler steps in completion order, which can assign
+Absurd's encounter-order checkpoint suffixes differently on replay. Outside an Absurd task, the
+capability leaves the agent's configured execution mode unchanged.
 
 ## Per-tool opt-out
 
@@ -139,7 +153,7 @@ def add(a: int, b: int) -> int:
     return a + b
 
 
-agent = Agent('openai:gpt-5', name='calc', toolsets=[tools], capabilities=[AbsurdDurability()])
+agent = Agent('openai:gpt-5.6-sol', name='calc', toolsets=[tools], capabilities=[AbsurdDurability()])
 ```
 
 `False` is the only supported value for the `absurd` metadata key. A step takes no per-tool options,

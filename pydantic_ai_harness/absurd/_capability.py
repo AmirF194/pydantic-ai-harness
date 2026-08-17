@@ -22,6 +22,7 @@ except ImportError as _import_error:  # pragma: no cover
 
 import copy
 from collections.abc import Callable, Mapping, Sequence
+from contextlib import AbstractContextManager
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, ClassVar, Literal
 
@@ -77,6 +78,7 @@ _TOOL_CONFIG_LABEL = 'Absurd step config'
 _NO_FALLBACK_CONFIG: Mapping[str, ToolConfig] = {}
 
 _Instructions = str | InstructionPart | Sequence[str | InstructionPart] | None
+_DurableRunContextScope = Callable[[RunContext[AgentDepsT]], AbstractContextManager[RunContext[AgentDepsT]]]
 
 _response_adapter: TypeAdapter[ModelResponse] = TypeAdapter(ModelResponse)
 _events_adapter: TypeAdapter[list[ModelResponseStreamEvent]] = TypeAdapter(list[ModelResponseStreamEvent])
@@ -182,7 +184,10 @@ def _resolve_mcp_tool_config(tool: ToolsetTool[Any] | None, tool_name: str) -> T
 
 
 def _build_function_toolset(
-    toolset: FunctionToolset[AgentDepsT], *, step_name_prefix: str
+    toolset: FunctionToolset[AgentDepsT],
+    *,
+    step_name_prefix: str,
+    durable_run_context_scope: _DurableRunContextScope[AgentDepsT],
 ) -> DurableFunctionToolset[AgentDepsT]:
     name = f'{step_name_prefix}__function_toolset__{toolset.id}'
 
@@ -197,7 +202,8 @@ def _build_function_toolset(
         assert task_ctx is not None  # pragma: no cover - only called inside a durable context
 
         async def _inner() -> JsonValue:
-            result = await wrap_tool_call_result(toolset.call_tool(tool_name, tool_args, ctx, tool))
+            with durable_run_context_scope(ctx) as step_ctx:
+                result = await wrap_tool_call_result(toolset.call_tool(tool_name, tool_args, step_ctx, tool))
             return _serialize_call_tool_result(result)
 
         payload = await task_ctx.step(f'{name}.call_tool:{tool_name}', _inner)
@@ -212,7 +218,12 @@ def _build_function_toolset(
     )
 
 
-def _build_mcp_toolset(toolset: MCPToolset[AgentDepsT], *, step_name_prefix: str) -> DurableMCPToolset[AgentDepsT]:
+def _build_mcp_toolset(
+    toolset: MCPToolset[AgentDepsT],
+    *,
+    step_name_prefix: str,
+    durable_run_context_scope: _DurableRunContextScope[AgentDepsT],
+) -> DurableMCPToolset[AgentDepsT]:
     name = f'{step_name_prefix}__mcp_server__{toolset.id}'
 
     async def get_tools_operation(ctx: RunContext[AgentDepsT]) -> dict[str, ToolDefinition]:
@@ -220,7 +231,8 @@ def _build_mcp_toolset(toolset: MCPToolset[AgentDepsT], *, step_name_prefix: str
         assert task_ctx is not None  # pragma: no cover - only called inside a durable context
 
         async def _inner() -> JsonValue:
-            tools = await toolset.get_tools(ctx)
+            with durable_run_context_scope(ctx) as step_ctx:
+                tools = await toolset.get_tools(step_ctx)
             return _tool_defs_adapter.dump_python({n: t.tool_def for n, t in tools.items()}, mode='json')
 
         payload = await task_ctx.step(f'{name}.get_tools', _inner)
@@ -231,8 +243,9 @@ def _build_mcp_toolset(toolset: MCPToolset[AgentDepsT], *, step_name_prefix: str
         assert task_ctx is not None  # pragma: no cover - only called inside a durable context
 
         async def _inner() -> JsonValue:
-            async with toolset:
-                return _instructions_adapter.dump_python(await toolset.get_instructions(ctx), mode='json')
+            with durable_run_context_scope(ctx) as step_ctx:
+                async with toolset:
+                    return _instructions_adapter.dump_python(await toolset.get_instructions(step_ctx), mode='json')
 
         payload = await task_ctx.step(f'{name}.get_instructions', _inner)
         return _instructions_adapter.validate_python(payload)
@@ -248,7 +261,8 @@ def _build_mcp_toolset(toolset: MCPToolset[AgentDepsT], *, step_name_prefix: str
         assert task_ctx is not None  # pragma: no cover - only called inside a durable context
 
         async def _inner() -> JsonValue:
-            result = await wrap_tool_call_result(toolset.call_tool(tool_name, tool_args, ctx, tool))
+            with durable_run_context_scope(ctx) as step_ctx:
+                result = await wrap_tool_call_result(toolset.call_tool(tool_name, tool_args, step_ctx, tool))
             return _serialize_call_tool_result(result)
 
         payload = await task_ctx.step(f'{name}.call_tool', _inner)
@@ -293,12 +307,14 @@ class _AbsurdDynamicToolset(WrapperToolset[AgentDepsT]):
         *,
         step_name_prefix: str,
         in_durable_context: Callable[[], bool],
+        durable_run_context_scope: _DurableRunContextScope[AgentDepsT],
     ) -> None:
         super().__init__(wrapped)
         # `wrapped.id` may be `None` here: the base capability calls `_wrap_leaf_toolset` before it
         # rejects an id-less leaf, and the name is never used in that case (binding raises first).
         self._name = f'{step_name_prefix}__dynamic_toolset__{wrapped.id}'
         self._in_durable_context = in_durable_context
+        self._durable_run_context_scope = durable_run_context_scope
         # Set by `get_tools`, read by `get_instructions` in the same run step. Lives on the per-run
         # copy so concurrent runs of the shared bound wrapper do not clobber each other.
         self._run_instructions: _Instructions = None
@@ -344,11 +360,12 @@ class _AbsurdDynamicToolset(WrapperToolset[AgentDepsT]):
         assert task_ctx is not None  # pragma: no cover - gated by `_in_durable_context`
 
         async def _inner() -> JsonValue:
-            run_toolset = await self.wrapped.for_run(ctx)
-            async with run_toolset:
-                resolved = await run_toolset.for_run_step(ctx)
-                tools = await resolved.get_tools(ctx)
-                instructions = await resolved.get_instructions(ctx)
+            with self._durable_run_context_scope(ctx) as step_ctx:
+                run_toolset = await self.wrapped.for_run(step_ctx)
+                async with run_toolset:
+                    resolved = await run_toolset.for_run_step(step_ctx)
+                    tools = await resolved.get_tools(step_ctx)
+                    instructions = await resolved.get_instructions(step_ctx)
                 return {
                     'tools': {
                         tool_name: {
@@ -426,7 +443,8 @@ class _AbsurdDynamicToolset(WrapperToolset[AgentDepsT]):
             # A `ValidationError` from arg re-validation is deterministic and pure, so it propagates
             # out of the step uncaught: no checkpoint slot is claimed and `ToolManager` converts it to
             # a retry prompt. `wrap_tool_call_result` still captures `ModelRetry`/approval/deferral.
-            result = await wrap_tool_call_result(self._resolve_validate_call(name, tool_args, ctx))
+            with self._durable_run_context_scope(ctx) as step_ctx:
+                result = await wrap_tool_call_result(self._resolve_validate_call(name, tool_args, step_ctx))
             return _serialize_call_tool_result(result)
 
         payload = await task_ctx.step(f'{self._name}.call_tool:{name}', _inner)
@@ -434,9 +452,17 @@ class _AbsurdDynamicToolset(WrapperToolset[AgentDepsT]):
 
 
 def _build_dynamic_toolset(
-    toolset: DynamicToolset[AgentDepsT], *, step_name_prefix: str
+    toolset: DynamicToolset[AgentDepsT],
+    *,
+    step_name_prefix: str,
+    durable_run_context_scope: _DurableRunContextScope[AgentDepsT],
 ) -> _AbsurdDynamicToolset[AgentDepsT]:
-    return _AbsurdDynamicToolset(toolset, step_name_prefix=step_name_prefix, in_durable_context=_in_durable_context)
+    return _AbsurdDynamicToolset(
+        toolset,
+        step_name_prefix=step_name_prefix,
+        in_durable_context=_in_durable_context,
+        durable_run_context_scope=durable_run_context_scope,
+    )
 
 
 @dataclass(init=False)
@@ -467,7 +493,7 @@ class AbsurdDurability(BaseDurabilityCapability[AgentDepsT]):
         from pydantic_ai_harness.absurd import AbsurdDurability
 
         absurd = AsyncAbsurd('postgresql://localhost/absurd', queue_name='agents')
-        agent = Agent('openai:gpt-5', name='analyst', capabilities=[AbsurdDurability()])
+        agent = Agent('openai:gpt-5.6-sol', name='analyst', capabilities=[AbsurdDurability()])
 
 
         @absurd.register_task(name='analyse')
@@ -534,15 +560,21 @@ class AbsurdDurability(BaseDurabilityCapability[AgentDepsT]):
 
     def _wrap_leaf_toolset(self, ts: AbstractToolset[AgentDepsT]) -> WrapperToolset[AgentDepsT] | None:
         if isinstance(ts, FunctionToolset):
-            return _build_function_toolset(ts, step_name_prefix=self.name)
+            return _build_function_toolset(
+                ts, step_name_prefix=self.name, durable_run_context_scope=self._durable_run_context_scope
+            )
         if isinstance(ts, DynamicToolset):
-            return _build_dynamic_toolset(ts, step_name_prefix=self.name)
+            return _build_dynamic_toolset(
+                ts, step_name_prefix=self.name, durable_run_context_scope=self._durable_run_context_scope
+            )
         try:
             from pydantic_ai.mcp import MCPToolset
         except ImportError:  # pragma: no cover - MCP wrapping only applies when the mcp extra is installed
             return None
         if isinstance(ts, MCPToolset):
-            return _build_mcp_toolset(ts, step_name_prefix=self.name)
+            return _build_mcp_toolset(
+                ts, step_name_prefix=self.name, durable_run_context_scope=self._durable_run_context_scope
+            )
         return None
 
     async def _dispatch_event_stream_event(self, ctx: RunContext[AgentDepsT], event: AgentStreamEvent) -> None:
@@ -552,7 +584,8 @@ class AbsurdDurability(BaseDurabilityCapability[AgentDepsT]):
         assert handler is not None  # pragma: no cover - only dispatched when a handler is set
 
         async def _inner() -> None:
-            await handler(ctx, self._single_event_stream(event))
+            with self._durable_run_context_scope(ctx) as step_ctx:
+                await handler(step_ctx, self._single_event_stream(event))
 
         # Checkpoint the handler call so its side effects do not re-run on recovery.
         await task_ctx.step(f'{self.name}__event_stream_handler', _inner)
@@ -591,9 +624,10 @@ class AbsurdDurability(BaseDurabilityCapability[AgentDepsT]):
 
         async def request_segment(request: ModelRequestContext) -> ModelResponse:
             async def _inner() -> JsonValue:
-                response = await request.model.request(
-                    request.messages, request.model_settings, request.model_request_parameters
-                )
+                with self._durable_run_context_scope(ctx):
+                    response = await request.model.request(
+                        request.messages, request.model_settings, request.model_request_parameters
+                    )
                 return _serialize_response(response)
 
             payload = await task_ctx.step(f'{self.name}__model.request{step_suffix}', _inner)
@@ -601,12 +635,13 @@ class AbsurdDurability(BaseDurabilityCapability[AgentDepsT]):
 
         async def request_stream_segment(request: ModelRequestContext) -> StreamedActivityResult:
             async def _inner() -> JsonValue:
-                async with request.model.request_stream(
-                    request.messages, request.model_settings, request.model_request_parameters, ctx
-                ) as streamed:
-                    events = await capture_event_stream(
-                        run_context=ctx, stream=streamed, handler=self._event_stream_handler
-                    )
+                with self._durable_run_context_scope(ctx) as step_ctx:
+                    async with request.model.request_stream(
+                        request.messages, request.model_settings, request.model_request_parameters, step_ctx
+                    ) as streamed:
+                        events = await capture_event_stream(
+                            run_context=step_ctx, stream=streamed, handler=self._event_stream_handler
+                        )
                 return {
                     'response': _serialize_response(streamed.get()),
                     'events': _events_adapter.dump_python(events, mode='json'),
@@ -621,7 +656,8 @@ class AbsurdDurability(BaseDurabilityCapability[AgentDepsT]):
 
         async def cancel_suspended_response_segment(response: ModelResponse) -> None:
             async def _inner() -> None:
-                await model.cancel_suspended_response(response)
+                with self._durable_run_context_scope(ctx):
+                    await model.cancel_suspended_response(response)
 
             await task_ctx.step(f'{self.name}__model.cancel_suspended_response{step_suffix}', _inner)
 
