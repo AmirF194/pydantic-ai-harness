@@ -4,6 +4,9 @@ from __future__ import annotations
 
 import errno
 import os
+import shutil
+import tempfile
+from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
@@ -1399,6 +1402,11 @@ class TestPatternCanonicalization:
             await ts.write_file('secrets.yaml', 'changed\n')
 
 
+_needs_effective_permissions = pytest.mark.skipif(
+    hasattr(os, 'geteuid') and os.geteuid() == 0, reason='chmod does not restrict root'
+)
+
+
 def _plain_toolset(root: Path) -> FileSystemToolset[None]:
     return FileSystemToolset(
         root_dir=root,
@@ -1647,6 +1655,7 @@ class TestDescriptorBinding:
         # The walk already holds the original directory's descriptor, so the
         # read lands on the object that was authorized, not the swapped-in one.
         result = await ts.read_file('sub/inner.txt')
+        assert swapped
         assert 'original content' in result
         assert 'outside secret' not in result
 
@@ -1656,7 +1665,7 @@ class TestDescriptorBinding:
         (root / 'a').symlink_to(root / 'b')
         (root / 'b').symlink_to(root / 'a')
         ts = _plain_toolset(root)
-        with pytest.raises(ModelRetry, match='symlink loop'):
+        with pytest.raises(ModelRetry, match='too many levels of symbolic links'):
             await ts.read_file('a')
 
     async def test_symlink_loop_skipped_by_search(self, tmp_path: Path) -> None:
@@ -1676,15 +1685,18 @@ class TestDescriptorBinding:
         with pytest.raises(ModelRetry, match='Not a directory: file.txt'):
             await ts.read_file('file.txt/impossible')
 
+    @_needs_effective_permissions
     async def test_unreadable_intermediate_reports_permission(self, tmp_path: Path) -> None:
+        # The nesting matters: on Linux `O_PATH` opens the unreadable
+        # directory itself, so the `EACCES` surfaces when descending FROM it.
         root = tmp_path / 'root'
-        (root / 'locked').mkdir(parents=True)
-        (root / 'locked' / 'f.txt').write_text('x\n')
+        (root / 'locked' / 'sub').mkdir(parents=True)
+        (root / 'locked' / 'sub' / 'f.txt').write_text('x\n')
         ts = _plain_toolset(root)
         os.chmod(root / 'locked', 0o000)
         try:
             with pytest.raises(ModelRetry, match='[Pp]ermission denied'):
-                await ts.read_file('locked/f.txt')
+                await ts.read_file('locked/sub/f.txt')
         finally:
             os.chmod(root / 'locked', 0o755)
 
@@ -1712,6 +1724,7 @@ class TestWalkRaces:
         monkeypatch.setattr(os, 'open', flaky_open)
         result = await ts.read_file('data.txt')
         assert 'content' in result
+        assert not failures
 
     async def test_final_component_kept_swapping_reports_loop(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -1729,7 +1742,7 @@ class TestWalkRaces:
             return real_open(path, flags, mode, dir_fd=dir_fd)
 
         monkeypatch.setattr(os, 'open', always_swapped_open)
-        with pytest.raises(ModelRetry, match='symlink loop'):
+        with pytest.raises(ModelRetry, match='too many levels of symbolic links'):
             await ts.read_file('data.txt')
 
     async def test_intermediate_became_symlink_retries_and_succeeds(
@@ -1751,6 +1764,7 @@ class TestWalkRaces:
         monkeypatch.setattr(os, 'open', flaky_open)
         result = await ts.read_file('sub/inner.txt')
         assert 'content' in result
+        assert not failures
 
     async def test_write_target_vanishing_between_opens_retries(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -1771,6 +1785,7 @@ class TestWalkRaces:
         result = await ts.write_file('v.txt', 'content\n')
         assert 'Wrote' in result
         assert (root / 'v.txt').read_text() == 'content\n'
+        assert not failures
 
 
 @_needs_fd_traversal
@@ -1824,6 +1839,7 @@ class TestWalkCoverageEdges:
         with pytest.raises(ModelRetry, match='File not found: ghost-dir/f.txt'):
             await toolset.read_file('ghost-dir/f.txt')
 
+    @_needs_effective_permissions
     async def test_read_unreadable_file_reports_permission(
         self, toolset: FileSystemToolset[None], fs_root: Path
     ) -> None:
@@ -1835,6 +1851,7 @@ class TestWalkCoverageEdges:
         finally:
             os.chmod(fs_root / 'noread.txt', 0o644)
 
+    @_needs_effective_permissions
     async def test_write_unwritable_file_reports_permission(
         self, toolset: FileSystemToolset[None], fs_root: Path
     ) -> None:
@@ -1848,3 +1865,307 @@ class TestWalkCoverageEdges:
 
     async def test_search_missing_directory_finds_nothing(self, toolset: FileSystemToolset[None]) -> None:
         assert await toolset.search_files('anything', path='ghost-dir') == 'No matches found.'
+
+
+class TestReviewRoundParity:
+    """Cases surfaced by adversarial review: identical behavior in both modes."""
+
+    async def test_absolute_path_through_symlinked_prefix(
+        self, toolset: FileSystemToolset[None], fs_root: Path
+    ) -> None:
+        alias = fs_root.parent / f'{fs_root.name}-alias'
+        alias.symlink_to(fs_root)
+        result = await toolset.read_file(str(alias / 'hello.txt'))
+        assert 'Hello, world!' in result
+
+    async def test_dotdot_after_missing_component_collapses(self, toolset: FileSystemToolset[None]) -> None:
+        result = await toolset.read_file('missing/../hello.txt')
+        assert 'Hello, world!' in result
+
+    async def test_dotdot_after_file_component_collapses(self, toolset: FileSystemToolset[None]) -> None:
+        result = await toolset.read_file('hello.txt/../multi.txt')
+        assert 'line1' in result
+
+    async def test_list_missing_then_dotdot_lists_root(self, toolset: FileSystemToolset[None]) -> None:
+        result = await toolset.list_directory('missing/..')
+        assert 'hello.txt' in result
+
+    async def test_search_through_file_component_finds_nothing(self, toolset: FileSystemToolset[None]) -> None:
+        assert await toolset.search_files('Hello', path='hello.txt/sub') == 'No matches found.'
+
+    async def test_names_starting_with_dots_are_not_traversal(
+        self, toolset: FileSystemToolset[None], fs_root: Path
+    ) -> None:
+        await toolset.create_directory('..data/sub')
+        assert (fs_root / '..data' / 'sub').is_dir()
+        with pytest.raises(ModelRetry, match="Parent directory '..bar' does not exist"):
+            await toolset.write_file('..bar/baz', 'x\n')
+        with pytest.raises(ModelRetry, match=r'File not found: \.\.\.'):
+            await toolset.read_file('...')
+
+    async def test_denied_pattern_wins_over_file_as_directory(self, fs_root: Path) -> None:
+        (fs_root / 'secretdir').write_text('a file, not a directory\n')
+        ts = FileSystemToolset(
+            root_dir=fs_root,
+            allowed_patterns=[],
+            denied_patterns=['secret*'],
+            protected_patterns=[],
+            max_read_lines=2000,
+            max_list_results=1000,
+            max_search_results=1000,
+            max_find_results=1000,
+        )
+        with pytest.raises(ModelRetry, match='denied by pattern'):
+            await ts.read_file('secretdir/inner.txt')
+
+    async def test_edit_through_in_root_alias_updates_target(
+        self, toolset: FileSystemToolset[None], fs_root: Path
+    ) -> None:
+        (fs_root / 'alias.txt').symlink_to(fs_root / 'hello.txt')
+        await toolset.edit_file('alias.txt', 'Hello, world!', 'Goodbye!')
+        assert (fs_root / 'hello.txt').read_text() == 'Goodbye!\n'
+
+    async def test_edit_through_escape_symlink_rejected(self, toolset: FileSystemToolset[None], fs_root: Path) -> None:
+        target = fs_root.parent / 'edit-escape-target'
+        target.write_text('untouched\n')
+        (fs_root / 'out.txt').symlink_to(target)
+        with pytest.raises(ModelRetry, match='outside the root'):
+            await toolset.edit_file('out.txt', 'untouched', 'HACKED')
+        assert target.read_text() == 'untouched\n'
+
+    async def test_file_info_out_of_root_symlink_rejected(
+        self, toolset: FileSystemToolset[None], fs_root: Path
+    ) -> None:
+        (fs_root / 'out.txt').symlink_to(fs_root.parent)
+        with pytest.raises(ModelRetry, match='outside the root'):
+            await toolset.file_info('out.txt')
+
+    async def test_create_directory_through_in_root_symlinked_parent(
+        self, toolset: FileSystemToolset[None], fs_root: Path
+    ) -> None:
+        (fs_root / 'dirlink').symlink_to(fs_root / 'subdir')
+        await toolset.create_directory('dirlink/newdir')
+        assert (fs_root / 'subdir' / 'newdir').is_dir()
+
+    async def test_write_creates_through_symlinked_parent(
+        self, toolset: FileSystemToolset[None], fs_root: Path
+    ) -> None:
+        (fs_root / 'dirlink').symlink_to(fs_root / 'subdir')
+        await toolset.write_file('dirlink/new.txt', 'content\n')
+        assert (fs_root / 'subdir' / 'new.txt').read_text() == 'content\n'
+
+
+class TestMutationKillers632:
+    """Each case kills a mutant of the walk that the rest of the suite misses."""
+
+    async def test_relative_link_target_resolves_against_link_directory(
+        self, toolset: FileSystemToolset[None], fs_root: Path
+    ) -> None:
+        (fs_root / 'subdir' / 'up_link.txt').symlink_to('../hello.txt')
+        result = await toolset.read_file('subdir/up_link.txt')
+        assert 'Hello, world!' in result
+
+    async def test_dotdot_pops_canonical_for_pattern_checks(self, fs_root: Path) -> None:
+        ts = FileSystemToolset(
+            root_dir=fs_root,
+            allowed_patterns=[],
+            denied_patterns=['subdir/*'],
+            protected_patterns=[],
+            max_read_lines=2000,
+            max_list_results=1000,
+            max_search_results=1000,
+            max_find_results=1000,
+        )
+        result = await ts.read_file('subdir/../hello.txt')
+        assert 'Hello, world!' in result
+
+    async def test_absolute_link_resets_canonical_for_pattern_checks(self, fs_root: Path) -> None:
+        (fs_root / 'subdir' / 'abs_link.txt').symlink_to(fs_root / 'hello.txt')
+        ts = FileSystemToolset(
+            root_dir=fs_root,
+            allowed_patterns=[],
+            denied_patterns=['subdir/hello*'],
+            protected_patterns=[],
+            max_read_lines=2000,
+            max_list_results=1000,
+            max_search_results=1000,
+            max_find_results=1000,
+        )
+        result = await ts.read_file('subdir/abs_link.txt')
+        assert 'Hello, world!' in result
+
+    async def test_five_hop_symlink_chain_resolves(self, toolset: FileSystemToolset[None], fs_root: Path) -> None:
+        # Relative targets, so each hop is resolved by the walk itself.
+        previous = 'hello.txt'
+        for i in range(5):
+            (fs_root / f'chain{i}').symlink_to(previous)
+            previous = f'chain{i}'
+        result = await toolset.read_file(previous)
+        assert 'Hello, world!' in result
+
+    @_needs_fd_traversal
+    async def test_chain_beyond_hop_budget_rejected(self, tmp_path: Path) -> None:
+        # The budget exists only in the descriptor walk; realpath has no cap.
+        root = tmp_path / 'root'
+        root.mkdir()
+        (root / 'target.txt').write_text('x\n')
+        previous = 'target.txt'
+        for i in range(45):
+            (root / f'chain{i}').symlink_to(previous)
+            previous = f'chain{i}'
+        ts = _plain_toolset(root)
+        with pytest.raises(ModelRetry, match='too many levels of symbolic links'):
+            await ts.read_file(previous)
+
+
+@_needs_fd_traversal
+class TestDescriptorBindingWrites:
+    """Write-side authorization is bound to the object written (#632)."""
+
+    async def test_write_swap_to_outside_symlink_is_rejected(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        root = tmp_path / 'root'
+        root.mkdir()
+        (root / 'data.txt').write_text('inside\n')
+        outside = tmp_path / 'outside.txt'
+        outside.write_text('untouched\n')
+        ts = _plain_toolset(root)
+
+        original_check = FileSystemToolset._check_access
+        swapped = False
+
+        def swapping_check(
+            self: FileSystemToolset[Any], rel: str, *, write: bool = False, check_allowed: bool = True
+        ) -> None:
+            nonlocal swapped
+            original_check(self, rel, write=write, check_allowed=check_allowed)
+            if rel == 'data.txt' and not swapped:
+                swapped = True
+                (root / 'data.txt').unlink()
+                (root / 'data.txt').symlink_to(outside)
+
+        monkeypatch.setattr(FileSystemToolset, '_check_access', swapping_check)
+        with pytest.raises(ModelRetry, match='outside the root'):
+            await ts.write_file('data.txt', 'HACKED\n')
+        assert swapped
+        assert outside.read_text() == 'untouched\n'
+
+    async def test_edit_swap_to_outside_symlink_is_rejected(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        root = tmp_path / 'root'
+        root.mkdir()
+        (root / 'data.txt').write_text('untouched\n')
+        outside = tmp_path / 'outside.txt'
+        outside.write_text('untouched\n')
+        ts = _plain_toolset(root)
+
+        original_check = FileSystemToolset._check_access
+        swapped = False
+
+        def swapping_check(
+            self: FileSystemToolset[Any], rel: str, *, write: bool = False, check_allowed: bool = True
+        ) -> None:
+            nonlocal swapped
+            original_check(self, rel, write=write, check_allowed=check_allowed)
+            if rel == 'data.txt' and not swapped:
+                swapped = True
+                (root / 'data.txt').unlink()
+                (root / 'data.txt').symlink_to(outside)
+
+        monkeypatch.setattr(FileSystemToolset, '_check_access', swapping_check)
+        with pytest.raises(ModelRetry, match='outside the root'):
+            await ts.edit_file('data.txt', 'untouched', 'HACKED')
+        assert swapped
+        assert outside.read_text() == 'untouched\n'
+
+    async def test_intermediate_kept_swapping_reports_too_many_levels(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        root = tmp_path / 'root'
+        (root / 'sub').mkdir(parents=True)
+        (root / 'sub' / 'inner.txt').write_text('content\n')
+        ts = _plain_toolset(root)
+
+        real_open = os.open
+
+        def always_swapped_open(path: str | Path, flags: int, mode: int = 0o777, *, dir_fd: int | None = None) -> int:
+            if path == 'sub' and dir_fd is not None:
+                raise OSError(errno.ELOOP, 'simulated swap')
+            return real_open(path, flags, mode, dir_fd=dir_fd)
+
+        monkeypatch.setattr(os, 'open', always_swapped_open)
+        with pytest.raises(ModelRetry, match='too many levels of symbolic links'):
+            await ts.read_file('sub/inner.txt')
+
+    async def test_create_directory_tolerates_concurrent_mkdir(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        root = tmp_path / 'root'
+        root.mkdir()
+        ts = _plain_toolset(root)
+
+        real_mkdir = os.mkdir
+        raced = False
+
+        def racing_mkdir(path: str | Path, mode: int = 0o777, *, dir_fd: int | None = None) -> None:
+            nonlocal raced
+            real_mkdir(path, mode, dir_fd=dir_fd)
+            if path == 'ghost' and not raced:
+                raced = True
+                raise OSError(errno.EEXIST, 'simulated concurrent mkdir')
+
+        monkeypatch.setattr(os, 'mkdir', racing_mkdir)
+        await ts.create_directory('ghost/sub')
+        assert raced
+        assert (root / 'ghost' / 'sub').is_dir()
+
+
+@_needs_fd_traversal
+class TestSocketEntries:
+    """Sockets are reported as unopenable files, never a run abort."""
+
+    @pytest.fixture
+    def socket_root(self) -> Iterator[Path]:
+        import socket as socket_module
+
+        # A short base path: AF_UNIX socket paths are capped near 104 bytes,
+        # which pytest's tmp_path can exceed on macOS.
+        root = Path(tempfile.mkdtemp(prefix='fs-sock-'))
+        try:
+            server = socket_module.socket(socket_module.AF_UNIX, socket_module.SOCK_STREAM)
+            try:
+                server.bind(str(root / 'srv.sock'))
+            except OSError:
+                pytest.skip('cannot bind an AF_UNIX socket at this path')
+            finally:
+                server.close()
+            yield root
+        finally:
+            shutil.rmtree(root, ignore_errors=True)
+
+    async def test_read_socket_reports_file_not_found(self, socket_root: Path) -> None:
+        ts = _plain_toolset(socket_root)
+        with pytest.raises(ModelRetry, match='File not found: srv.sock'):
+            await ts.read_file('srv.sock')
+
+    async def test_edit_socket_reports_file_not_found(self, socket_root: Path) -> None:
+        ts = _plain_toolset(socket_root)
+        with pytest.raises(ModelRetry, match='File not found: srv.sock'):
+            await ts.edit_file('srv.sock', 'a', 'b')
+
+    async def test_write_socket_reports_not_regular(self, socket_root: Path) -> None:
+        ts = _plain_toolset(socket_root)
+        with pytest.raises(ModelRetry, match='not a regular file'):
+            await ts.write_file('srv.sock', 'x\n')
+
+    async def test_file_info_socket_reports_metadata(self, socket_root: Path) -> None:
+        ts = _plain_toolset(socket_root)
+        result = await ts.file_info('srv.sock')
+        assert 'type: file' in result
+        assert 'binary:' not in result
+
+    async def test_list_directory_shows_socket(self, socket_root: Path) -> None:
+        ts = _plain_toolset(socket_root)
+        assert 'srv.sock' in await ts.list_directory('.')

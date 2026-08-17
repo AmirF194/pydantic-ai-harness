@@ -55,6 +55,10 @@ _FILE_OPEN_FLAGS = (os.O_NOFOLLOW | os.O_NONBLOCK) if _HAS_FD_TRAVERSAL else 0
 # as `EMLINK` on some BSDs.
 _SYMLINK_ERRNOS = frozenset({errno.ELOOP, errno.EMLINK})
 
+# Entries that exist but cannot be opened as files: sockets (`EOPNOTSUPP` on
+# macOS, `ENXIO` on Linux) and device nodes without a driver (`ENODEV`).
+_SPECIAL_FILE_ERRNOS = frozenset({errno.ENXIO, errno.ENODEV, getattr(errno, 'EOPNOTSUPP', errno.ENXIO)})
+
 _MAX_SYMLINK_HOPS = 40
 """Symlink resolutions allowed per lookup before reporting a loop, mirroring the kernel's own bound."""
 
@@ -151,6 +155,15 @@ def _readlink_or_none(name: str, dir_fd: int) -> str | None:
         raise  # pragma: no cover
 
 
+class _SpecialFileError(Exception):
+    """Internal: the walk's final component exists but cannot be opened (socket, device node)."""
+
+
+def _too_many_links(path: str) -> PermissionError:
+    """The error for a lookup that exhausted the symlink budget (a loop, or an absurd chain)."""
+    return PermissionError(f'Path {path!r} resolves through too many levels of symbolic links.')
+
+
 def _normalized_remainder(path: str, canonical: list[str], name: str, pending: list[str]) -> str:
     """Lexically collapse the un-walked tail of a missing path for pattern checks and messages.
 
@@ -158,9 +171,19 @@ def _normalized_remainder(path: str, canonical: list[str], name: str, pending: l
     them lexically matches what `realpath` would have produced.
     """
     remainder = posixpath.normpath('/'.join([*canonical, name, *reversed(pending)]))
-    if remainder.startswith('..'):
+    if remainder == '..' or remainder.startswith('../'):
         raise PermissionError(f'Path {path!r} resolves outside the root directory.')
     return remainder
+
+
+def _restart_collapsed(remainder: str, fds: list[int], canonical: list[str], pending: list[str]) -> None:
+    """Restart the walk from the root on a lexically collapsed remainder."""
+    while len(fds) > 1:
+        os.close(fds.pop())
+    canonical.clear()
+    pending.clear()
+    if remainder != '.':
+        pending.extend(reversed(remainder.split('/')))
 
 
 class _Resolved:
@@ -331,15 +354,21 @@ class FileSystemToolset(FunctionToolset[AgentDepsT]):
         """Split a tool path into components to walk from the root.
 
         `..` components are kept for the walk to apply physically. An absolute
-        path is accepted only when it lexically names a location under the
-        root; the walk still verifies every component of it.
+        path is accepted only when it names a location under the root; the
+        walk still verifies every component of it.
         """
         pure = PurePath(path)
         if pure.is_absolute():
             try:
                 pure = pure.relative_to(self._real_root)
             except ValueError:
-                raise PermissionError(f'Path {path!r} resolves outside the root directory.') from None
+                # The absolute spelling may reach the root through symlinks
+                # (e.g. macOS `/tmp` vs `/private/tmp`). `realpath` here is
+                # advisory: the walk still verifies every component it yields.
+                try:
+                    pure = PurePath(os.path.realpath(path)).relative_to(self._real_root)
+                except ValueError:
+                    raise PermissionError(f'Path {path!r} resolves outside the root directory.') from None
         return [c for c in pure.parts if c != '.']
 
     def _resolve_for(
@@ -398,7 +427,7 @@ class FileSystemToolset(FunctionToolset[AgentDepsT]):
         missing: str,
         missing_parent: Callable[[str], str] | None,
         need_read: bool,
-    ) -> tuple[int, str, bool]:
+    ) -> tuple[int | None, str, bool]:
         """Open `path` by walking each component relative to the previous one.
 
         Every step uses `os.open(..., O_NOFOLLOW, dir_fd=parent)`, symlinks are
@@ -407,7 +436,9 @@ class FileSystemToolset(FunctionToolset[AgentDepsT]):
         descriptor is therefore the object the checks authorized, closing the
         gap between pathname authorization and pathname I/O (#632).
 
-        Returns `(fd, canonical_relative_path, created)`.
+        Returns `(fd, canonical_relative_path, created)`. `fd` is None only for
+        a special file (socket, device node) that exists but cannot be opened;
+        the caller falls back to metadata-only handling for it.
         """
         pending = list(reversed(self._split_components(path)))
         hops = _MAX_SYMLINK_HOPS
@@ -426,11 +457,11 @@ class FileSystemToolset(FunctionToolset[AgentDepsT]):
                 if target is not None:
                     hops -= 1
                     if hops <= 0:
-                        raise PermissionError(f'Path {path!r} resolves through a symlink loop.')
+                        raise _too_many_links(path)
                     self._splice_link(target, path, fds, canonical, pending)
                     continue
                 if pending:
-                    self._descend(
+                    outcome = self._descend(
                         name,
                         fds,
                         canonical,
@@ -442,16 +473,25 @@ class FileSystemToolset(FunctionToolset[AgentDepsT]):
                         missing=missing,
                         missing_parent=missing_parent,
                     )
+                    if outcome == 'retry_symlink':
+                        hops -= 1
+                        if hops <= 0:
+                            raise _too_many_links(path)
                     continue
                 rel = '/'.join([*canonical, name])
                 self._check_access(rel, write=write, check_allowed=check_allowed)
-                opened = self._open_final(name, fds[-1], path=path, intent=intent, missing=missing, need_read=need_read)
+                try:
+                    opened = self._open_final(
+                        name, fds[-1], rel=rel, path=path, intent=intent, missing=missing, need_read=need_read
+                    )
+                except _SpecialFileError:
+                    return None, rel, False
                 if opened is None:
                     # The component turned into a symlink after it was resolved
                     # as a plain entry; go around to resolve it safely.
                     hops -= 1
                     if hops <= 0:
-                        raise PermissionError(f'Path {path!r} resolves through a symlink loop.')
+                        raise _too_many_links(path)
                     pending.append(name)
                     continue
                 return opened[0], rel, opened[1]
@@ -499,52 +539,58 @@ class FileSystemToolset(FunctionToolset[AgentDepsT]):
         check_allowed: bool,
         missing: str,
         missing_parent: Callable[[str], str] | None,
-    ) -> None:
+    ) -> Literal['descended', 'retry', 'retry_symlink']:
         """Open intermediate directory `name` and push it onto the walk stack.
 
-        May instead push `name` back onto `pending` (to re-resolve a component
-        that changed underneath the walk, or to reopen a directory just created
-        for `create_directory`) or raise for a missing or non-directory
-        component.
+        Returns 'descended' after pushing the opened directory, 'retry' when
+        the queue should simply be reprocessed (a directory was created for
+        `create_directory`, or a lexical `..` past an un-walkable component was
+        collapsed), and 'retry_symlink' when the component changed into a
+        symlink underneath the walk, which must count against the symlink
+        budget. Raises for a missing or non-directory component.
         """
         try:
             fd = os.open(name, _DIR_OPEN_FLAGS, dir_fd=fds[-1])
         except OSError as e:
             if e.errno in _SYMLINK_ERRNOS:
                 pending.append(name)
-                return
+                return 'retry_symlink'
+            if e.errno in (errno.ENOENT, errno.ENOTDIR) and '..' in pending:
+                # A lexical `..` beyond a missing or non-directory component:
+                # restart the walk on the collapsed path, matching what
+                # `realpath` produces for a tail that cannot be walked.
+                _restart_collapsed(_normalized_remainder(path, canonical, name, pending), fds, canonical, pending)
+                return 'retry'
             if e.errno == errno.ENOENT:
                 remainder = _normalized_remainder(path, canonical, name, pending)
                 self._check_access(remainder, write=write, check_allowed=check_allowed)
                 if intent == 'mkdir':
-                    if '..' in pending:
-                        # A lexical `..` beyond the missing directory: restart
-                        # the walk on the collapsed path, so only the
-                        # directories `realpath` would name get created.
-                        while len(fds) > 1:
-                            os.close(fds.pop())
-                        canonical.clear()
-                        pending.clear()
-                        if remainder != '.':
-                            pending.extend(reversed(remainder.split('/')))
-                        return
-                    os.mkdir(name, dir_fd=fds[-1])
+                    try:
+                        os.mkdir(name, dir_fd=fds[-1])
+                    except FileExistsError:
+                        # Created concurrently; reopening it below is fine.
+                        pass
                     pending.append(name)
-                    return
+                    return 'retry'
                 if missing_parent is not None:
                     raise FileNotFoundError(missing_parent(posixpath.dirname(remainder))) from e
                 raise FileNotFoundError(missing) from e
             if e.errno == errno.ENOTDIR:
+                remainder = _normalized_remainder(path, canonical, name, pending)
+                self._check_access(remainder, write=write, check_allowed=check_allowed)
                 raise NotADirectoryError(f'Not a directory: {"/".join([*canonical, name])}') from e
+            e.filename = '/'.join([*canonical, name])
             raise
         fds.append(fd)
         canonical.append(name)
+        return 'descended'
 
     def _open_final(
         self,
         name: str,
         dir_fd: int,
         *,
+        rel: str,
         path: str,
         intent: _Intent,
         missing: str,
@@ -553,12 +599,13 @@ class FileSystemToolset(FunctionToolset[AgentDepsT]):
         """Open the walk's fully resolved final component, `O_NOFOLLOW`.
 
         Returns `(fd, created)`, or None when the component became a symlink
-        (or vanished mid-create) and the walk must re-resolve it.
+        (or vanished mid-create) and the walk must re-resolve it. Raises
+        `_SpecialFileError` for an entry that exists but cannot be opened.
         """
         if intent == 'mkdir':
             return self._open_final_dir(name, dir_fd)
         if intent == 'write':
-            return self._open_final_write(name, dir_fd, path=path, need_read=need_read)
+            return self._open_final_write(name, dir_fd, rel=rel, path=path, need_read=need_read)
         flags = os.O_RDWR if intent == 'edit' else os.O_RDONLY
         try:
             return os.open(name, flags | _FILE_OPEN_FLAGS, dir_fd=dir_fd), False
@@ -569,9 +616,14 @@ class FileSystemToolset(FunctionToolset[AgentDepsT]):
                 # `EISDIR` is `edit` only: a directory cannot be edited, and
                 # the tool reports that the same way as a missing file.
                 raise FileNotFoundError(missing) from e
+            if e.errno in _SPECIAL_FILE_ERRNOS:
+                raise _SpecialFileError from e
+            e.filename = rel
             raise
 
-    def _open_final_write(self, name: str, dir_fd: int, *, path: str, need_read: bool) -> tuple[int, bool] | None:
+    def _open_final_write(
+        self, name: str, dir_fd: int, *, rel: str, path: str, need_read: bool
+    ) -> tuple[int, bool] | None:
         """Open (or create) the final component for `write_file`.
 
         Creation is attempted first with `O_EXCL` so the caller knows whether
@@ -592,9 +644,11 @@ class FileSystemToolset(FunctionToolset[AgentDepsT]):
                 return None
             if e.errno == errno.EISDIR:
                 raise IsADirectoryError(f'Is a directory: {path}') from e
-            if e.errno == errno.ENXIO:
-                # A FIFO with no reader; without `O_NONBLOCK` this open would hang.
+            if e.errno in _SPECIAL_FILE_ERRNOS:
+                # For example a FIFO with no reader, or a socket; without
+                # `O_NONBLOCK` the FIFO open would hang.
                 raise ValueError(f'Path {path!r} exists and is not a regular file.') from e
+            e.filename = rel
             raise
 
     def _open_final_dir(self, name: str, dir_fd: int) -> tuple[int, bool]:
@@ -807,7 +861,8 @@ class FileSystemToolset(FunctionToolset[AgentDepsT]):
             with self._resolve_for(path, check_allowed=False, missing=f'File not found: {path}') as resolved:
                 root_kind = _kind_of(resolved.stat())
                 base = resolved.path
-        except FileNotFoundError:
+        except (FileNotFoundError, NotADirectoryError):
+            # A root that does not name a directory tree has no matches in it.
             pass
         try:
             compiled = re.compile(pattern)
