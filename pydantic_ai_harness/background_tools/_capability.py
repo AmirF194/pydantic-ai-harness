@@ -6,8 +6,7 @@ import asyncio
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
-from pydantic_ai.capabilities import AbstractCapability, CapabilityOrdering
-from pydantic_ai.capabilities._pending_messages import PendingMessageDrainCapability
+from pydantic_ai.capabilities import AbstractCapability
 from pydantic_ai.messages import ToolCallPart
 from pydantic_ai.tools import (
     AgentDepsT,
@@ -19,12 +18,12 @@ from pydantic_ai.tools import (
 
 if TYPE_CHECKING:
     from pydantic_ai import _agent_graph
-    from pydantic_ai.capabilities.abstract import WrapToolExecuteHandler
+    from pydantic_ai._instructions import AgentInstructions
+    from pydantic_ai.capabilities.abstract import WrapRunHandler, WrapToolExecuteHandler
     from pydantic_ai.result import FinalResult
+    from pydantic_ai.run import AgentRunResult
     from pydantic_graph import End
 
-
-_DEFAULT_SELECTOR: dict[str, Any] = {'background': True}
 
 _INSTRUCTIONS = """\
 Some tools run in the background: when you call them you'll get an immediate \
@@ -64,7 +63,7 @@ class BackgroundTools(AbstractCapability[AgentDepsT]):
     metadata entirely.
     """
 
-    tools: ToolSelector[AgentDepsT] = field(default_factory=lambda: dict(_DEFAULT_SELECTOR))
+    tools: ToolSelector[AgentDepsT] = field(default_factory=lambda: {'background': True})
     """Which tools should run in the background.
 
     - `dict[str, Any]` (default `{'background': True}`): tools whose metadata deeply
@@ -77,16 +76,8 @@ class BackgroundTools(AbstractCapability[AgentDepsT]):
     _tasks: dict[str, asyncio.Task[None]] = field(
         default_factory=dict[str, 'asyncio.Task[None]'], init=False, repr=False
     )
-    _completion_event: asyncio.Event = field(default_factory=asyncio.Event, init=False, repr=False)
 
-    def get_ordering(self) -> CapabilityOrdering:
-        # `after_node_run` runs in reverse order (outermost runs last). We need to
-        # wait for at least one background task BEFORE the core
-        # `PendingMessageDrainCapability` checks the queue for follow-ups, so
-        # drain must be outermost relative to us.
-        return CapabilityOrdering(wrapped_by=[PendingMessageDrainCapability])
-
-    def get_instructions(self) -> str:
+    def get_instructions(self) -> AgentInstructions[AgentDepsT] | None:
         return _INSTRUCTIONS
 
     async def for_run(self, ctx: RunContext[AgentDepsT]) -> BackgroundTools[AgentDepsT]:
@@ -111,18 +102,11 @@ class BackgroundTools(AbstractCapability[AgentDepsT]):
         async def _run() -> None:
             try:
                 result = await handler(args)
-                # 'asap' (the default) is the right semantic for background tool results:
-                # deliver as soon as possible — into the next model request if the agent
-                # is still running, or by redirecting if it would otherwise terminate.
                 ctx.enqueue(f"Background tool '{tool_name}' (task {task_id}) completed.\nResult: {result}")
-            except asyncio.CancelledError:
-                # Run cleanup cancelled us; don't enqueue a spurious failure follow-up.
-                raise
             except Exception as e:
                 ctx.enqueue(f"Background tool '{tool_name}' (task {task_id}) failed: {e}")
             finally:
                 self._tasks.pop(task_id, None)
-                self._completion_event.set()
 
         self._tasks[task_id] = asyncio.create_task(_run())
         return (
@@ -140,25 +124,22 @@ class BackgroundTools(AbstractCapability[AgentDepsT]):
     ) -> _agent_graph.AgentNode[AgentDepsT, Any] | End[FinalResult[Any]]:
         from pydantic_graph import End
 
-        if not isinstance(result, End) or not self._tasks:
-            return result
-
-        # Hold End until at least one task completes so the drain capability
-        # (which runs after us in reverse order) has a follow-up to deliver.
-        self._completion_event.clear()
-        await self._completion_event.wait()
+        if isinstance(result, End) and self._tasks:
+            # Hold `End` until at least one task completes and enqueues its follow-up,
+            # so the core pending-message drain capability (always ordered outermost,
+            # i.e. after us) redirects the run to deliver it instead of terminating.
+            await asyncio.wait(list(self._tasks.values()), return_when=asyncio.FIRST_COMPLETED)
         return result
 
     async def wrap_run(
         self,
         ctx: RunContext[AgentDepsT],
         *,
-        handler: Any,
-    ) -> Any:
+        handler: WrapRunHandler,
+    ) -> AgentRunResult[Any]:
         try:
             return await handler()
         finally:
             for task in self._tasks.values():
                 task.cancel()
-            if self._tasks:
-                await asyncio.gather(*self._tasks.values(), return_exceptions=True)
+            await asyncio.gather(*self._tasks.values(), return_exceptions=True)

@@ -16,7 +16,6 @@ from pydantic_ai.messages import (
     UserPromptPart,
 )
 from pydantic_ai.models.function import AgentInfo, FunctionModel
-from pydantic_ai.usage import RequestUsage
 
 from pydantic_ai_harness import BackgroundTools
 
@@ -39,7 +38,7 @@ def _ack_seen(messages: list[ModelMessage]) -> bool:
 
 
 def _follow_up_seen(messages: list[ModelMessage], needle: str) -> bool:
-    """True if any drained user prompt in the history contains *needle* (e.g. 'completed' / 'failed')."""
+    """True if any drained user prompt in the history contains `needle`."""
     return any(
         isinstance(part, UserPromptPart) and isinstance(part.content, str) and needle in part.content
         for msg in messages
@@ -48,69 +47,41 @@ def _follow_up_seen(messages: list[ModelMessage], needle: str) -> bool:
     )
 
 
+def _model_calling(tool_name: str, args: str = '{}') -> FunctionModel:
+    """A model that calls `tool_name` once, idles while the task runs, and answers `done` on the follow-up."""
+
+    def model_fn(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        if _follow_up_seen(messages, f"Background tool '{tool_name}'"):
+            return ModelResponse(parts=[TextPart(content='done')])
+        if _ack_seen(messages):
+            return ModelResponse(parts=[TextPart(content='waiting')])
+        return ModelResponse(parts=[ToolCallPart(tool_name=tool_name, args=args)])
+
+    return FunctionModel(model_fn)
+
+
 class TestBackgroundTools:
-    """Cover the metadata-default selector path: spawn, ack, deliver, error, cancel."""
+    """The metadata-default selector path: spawn, ack, deliver, error, cancel."""
 
-    async def test_metadata_marked_tool_runs_in_background(self) -> None:
-        """A tool with `metadata={'background': True}` returns an ack and delivers result as follow-up."""
-        call_count = 0
-
-        def model_fn(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
-            nonlocal call_count
-            call_count += 1
-            if call_count == 1:
-                return ModelResponse(
-                    parts=[ToolCallPart(tool_name='slow_research', args='{"query": "topic"}')],
-                    usage=RequestUsage(input_tokens=10, output_tokens=5),
-                )
-            if call_count == 2:
-                # Agent saw the ack; produce a placeholder, drain holds it back.
-                return ModelResponse(
-                    parts=[TextPart(content='waiting')],
-                    usage=RequestUsage(input_tokens=10, output_tokens=5),
-                )
-            # Third call: the follow-up has been delivered.
-            assert _follow_up_seen(messages, 'completed')
-            return ModelResponse(
-                parts=[TextPart(content='got result')],
-                usage=RequestUsage(input_tokens=10, output_tokens=5),
-            )
-
-        agent = Agent(FunctionModel(model_fn), capabilities=[BackgroundTools()])
+    async def test_metadata_marked_tool_acks_then_delivers_result_as_follow_up(self) -> None:
+        agent = Agent(
+            _model_calling('slow_research', args='{"query": "topic"}'),
+            capabilities=[BackgroundTools()],
+        )
 
         @agent.tool_plain(metadata={'background': True})
         async def slow_research(query: str) -> str:  # pyright: ignore[reportUnusedFunction]
             await asyncio.sleep(0.01)
             return f'researched {query}'
 
-        result = await agent.run('research X')
-        assert result.output == 'got result'
+        result = await agent.run('go')
+
+        assert result.output == 'done'
         assert _ack_seen(result.all_messages())
+        assert _follow_up_seen(result.all_messages(), 'completed.\nResult: researched topic')
 
     async def test_failure_delivered_as_follow_up(self) -> None:
-        """A background tool that raises produces a 'failed' follow-up message."""
-        call_count = 0
-
-        def model_fn(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
-            nonlocal call_count
-            call_count += 1
-            if call_count == 1:
-                return ModelResponse(
-                    parts=[ToolCallPart(tool_name='broken', args='{}')],
-                    usage=RequestUsage(input_tokens=10, output_tokens=5),
-                )
-            if call_count == 2:
-                return ModelResponse(
-                    parts=[TextPart(content='waiting')],
-                    usage=RequestUsage(input_tokens=10, output_tokens=5),
-                )
-            assert _follow_up_seen(messages, 'failed')
-            return ModelResponse(
-                parts=[TextPart(content='handled error')],
-                usage=RequestUsage(input_tokens=10, output_tokens=5),
-            )
-
-        agent = Agent(FunctionModel(model_fn), capabilities=[BackgroundTools()])
+        agent = Agent(_model_calling('broken'), capabilities=[BackgroundTools()])
 
         @agent.tool_plain(metadata={'background': True})
         async def broken() -> str:  # pyright: ignore[reportUnusedFunction]
@@ -118,24 +89,21 @@ class TestBackgroundTools:
             raise RuntimeError('boom')
 
         result = await agent.run('go')
-        assert result.output == 'handled error'
 
-    async def test_unmarked_tool_runs_synchronously(self) -> None:
-        """A tool without the metadata flag is executed normally; no ack, no follow-up."""
+        assert result.output == 'done'
+        assert _follow_up_seen(result.all_messages(), 'failed: boom')
 
+    async def test_unmarked_tool_runs_normally(self) -> None:
         def model_fn(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
-            for msg in messages:
-                if isinstance(msg, ModelRequest):
-                    for part in msg.parts:
-                        if isinstance(part, ToolReturnPart) and part.content == 'sync result':
-                            return ModelResponse(
-                                parts=[TextPart(content='done')],
-                                usage=RequestUsage(input_tokens=10, output_tokens=5),
-                            )
-            return ModelResponse(
-                parts=[ToolCallPart(tool_name='plain', args='{}')],
-                usage=RequestUsage(input_tokens=10, output_tokens=5),
+            returned = any(
+                isinstance(part, ToolReturnPart) and part.content == 'sync result'
+                for msg in messages
+                if isinstance(msg, ModelRequest)
+                for part in msg.parts
             )
+            if returned:
+                return ModelResponse(parts=[TextPart(content='done')])
+            return ModelResponse(parts=[ToolCallPart(tool_name='plain', args='{}')])
 
         agent = Agent(FunctionModel(model_fn), capabilities=[BackgroundTools()])
 
@@ -144,25 +112,14 @@ class TestBackgroundTools:
             return 'sync result'
 
         result = await agent.run('go')
+
         assert result.output == 'done'
         assert not _ack_seen(result.all_messages())
+        assert not _follow_up_seen(result.all_messages(), 'Background tool')
 
     async def test_run_abort_cancels_live_tasks(self) -> None:
-        """When the surrounding run is cancelled (e.g. timeout), live background tasks are cancelled too."""
         cancel_seen = asyncio.Event()
-
-        def model_fn(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
-            if _ack_seen(messages):
-                return ModelResponse(
-                    parts=[TextPart(content='done')],
-                    usage=RequestUsage(input_tokens=10, output_tokens=5),
-                )
-            return ModelResponse(
-                parts=[ToolCallPart(tool_name='slow', args='{}')],
-                usage=RequestUsage(input_tokens=10, output_tokens=5),
-            )
-
-        agent = Agent(FunctionModel(model_fn), capabilities=[BackgroundTools()])
+        agent = Agent(_model_calling('slow'), capabilities=[BackgroundTools()])
 
         @agent.tool_plain(metadata={'background': True})
         async def slow() -> str:  # pyright: ignore[reportUnusedFunction]
@@ -178,33 +135,8 @@ class TestBackgroundTools:
 
         await asyncio.wait_for(cancel_seen.wait(), timeout=1)
 
-
-class TestSelectors:
-    """Cover the non-default `tools=...` selectors: name list, predicate, custom dict."""
-
     async def test_name_list_selector(self) -> None:
-        """`tools=['name']` selects without needing metadata."""
-        call_count = 0
-
-        def model_fn(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
-            nonlocal call_count
-            call_count += 1
-            if call_count == 1:
-                return ModelResponse(
-                    parts=[ToolCallPart(tool_name='by_name', args='{}')],
-                    usage=RequestUsage(input_tokens=10, output_tokens=5),
-                )
-            if call_count == 2:
-                return ModelResponse(
-                    parts=[TextPart(content='waiting')],
-                    usage=RequestUsage(input_tokens=10, output_tokens=5),
-                )
-            return ModelResponse(
-                parts=[TextPart(content='done')],
-                usage=RequestUsage(input_tokens=10, output_tokens=5),
-            )
-
-        agent = Agent(FunctionModel(model_fn), capabilities=[BackgroundTools(tools=['by_name'])])
+        agent = Agent(_model_calling('by_name'), capabilities=[BackgroundTools(tools=['by_name'])])
 
         @agent.tool_plain
         async def by_name() -> str:  # pyright: ignore[reportUnusedFunction]
@@ -212,35 +144,12 @@ class TestSelectors:
             return 'value'
 
         result = await agent.run('go')
+
         assert result.output == 'done'
         assert _ack_seen(result.all_messages())
 
     async def test_custom_metadata_key_selector(self) -> None:
-        """`tools={'async': True}` matches any other metadata key."""
-        call_count = 0
-
-        def model_fn(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
-            nonlocal call_count
-            call_count += 1
-            if call_count == 1:
-                return ModelResponse(
-                    parts=[ToolCallPart(tool_name='custom', args='{}')],
-                    usage=RequestUsage(input_tokens=10, output_tokens=5),
-                )
-            if call_count == 2:
-                return ModelResponse(
-                    parts=[TextPart(content='waiting')],
-                    usage=RequestUsage(input_tokens=10, output_tokens=5),
-                )
-            return ModelResponse(
-                parts=[TextPart(content='done')],
-                usage=RequestUsage(input_tokens=10, output_tokens=5),
-            )
-
-        agent = Agent(
-            FunctionModel(model_fn),
-            capabilities=[BackgroundTools(tools={'async': True})],
-        )
+        agent = Agent(_model_calling('custom'), capabilities=[BackgroundTools(tools={'async': True})])
 
         @agent.tool_plain(metadata={'async': True})
         async def custom() -> str:  # pyright: ignore[reportUnusedFunction]
@@ -248,5 +157,6 @@ class TestSelectors:
             return 'value'
 
         result = await agent.run('go')
+
         assert result.output == 'done'
         assert _ack_seen(result.all_messages())
