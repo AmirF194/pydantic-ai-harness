@@ -97,6 +97,9 @@ stackone = [
     "fastmcp>=3.4.5,<4",
     "pydantic-ai-slim[mcp]>=2.18.0",
 ]
+e2b = [
+    "e2b>=2.34.0",
+]
 prompt-injection-defender = [
     "stackone-defender>=0.7.3,<0.8 ; python_full_version >= '3.11'",
 ]
@@ -135,6 +138,12 @@ lint = [
     'ruff>=0.14',
     'pyright>=1.1.408',
 ]
+
+[tool.uv.sources]
+# Pinned to the unreleased sandbox concept branch (pydantic/pydantic-ai#6492) so this
+# harness can consume `RunContext.sandbox`, the capability sandbox lifecycle hooks, and
+# the `Sandbox` facade. Flip back to a released pydantic-ai-slim once #6492 lands.
+pydantic-ai-slim = { git = 'https://github.com/pydantic/pydantic-ai.git', branch = 'sandbox-concept', subdirectory = 'pydantic_ai_slim' }
 
 [tool.hatch.version]
 source = 'uv-dynamic-versioning'
