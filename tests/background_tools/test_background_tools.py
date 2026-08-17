@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 
 import pytest
-from pydantic_ai import Agent, RunContext
+from pydantic_ai import Agent
 from pydantic_ai.messages import (
     ModelMessage,
     ModelRequest,
@@ -164,9 +164,9 @@ class TestBackgroundTools:
         # Finish the first run completely while the second's task is still live;
         # shared state would let the first run's cleanup cancel the second's task.
         release['first'].set()
-        await first
+        await asyncio.wait_for(first, timeout=5)
         release['second'].set()
-        await second
+        await asyncio.wait_for(second, timeout=5)
 
     async def test_deferred_tool_pause_is_not_held_behind_background_tasks(self) -> None:
         def model_fn(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
@@ -199,37 +199,40 @@ class TestBackgroundTools:
 
         assert isinstance(result.output, DeferredToolRequests)
 
-    async def test_queued_message_at_end_of_run_is_not_delayed_by_live_tasks(self) -> None:
-        release = asyncio.Event()
+    async def test_queued_result_is_not_delayed_by_an_unrelated_live_task(self) -> None:
+        release = {'fast_bg': asyncio.Event(), 'slow_bg': asyncio.Event()}
 
         def model_fn(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
-            if _follow_up_seen(messages, 'completed'):
+            if _follow_up_seen(messages, 'fast value') and _follow_up_seen(messages, 'slow value'):
                 return ModelResponse(parts=[TextPart(content='done')])
-            if _follow_up_seen(messages, 'note delivered'):
-                # The note reached us without waiting on the live task; let it finish now.
-                release.set()
+            if _follow_up_seen(messages, 'fast value'):
+                # The fast result arrived without waiting on `slow_bg`; let it finish now.
+                release['slow_bg'].set()
                 return ModelResponse(parts=[TextPart(content='waiting')])
             if _ack_seen(messages):
-                # Enqueue a message and end the run in the same step, while `slow_bg` is live.
-                return ModelResponse(parts=[ToolCallPart(tool_name='note', args='{}'), TextPart(content='all done')])
-            return ModelResponse(parts=[ToolCallPart(tool_name='slow_bg', args='{}')])
+                release['fast_bg'].set()
+                return ModelResponse(parts=[TextPart(content='waiting')])
+            return ModelResponse(
+                parts=[ToolCallPart(tool_name='fast_bg', args='{}'), ToolCallPart(tool_name='slow_bg', args='{}')]
+            )
 
         agent = Agent(FunctionModel(model_fn), capabilities=[BackgroundTools()])
 
         @agent.tool_plain(metadata={'background': True})
-        async def slow_bg() -> str:  # pyright: ignore[reportUnusedFunction]
-            await release.wait()
-            return 'bg value'
+        async def fast_bg() -> str:  # pyright: ignore[reportUnusedFunction]
+            await release['fast_bg'].wait()
+            return 'fast value'
 
-        @agent.tool
-        def note(ctx: RunContext[object]) -> str:  # pyright: ignore[reportUnusedFunction]
-            ctx.enqueue('note delivered')
-            return 'noted'
+        @agent.tool_plain(metadata={'background': True})
+        async def slow_bg() -> str:  # pyright: ignore[reportUnusedFunction]
+            await release['slow_bg'].wait()
+            return 'slow value'
 
         result = await asyncio.wait_for(agent.run('go'), timeout=5)
 
         assert result.output == 'done'
-        assert _follow_up_seen(result.all_messages(), 'completed.\nResult: bg value')
+        assert _follow_up_seen(result.all_messages(), 'completed.\nResult: fast value')
+        assert _follow_up_seen(result.all_messages(), 'completed.\nResult: slow value')
 
     async def test_run_abort_cancels_live_tasks(self) -> None:
         cancel_seen = asyncio.Event()

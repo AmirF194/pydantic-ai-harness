@@ -78,7 +78,7 @@ The model sees the task ID alongside the result so it can correlate against the 
 
 - Each agent run gets fresh task state, so concurrent runs do not share tasks
 - The run does not finish while a background task is still live: a would-be final answer is held until the task delivers its follow-up, so total run duration still includes every background task
-- A run that pauses for [deferred tools](https://ai.pydantic.dev/deferred-tools/) (human-in-the-loop approval, external execution) is never held; the pause reaches the caller immediately and remaining background tasks are cancelled
+- A run that pauses for [deferred tools](https://ai.pydantic.dev/deferred-tools/) (human-in-the-loop approval, external execution) is never held behind background work; remaining background tasks are cancelled when the run pauses
 - When the run ends for any other reason with tasks still live (caller cancellation, a usage limit, an unexpected error), those tasks are cancelled and their results are dropped
 - `asyncio.CancelledError` from a cancelled task does not produce a result message; it propagates as a normal task cancellation
 
