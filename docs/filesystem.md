@@ -70,14 +70,18 @@ the run.
 ## Security model
 
 - **Containment.** Paths resolve relative to `root_dir`; anything resolving
-  outside -- via `..`, an absolute path, or a symlink -- is rejected. Symlinks
-  are resolved with `os.path.realpath` *before* the containment check, and I/O
-  then uses the resolved path. Directory walks (`list_directory`,
-  `search_files`, `find_files`) resolve each entry the same way and match the
-  patterns against that resolved target, so a symlink cannot name a file
-  outside the tree or present a denied file under a permitted name. These
-  checks are pathname-based: if another process mutates the tree between
-  resolution and I/O, the path read can differ from the path checked.
+  outside -- via `..`, an absolute path, or a symlink -- is rejected. On Linux
+  and macOS every path component is opened `O_NOFOLLOW` relative to its parent
+  directory (`openat`-style), symlinks are resolved through the same walk, and
+  all I/O happens on the descriptor those checks authorized -- so a path
+  swapped for a symlink mid-operation cannot redirect the I/O outside the
+  root. Directory walks (`list_directory`, `search_files`, `find_files`)
+  authorize each entry the same way and match the patterns against the
+  resolved target, so a symlink cannot name a file outside the tree or present
+  a denied file under a permitted name. On platforms without `dir_fd` support
+  (Windows), symlinks are instead resolved with `os.path.realpath` before the
+  containment check; those checks are pathname-based and best-effort under
+  concurrent mutation of the workspace.
 - **Binary detection.** `read_file` returns a placeholder instead of dumping
   binary bytes into the model context.
 - **Optimistic concurrency.** `write_file`/`edit_file` accept an

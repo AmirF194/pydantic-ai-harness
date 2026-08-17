@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import errno
+import os
 from pathlib import Path
+from typing import Any
 
 import pytest
 from pydantic_ai import Agent
@@ -12,6 +15,7 @@ from pydantic_ai.tools import RunContext
 from pydantic_ai.usage import RunUsage
 
 from pydantic_ai_harness.filesystem import READ_ONLY_TOOL_NAMES, FileSystem
+from pydantic_ai_harness.filesystem import _toolset as toolset_module
 from pydantic_ai_harness.filesystem._toolset import FileSystemToolset, _content_hash, _format_lines, _is_binary
 
 
@@ -80,8 +84,14 @@ class TestContentHash:
         assert len(_content_hash('test')) == 12
 
 
-@pytest.fixture
-def fs_root(tmp_path: Path) -> Path:
+# Every test that goes through `fs_root` runs twice: once with descriptor
+# (openat-style) traversal and once with the pathname fallback used on
+# platforms without `dir_fd` support, so both implementations keep identical
+# observable behavior.
+@pytest.fixture(params=['descriptor', 'pathname'])
+def fs_root(request: pytest.FixtureRequest, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    if request.param == 'pathname':
+        monkeypatch.setattr(toolset_module, '_HAS_FD_TRAVERSAL', False)
     (tmp_path / 'hello.txt').write_text('Hello, world!\n')
     (tmp_path / 'multi.txt').write_text('line1\nline2\nline3\nline4\nline5\n')
     (tmp_path / 'subdir').mkdir()
@@ -1195,17 +1205,17 @@ class TestMutationKillers:
         # Exact match: no trailing double newline
         assert result == '     1\thello\n'
 
-    def test_safe_resolve_write_default_is_false(self, toolset: FileSystemToolset[None], fs_root: Path) -> None:
-        """Protected files should be readable via _safe_resolve's default (write=False)."""
+    def test_resolve_for_write_default_is_false(self, toolset: FileSystemToolset[None], fs_root: Path) -> None:
+        """Protected files should be readable via _resolve_for's default (write=False)."""
         (fs_root / '.env.local').write_text('SECRET=x\n')
-        # _safe_resolve without write= uses default write=False → read is allowed
-        resolved = toolset._safe_resolve('.env.local')
-        assert resolved.name == '.env.local'
-        # But with write=True, it should raise. `_safe_resolve` is an internal
+        # _resolve_for without write= uses default write=False → read is allowed
+        with toolset._resolve_for('.env.local', missing='File not found: .env.local') as resolved:
+            assert resolved.canonical == '.env.local'
+        # But with write=True, it should raise. `_resolve_for` is an internal
         # helper, so it raises the native PermissionError; the `ModelRetry`
         # conversion happens in the public tool methods that wrap it.
         with pytest.raises(PermissionError, match='protected'):
-            toolset._safe_resolve('.env.local', write=True)
+            toolset._resolve_for('.env.local', write=True, missing='File not found: .env.local')
 
     async def test_list_directory_exact_size(self, toolset: FileSystemToolset[None]) -> None:
         result = await toolset.list_directory('.')
@@ -1387,3 +1397,454 @@ class TestPatternCanonicalization:
         assert 'secrets.yaml:1:api: PRIVATE KEY material' in await ts.search_files('PRIVATE KEY')
         with pytest.raises(ModelRetry, match='protected'):
             await ts.write_file('secrets.yaml', 'changed\n')
+
+
+def _plain_toolset(root: Path) -> FileSystemToolset[None]:
+    return FileSystemToolset(
+        root_dir=root,
+        allowed_patterns=[],
+        denied_patterns=[],
+        protected_patterns=[],
+        max_read_lines=2000,
+        max_list_results=1000,
+        max_search_results=1000,
+        max_find_results=1000,
+    )
+
+
+class TestSymlinkResolution:
+    """Symlink and traversal semantics hold in both traversal modes."""
+
+    async def test_relative_dotdot_symlink_escape_rejected(
+        self, toolset: FileSystemToolset[None], fs_root: Path
+    ) -> None:
+        (fs_root.parent / 'rel-escape-target').write_text('outside secret\n')
+        (fs_root / 'up.txt').symlink_to('../rel-escape-target')
+        with pytest.raises(ModelRetry, match='outside the root'):
+            await toolset.read_file('up.txt')
+
+    async def test_symlinked_directory_escape_rejected(self, toolset: FileSystemToolset[None], fs_root: Path) -> None:
+        outdir = fs_root.parent / 'outdir'
+        outdir.mkdir(exist_ok=True)
+        (outdir / 'f.txt').write_text('outside secret\n')
+        (fs_root / 'linkdir').symlink_to(outdir)
+        with pytest.raises(ModelRetry, match='outside the root'):
+            await toolset.read_file('linkdir/f.txt')
+
+    async def test_absolute_symlinked_directory_inside_root_traverses(
+        self, toolset: FileSystemToolset[None], fs_root: Path
+    ) -> None:
+        (fs_root / 'dirlink').symlink_to(fs_root / 'subdir')
+        result = await toolset.read_file('dirlink/nested.py')
+        assert 'nested' in result
+
+    async def test_relative_symlinked_directory_inside_root_traverses(
+        self, toolset: FileSystemToolset[None], fs_root: Path
+    ) -> None:
+        (fs_root / 'dirlink').symlink_to('subdir')
+        result = await toolset.read_file('dirlink/nested.py')
+        assert 'nested' in result
+
+    async def test_write_through_in_root_alias_updates_target(
+        self, toolset: FileSystemToolset[None], fs_root: Path
+    ) -> None:
+        (fs_root / 'alias.txt').symlink_to(fs_root / 'hello.txt')
+        await toolset.write_file('alias.txt', 'replaced\n')
+        assert (fs_root / 'hello.txt').read_text() == 'replaced\n'
+        assert (fs_root / 'alias.txt').is_symlink()
+
+    async def test_write_through_escape_symlink_rejected(self, toolset: FileSystemToolset[None], fs_root: Path) -> None:
+        target = fs_root.parent / 'write-escape-target'
+        target.write_text('untouched\n')
+        (fs_root / 'out.txt').symlink_to(target)
+        with pytest.raises(ModelRetry, match='outside the root'):
+            await toolset.write_file('out.txt', 'HACKED\n')
+        assert target.read_text() == 'untouched\n'
+
+    async def test_write_through_dangling_in_root_symlink_creates_target(
+        self, toolset: FileSystemToolset[None], fs_root: Path
+    ) -> None:
+        (fs_root / 'dangling.txt').symlink_to(fs_root / 'made.txt')
+        await toolset.write_file('dangling.txt', 'content\n')
+        assert (fs_root / 'made.txt').read_text() == 'content\n'
+
+    async def test_dotdot_within_root_resolves(self, toolset: FileSystemToolset[None]) -> None:
+        result = await toolset.read_file('subdir/../hello.txt')
+        assert 'Hello, world!' in result
+
+    async def test_absolute_path_inside_root_allowed(self, toolset: FileSystemToolset[None], fs_root: Path) -> None:
+        result = await toolset.read_file(str(fs_root / 'hello.txt'))
+        assert 'Hello, world!' in result
+
+    async def test_absolute_path_outside_root_rejected(self, toolset: FileSystemToolset[None]) -> None:
+        with pytest.raises(ModelRetry, match='outside the root'):
+            await toolset.read_file('/etc/passwd')
+
+    async def test_missing_path_with_dotdot_escape_rejected(self, toolset: FileSystemToolset[None]) -> None:
+        with pytest.raises(ModelRetry, match='outside the root'):
+            await toolset.read_file('ghost/../../etc/passwd')
+
+    async def test_denied_pattern_wins_over_missing_file(self, fs_root: Path) -> None:
+        ts = FileSystemToolset(
+            root_dir=fs_root,
+            allowed_patterns=[],
+            denied_patterns=['secret*'],
+            protected_patterns=[],
+            max_read_lines=2000,
+            max_list_results=1000,
+            max_search_results=1000,
+            max_find_results=1000,
+        )
+        with pytest.raises(ModelRetry, match='denied by pattern'):
+            await ts.read_file('secret.txt')
+        with pytest.raises(ModelRetry, match='denied by pattern'):
+            await ts.read_file('secretdir/inner.txt')
+
+    async def test_write_deep_missing_parent_names_full_parent(self, toolset: FileSystemToolset[None]) -> None:
+        with pytest.raises(ModelRetry, match="Parent directory 'missing/sub' does not exist"):
+            await toolset.write_file('missing/sub/f.txt', 'x\n')
+
+    async def test_create_directory_collapses_dotdot_through_missing(
+        self, toolset: FileSystemToolset[None], fs_root: Path
+    ) -> None:
+        result = await toolset.create_directory('ghost/../made')
+        assert result == 'Created directory: ghost/../made'
+        assert (fs_root / 'made').is_dir()
+        assert not (fs_root / 'ghost').exists()
+
+    async def test_create_directory_missing_then_dotdot_is_noop(
+        self, toolset: FileSystemToolset[None], fs_root: Path
+    ) -> None:
+        result = await toolset.create_directory('ghost/..')
+        assert result == 'Created directory: ghost/..'
+        assert not (fs_root / 'ghost').exists()
+
+
+class TestDirectoryIntentEdges:
+    """Directory-shaped inputs to file tools behave the same in both modes."""
+
+    async def test_read_root_dot_is_reported_as_directory(self, toolset: FileSystemToolset[None]) -> None:
+        with pytest.raises(ModelRetry, match='is a directory'):
+            await toolset.read_file('.')
+
+    async def test_write_to_root_dot_rejected(self, toolset: FileSystemToolset[None]) -> None:
+        with pytest.raises(ModelRetry, match='[Ii]s a directory'):
+            await toolset.write_file('.', 'x\n')
+
+    async def test_write_to_directory_rejected(self, toolset: FileSystemToolset[None]) -> None:
+        with pytest.raises(ModelRetry, match='[Ii]s a directory'):
+            await toolset.write_file('subdir', 'x\n')
+
+    async def test_edit_directory_reports_missing_file(self, toolset: FileSystemToolset[None]) -> None:
+        with pytest.raises(ModelRetry, match='File not found: subdir'):
+            await toolset.edit_file('subdir', 'a', 'b')
+
+    async def test_edit_root_dot_reports_missing_file(self, toolset: FileSystemToolset[None]) -> None:
+        with pytest.raises(ModelRetry, match='File not found: .'):
+            await toolset.edit_file('.', 'a', 'b')
+
+    async def test_create_directory_dot_is_noop(self, toolset: FileSystemToolset[None]) -> None:
+        assert await toolset.create_directory('.') == 'Created directory: .'
+
+    async def test_create_directory_over_file_aborts(self, toolset: FileSystemToolset[None]) -> None:
+        # Parity with `Path.mkdir`: an existing file aborts the run today; the
+        # recoverable conversion is tracked separately (#602, #612).
+        with pytest.raises(FileExistsError):
+            await toolset.create_directory('hello.txt')
+
+    async def test_write_empty_content(self, toolset: FileSystemToolset[None], fs_root: Path) -> None:
+        result = await toolset.write_file('empty.txt', '')
+        assert 'Wrote 0 chars' in result
+        assert (fs_root / 'empty.txt').read_text() == ''
+
+    async def test_file_info_on_root_dot(self, toolset: FileSystemToolset[None]) -> None:
+        result = await toolset.file_info('.')
+        assert 'type: directory' in result
+
+
+@pytest.mark.skipif(not hasattr(os, 'mkfifo'), reason='needs FIFO support')
+class TestSpecialFileReads:
+    """Non-regular files are reported, not read, in both modes."""
+
+    async def test_read_fifo_reports_file_not_found(self, toolset: FileSystemToolset[None], fs_root: Path) -> None:
+        os.mkfifo(fs_root / 'pipe')
+        with pytest.raises(ModelRetry, match='File not found: pipe'):
+            await toolset.read_file('pipe')
+
+    async def test_file_info_fifo_skips_content(self, toolset: FileSystemToolset[None], fs_root: Path) -> None:
+        os.mkfifo(fs_root / 'pipe')
+        result = await toolset.file_info('pipe')
+        assert 'type: file' in result
+        assert 'binary:' not in result
+
+    async def test_search_rooted_at_fifo_finds_nothing(self, toolset: FileSystemToolset[None], fs_root: Path) -> None:
+        os.mkfifo(fs_root / 'pipe')
+        assert await toolset.search_files('anything', path='pipe') == 'No matches found.'
+
+
+_needs_fd_traversal = pytest.mark.skipif(
+    not toolset_module._HAS_FD_TRAVERSAL, reason='needs openat-style descriptor traversal'
+)
+
+
+@_needs_fd_traversal
+class TestDescriptorBinding:
+    """Authorization is bound to the object the I/O touches (#632).
+
+    These tests mutate the workspace at the exact seam where the legacy
+    pathname implementation had authorized one object and would go on to open
+    another.
+    """
+
+    async def test_final_component_swapped_for_outside_symlink_is_rejected(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        root = tmp_path / 'root'
+        root.mkdir()
+        (root / 'data.txt').write_text('inside\n')
+        (tmp_path / 'outside.txt').write_text('outside secret\n')
+        ts = _plain_toolset(root)
+
+        original_check = FileSystemToolset._check_access
+
+        def swapping_check(
+            self: FileSystemToolset[Any], rel: str, *, write: bool = False, check_allowed: bool = True
+        ) -> None:
+            original_check(self, rel, write=write, check_allowed=check_allowed)
+            if rel == 'data.txt' and not (root / 'data.txt').is_symlink():
+                (root / 'data.txt').unlink()
+                (root / 'data.txt').symlink_to(tmp_path / 'outside.txt')
+
+        monkeypatch.setattr(FileSystemToolset, '_check_access', swapping_check)
+        with pytest.raises(ModelRetry, match='outside the root'):
+            await ts.read_file('data.txt')
+
+    async def test_intermediate_directory_swap_still_reads_authorized_object(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        root = tmp_path / 'root'
+        (root / 'sub').mkdir(parents=True)
+        (root / 'sub' / 'inner.txt').write_text('original content\n')
+        outside = tmp_path / 'outside-dir'
+        outside.mkdir()
+        (outside / 'inner.txt').write_text('outside secret\n')
+        ts = _plain_toolset(root)
+
+        original_check = FileSystemToolset._check_access
+        swapped = False
+
+        def swapping_check(
+            self: FileSystemToolset[Any], rel: str, *, write: bool = False, check_allowed: bool = True
+        ) -> None:
+            nonlocal swapped
+            original_check(self, rel, write=write, check_allowed=check_allowed)
+            if rel == 'sub/inner.txt' and not swapped:
+                swapped = True
+                (root / 'sub').rename(root / 'sub-moved')
+                (root / 'sub').symlink_to(outside)
+
+        monkeypatch.setattr(FileSystemToolset, '_check_access', swapping_check)
+        # The walk already holds the original directory's descriptor, so the
+        # read lands on the object that was authorized, not the swapped-in one.
+        result = await ts.read_file('sub/inner.txt')
+        assert 'original content' in result
+        assert 'outside secret' not in result
+
+    async def test_symlink_loop_reported_as_loop(self, tmp_path: Path) -> None:
+        root = tmp_path / 'root'
+        root.mkdir()
+        (root / 'a').symlink_to(root / 'b')
+        (root / 'b').symlink_to(root / 'a')
+        ts = _plain_toolset(root)
+        with pytest.raises(ModelRetry, match='symlink loop'):
+            await ts.read_file('a')
+
+    async def test_symlink_loop_skipped_by_search(self, tmp_path: Path) -> None:
+        root = tmp_path / 'root'
+        root.mkdir()
+        (root / 'real.txt').write_text('cycle needle\n')
+        (root / 'loop').symlink_to(root / 'loop2')
+        (root / 'loop2').symlink_to(root / 'loop')
+        ts = _plain_toolset(root)
+        assert await ts.search_files('cycle needle') == 'real.txt:1:cycle needle'
+
+    async def test_read_through_file_reports_not_a_directory(self, tmp_path: Path) -> None:
+        root = tmp_path / 'root'
+        root.mkdir()
+        (root / 'file.txt').write_text('x\n')
+        ts = _plain_toolset(root)
+        with pytest.raises(ModelRetry, match='Not a directory: file.txt'):
+            await ts.read_file('file.txt/impossible')
+
+    async def test_unreadable_intermediate_reports_permission(self, tmp_path: Path) -> None:
+        root = tmp_path / 'root'
+        (root / 'locked').mkdir(parents=True)
+        (root / 'locked' / 'f.txt').write_text('x\n')
+        ts = _plain_toolset(root)
+        os.chmod(root / 'locked', 0o000)
+        try:
+            with pytest.raises(ModelRetry, match='[Pp]ermission denied'):
+                await ts.read_file('locked/f.txt')
+        finally:
+            os.chmod(root / 'locked', 0o755)
+
+
+@_needs_fd_traversal
+class TestWalkRaces:
+    """Retry paths for components that change while the walk runs."""
+
+    async def test_final_component_became_symlink_retries_and_succeeds(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        root = tmp_path / 'root'
+        root.mkdir()
+        (root / 'data.txt').write_text('content\n')
+        ts = _plain_toolset(root)
+
+        real_open = os.open
+        failures = [OSError(errno.ELOOP, 'simulated swap')]
+
+        def flaky_open(path: str | Path, flags: int, mode: int = 0o777, *, dir_fd: int | None = None) -> int:
+            if path == 'data.txt' and dir_fd is not None and failures:
+                raise failures.pop()
+            return real_open(path, flags, mode, dir_fd=dir_fd)
+
+        monkeypatch.setattr(os, 'open', flaky_open)
+        result = await ts.read_file('data.txt')
+        assert 'content' in result
+
+    async def test_final_component_kept_swapping_reports_loop(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        root = tmp_path / 'root'
+        root.mkdir()
+        (root / 'data.txt').write_text('content\n')
+        ts = _plain_toolset(root)
+
+        real_open = os.open
+
+        def always_swapped_open(path: str | Path, flags: int, mode: int = 0o777, *, dir_fd: int | None = None) -> int:
+            if path == 'data.txt' and dir_fd is not None:
+                raise OSError(errno.ELOOP, 'simulated swap')
+            return real_open(path, flags, mode, dir_fd=dir_fd)
+
+        monkeypatch.setattr(os, 'open', always_swapped_open)
+        with pytest.raises(ModelRetry, match='symlink loop'):
+            await ts.read_file('data.txt')
+
+    async def test_intermediate_became_symlink_retries_and_succeeds(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        root = tmp_path / 'root'
+        (root / 'sub').mkdir(parents=True)
+        (root / 'sub' / 'inner.txt').write_text('content\n')
+        ts = _plain_toolset(root)
+
+        real_open = os.open
+        failures = [OSError(errno.ELOOP, 'simulated swap')]
+
+        def flaky_open(path: str | Path, flags: int, mode: int = 0o777, *, dir_fd: int | None = None) -> int:
+            if path == 'sub' and dir_fd is not None and failures:
+                raise failures.pop()
+            return real_open(path, flags, mode, dir_fd=dir_fd)
+
+        monkeypatch.setattr(os, 'open', flaky_open)
+        result = await ts.read_file('sub/inner.txt')
+        assert 'content' in result
+
+    async def test_write_target_vanishing_between_opens_retries(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        root = tmp_path / 'root'
+        root.mkdir()
+        ts = _plain_toolset(root)
+
+        real_open = os.open
+        failures = [OSError(errno.ENOENT, 'simulated delete'), OSError(errno.EEXIST, 'simulated create')]
+
+        def flaky_open(path: str | Path, flags: int, mode: int = 0o777, *, dir_fd: int | None = None) -> int:
+            if path == 'v.txt' and dir_fd is not None and failures:
+                raise failures.pop()
+            return real_open(path, flags, mode, dir_fd=dir_fd)
+
+        monkeypatch.setattr(os, 'open', flaky_open)
+        result = await ts.write_file('v.txt', 'content\n')
+        assert 'Wrote' in result
+        assert (root / 'v.txt').read_text() == 'content\n'
+
+
+@_needs_fd_traversal
+@pytest.mark.skipif(not hasattr(os, 'mkfifo'), reason='needs FIFO support')
+class TestFifoWrites:
+    """Write-path tools refuse non-regular files instead of blocking on them."""
+
+    async def test_write_to_fifo_reports_not_regular(self, tmp_path: Path) -> None:
+        root = tmp_path / 'root'
+        root.mkdir()
+        os.mkfifo(root / 'pipe')
+        ts = _plain_toolset(root)
+        with pytest.raises(ModelRetry, match='not a regular file'):
+            await ts.write_file('pipe', 'x\n')
+
+    async def test_write_to_fifo_with_expected_hash_reports_not_regular(self, tmp_path: Path) -> None:
+        root = tmp_path / 'root'
+        root.mkdir()
+        os.mkfifo(root / 'pipe')
+        ts = _plain_toolset(root)
+        with pytest.raises(ModelRetry, match='not a regular file'):
+            await ts.write_file('pipe', 'x\n', expected_hash='abc123abc123')
+
+    async def test_edit_fifo_reports_file_not_found(self, tmp_path: Path) -> None:
+        root = tmp_path / 'root'
+        root.mkdir()
+        os.mkfifo(root / 'pipe')
+        ts = _plain_toolset(root)
+        with pytest.raises(ModelRetry, match='File not found: pipe'):
+            await ts.edit_file('pipe', 'a', 'b')
+
+
+class TestWalkCoverageEdges:
+    """Remaining walk paths behave identically in both modes."""
+
+    async def test_absolute_in_root_symlink_inside_subdir(
+        self, toolset: FileSystemToolset[None], fs_root: Path
+    ) -> None:
+        (fs_root / 'subdir' / 'abs_link.txt').symlink_to(fs_root / 'hello.txt')
+        result = await toolset.read_file('subdir/abs_link.txt')
+        assert 'Hello, world!' in result
+
+    async def test_create_directory_collapses_dotdot_inside_subdir(
+        self, toolset: FileSystemToolset[None], fs_root: Path
+    ) -> None:
+        await toolset.create_directory('subdir/ghost/../made')
+        assert (fs_root / 'subdir' / 'made').is_dir()
+        assert not (fs_root / 'subdir' / 'ghost').exists()
+
+    async def test_read_through_missing_directory(self, toolset: FileSystemToolset[None]) -> None:
+        with pytest.raises(ModelRetry, match='File not found: ghost-dir/f.txt'):
+            await toolset.read_file('ghost-dir/f.txt')
+
+    async def test_read_unreadable_file_reports_permission(
+        self, toolset: FileSystemToolset[None], fs_root: Path
+    ) -> None:
+        (fs_root / 'noread.txt').write_text('x\n')
+        os.chmod(fs_root / 'noread.txt', 0o000)
+        try:
+            with pytest.raises(ModelRetry, match='[Pp]ermission denied'):
+                await toolset.read_file('noread.txt')
+        finally:
+            os.chmod(fs_root / 'noread.txt', 0o644)
+
+    async def test_write_unwritable_file_reports_permission(
+        self, toolset: FileSystemToolset[None], fs_root: Path
+    ) -> None:
+        (fs_root / 'readonly.txt').write_text('x\n')
+        os.chmod(fs_root / 'readonly.txt', 0o444)
+        try:
+            with pytest.raises(ModelRetry, match='[Pp]ermission denied'):
+                await toolset.write_file('readonly.txt', 'y\n')
+        finally:
+            os.chmod(fs_root / 'readonly.txt', 0o644)
+
+    async def test_search_missing_directory_finds_nothing(self, toolset: FileSystemToolset[None]) -> None:
+        assert await toolset.search_files('anything', path='ghost-dir') == 'No matches found.'

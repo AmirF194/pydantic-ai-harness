@@ -2,14 +2,17 @@
 
 from __future__ import annotations
 
+import errno
 import fnmatch
 import functools
 import hashlib
 import os
+import posixpath
 import re
+import stat
 from collections.abc import Awaitable, Callable, Sequence
-from pathlib import Path
-from typing import Concatenate, ParamSpec
+from pathlib import Path, PurePath
+from typing import Concatenate, Literal, ParamSpec
 
 from pydantic_ai.exceptions import ModelRetry
 from pydantic_ai.tools import AgentDepsT
@@ -27,6 +30,37 @@ READ_ONLY_TOOL_NAMES: frozenset[str] = frozenset(
 # to the model; any other exception aborts the whole run. `_recoverable`
 # converts these so the agent can correct itself and continue.
 _RECOVERABLE_ERRORS = (PermissionError, FileNotFoundError, NotADirectoryError, IsADirectoryError, ValueError)
+
+_HAS_FD_TRAVERSAL = (
+    {os.open, os.mkdir, os.readlink} <= os.supports_dir_fd and hasattr(os, 'O_NOFOLLOW') and hasattr(os, 'O_DIRECTORY')
+)
+"""Whether the platform can walk paths descriptor-relative (`openat` style).
+
+True on Linux and macOS. Where it is False (Windows), containment falls back
+to the pathname-based `realpath` check, which cannot bind the check to the
+object the I/O later touches.
+"""
+
+# Directories along the walk only anchor the next `dir_fd` step. `O_PATH`
+# (Linux) grants exactly that without needing read permission; platforms
+# without it fall back to `O_RDONLY`.
+_DIR_OPEN_FLAGS = (getattr(os, 'O_PATH', os.O_RDONLY) | os.O_DIRECTORY | os.O_NOFOLLOW) if _HAS_FD_TRAVERSAL else 0
+
+# `O_NONBLOCK` keeps an open from waiting on a FIFO; it has no effect on
+# regular files. `O_NOFOLLOW` refuses a symlink swapped in after the walk
+# resolved the component.
+_FILE_OPEN_FLAGS = (os.O_NOFOLLOW | os.O_NONBLOCK) if _HAS_FD_TRAVERSAL else 0
+
+# A symlink refused by `O_NOFOLLOW` surfaces as `ELOOP` on Linux and macOS and
+# as `EMLINK` on some BSDs.
+_SYMLINK_ERRNOS = frozenset({errno.ELOOP, errno.EMLINK})
+
+_MAX_SYMLINK_HOPS = 40
+"""Symlink resolutions allowed per lookup before reporting a loop, mirroring the kernel's own bound."""
+
+_Intent = Literal['read', 'write', 'edit', 'mkdir']
+
+_Kind = Literal['missing', 'dir', 'file', 'other']
 
 
 def _recoverable(
@@ -94,13 +128,110 @@ def _content_hash(content: str) -> str:
     return hashlib.sha256(content.encode('utf-8')).hexdigest()[:12]
 
 
+def _kind_of(st: os.stat_result | None) -> _Kind:
+    """Classify a stat result by what I/O the target supports."""
+    if st is None:
+        return 'missing'
+    if stat.S_ISDIR(st.st_mode):
+        return 'dir'
+    if stat.S_ISREG(st.st_mode):
+        return 'file'
+    return 'other'
+
+
+def _readlink_or_none(name: str, dir_fd: int) -> str | None:
+    """The symlink target of `name` in the directory `dir_fd`, or None when it is not a symlink."""
+    try:
+        return os.readlink(name, dir_fd=dir_fd)
+    except OSError as e:
+        # `EINVAL`: a real (non-symlink) entry. `ENOENT`: nothing there; the
+        # open step reports it with the caller's message.
+        if e.errno in (errno.EINVAL, errno.ENOENT):
+            return None
+        raise  # pragma: no cover
+
+
+def _normalized_remainder(path: str, canonical: list[str], name: str, pending: list[str]) -> str:
+    """Lexically collapse the un-walked tail of a missing path for pattern checks and messages.
+
+    Components past a missing directory cannot contain symlinks, so collapsing
+    them lexically matches what `realpath` would have produced.
+    """
+    remainder = posixpath.normpath('/'.join([*canonical, name, *reversed(pending)]))
+    if remainder.startswith('..'):
+        raise PermissionError(f'Path {path!r} resolves outside the root directory.')
+    return remainder
+
+
+class _Resolved:
+    """One authorized filesystem location, ready for I/O.
+
+    With descriptor traversal, `fd` was opened by walking every component
+    `O_NOFOLLOW` relative to its parent, so the object the checks authorized is
+    the object the I/O touches. On fallback platforms `fd` is None and I/O uses
+    the pathname, keeping the legacy best-effort guarantee.
+    """
+
+    __slots__ = ('fd', 'path', 'canonical', 'created')
+
+    def __init__(self, fd: int | None, path: Path, canonical: str, *, created: bool = False) -> None:
+        self.fd = fd
+        self.path = path
+        self.canonical = canonical
+        self.created = created
+
+    def __enter__(self) -> _Resolved:
+        return self
+
+    def __exit__(self, *_exc_info: object) -> None:
+        if self.fd is not None:
+            os.close(self.fd)
+            self.fd = None
+
+    def stat(self) -> os.stat_result | None:
+        """Stat the target, or None when it does not exist."""
+        try:
+            return os.fstat(self.fd) if self.fd is not None else os.stat(self.path)
+        except OSError:
+            return None
+
+    def read_bytes(self) -> bytes:
+        """Read the target's full content as bytes."""
+        if self.fd is None:
+            return self.path.read_bytes()
+        os.lseek(self.fd, 0, os.SEEK_SET)
+        chunks = bytearray()
+        while chunk := os.read(self.fd, 1 << 16):
+            chunks += chunk
+        return bytes(chunks)
+
+    def read_text(self) -> str:
+        """Strict UTF-8 text with universal newlines, matching `Path.read_text`."""
+        if self.fd is None:
+            return self.path.read_text(encoding='utf-8')
+        return self.read_bytes().decode('utf-8').replace('\r\n', '\n').replace('\r', '\n')
+
+    def replace_text(self, content: str) -> None:
+        """Replace the target's content, through the descriptor when there is one."""
+        if self.fd is None:
+            self.path.write_text(content, encoding='utf-8')
+            return
+        os.lseek(self.fd, 0, os.SEEK_SET)
+        os.truncate(self.fd, 0)
+        data = content.encode('utf-8')
+        while data:
+            data = data[os.write(self.fd, data) :]
+
+
 class FileSystemToolset(FunctionToolset[AgentDepsT]):
     """Toolset providing filesystem operations scoped to a root directory.
 
     Security model:
     - All paths resolved relative to root with canonical path checks
-    - Symlinks resolved before authorization (prevents TOCTTOU)
-    - Glob-based allow/deny filtering
+    - Where the platform supports `openat`-style traversal, every path
+      component is opened `O_NOFOLLOW` relative to its parent and I/O happens
+      on that descriptor, so a path swapped mid-operation cannot redirect it
+    - Glob-based allow/deny filtering, matched against resolved locations
     - Protected path patterns (e.g. `.git/`, `.env`)
     - Binary file detection blocks text operations
     """
@@ -155,9 +286,11 @@ class FileSystemToolset(FunctionToolset[AgentDepsT]):
         return next((p for p in patterns if self._matches(path, p)), None)
 
     def _resolve_path(self, path: str) -> Path:
-        """Resolve path relative to root, rejecting traversal.
+        """Resolve path relative to root the legacy way, rejecting traversal.
 
-        Uses os.path.realpath for symlink resolution before checking containment.
+        Fallback for platforms without descriptor traversal: `os.path.realpath`
+        resolves symlinks before the containment check, but nothing binds that
+        check to the object later I/O touches.
         """
         candidate = (self._root / path).resolve()
         real = Path(os.path.realpath(candidate))
@@ -174,7 +307,7 @@ class FileSystemToolset(FunctionToolset[AgentDepsT]):
         directory isn't required to match `allowed_patterns` itself -- `.` or
         `src` would never match a file pattern like `src/*.py`. The walk's
         entries are still filtered against `allowed_patterns` per-entry via
-        `_resolve_walk_entry`. Denied patterns continue to gate the root.
+        `_resolve_entry`. Denied patterns continue to gate the root.
         """
         if write and self._protected_patterns:
             matched = self._first_matching_pattern(path, self._protected_patterns)
@@ -190,50 +323,293 @@ class FileSystemToolset(FunctionToolset[AgentDepsT]):
             if not any(self._matches(path, p) for p in self._allowed_patterns):
                 raise PermissionError(f'Path {path!r} does not match any allowed pattern.')
 
-    def _is_accessible(self, path: str) -> bool:
-        """Predicate form of the read-level `_check_access` checks.
-
-        Protected patterns are not consulted: they gate writes, and the walkers
-        only read.
-        """
-        if self._denied_patterns:
-            if self._first_matching_pattern(path, self._denied_patterns) is not None:
-                return False
-        if self._allowed_patterns and not any(self._matches(path, p) for p in self._allowed_patterns):
-            return False
-        return True
-
-    def _resolve_walk_entry(self, entry: Path) -> Path | None:
-        """Authorize one entry of a directory walk, or return `None` to skip it.
-
-        Callers must do their I/O on the returned path. Resolving once means the
-        path that was authorized is the path that gets read, and matching the
-        patterns against the resolved location keeps the walkers in step with
-        direct access: a symlink can neither escape the root nor alias a file
-        past a rule its own name would trip.
-        """
-        target = Path(os.path.realpath(entry))
-        if not target.is_relative_to(self._real_root):
-            return None
-        if not self._is_accessible(self._relative_to_root(target)):
-            return None
-        return target
-
     def _relative_to_root(self, resolved: Path) -> str:
         """Canonical path of a resolved location relative to the real root."""
         return str(resolved.relative_to(self._real_root))
 
-    def _safe_resolve(self, path: str, *, write: bool = False, check_allowed: bool = True) -> Path:
-        """Resolve and access-check a path in one step.
+    def _split_components(self, path: str) -> list[str]:
+        """Split a tool path into components to walk from the root.
 
-        Resolution happens first so the access check matches patterns against
-        the canonical path relative to the root, collapsing `.`/`..`/`//`
-        segments that would otherwise slip past a literal pattern (e.g.
-        `config/./secret.txt` evading a `config/secret.txt` deny rule).
+        `..` components are kept for the walk to apply physically. An absolute
+        path is accepted only when it lexically names a location under the
+        root; the walk still verifies every component of it.
         """
-        resolved = self._resolve_path(path)
-        self._check_access(self._relative_to_root(resolved), write=write, check_allowed=check_allowed)
-        return resolved
+        pure = PurePath(path)
+        if pure.is_absolute():
+            try:
+                pure = pure.relative_to(self._real_root)
+            except ValueError:
+                raise PermissionError(f'Path {path!r} resolves outside the root directory.') from None
+        return [c for c in pure.parts if c != '.']
+
+    def _resolve_for(
+        self,
+        path: str,
+        *,
+        intent: _Intent = 'read',
+        write: bool = False,
+        check_allowed: bool = True,
+        missing: str,
+        missing_parent: Callable[[str], str] | None = None,
+        need_read: bool = False,
+    ) -> _Resolved:
+        """Authorize `path` and open it for the given intent.
+
+        With descriptor traversal, the returned handle's descriptor is the very
+        object the containment and pattern checks authorized. On fallback
+        platforms the handle is pathname-bound and the checks stay best-effort.
+        """
+        if not _HAS_FD_TRAVERSAL:
+            resolved = self._resolve_path(path)
+            canonical = self._relative_to_root(resolved)
+            self._check_access(canonical, write=write, check_allowed=check_allowed)
+            return _Resolved(None, resolved, canonical)
+        fd, canonical, created = self._walk_beneath(
+            path,
+            intent=intent,
+            write=write,
+            check_allowed=check_allowed,
+            missing=missing,
+            missing_parent=missing_parent,
+            need_read=need_read,
+        )
+        return _Resolved(fd, self._real_root / canonical, canonical, created=created)
+
+    def _resolve_entry(self, rel: str) -> _Resolved | None:
+        """Authorize one entry of a directory walk, or return None to skip it.
+
+        Callers must do their I/O through the returned handle. Resolving and
+        opening in one authorized step means a symlink can neither escape the
+        root nor alias a file past a rule its own name would trip, since the
+        patterns are matched against the resolved location.
+        """
+        try:
+            return self._resolve_for(rel, missing=f'File not found: {rel}')
+        except OSError:
+            return None
+
+    def _walk_beneath(
+        self,
+        path: str,
+        *,
+        intent: _Intent,
+        write: bool,
+        check_allowed: bool,
+        missing: str,
+        missing_parent: Callable[[str], str] | None,
+        need_read: bool,
+    ) -> tuple[int, str, bool]:
+        """Open `path` by walking each component relative to the previous one.
+
+        Every step uses `os.open(..., O_NOFOLLOW, dir_fd=parent)`, symlinks are
+        resolved manually and re-checked for containment, and `..` pops the
+        directory stack so it can never climb past the root. The returned
+        descriptor is therefore the object the checks authorized, closing the
+        gap between pathname authorization and pathname I/O (#632).
+
+        Returns `(fd, canonical_relative_path, created)`.
+        """
+        pending = list(reversed(self._split_components(path)))
+        hops = _MAX_SYMLINK_HOPS
+        fds = [os.open(self._real_root, os.O_RDONLY | os.O_DIRECTORY)]
+        canonical: list[str] = []
+        try:
+            while pending:
+                name = pending.pop()
+                if name == '..':
+                    if len(fds) == 1:
+                        raise PermissionError(f'Path {path!r} resolves outside the root directory.')
+                    os.close(fds.pop())
+                    canonical.pop()
+                    continue
+                target = _readlink_or_none(name, fds[-1])
+                if target is not None:
+                    hops -= 1
+                    if hops <= 0:
+                        raise PermissionError(f'Path {path!r} resolves through a symlink loop.')
+                    self._splice_link(target, path, fds, canonical, pending)
+                    continue
+                if pending:
+                    self._descend(
+                        name,
+                        fds,
+                        canonical,
+                        pending,
+                        path=path,
+                        intent=intent,
+                        write=write,
+                        check_allowed=check_allowed,
+                        missing=missing,
+                        missing_parent=missing_parent,
+                    )
+                    continue
+                rel = '/'.join([*canonical, name])
+                self._check_access(rel, write=write, check_allowed=check_allowed)
+                opened = self._open_final(name, fds[-1], path=path, intent=intent, missing=missing, need_read=need_read)
+                if opened is None:
+                    # The component turned into a symlink after it was resolved
+                    # as a plain entry; go around to resolve it safely.
+                    hops -= 1
+                    if hops <= 0:
+                        raise PermissionError(f'Path {path!r} resolves through a symlink loop.')
+                    pending.append(name)
+                    continue
+                return opened[0], rel, opened[1]
+            # No components left: the path names the walked directory itself.
+            rel = '/'.join(canonical) or '.'
+            self._check_access(rel, write=write, check_allowed=check_allowed)
+            if intent == 'write':
+                raise IsADirectoryError(f'Is a directory: {path}')
+            if intent == 'edit':
+                raise FileNotFoundError(missing)
+            return os.dup(fds[-1]), rel, False
+        finally:
+            for fd in fds:
+                os.close(fd)
+
+    def _splice_link(self, target: str, path: str, fds: list[int], canonical: list[str], pending: list[str]) -> None:
+        """Queue a symlink target's components for the walk.
+
+        An absolute target restarts the walk at the root. `realpath` here is
+        advisory -- it produces the canonical candidate to compare and walk --
+        while enforcement stays with the `O_NOFOLLOW` open of each component.
+        """
+        if os.path.isabs(target):
+            real_target = Path(os.path.realpath(target))
+            if not real_target.is_relative_to(self._real_root):
+                raise PermissionError(f'Path {path!r} resolves outside the root directory.')
+            while len(fds) > 1:
+                os.close(fds.pop())
+            canonical.clear()
+            parts: Sequence[str] = real_target.relative_to(self._real_root).parts
+        else:
+            parts = [c for c in PurePath(target).parts if c != '.']
+        pending.extend(reversed(parts))
+
+    def _descend(
+        self,
+        name: str,
+        fds: list[int],
+        canonical: list[str],
+        pending: list[str],
+        *,
+        path: str,
+        intent: _Intent,
+        write: bool,
+        check_allowed: bool,
+        missing: str,
+        missing_parent: Callable[[str], str] | None,
+    ) -> None:
+        """Open intermediate directory `name` and push it onto the walk stack.
+
+        May instead push `name` back onto `pending` (to re-resolve a component
+        that changed underneath the walk, or to reopen a directory just created
+        for `create_directory`) or raise for a missing or non-directory
+        component.
+        """
+        try:
+            fd = os.open(name, _DIR_OPEN_FLAGS, dir_fd=fds[-1])
+        except OSError as e:
+            if e.errno in _SYMLINK_ERRNOS:
+                pending.append(name)
+                return
+            if e.errno == errno.ENOENT:
+                remainder = _normalized_remainder(path, canonical, name, pending)
+                self._check_access(remainder, write=write, check_allowed=check_allowed)
+                if intent == 'mkdir':
+                    if '..' in pending:
+                        # A lexical `..` beyond the missing directory: restart
+                        # the walk on the collapsed path, so only the
+                        # directories `realpath` would name get created.
+                        while len(fds) > 1:
+                            os.close(fds.pop())
+                        canonical.clear()
+                        pending.clear()
+                        if remainder != '.':
+                            pending.extend(reversed(remainder.split('/')))
+                        return
+                    os.mkdir(name, dir_fd=fds[-1])
+                    pending.append(name)
+                    return
+                if missing_parent is not None:
+                    raise FileNotFoundError(missing_parent(posixpath.dirname(remainder))) from e
+                raise FileNotFoundError(missing) from e
+            if e.errno == errno.ENOTDIR:
+                raise NotADirectoryError(f'Not a directory: {"/".join([*canonical, name])}') from e
+            raise
+        fds.append(fd)
+        canonical.append(name)
+
+    def _open_final(
+        self,
+        name: str,
+        dir_fd: int,
+        *,
+        path: str,
+        intent: _Intent,
+        missing: str,
+        need_read: bool,
+    ) -> tuple[int, bool] | None:
+        """Open the walk's fully resolved final component, `O_NOFOLLOW`.
+
+        Returns `(fd, created)`, or None when the component became a symlink
+        (or vanished mid-create) and the walk must re-resolve it.
+        """
+        if intent == 'mkdir':
+            return self._open_final_dir(name, dir_fd)
+        if intent == 'write':
+            return self._open_final_write(name, dir_fd, path=path, need_read=need_read)
+        flags = os.O_RDWR if intent == 'edit' else os.O_RDONLY
+        try:
+            return os.open(name, flags | _FILE_OPEN_FLAGS, dir_fd=dir_fd), False
+        except OSError as e:
+            if e.errno in _SYMLINK_ERRNOS:
+                return None
+            if e.errno in (errno.ENOENT, errno.EISDIR):
+                # `EISDIR` is `edit` only: a directory cannot be edited, and
+                # the tool reports that the same way as a missing file.
+                raise FileNotFoundError(missing) from e
+            raise
+
+    def _open_final_write(self, name: str, dir_fd: int, *, path: str, need_read: bool) -> tuple[int, bool] | None:
+        """Open (or create) the final component for `write_file`.
+
+        Creation is attempted first with `O_EXCL` so the caller knows whether
+        the file existed and an `expected_hash` must be honored. Opening
+        without truncation lets the caller classify the descriptor and check
+        the hash before any content changes.
+        """
+        base = (os.O_RDWR if need_read else os.O_WRONLY) | _FILE_OPEN_FLAGS
+        try:
+            return os.open(name, base | os.O_CREAT | os.O_EXCL, 0o666, dir_fd=dir_fd), True
+        except FileExistsError:
+            pass
+        try:
+            return os.open(name, base, dir_fd=dir_fd), False
+        except OSError as e:
+            if e.errno in _SYMLINK_ERRNOS or e.errno == errno.ENOENT:
+                # Swapped for a symlink, or deleted between the two opens.
+                return None
+            if e.errno == errno.EISDIR:
+                raise IsADirectoryError(f'Is a directory: {path}') from e
+            if e.errno == errno.ENXIO:
+                # A FIFO with no reader; without `O_NONBLOCK` this open would hang.
+                raise ValueError(f'Path {path!r} exists and is not a regular file.') from e
+            raise
+
+    def _open_final_dir(self, name: str, dir_fd: int) -> tuple[int, bool]:
+        """Create (or reuse) the final directory for `create_directory`."""
+        try:
+            os.mkdir(name, dir_fd=dir_fd)
+        except FileExistsError as exists_error:
+            try:
+                return os.open(name, _DIR_OPEN_FLAGS, dir_fd=dir_fd), False
+            except OSError as e:
+                if e.errno == errno.ENOTDIR or e.errno in _SYMLINK_ERRNOS:
+                    # Exists but is not a directory: report it as `mkdir` would.
+                    raise exists_error from e
+                raise  # pragma: no cover
+        return os.open(name, _DIR_OPEN_FLAGS, dir_fd=dir_fd), True
 
     @_recoverable
     async def read_file(self, path: str, *, offset: int = 0, limit: int | None = None) -> str:
@@ -249,13 +625,14 @@ class FileSystemToolset(FunctionToolset[AgentDepsT]):
         """
         if limit is None:
             limit = self._max_read_lines
-        resolved = self._safe_resolve(path)
-        if not resolved.is_file():
-            if resolved.is_dir():
+        with self._resolve_for(path, missing=f'File not found: {path}') as resolved:
+            kind = _kind_of(resolved.stat())
+            if kind == 'dir':
                 raise FileNotFoundError(f"'{path}' is a directory, not a file.")
-            raise FileNotFoundError(f'File not found: {path}')
+            if kind != 'file':
+                raise FileNotFoundError(f'File not found: {path}')
+            raw = resolved.read_bytes()
 
-        raw = resolved.read_bytes()
         if _is_binary(raw):
             size = len(raw)
             return f'[Binary file: {size} bytes. Use a binary-aware tool to inspect.]'
@@ -280,25 +657,43 @@ class FileSystemToolset(FunctionToolset[AgentDepsT]):
         Returns:
             Confirmation message with new hash.
         """
-        resolved = self._safe_resolve(path, write=True)
 
-        # Optimistic concurrency: reject stale writes
-        if expected_hash is not None and resolved.is_file():
-            current = resolved.read_text(encoding='utf-8')
-            current_hash = _content_hash(current)
-            if current_hash != expected_hash:
-                raise ValueError(
-                    f'Conflict: file {path!r} has changed (expected hash:{expected_hash}, '
-                    f'got hash:{current_hash}). Re-read the file and retry.'
-                )
+        def missing_parent(parent: str) -> str:
+            return f"Parent directory '{parent}' does not exist. Use create_directory first."
 
-        if not resolved.parent.exists():
-            parent_rel = str(resolved.parent.relative_to(self._root))
-            raise FileNotFoundError(f"Parent directory '{parent_rel}' does not exist. Use create_directory first.")
-        resolved.write_text(content, encoding='utf-8')
+        with self._resolve_for(
+            path,
+            intent='write',
+            write=True,
+            missing=f'File not found: {path}',
+            missing_parent=missing_parent,
+            need_read=expected_hash is not None,
+        ) as resolved:
+            if resolved.fd is None:
+                # Pathname fallback: the same checks, without descriptor binding.
+                if expected_hash is not None and resolved.path.is_file():
+                    self._check_expected_hash(path, expected_hash, resolved.read_text())
+                if not resolved.path.parent.exists():
+                    parent_rel = str(resolved.path.parent.relative_to(self._root))
+                    raise FileNotFoundError(missing_parent(parent_rel))
+            else:
+                if _kind_of(resolved.stat()) == 'other':
+                    raise ValueError(f'Path {path!r} exists and is not a regular file.')
+                if expected_hash is not None and not resolved.created:
+                    self._check_expected_hash(path, expected_hash, resolved.read_text())
+            resolved.replace_text(content)
         new_hash = _content_hash(content)
         lines = len(content.splitlines())
         return f'Wrote {len(content)} chars ({lines} lines) to {path}. [hash:{new_hash}]'
+
+    def _check_expected_hash(self, path: str, expected_hash: str, current: str) -> None:
+        """Reject a stale write or edit (optimistic concurrency)."""
+        current_hash = _content_hash(current)
+        if current_hash != expected_hash:
+            raise ValueError(
+                f'Conflict: file {path!r} has changed (expected hash:{expected_hash}, '
+                f'got hash:{current_hash}). Re-read the file and retry.'
+            )
 
     @_recoverable
     async def edit_file(self, path: str, old_text: str, new_text: str, *, expected_hash: str | None = None) -> str:
@@ -317,30 +712,28 @@ class FileSystemToolset(FunctionToolset[AgentDepsT]):
         Returns:
             Summary with new hash for subsequent operations.
         """
-        resolved = self._safe_resolve(path, write=True)
-        if not resolved.is_file():
-            raise FileNotFoundError(f'File not found: {path}')
+        with self._resolve_for(
+            path, intent='edit', write=True, missing=f'File not found: {path}', need_read=True
+        ) as resolved:
+            if _kind_of(resolved.stat()) != 'file':
+                raise FileNotFoundError(f'File not found: {path}')
 
-        text = resolved.read_text(encoding='utf-8')
-        current_hash = _content_hash(text)
+            text = resolved.read_text()
 
-        # Optimistic concurrency check
-        if expected_hash is not None and current_hash != expected_hash:
-            raise ValueError(
-                f'Conflict: file {path!r} has changed (expected hash:{expected_hash}, '
-                f'got hash:{current_hash}). Re-read the file and retry.'
-            )
+            if expected_hash is not None:
+                self._check_expected_hash(path, expected_hash, text)
 
-        count = text.count(old_text)
-        if count == 0:
-            raise ValueError(f'old_text not found in {path}.')
-        if count > 1:
-            raise ValueError(
-                f'old_text found {count} times in {path}. Include more surrounding context to make the match unique.'
-            )
+            count = text.count(old_text)
+            if count == 0:
+                raise ValueError(f'old_text not found in {path}.')
+            if count > 1:
+                raise ValueError(
+                    f'old_text found {count} times in {path}. '
+                    'Include more surrounding context to make the match unique.'
+                )
 
-        new_content = text.replace(old_text, new_text, 1)
-        resolved.write_text(new_content, encoding='utf-8')
+            new_content = text.replace(old_text, new_text, 1)
+            resolved.replace_text(new_content)
         new_hash = _content_hash(new_content)
         return f'Edited {path}. [hash:{new_hash}]'
 
@@ -357,12 +750,13 @@ class FileSystemToolset(FunctionToolset[AgentDepsT]):
         # The listing root is gated by denied patterns but not by
         # allowed_patterns: a directory like '.' never matches a file pattern.
         # Entries are filtered per-entry against allowed_patterns below.
-        resolved = self._safe_resolve(path, check_allowed=False)
-        if not resolved.is_dir():
-            raise NotADirectoryError(f'Not a directory: {path}')
+        with self._resolve_for(path, check_allowed=False, missing=f'Not a directory: {path}') as resolved:
+            if _kind_of(resolved.stat()) != 'dir':
+                raise NotADirectoryError(f'Not a directory: {path}')
+            base = resolved.path
 
         entries: list[str] = []
-        for entry in sorted(resolved.iterdir()):
+        for entry in sorted(base.iterdir()):
             try:
                 rel_path = entry.relative_to(self._real_root)
             except ValueError:  # pragma: no cover
@@ -371,20 +765,20 @@ class FileSystemToolset(FunctionToolset[AgentDepsT]):
             # find_files so the three walkers agree on what exists.
             if any(part.startswith('.') for part in rel_path.parts):
                 continue
-            target = self._resolve_walk_entry(entry)
+            target = self._resolve_entry(str(rel_path))
             if target is None:
                 continue
+            with target:
+                st = target.stat()
+            if st is None:
+                # A dangling symlink, or an entry deleted mid-walk: it has
+                # no size to report, so leave it out of the listing.
+                continue
             rel = str(rel_path)
-            if target.is_dir():
+            if _kind_of(st) == 'dir':
                 line = f'{rel}/'
             else:
-                try:
-                    size = target.stat().st_size
-                except OSError:
-                    # A dangling symlink, or an entry deleted mid-walk: it has
-                    # no size to report, so leave it out of the listing.
-                    continue
-                line = f'{rel}  ({size} bytes)'
+                line = f'{rel}  ({st.st_size} bytes)'
             # Only a listing that actually dropped an entry is marked truncated,
             # so one that merely fills the cap reads as complete.
             if len(entries) >= self._max_list_results:
@@ -407,7 +801,14 @@ class FileSystemToolset(FunctionToolset[AgentDepsT]):
         """
         # See list_directory: the search root isn't gated by allowed_patterns;
         # matched files are filtered per-entry below.
-        resolved = self._safe_resolve(path, check_allowed=False)
+        root_kind: _Kind = 'missing'
+        base: Path | None = None
+        try:
+            with self._resolve_for(path, check_allowed=False, missing=f'File not found: {path}') as resolved:
+                root_kind = _kind_of(resolved.stat())
+                base = resolved.path
+        except FileNotFoundError:
+            pass
         try:
             compiled = re.compile(pattern)
         except re.error as e:
@@ -415,10 +816,12 @@ class FileSystemToolset(FunctionToolset[AgentDepsT]):
 
         results: list[str] = []
 
-        if resolved.is_file():
-            files = [resolved]
+        if base is None or root_kind in ('missing', 'other'):
+            files: list[Path] = []
+        elif root_kind == 'file':
+            files = [base]
         else:
-            files = sorted(resolved.rglob('*'))
+            files = sorted(base.rglob('*'))
 
         for file_path in files:
             try:
@@ -430,15 +833,16 @@ class FileSystemToolset(FunctionToolset[AgentDepsT]):
             rel_str = str(rel_path)
             if include_glob and not fnmatch.fnmatch(rel_str, include_glob):
                 continue
-            target = self._resolve_walk_entry(file_path)
+            target = self._resolve_entry(rel_str)
             if target is None:
                 continue
-            if not target.is_file():
-                continue
-            try:
-                raw = target.read_bytes()
-            except OSError:  # pragma: no cover
-                continue
+            with target:
+                if _kind_of(target.stat()) != 'file':
+                    continue
+                try:
+                    raw = target.read_bytes()
+                except OSError:  # pragma: no cover
+                    continue
             if _is_binary(raw):
                 continue
             text = raw.decode('utf-8', errors='replace')
@@ -467,29 +871,32 @@ class FileSystemToolset(FunctionToolset[AgentDepsT]):
 
         # See list_directory: the find root isn't gated by allowed_patterns;
         # matched entries are filtered per-entry below.
-        resolved = self._safe_resolve(path, check_allowed=False)
-        if not resolved.is_dir():
-            raise NotADirectoryError(f'Not a directory: {path}')
+        with self._resolve_for(path, check_allowed=False, missing=f'Not a directory: {path}') as resolved:
+            if _kind_of(resolved.stat()) != 'dir':
+                raise NotADirectoryError(f'Not a directory: {path}')
+            base = resolved.path
 
         matches: list[str] = []
-        for match in sorted(resolved.glob(pattern)):
+        for match in sorted(base.glob(pattern)):
             try:
                 rel_path = match.relative_to(self._real_root)
             except ValueError:  # pragma: no cover
                 continue
             if any(part.startswith('.') for part in rel_path.parts):
                 continue
-            target = self._resolve_walk_entry(match)
+            target = self._resolve_entry(str(rel_path))
             if target is None:
                 continue
-            if not target.exists():
+            with target:
+                kind = _kind_of(target.stat())
+            if kind == 'missing':
                 # A dangling symlink resolves inside the root but names nothing.
                 continue
             if len(matches) >= self._max_find_results:
                 matches.append(f'[... truncated at {self._max_find_results} matches]')
                 break
             rel = str(rel_path)
-            suffix = '/' if target.is_dir() else ''
+            suffix = '/' if kind == 'dir' else ''
             matches.append(f'{rel}{suffix}')
 
         return '\n'.join(matches) if matches else 'No matches found.'
@@ -504,8 +911,9 @@ class FileSystemToolset(FunctionToolset[AgentDepsT]):
         Returns:
             Confirmation message.
         """
-        resolved = self._safe_resolve(path, write=True)
-        resolved.mkdir(parents=True, exist_ok=True)
+        with self._resolve_for(path, intent='mkdir', write=True, missing=f'Path not found: {path}') as resolved:
+            if resolved.fd is None:
+                resolved.path.mkdir(parents=True, exist_ok=True)
         return f'Created directory: {path}'
 
     @_recoverable
@@ -518,30 +926,30 @@ class FileSystemToolset(FunctionToolset[AgentDepsT]):
         Returns:
             Formatted metadata including size, type, and permissions.
         """
-        resolved = self._safe_resolve(path)
-        if not resolved.exists():
-            raise FileNotFoundError(f'Path not found: {path}')
+        with self._resolve_for(path, missing=f'Path not found: {path}') as resolved:
+            st = resolved.stat()
+            if st is None:
+                raise FileNotFoundError(f'Path not found: {path}')
+            kind = _kind_of(st)
 
-        # Check if the original (pre-resolve) path is a symlink
-        original = self._root / path
-        is_link = original.is_symlink()
+            # Whether the path as given is a symlink, and where it points. This
+            # is display-only metadata about the name, not the object read, so
+            # a pathname lookup is fine here.
+            original = self._root / path
+            is_link = original.is_symlink()
 
-        stat = resolved.stat()
-        kind = 'directory' if resolved.is_dir() else 'file'
-        size = stat.st_size
+            parts = [f'path: {path}', f'type: {"directory" if kind == "dir" else "file"}', f'size: {st.st_size} bytes']
 
-        parts = [f'path: {path}', f'type: {kind}', f'size: {size} bytes']
+            if kind == 'file':
+                raw = resolved.read_bytes()
+                is_bin = _is_binary(raw)
+                parts.append(f'binary: {is_bin}')
+                if not is_bin:
+                    text = raw.decode('utf-8', errors='replace')
+                    parts.append(f'lines: {len(text.splitlines())}')
+                    parts.append(f'hash: {_content_hash(text)}')
 
-        if resolved.is_file():
-            raw = resolved.read_bytes()
-            is_bin = _is_binary(raw)
-            parts.append(f'binary: {is_bin}')
-            if not is_bin:
-                text = raw.decode('utf-8', errors='replace')
-                parts.append(f'lines: {len(text.splitlines())}')
-                parts.append(f'hash: {_content_hash(text)}')
-
-        if is_link:
-            parts.append(f'symlink_target: {os.readlink(original)}')
+            if is_link:
+                parts.append(f'symlink_target: {os.readlink(original)}')
 
         return '\n'.join(parts)
