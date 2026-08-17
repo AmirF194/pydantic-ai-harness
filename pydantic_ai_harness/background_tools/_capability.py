@@ -3,13 +3,14 @@
 from __future__ import annotations
 
 import asyncio
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Any
 
 from pydantic_ai.capabilities import AbstractCapability
 from pydantic_ai.messages import ToolCallPart
 from pydantic_ai.tools import (
     AgentDepsT,
+    DeferredToolRequests,
     RunContext,
     ToolDefinition,
     ToolSelector,
@@ -81,8 +82,9 @@ class BackgroundTools(AbstractCapability[AgentDepsT]):
         return _INSTRUCTIONS
 
     async def for_run(self, ctx: RunContext[AgentDepsT]) -> BackgroundTools[AgentDepsT]:
-        # Fresh per-run state so concurrent runs don't share tasks.
-        return BackgroundTools(tools=self.tools)
+        # `_tasks` is init=False, so `replace` gives the copy a fresh dict:
+        # concurrent runs don't share tasks.
+        return replace(self)
 
     async def wrap_tool_execute(
         self,
@@ -124,10 +126,16 @@ class BackgroundTools(AbstractCapability[AgentDepsT]):
     ) -> _agent_graph.AgentNode[AgentDepsT, Any] | End[FinalResult[Any]]:
         from pydantic_graph import End
 
-        if isinstance(result, End) and self._tasks:
-            # Hold `End` until at least one task completes and enqueues its follow-up,
-            # so the core pending-message drain capability (always ordered outermost,
-            # i.e. after us) redirects the run to deliver it instead of terminating.
+        if not isinstance(result, End) or isinstance(result.data.output, DeferredToolRequests):
+            # A deferred-tools pause must reach the caller immediately; never hold it
+            # behind background work.
+            return result
+        # Hold `End` until a follow-up is queued, so the core pending-message drain
+        # capability (always ordered outermost, i.e. after us) redirects the run to
+        # deliver it instead of terminating. The loop re-waits if a task finished
+        # without enqueueing (e.g. it was cancelled); the queue check skips waiting
+        # when a result is already pending delivery.
+        while self._tasks and not ctx.pending_messages:
             await asyncio.wait(list(self._tasks.values()), return_when=asyncio.FIRST_COMPLETED)
         return result
 
