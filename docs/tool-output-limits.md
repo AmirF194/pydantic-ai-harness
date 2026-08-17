@@ -140,6 +140,33 @@ estimated tokens (the same ~4-chars-per-token heuristic as [compaction](compacti
 character operation regardless of the threshold unit. Set `strip_ansi=True` to strip ANSI
 escape sequences from text returns before measuring and reducing.
 
+## Pageable structured spills
+
+Structured returns serialize as compact JSON, which puts the whole value on one line, so the
+line-based `read_tool_result` tool cannot page through a large spilled list. The `serializer`
+setting replaces that rendering for structured (non-string, non-binary) returns. Two presets
+cover the common layouts:
+
+```python
+from pydantic_ai_harness.tool_output_limits import ToolOutputLimits, indented_json, json_lines
+
+ToolOutputLimits(serializer=indented_json)  # indented JSON: one field per line
+ToolOutputLimits(serializer=json_lines)  # top-level list: one record per line
+```
+
+`indented_json` renders indent-2 JSON, so fields land on separate lines and
+`read_tool_result` can slice and `pattern`-filter them. `json_lines` renders a top-level list
+as one compact JSON object per line (JSON Lines), so line offsets map directly to records; a
+value that is not a list falls back to `indented_json`.
+
+Any `(value) -> str` callable works; `Serializer` is the exported alias. The capability
+serializes each structured return once: measurement, band selection, previews, stored bytes,
+and read-back all use the same text, which means an indented layout measures larger than
+compact JSON and can reach a band the compact form would not. The callable must be
+deterministic, so an identical return reduces to identical bytes and keeps the prompt prefix
+stable. Strings and binary payloads never pass through the serializer, and a structured
+return below the smallest band threshold passes through as the original object.
+
 ## Spill store
 
 Spilled payloads go through the narrow `OverflowStore` protocol. The default `LocalFileStore`

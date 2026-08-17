@@ -24,6 +24,7 @@ from pydantic_ai_harness.tool_output_limits._bands import (
     Truncate,
 )
 from pydantic_ai_harness.tool_output_limits._payload import (
+    Serializer,
     is_binary,
     json_sketch,
     measure,
@@ -143,6 +144,13 @@ class ToolOutputLimits(AbstractCapability[AgentDepsT]):
 
     summary_prompt: str = _DEFAULT_SUMMARY_PROMPT
     """Prompt template for `Summarize`. Must contain `{tool_name}` and `{output}`."""
+
+    serializer: Serializer | None = None
+    """Render a structured (non-string, non-binary) return to the text that is measured,
+    previewed, spilled, and read back. Defaults to compact JSON, which puts the whole value
+    on one line; the `indented_json` and `json_lines` presets make large spills pageable by
+    line through `read_tool_result`. The callable must be deterministic, so an identical
+    return reduces to identical bytes and keeps the prompt prefix stable."""
 
     _store: OverflowStore = field(init=False, repr=False)
     _bands: list[Band] = field(init=False, repr=False)
@@ -279,7 +287,10 @@ class ToolOutputLimits(AbstractCapability[AgentDepsT]):
         """Pre-render a value into the text / bytes the reduction pipeline needs."""
         if is_binary(value):
             return _Unit(binary=True, text=None, data=to_bytes(value), value=value, suffix=suffix)
-        text = to_text(value)
+        if self.serializer is not None and not isinstance(value, str):
+            text = self.serializer(value)
+        else:
+            text = to_text(value)
         if self.strip_ansi:
             text = strip_ansi(text)
         return _Unit(binary=False, text=text, data=text.encode('utf-8'), value=value, suffix=suffix)
