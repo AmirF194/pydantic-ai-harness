@@ -2,8 +2,13 @@
 
 Tests never reach real Modal: a fake `modal` module is injected into `sys.modules`
 (via the `fake_modal` fixture in `conftest.py`), so the lazy `import modal` inside
-the session returns it. The fake records calls and lets each test decide what
+the backend returns it. The fake records calls and lets each test decide what
 `exec` returns.
+
+Fidelity to the real SDK is the point: signatures are closed, `.aio` suspends, an
+exec output reader replays from byte zero on every read, and missing paths raise
+Modal's own filesystem exception. Flattering the code under test here would hide
+production failures.
 """
 
 from __future__ import annotations
@@ -12,7 +17,7 @@ import posixpath
 import types
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Any
+from typing import TYPE_CHECKING, Any, Protocol
 
 import anyio.lowlevel
 
@@ -36,6 +41,8 @@ class ExecCall:
     argv: list[str]
     timeout: int | None
     text: bool
+    workdir: str | None = None
+    env: dict[str, str | None] | None = None
 
 
 class _AioCallable:
@@ -63,12 +70,11 @@ class _AioCallable:
 class _FakeStream:
     """Mimics a Modal exec stdio stream: readable whole via `.read.aio()`, or iterable.
 
-    The session reads unbounded output with `.read.aio()` and bounded output by iterating
-    chunks. `chunk_size` controls how the iterable path splits the data, so a test can drive
-    the bounded reader's drop logic with more than one chunk. `chunks` overrides the split
-    with an explicit, possibly non-uniform sequence (real transport chunks are arbitrary
-    sizes). `None` for both yields the data as a single chunk (the realistic "one message"
-    case, and what most tests want).
+    `wait()` reads the whole stream with `.read.aio()`, and `stream()` iterates chunks. Both
+    replay from byte zero, like Modal's own readers: every read opens a fresh view of the
+    command's output, so reading after iterating returns everything again. `chunk_size`
+    controls how the iterable path splits the data; `None` yields it as a single chunk (the
+    realistic "one message" case, and what most tests want).
     """
 
     def __init__(
@@ -76,11 +82,9 @@ class _FakeStream:
         data: bytes,
         chunk_size: int | None,
         error: Exception | None = None,
-        chunks: list[bytes] | None = None,
     ) -> None:
         self._data = data
         self._chunk_size = chunk_size
-        self._chunks = chunks
         self._error = error
         self.read = _AioCallable(self._read)
         self._pending: list[bytes] = []
@@ -92,9 +96,7 @@ class _FakeStream:
         return self._data
 
     def __aiter__(self) -> _FakeStream:
-        if self._chunks is not None:
-            self._pending = list(self._chunks)
-        elif self._chunk_size is None:
+        if self._chunk_size is None:
             self._pending = [self._data] if self._data else []
         else:
             self._pending = [self._data[i : i + self._chunk_size] for i in range(0, len(self._data), self._chunk_size)]
@@ -121,10 +123,8 @@ class _FakeProcess:
         stdout_error: Exception | None,
         stderr_error: Exception | None,
         wait_error: Exception | None,
-        chunks: list[bytes] | None = None,
     ) -> None:
-        self.stdout = _FakeStream(stdout, chunk_size, stdout_error, chunks)
-        # The explicit chunk override drives stdout only, so a test cannot conflate streams.
+        self.stdout = _FakeStream(stdout, chunk_size, stdout_error)
         self.stderr = _FakeStream(stderr, chunk_size, stderr_error)
         self._returncode = returncode
         self._wait_error = wait_error
@@ -170,9 +170,13 @@ class FakeSandboxFilesystemNotFoundError(FakeSandboxFilesystemError):
     """Stand-in for `modal.exception.SandboxFilesystemNotFoundError` (a missing file, recoverable)."""
 
 
+class FakeSandboxFilesystemNotADirectoryError(FakeSandboxFilesystemError):
+    """Stand-in for `modal.exception.SandboxFilesystemNotADirectoryError` (a non-directory path component)."""
+
+
 @dataclass
 class FileInfo:
-    """Minimal stand-in for `modal.sandbox_fs.FileInfo`."""
+    """Minimal stand-in for `modal.types.FileInfo`, covering what the backend reads."""
 
     name: str
     _is_dir: bool
@@ -191,13 +195,22 @@ class _FakeFilesystem:
         self.write_bytes = _AioCallable(self._write_bytes)
         self.list_files = _AioCallable(self._list_files)
         self.stat = _AioCallable(self._stat)
+        self.make_directory = _AioCallable(self._make_directory)
+        self.remove = _AioCallable(self._remove)
 
     def _read_bytes(self, remote_path: str) -> bytes:
         self._check(remote_path)
-        return self._sandbox.files[remote_path]
+        data = self._sandbox.files.get(remote_path)
+        if data is None:
+            raise FakeSandboxFilesystemNotFoundError(f'No such file or directory: {remote_path}')
+        return data
 
     def _stat(self, remote_path: str) -> FileInfo:
         self._check(remote_path)
+        if remote_path in self._sandbox.directories:
+            return FileInfo(posixpath.basename(remote_path), True)
+        if remote_path not in self._sandbox.files and remote_path not in self._sandbox.stat_sizes:
+            raise FakeSandboxFilesystemNotFoundError(f'No such file or directory: {remote_path}')
         # Size comes from the stored bytes, or an override the test set for this path.
         size = self._sandbox.stat_sizes.get(remote_path, len(self._sandbox.files.get(remote_path, b'')))
         # Real Modal reports the entry's basename, not the full path.
@@ -212,9 +225,21 @@ class _FakeFilesystem:
         self._sandbox.list_paths.append(remote_path)
         return self._sandbox.listing
 
+    def _make_directory(self, remote_path: str, *, create_parents: bool = True) -> None:
+        # Closed keyword signature on purpose, like `sandbox_create`: `create_parents` is the
+        # real API's `mkdir -p` switch and defaults to True there too.
+        self._check(remote_path)
+        self._sandbox.directories.add(remote_path)
+
+    def _remove(self, remote_path: str, *, recursive: bool = False) -> None:
+        self._check(remote_path)
+        self._sandbox.removals.append((remote_path, recursive))
+        self._sandbox.directories.discard(remote_path)
+        self._sandbox.files.pop(remote_path, None)
+
     def _check(self, remote_path: str) -> None:
         # Real Modal's filesystem API only accepts absolute paths; assert it here so a
-        # regression that let a relative path bypass `_resolve` fails in the fake the way it
+        # regression that let a relative path through unresolved fails in the fake the way it
         # would in prod, instead of silently keying the in-memory store on a relative path.
         assert posixpath.isabs(remote_path), f'Modal filesystem requires an absolute path, got {remote_path!r}'
         if self._sandbox.fs_error is not None:
@@ -236,6 +261,8 @@ class FakeSandbox:
         self.poll = _AioCallable(self._poll)
         # Filesystem state the tests read and write.
         self.files: dict[str, bytes] = {}
+        self.directories: set[str] = set()
+        self.removals: list[tuple[str, bool]] = []
         # Lets a test report a large size for a path without allocating the bytes.
         self.stat_sizes: dict[str, int] = {}
         self.list_paths: list[str] = []
@@ -249,11 +276,18 @@ class FakeSandbox:
     def filesystem(self) -> _FakeFilesystem:
         return self._filesystem
 
-    def _exec(self, *args: str, timeout: int | None = None, text: bool = True) -> _FakeProcess:
+    def _exec(
+        self,
+        *args: str,
+        timeout: int | None = None,
+        workdir: str | None = None,
+        env: dict[str, str | None] | None = None,
+        text: bool = True,
+    ) -> _FakeProcess:
         # Closed keyword signature on purpose: real `Sandbox.exec` rejects unknown kwargs,
-        # so the fake must too, or a bad kwarg in the session would only fail in production.
+        # so the fake must too, or a bad kwarg in the backend would only fail in production.
         argv = list(args)
-        self.exec_calls.append(ExecCall(argv=argv, timeout=timeout, text=text))
+        self.exec_calls.append(ExecCall(argv=argv, timeout=timeout, text=text, workdir=workdir, env=env))
         if self._control.exec_error is not None:
             raise self._control.exec_error
         stdout, stderr, code = self._control.responder(argv, timeout)
@@ -265,7 +299,6 @@ class FakeSandbox:
             self._control.stdout_error,
             self._control.stderr_error,
             self._control.wait_error,
-            self._control.output_chunks,
         )
 
     def _terminate(self, *, wait: bool = False) -> int | None:
@@ -312,8 +345,6 @@ class FakeModal:
         # How the fake splits exec output when the bounded reader iterates it; None yields the
         # whole output as one chunk. A test bounding output sets a small size to force drops.
         self.output_chunk_size: int | None = None
-        # Explicit, possibly non-uniform chunk sequence; overrides `output_chunk_size`.
-        self.output_chunks: list[bytes] | None = None
         self.module = self._build_module()
 
     @property
@@ -341,11 +372,6 @@ class FakeModal:
     def sandbox_timeout_type(self) -> type[Exception]:
         """Modal `SandboxTimeoutError`: the sandbox expired at its `sandbox_timeout` -- terminal."""
         return FakeSandboxTimeoutError
-
-    @property
-    def file_not_found_type(self) -> type[Exception]:
-        """A missing *file* (Modal `SandboxFilesystemNotFoundError`) -- recoverable, retried."""
-        return FakeSandboxFilesystemNotFoundError
 
     @property
     def conflict_type(self) -> type[Exception]:
@@ -416,5 +442,28 @@ class FakeModal:
             SandboxTimeoutError=FakeSandboxTimeoutError,
             SandboxFilesystemError=FakeSandboxFilesystemError,
             SandboxFilesystemNotFoundError=FakeSandboxFilesystemNotFoundError,
+            SandboxFilesystemNotADirectoryError=FakeSandboxFilesystemNotADirectoryError,
         )
         return module
+
+
+if TYPE_CHECKING:
+    import modal.types
+
+    class _FileInfoSurface(Protocol):
+        """The `modal.types.FileInfo` members the backend reads.
+
+        Pinned against both the fake and the real SDK type below, so a fake that drifts from
+        Modal's own entry shape fails the type check instead of at the next live run.
+        """
+
+        @property
+        def name(self) -> str: ...
+
+        @property
+        def size(self) -> int: ...
+
+        def is_dir(self) -> bool: ...
+
+    _fake_file_info_conforms: _FileInfoSurface = FileInfo('name', False)
+    _real_file_info_conforms: _FileInfoSurface = modal.types.FileInfo.__new__(modal.types.FileInfo)

@@ -5,23 +5,26 @@ from __future__ import annotations
 import inspect
 from collections.abc import AsyncGenerator, Mapping
 from contextlib import asynccontextmanager
-from typing import Protocol, TypeGuard, runtime_checkable
+from dataclasses import dataclass, replace
+from typing import Any, Protocol, TypeGuard, runtime_checkable
 
 import pytest
 from pydantic_ai import Agent, RunContext
 from pydantic_ai.capabilities import AbstractCapability
-from pydantic_ai.exceptions import ModelRetry
+from pydantic_ai.exceptions import ModelRetry, UserError
 from pydantic_ai.messages import ModelMessage, ModelResponse, TextPart, ToolCallPart, ToolReturnPart
 from pydantic_ai.models.function import AgentInfo, FunctionModel
 from pydantic_ai.models.test import TestModel
+from pydantic_ai.sandboxes import LocalSandbox, Sandbox, SandboxBackend, SandboxCommand, SandboxRef
 from pydantic_ai.toolsets import AbstractToolset
 from pydantic_ai.usage import RunUsage
+from typing_extensions import Never
 
 from pydantic_ai_harness.code_mode import CodeMode
 from pydantic_ai_harness.modal_sandbox import (
     ModalSandbox,
+    ModalSandboxBackend,
     ModalSandboxError,
-    ModalSandboxSession,
     ModalSandboxTerminalError,
     ModalSandboxUnavailableError,
 )
@@ -31,13 +34,58 @@ from .fake_modal import FakeModal, FileInfo
 
 @runtime_checkable
 class _ModalSandboxTools(Protocol):  # pragma: no cover - structural typing only
-    async def run_command(self, command: str, *, timeout_seconds: float | None = None) -> str: ...
+    async def run_command(
+        self, ctx: RunContext[None], command: str, *, timeout_seconds: float | None = None
+    ) -> str: ...
 
-    async def read_file(self, path: str, *, offset: int = 1, limit: int | None = None) -> str: ...
+    async def read_file(
+        self, ctx: RunContext[None], path: str, *, offset: int | None = None, limit: int | None = None
+    ) -> str: ...
 
-    async def write_file(self, path: str, content: str) -> str: ...
+    async def write_file(self, ctx: RunContext[None], path: str, content: str) -> str: ...
 
-    async def list_directory(self, path: str = '.') -> str: ...
+    async def list_directory(self, ctx: RunContext[None], path: str = '.') -> str: ...
+
+
+class _TimingOutSandbox:
+    """A non-Modal backend whose commands always report a bare deadline kill."""
+
+    provider = 'stub'
+    sandbox_id = 'stub-1'
+
+    async def run(
+        self,
+        command: SandboxCommand,
+        *,
+        shell: bool = False,
+        cwd: str | None = None,
+        env: Mapping[str, str] | None = None,
+        timeout: float | None = None,
+    ) -> Never:
+        raise TimeoutError('deadline reached')
+
+    async def working_dir(self) -> str:
+        return '/'  # pragma: no cover - the timeout fires before any path is resolved
+
+
+@dataclass
+class _Tools:
+    """The capability's tools bound to a run context, the way an agent run calls them."""
+
+    tools: _ModalSandboxTools
+    ctx: RunContext[None]
+
+    async def run_command(self, command: str, *, timeout_seconds: float | None = None) -> str:
+        return await self.tools.run_command(self.ctx, command, timeout_seconds=timeout_seconds)
+
+    async def read_file(self, path: str, *, offset: int | None = None, limit: int | None = None) -> str:
+        return await self.tools.read_file(self.ctx, path, offset=offset, limit=limit)
+
+    async def write_file(self, path: str, content: str) -> str:
+        return await self.tools.write_file(self.ctx, path, content)
+
+    async def list_directory(self, path: str = '.') -> str:
+        return await self.tools.list_directory(self.ctx, path)
 
 
 def _is_abstract_toolset(value: object) -> TypeGuard[AbstractToolset[None]]:
@@ -55,131 +103,150 @@ def _run_context() -> RunContext[None]:
     )
 
 
+def _tool_surface(capability: ModalSandbox[None]) -> _ModalSandboxTools:
+    toolset = capability.get_toolset()
+    if not _is_abstract_toolset(toolset) or not isinstance(toolset, _ModalSandboxTools):  # pragma: no cover
+        raise AssertionError('ModalSandbox must return a toolset with its public tools')
+    return toolset
+
+
 @asynccontextmanager
-async def _toolset(
-    *,
-    sandbox_id: str | None = None,
-    max_output_bytes: int = 50_000,
-    max_output_lines: int = 2000,
-    image: str = 'python:3.12-slim',
-    app_name: str = 'pydantic-ai-harness',
-    create_app_if_missing: bool = True,
-    sandbox_timeout: int = 300,
-    workdir: str | None = None,
-    max_command_timeout: int | None = None,
-    max_read_bytes: int = 5 * 1024 * 1024,
-    env: Mapping[str, str] | None = None,
-    session: ModalSandboxSession | None = None,
-) -> AsyncGenerator[_ModalSandboxTools]:
-    toolset = ModalSandbox[None](
-        image=image,
-        sandbox_id=sandbox_id,
-        app_name=app_name,
-        create_app_if_missing=create_app_if_missing,
-        sandbox_timeout=sandbox_timeout,
-        workdir=workdir,
-        default_command_timeout=30.0,
-        max_command_timeout=max_command_timeout,
-        max_output_bytes=max_output_bytes,
-        max_output_lines=max_output_lines,
-        max_read_bytes=max_read_bytes,
-        env=env,
-        session=session,
-    ).get_toolset()
-    if not _is_abstract_toolset(toolset):  # pragma: no cover - capability contract
-        raise AssertionError('ModalSandbox must return an AbstractToolset')
-    run_toolset = await toolset.for_run(_run_context())
-    if not isinstance(run_toolset, _ModalSandboxTools):  # pragma: no cover - capability contract
-        raise AssertionError('ModalSandbox toolset is missing its public tools')
-    async with run_toolset:
-        yield run_toolset
+async def _tools(**settings: Any) -> AsyncGenerator[_Tools]:
+    """Drive the capability's sandbox lifecycle the way a run does, then hand back its tools."""
+    settings.setdefault('default_command_timeout', 30.0)
+    capability = ModalSandbox[None](**settings)
+    ctx = _run_context()
+    ref = await capability.create_sandbox(ctx)
+
+    async def resolve(reference: SandboxRef) -> SandboxBackend:
+        backend = await capability.get_sandbox(ctx, reference)
+        assert backend is not None
+        return backend
+
+    try:
+        yield _Tools(_tool_surface(capability), replace(ctx, sandbox=Sandbox.from_ref(ref, resolve)))
+    finally:
+        await capability.destroy_sandbox(ctx, ref)
 
 
 class TestRunCommand:
     async def test_labels_stdout(self, fake_modal: FakeModal) -> None:
         fake_modal.responder = lambda argv, timeout: ('hello\n', '', 0)
-        async with _toolset() as ts:
+        async with _tools() as ts:
             result = await ts.run_command('echo hello')
         assert result == '[stdout]\nhello'
-        assert fake_modal.sandboxes[0].exec_calls[-1].argv == ['sh', '-c', 'echo hello']
+        # The protocol takes argv, so a shell command is wrapped explicitly.
+        assert fake_modal.sandboxes[0].exec_calls[-1].argv == ['/bin/sh', '-c', 'echo hello']
 
     async def test_combines_stdout_stderr_and_exit_code(self, fake_modal: FakeModal) -> None:
         fake_modal.responder = lambda argv, timeout: ('out\n', 'err\n', 2)
-        async with _toolset() as ts:
+        async with _tools() as ts:
             result = await ts.run_command('false')
         assert result == '[stdout]\nout\n[stderr]\nerr\n[exit code: 2]'
 
     async def test_no_output(self, fake_modal: FakeModal) -> None:
         fake_modal.responder = lambda argv, timeout: ('', '', 0)
-        async with _toolset() as ts:
+        async with _tools() as ts:
             assert await ts.run_command('true') == '(no output)'
 
     async def test_per_call_timeout_passed(self, fake_modal: FakeModal) -> None:
-        fake_modal.responder = lambda argv, timeout: (str(timeout), '', 0)
-        async with _toolset() as ts:
+        async with _tools() as ts:
             await ts.run_command('echo', timeout_seconds=12.0)
         assert fake_modal.sandboxes[0].exec_calls[-1].timeout == 12
 
     async def test_omitted_timeout_falls_back_to_default_never_unbounded(self, fake_modal: FakeModal) -> None:
         # Modal cannot kill a running command, so every command must carry a finite
         # deadline; an omitted timeout_seconds means default_command_timeout, not None.
-        fake_modal.responder = lambda argv, timeout: ('', '', 0)
-        async with _toolset() as ts:
+        async with _tools() as ts:
             await ts.run_command('echo hi')
         assert fake_modal.sandboxes[0].exec_calls[-1].timeout == 30
 
     async def test_timeout_clamped_to_sandbox_timeout(self, fake_modal: FakeModal) -> None:
         # Modal cannot kill a running command, so a model-supplied timeout is capped. With no
         # explicit ceiling it falls back to the sandbox lifetime.
-        fake_modal.responder = lambda argv, timeout: (str(timeout), '', 0)
-        async with _toolset(sandbox_timeout=120) as ts:
+        async with _tools(sandbox_timeout=120) as ts:
             await ts.run_command('echo', timeout_seconds=9999)
         assert fake_modal.sandboxes[0].exec_calls[-1].timeout == 120
 
     async def test_max_command_timeout_overrides_ceiling(self, fake_modal: FakeModal) -> None:
-        # An explicit ceiling lets an attached/injected sandbox allow longer or shorter
-        # single commands than the sandbox lifetime.
-        fake_modal.responder = lambda argv, timeout: (str(timeout), '', 0)
-        async with _toolset(sandbox_timeout=120, max_command_timeout=50) as ts:
+        # An explicit ceiling lets an attached sandbox allow longer or shorter single
+        # commands than the sandbox lifetime.
+        async with _tools(sandbox_timeout=120, max_command_timeout=50) as ts:
             await ts.run_command('echo', timeout_seconds=9999)
         assert fake_modal.sandboxes[0].exec_calls[-1].timeout == 50
 
     async def test_fractional_timeout_rounds_up(self, fake_modal: FakeModal) -> None:
-        fake_modal.responder = lambda argv, timeout: (str(timeout), '', 0)
-        async with _toolset() as ts:
+        async with _tools() as ts:
             await ts.run_command('echo', timeout_seconds=0.5)
         # A sub-second timeout must not floor to 0, which Modal treats as "no timeout".
         assert fake_modal.sandboxes[0].exec_calls[-1].timeout == 1
 
     @pytest.mark.parametrize('bad_timeout', [0, -5.0])
     async def test_non_positive_timeout_rejected(self, fake_modal: FakeModal, bad_timeout: float) -> None:
-        # A 0 or negative request is a model mistake; reject it rather than let the session
+        # A 0 or negative request is a model mistake; reject it rather than let the backend
         # floor it to a surprise 1-second deadline.
-        fake_modal.responder = lambda argv, timeout: ('', '', 0)
-        async with _toolset() as ts:
+        async with _tools() as ts:
             with pytest.raises(ModelRetry, match='timeout_seconds must be greater than 0'):
                 await ts.run_command('echo', timeout_seconds=bad_timeout)
         assert fake_modal.sandboxes[0].exec_calls == []
 
     async def test_output_truncated(self, fake_modal: FakeModal) -> None:
         fake_modal.responder = lambda argv, timeout: ('x' * 1000, '', 0)
-        async with _toolset(max_output_bytes=100) as ts:
+        async with _tools(max_output_bytes=100) as ts:
             result = await ts.run_command('big')
         assert 'output truncated' in result
 
-    async def test_timeout_is_reported(self, fake_modal: FakeModal) -> None:
-        # Modal's -1 timeout sentinel becomes a legible note, not a bare exit code.
+    async def test_output_is_bounded_before_it_reaches_the_model(self, fake_modal: FakeModal) -> None:
+        # The sandbox protocol delivers a command's whole output, so the cap is a
+        # presentation one: the tail survives, where the exit status lives.
+        fake_modal.responder = lambda argv, timeout: ('A' * 500 + 'END', '', 0)
+        async with _tools(max_output_bytes=50) as ts:
+            result = await ts.run_command('flood')
+        assert 'output truncated to the last 50B' in result
+        assert result.endswith('END')
+
+    async def test_output_line_cap_keeps_last_lines(self, fake_modal: FakeModal) -> None:
+        fake_modal.responder = lambda argv, timeout: ('first\nsecond\nthird', '', 0)
+        async with _tools(max_output_lines=1) as ts:
+            result = await ts.run_command('many-lines')
+        assert 'truncated to the last 1 lines' in result
+        assert result.endswith('third')
+
+    async def test_multibyte_output_truncation_drops_partial_character(self, fake_modal: FakeModal) -> None:
+        fake_modal.responder = lambda argv, timeout: ('é' * 20, '', 0)
+        async with _tools(max_output_bytes=5) as ts:
+            result = await ts.run_command('unicode')
+        assert 'output truncated to the last 5B' in result
+
+    async def test_stream_labels_survive_truncation(self, fake_modal: FakeModal) -> None:
+        # Each stream is truncated separately with its label attached afterwards, so a
+        # flood on one stream cannot erase the labels or crowd out the other stream.
+        fake_modal.responder = lambda argv, timeout: ('ok\n', 'E' * 500, 1)
+        async with _tools(max_output_bytes=50) as ts:
+            result = await ts.run_command('noisy')
+        assert result.startswith('[stdout]\nok\n[stderr]\n')
+        assert 'output truncated to the last 50B' in result
+        assert result.endswith('[exit code: 1]')
+
+    async def test_timeout_keeps_the_output_that_preceded_it(self, fake_modal: FakeModal) -> None:
+        # Modal's -1 deadline sentinel becomes a legible note, and the output produced before
+        # the kill -- which the protocol's raise-on-timeout cannot return -- still reaches the
+        # model.
         fake_modal.responder = lambda argv, timeout: ('partial\n', '', -1)
-        async with _toolset() as ts:
+        async with _tools() as ts:
             result = await ts.run_command('sleep 99', timeout_seconds=5)
         assert result == '[stdout]\npartial\n[timed out after 5s]'
 
-    async def test_exec_failure_raises_model_retry(self, fake_modal: FakeModal) -> None:
-        def boom(argv: list[str], timeout: int | None) -> tuple[str, str, int]:
-            raise fake_modal.error_type('transient blip')
+    async def test_a_backend_without_partial_output_still_reports_the_timeout(self) -> None:
+        # The tools work against whatever sandbox the run has, so a backend that reports a
+        # deadline kill with no output alongside it still gets a legible note.
+        ctx = replace(_run_context(), sandbox=Sandbox(_TimingOutSandbox()))
+        tools = _tool_surface(ModalSandbox[None]())
+        assert await tools.run_command(ctx, 'sleep 99', timeout_seconds=5) == '[timed out after 5s]'
 
-        fake_modal.responder = boom
-        async with _toolset() as ts:
+    async def test_exec_failure_raises_model_retry(self, fake_modal: FakeModal) -> None:
+        async with _tools() as ts:
+            fake_modal.exec_error = fake_modal.error_type('transient blip')
             with pytest.raises(ModelRetry, match='Command could not run in the sandbox: transient blip'):
                 await ts.run_command('echo hi')
 
@@ -199,89 +266,22 @@ class TestRunCommand:
         # way; sandbox expiry (SandboxTimeoutError) is the one an owned run outliving its
         # lifetime actually produces, and rejected credentials are the non-sandbox case.
         exc_type: type[Exception] = getattr(fake_modal, exc_property)
-
-        def fail(argv: list[str], timeout: int | None) -> tuple[str, str, int]:
-            raise exc_type('terminal failure')
-
-        fake_modal.responder = fail
-        async with _toolset() as ts:
+        async with _tools() as ts:
+            fake_modal.exec_error = exc_type('terminal failure')
             with pytest.raises(ModalSandboxTerminalError, match=match):
                 await ts.run_command('echo hi')
-
-    async def test_output_is_bounded_end_to_end(self, fake_modal: FakeModal) -> None:
-        # A command that floods stdout is capped before it reaches the model, and the cut is
-        # marked. One-char chunks drive the session's bounded reader.
-        fake_modal.output_chunk_size = 1
-        fake_modal.responder = lambda argv, timeout: ('A' * 500 + 'END', '', 0)
-        async with _toolset(max_output_bytes=50) as ts:
-            result = await ts.run_command('flood')
-        assert 'output truncated' in result
-        assert result.endswith('END')  # the tail, where the exit status lives, survives
-
-    async def test_output_is_bounded_when_one_chunk_exceeds_limit(self, fake_modal: FakeModal) -> None:
-        fake_modal.responder = lambda argv, timeout: ('A' * 500 + 'END', '', 0)
-        async with _toolset(max_output_bytes=50) as ts:
-            result = await ts.run_command('flood')
-        assert 'output truncated' in result
-        assert result.endswith('END')
-
-    async def test_output_line_cap_keeps_last_lines(self, fake_modal: FakeModal) -> None:
-        fake_modal.responder = lambda argv, timeout: ('first\nsecond\nthird', '', 0)
-        async with _toolset(max_output_lines=1) as ts:
-            result = await ts.run_command('many-lines')
-        assert 'truncated to the last 1 lines' in result
-        assert result.endswith('third')
-
-    async def test_multibyte_output_truncation_drops_partial_character(self, fake_modal: FakeModal) -> None:
-        fake_modal.responder = lambda argv, timeout: ('é' * 20, '', 0)
-        async with _toolset(max_output_bytes=5) as ts:
-            result = await ts.run_command('unicode')
-        assert 'output truncated to the last 5B' in result
-
-    async def test_stream_labels_survive_truncation(self, fake_modal: FakeModal) -> None:
-        # Each stream is truncated separately with its label attached afterwards, so a
-        # flood on one stream cannot erase the labels or crowd out the other stream.
-        fake_modal.responder = lambda argv, timeout: ('ok\n', 'E' * 500, 1)
-        async with _toolset(max_output_bytes=50) as ts:
-            result = await ts.run_command('noisy')
-        assert result.startswith('[stdout]\nok\n[stderr]\n')
-        assert 'output truncated to the last 50B' in result
-        assert result.endswith('[exit code: 1]')
-
-    async def test_session_level_truncation_is_marked(self, fake_modal: FakeModal) -> None:
-        # When the transport reader drops bytes, the retained tail can fit the presentation
-        # caps exactly; the cut must still be marked so the model knows output is missing.
-        fake_modal.output_chunk_size = 1
-        fake_modal.responder = lambda argv, timeout: ('A' * 500 + 'END', '', 0)
-        async with _toolset(max_output_bytes=50) as ts:
-            result = await ts.run_command('flood')
-        assert 'output truncated to the last 50B' in result
-        assert result.endswith('END')
-
-    async def test_client_side_bounding_is_engaged_not_only_presentation(self, fake_modal: FakeModal) -> None:
-        # The session-level ring buffer bounds client memory during the read; the
-        # presentation cap alone cannot substitute for it. With a multi-line flood the two
-        # layers keep different tails: the session keeps a byte suffix of the long line,
-        # the presentation cap alone would keep only whole trailing lines.
-        fake_modal.output_chunk_size = 1
-        fake_modal.responder = lambda argv, timeout: ('X' * 100 + '\nEND', '', 0)
-        async with _toolset(max_output_bytes=50) as ts:
-            result = await ts.run_command('flood')
-        # Last 50 bytes of the stream: a 46-char X suffix, then the END line.
-        assert 'X' * 46 + '\nEND' in result
-        assert 'output truncated' in result
 
     async def test_dead_sandbox_conflict_on_first_exec_is_terminal(self, fake_modal: FakeModal) -> None:
         # A first exec on a dead sandbox surfaces as Modal's ambiguous ConflictError; the
         # poll disambiguates so the model is not sent into a retry loop against a corpse.
-        async with _toolset() as ts:
+        async with _tools() as ts:
             fake_modal.exec_error = fake_modal.conflict_type('Sandbox already finished')
             fake_modal.sandboxes[0].poll_result = 0
             with pytest.raises(ModalSandboxUnavailableError, match='no longer running'):
                 await ts.run_command('echo hi')
 
     async def test_transient_conflict_on_exec_is_retried(self, fake_modal: FakeModal) -> None:
-        async with _toolset() as ts:
+        async with _tools() as ts:
             fake_modal.exec_error = fake_modal.conflict_type('aborted')
             with pytest.raises(ModelRetry, match='aborted'):
                 await ts.run_command('echo hi')
@@ -291,34 +291,45 @@ class TestRunCommand:
         # modal.exception.Error; they must still become a retryable sandbox error rather
         # than abort the agent run.
         fake_modal.stdout_error = ValueError('Received empty message')
-        async with _toolset() as ts:
+        async with _tools() as ts:
             with pytest.raises(ModelRetry, match='ValueError: Received empty message'):
                 await ts.run_command('echo hi')
 
-    async def test_tool_on_unentered_toolset_raises(self) -> None:
-        # A tool called outside the entered toolset (a caller error, not a model mistake)
-        # gets the typed error raw, not a ModelRetry.
-        toolset = ModalSandbox[None]().get_toolset()
-        assert isinstance(toolset, _ModalSandboxTools)
-        with pytest.raises(ModalSandboxError, match='session is not open'):
-            await toolset.run_command('echo hi')
+    async def test_tool_without_a_sandbox_explains_how_to_attach(self) -> None:
+        # Outside a run there is no sandbox, and the framework default says so rather than
+        # reaching for the host.
+        tools = _tool_surface(ModalSandbox[None]())
+        with pytest.raises(UserError, match='No sandbox is attached'):
+            await tools.run_command(_run_context(), 'echo hi')
+
+    async def test_the_tools_run_against_any_sandbox_backend(self) -> None:
+        # The toolset reads `ctx.sandbox`, so a run that supplied its own sandbox gets these
+        # tools over that one instead of a Modal container.
+        import sniffio
+
+        if sniffio.current_async_library() != 'asyncio':
+            pytest.skip('LocalSandbox spawns asyncio subprocesses')
+        async with LocalSandbox() as local:
+            ctx = replace(_run_context(), sandbox=Sandbox(local))
+            tools = _tool_surface(ModalSandbox[None]())
+            assert await tools.run_command(ctx, 'echo hi') == '[stdout]\nhi'
 
 
 class TestReadFile:
     async def test_returns_contents(self, fake_modal: FakeModal) -> None:
-        async with _toolset() as ts:
+        async with _tools() as ts:
             # The single trailing newline is dropped with its phantom empty line, so the read
             # returns the real line content rather than a body counted as two lines.
             fake_modal.sandboxes[0].files['/etc/hosts'] = b'file body\n'
             assert await ts.read_file('/etc/hosts') == 'file body'
 
     async def test_at_size_limit_is_not_truncated(self, fake_modal: FakeModal) -> None:
-        async with _toolset(max_output_bytes=100) as ts:
+        async with _tools(max_output_bytes=100) as ts:
             fake_modal.sandboxes[0].files['/f'] = b'x' * 100
             assert await ts.read_file('/f') == 'x' * 100
 
     async def test_over_size_limit_pages_from_head(self, fake_modal: FakeModal) -> None:
-        async with _toolset(max_output_bytes=20) as ts:
+        async with _tools(max_output_bytes=20) as ts:
             fake_modal.sandboxes[0].files['/big'] = b'\n'.join(b'line%02d' % i for i in range(10))
             result = await ts.read_file('/big')
         # File reads keep the head and tell the model how to page the rest.
@@ -326,33 +337,40 @@ class TestReadFile:
         assert 'Use offset=' in result
 
     async def test_offset_and_limit(self, fake_modal: FakeModal) -> None:
-        async with _toolset() as ts:
+        async with _tools() as ts:
             fake_modal.sandboxes[0].files['/f'] = b'a\nb\nc\nd\ne'
             result = await ts.read_file('/f', offset=2, limit=2)
         assert result.startswith('b\nc')
         assert 'more lines in file. Use offset=4 to continue.' in result
 
     async def test_binary_file_raises_model_retry(self, fake_modal: FakeModal) -> None:
-        async with _toolset() as ts:
+        async with _tools() as ts:
             fake_modal.sandboxes[0].files['/img.png'] = b'\xff\xfe\x00\x01'
             with pytest.raises(ModelRetry, match='not valid UTF-8'):
                 await ts.read_file('/img.png')
 
-    async def test_error_raises_model_retry(self, fake_modal: FakeModal) -> None:
-        async with _toolset() as ts:
-            fake_modal.sandboxes[0].fs_error = fake_modal.filesystem_error_type('No such file: /nope')
+    async def test_missing_file_raises_model_retry(self, fake_modal: FakeModal) -> None:
+        # The backend translates Modal's missing-file exception into the builtin
+        # `FileNotFoundError` the protocol promises; the tool turns that into a retry.
+        async with _tools() as ts:
             with pytest.raises(ModelRetry, match="Could not read '/nope': No such file"):
                 await ts.read_file('/nope')
 
+    async def test_filesystem_error_raises_model_retry(self, fake_modal: FakeModal) -> None:
+        async with _tools() as ts:
+            fake_modal.sandboxes[0].fs_error = fake_modal.filesystem_error_type('Permission denied: /root/x')
+            with pytest.raises(ModelRetry, match="Could not read '/root/x': Permission denied"):
+                await ts.read_file('/root/x')
+
     async def test_refuses_file_over_read_limit(self, fake_modal: FakeModal) -> None:
-        async with _toolset(max_read_bytes=1000) as ts:
-            # Report a large size without allocating the bytes; the guard fires before read_bytes.
+        async with _tools(max_read_bytes=1000) as ts:
+            # Report a large size without allocating the bytes; the guard fires before the read.
             fake_modal.sandboxes[0].stat_sizes['/big.log'] = 5000
             with pytest.raises(ModelRetry, match='over the 1000B read limit'):
                 await ts.read_file('/big.log')
 
     async def test_read_limit_formats_megabytes(self, fake_modal: FakeModal) -> None:
-        async with _toolset(max_read_bytes=1000) as ts:
+        async with _tools(max_read_bytes=1000) as ts:
             fake_modal.sandboxes[0].stat_sizes['/big.log'] = 3 * 1024 * 1024
             with pytest.raises(ModelRetry, match='File is 3.0MB'):
                 await ts.read_file('/big.log')
@@ -360,20 +378,28 @@ class TestReadFile:
     async def test_line_cap_is_configurable(self, fake_modal: FakeModal) -> None:
         # Bytes are well under budget, so only the line cap can fire: proves it is plumbed
         # through, not silently fixed at the helper default.
-        async with _toolset(max_output_lines=3, max_output_bytes=50_000) as ts:
+        async with _tools(max_output_lines=3, max_output_bytes=50_000) as ts:
             fake_modal.sandboxes[0].files['/many'] = b'\n'.join(b'L%d' % i for i in range(20))
             result = await ts.read_file('/many')
         assert 'Showing lines 1-3 of 20' in result
         assert 'Use offset=4 to continue.' in result
 
     async def test_refuses_file_that_grew_after_stat(self, fake_modal: FakeModal) -> None:
-        async with _toolset(max_read_bytes=1000) as ts:
+        async with _tools(max_read_bytes=1000) as ts:
             # stat reports under the limit, but the read returns more (the file grew between
             # the two round-trips). The post-read guard refuses before the decode/window.
             fake_modal.sandboxes[0].stat_sizes['/grows'] = 10
             fake_modal.sandboxes[0].files['/grows'] = b'x' * 5000
             with pytest.raises(ModelRetry, match='over the 1000B read limit'):
                 await ts.read_file('/grows')
+
+    async def test_a_directory_has_no_size_to_guard(self, fake_modal: FakeModal) -> None:
+        # The protocol reports no size for a directory, so the guard cannot fire and the read
+        # itself is what refuses.
+        async with _tools() as ts:
+            fake_modal.sandboxes[0].directories.add('/pkg')
+            with pytest.raises(ModelRetry, match="Could not read '/pkg'"):
+                await ts.read_file('/pkg')
 
     @pytest.mark.parametrize(
         ('kwargs', 'message'),
@@ -386,45 +412,45 @@ class TestReadFile:
     async def test_invalid_window_is_a_model_retry(
         self, fake_modal: FakeModal, kwargs: dict[str, int], message: str
     ) -> None:
-        async with _toolset() as ts:
+        async with _tools() as ts:
             fake_modal.sandboxes[0].files['/f'] = b'one\ntwo'
             with pytest.raises(ModelRetry, match=message):
                 await ts.read_file('/f', **kwargs)
 
     async def test_oversized_first_line_is_omitted(self, fake_modal: FakeModal) -> None:
-        async with _toolset(max_output_bytes=10) as ts:
+        async with _tools(max_output_bytes=10) as ts:
             fake_modal.sandboxes[0].files['/f'] = b'x' * 200
             result = await ts.read_file('/f')
         assert result == '[Line 1 is 200B, exceeds the 10B limit and was omitted.]'
 
     async def test_oversized_first_line_points_to_next_line(self, fake_modal: FakeModal) -> None:
-        async with _toolset(max_output_bytes=10) as ts:
+        async with _tools(max_output_bytes=10) as ts:
             fake_modal.sandboxes[0].files['/f'] = b'x' * 200 + b'\nnext'
             result = await ts.read_file('/f')
         assert 'Use offset=2 to continue.' in result
 
     async def test_byte_cap_returns_continuation_offset(self, fake_modal: FakeModal) -> None:
-        async with _toolset(max_output_bytes=12) as ts:
+        async with _tools(max_output_bytes=12) as ts:
             fake_modal.sandboxes[0].files['/f'] = b'line00\nline01\nline02'
             result = await ts.read_file('/f')
         assert '(12B limit). Use offset=' in result
 
     async def test_terminal_error_ends_the_run(self, fake_modal: FakeModal) -> None:
         # A missing sandbox during a read is terminal, not a retryable "could not read".
-        async with _toolset() as ts:
+        async with _tools() as ts:
             fake_modal.sandboxes[0].fs_error = fake_modal.unavailable_type('sandbox not found')
             fake_modal.sandboxes[0].poll_result = 0
             with pytest.raises(ModalSandboxUnavailableError):
                 await ts.read_file('/x')
 
     async def test_wrapped_not_found_is_recoverable_while_sandbox_runs(self, fake_modal: FakeModal) -> None:
-        async with _toolset() as ts:
+        async with _tools() as ts:
             fake_modal.sandboxes[0].fs_error = fake_modal.unavailable_type('filesystem request failed')
             with pytest.raises(ModelRetry, match='filesystem request failed'):
                 await ts.read_file('/x')
 
     async def test_wrapped_auth_error_is_terminal(self, fake_modal: FakeModal) -> None:
-        async with _toolset() as ts:
+        async with _tools() as ts:
             fake_modal.sandboxes[0].fs_error = fake_modal.filesystem_error_type('filesystem request failed')
             fake_modal.sandboxes[0].poll_error = fake_modal.auth_type('unauthenticated')
             with pytest.raises(ModalSandboxError, match='Modal rejected the credentials'):
@@ -433,7 +459,7 @@ class TestReadFile:
 
 class TestWriteFile:
     async def test_writes_file_content(self, fake_modal: FakeModal) -> None:
-        async with _toolset() as ts:
+        async with _tools() as ts:
             result = await ts.write_file('/tmp/pkg/a.py', 'print(1)\n')
         assert result == "Wrote 9 bytes to '/tmp/pkg/a.py'."
         assert fake_modal.sandboxes[0].files['/tmp/pkg/a.py'] == b'print(1)\n'
@@ -441,18 +467,18 @@ class TestWriteFile:
     async def test_unencodable_content_raises_model_retry(self, fake_modal: FakeModal) -> None:
         # A provider that pre-parses tool args to a dict can hand the tool an unpaired
         # surrogate; that is a model mistake, so it must retry, not abort the run.
-        async with _toolset() as ts:
+        async with _tools() as ts:
             with pytest.raises(ModelRetry, match='cannot be encoded as UTF-8'):
                 await ts.write_file('/tmp/x', '\ud800')
 
     async def test_error_raises_model_retry(self, fake_modal: FakeModal) -> None:
-        async with _toolset() as ts:
+        async with _tools() as ts:
             fake_modal.sandboxes[0].fs_error = fake_modal.filesystem_error_type('Permission denied: /root/x')
             with pytest.raises(ModelRetry, match="Could not write '/root/x': Permission denied"):
                 await ts.write_file('/root/x', 'data')
 
     async def test_terminal_error_ends_the_run(self, fake_modal: FakeModal) -> None:
-        async with _toolset() as ts:
+        async with _tools() as ts:
             fake_modal.sandboxes[0].fs_error = fake_modal.unavailable_type('sandbox not found')
             fake_modal.sandboxes[0].poll_result = 0
             with pytest.raises(ModalSandboxUnavailableError):
@@ -461,7 +487,7 @@ class TestWriteFile:
 
 class TestListDirectory:
     async def test_lists_with_trailing_slash_on_dirs(self, fake_modal: FakeModal) -> None:
-        async with _toolset() as ts:
+        async with _tools() as ts:
             fake_modal.sandboxes[0].listing = [FileInfo('b', True), FileInfo('a', False)]
             assert await ts.list_directory('/tmp') == 'a\nb/'
         assert fake_modal.sandboxes[0].list_paths == ['/tmp']
@@ -469,7 +495,7 @@ class TestListDirectory:
     async def test_directories_keep_plain_name_order(self, fake_modal: FakeModal) -> None:
         # Sorting happens before the '/' suffix is added; '/' sorts after '-' and '.', so
         # sorting the suffixed strings would misplace directories relative to `ls` order.
-        async with _toolset() as ts:
+        async with _tools() as ts:
             fake_modal.sandboxes[0].listing = [
                 FileInfo('a.txt', False),
                 FileInfo('a', True),
@@ -480,7 +506,7 @@ class TestListDirectory:
     async def test_oversized_entry_name_is_marked_not_blank(self, fake_modal: FakeModal) -> None:
         # A single entry name wider than the byte cap cannot be shown head-first; the model
         # gets an explicit marker instead of an empty body under a "truncated" note.
-        async with _toolset(max_output_bytes=10) as ts:
+        async with _tools(max_output_bytes=10) as ts:
             fake_modal.sandboxes[0].listing = [FileInfo('a-very-long-entry-name', False)]
             result = await ts.list_directory('/tmp')
         assert result == '[... first line exceeds the 10B limit, output omitted ...]'
@@ -488,9 +514,8 @@ class TestListDirectory:
     async def test_head_truncation_appends_marker_after_the_listing(self, fake_modal: FakeModal) -> None:
         # Directory listings truncate head-first: the kept entries come first and the
         # marker says "first", appended after the body (the opposite arrangement to
-        # command output). coverage's branch metric cannot see these ternary arms, so
-        # this pins them explicitly.
-        async with _toolset(max_output_lines=2) as ts:
+        # command output).
+        async with _tools(max_output_lines=2) as ts:
             fake_modal.sandboxes[0].listing = [
                 FileInfo('a', False),
                 FileInfo('b', False),
@@ -501,121 +526,127 @@ class TestListDirectory:
 
     async def test_default_path_resolves_to_cwd(self, fake_modal: FakeModal) -> None:
         fake_modal.responder = lambda argv, timeout: ('/work\n', '', 0)
-        async with _toolset() as ts:
+        async with _tools() as ts:
             assert await ts.list_directory() == '(empty)'
-        # The default '.' is resolved against the sandbox working directory.
+        # The default '.' is resolved against the sandbox working directory, discovered
+        # with a single `pwd`.
         assert fake_modal.sandboxes[0].list_paths == ['/work']
+        assert [call.argv for call in fake_modal.sandboxes[0].exec_calls] == [['pwd']]
 
     async def test_relative_path_resolved_against_cwd(self, fake_modal: FakeModal) -> None:
         fake_modal.responder = lambda argv, timeout: ('/work\n', '', 0)
-        async with _toolset() as ts:
+        async with _tools() as ts:
             fake_modal.sandboxes[0].listing = [FileInfo('a.py', False)]
             assert await ts.list_directory('src') == 'a.py'
         assert fake_modal.sandboxes[0].list_paths == ['/work/src']
 
-    async def test_relative_path_preserves_parent_segments(self, fake_modal: FakeModal) -> None:
+    async def test_parent_segments_are_normalized_away(self, fake_modal: FakeModal) -> None:
+        # The facade normalizes a resolved path textually. That is a spelling convenience,
+        # not confinement: isolation is the sandbox's job, not the path helper's.
         fake_modal.responder = lambda argv, timeout: ('/work\n', '', 0)
-        async with _toolset() as ts:
+        async with _tools() as ts:
             await ts.list_directory('link/../secret')
-        assert fake_modal.sandboxes[0].list_paths == ['/work/link/../secret']
+        assert fake_modal.sandboxes[0].list_paths == ['/work/secret']
 
     async def test_error_raises_model_retry(self, fake_modal: FakeModal) -> None:
-        async with _toolset() as ts:
+        async with _tools() as ts:
             fake_modal.sandboxes[0].fs_error = fake_modal.filesystem_error_type('Not a directory: /etc/hosts')
             with pytest.raises(ModelRetry, match="Could not list '/etc/hosts': Not a directory"):
                 await ts.list_directory('/etc/hosts')
 
     async def test_terminal_error_ends_the_run(self, fake_modal: FakeModal) -> None:
-        async with _toolset() as ts:
+        async with _tools() as ts:
             fake_modal.sandboxes[0].fs_error = fake_modal.unavailable_type('sandbox not found')
             fake_modal.sandboxes[0].poll_result = 0
             with pytest.raises(ModalSandboxUnavailableError):
                 await ts.list_directory('/x')
 
 
-class TestToolsetLifecycle:
-    async def test_enter_creates_sandbox_from_config(self, fake_modal: FakeModal) -> None:
-        async with _toolset(image='ubuntu:22.04', app_name='my-app', sandbox_timeout=120, workdir='/work'):
-            pass
+class TestSandboxLifecycle:
+    async def test_create_provisions_from_config_and_destroy_terminates(self, fake_modal: FakeModal) -> None:
+        capability = ModalSandbox[None](image='ubuntu:22.04', app_name='my-app', sandbox_timeout=120, workdir='/work')
+        ctx = _run_context()
+        ref = await capability.create_sandbox(ctx)
+        assert ref == SandboxRef(provider='modal', sandbox_id='sb-owned')
         assert fake_modal.app_lookups[-1]['name'] == 'my-app'
         assert fake_modal.image_tags[-1] == 'ubuntu:22.04'
         assert fake_modal.create_kwargs[-1]['timeout'] == 120
         assert fake_modal.create_kwargs[-1]['workdir'] == '/work'
 
+        await capability.destroy_sandbox(ctx, ref)
+        assert fake_modal.sandboxes[0].terminated is True
+        assert fake_modal.sandboxes[0].detached is True
+
     async def test_env_passed_to_owned_sandbox(self, fake_modal: FakeModal) -> None:
-        async with _toolset(env={'FOO': 'bar'}):
-            pass
+        await ModalSandbox[None](env={'FOO': 'bar'}).create_sandbox(_run_context())
         assert fake_modal.create_kwargs[-1]['env'] == {'FOO': 'bar'}
 
-    async def test_for_run_carries_config_to_a_fresh_instance(self, fake_modal: FakeModal) -> None:
-        original = ModalSandbox[None](image='ubuntu:22.04', app_name='my-app', sandbox_timeout=99).get_toolset()
-        assert _is_abstract_toolset(original)
-        fresh = await original.for_run(_run_context())
-        assert fresh is not original
-        async with fresh:
-            pass
-        assert fake_modal.image_tags[-1] == 'ubuntu:22.04'
-        assert fake_modal.app_lookups[-1]['name'] == 'my-app'
-        assert fake_modal.create_kwargs[-1]['timeout'] == 99
+    async def test_get_sandbox_reuses_the_handle_this_run_created(self, fake_modal: FakeModal) -> None:
+        # `get_sandbox` receives only a serializable ref, so without the run's own handle
+        # every run would look its sandbox up again just to use it.
+        capability = ModalSandbox[None]()
+        ctx = _run_context()
+        ref = await capability.create_sandbox(ctx)
+        backend = await capability.get_sandbox(ctx, ref)
+        assert isinstance(backend, ModalSandboxBackend)
+        assert backend.sandbox is fake_modal.sandboxes[0]
+        assert fake_modal.attach_ids == []
 
-    async def test_agent_level_toolset_enter_does_not_create_a_sandbox(self, fake_modal: FakeModal) -> None:
-        toolset = ModalSandbox[None]().get_toolset()
-        assert _is_abstract_toolset(toolset)
-        async with toolset:
-            pass
+    async def test_get_sandbox_connects_when_the_handle_is_elsewhere(self, fake_modal: FakeModal) -> None:
+        # A run that resumed in another process holds no handle, so the ref is connected to.
+        capability = ModalSandbox[None]()
+        backend = await capability.get_sandbox(_run_context(), SandboxRef(provider='modal', sandbox_id='sb-other'))
+        assert isinstance(backend, ModalSandboxBackend)
+        assert fake_modal.attach_ids == ['sb-other']
+
+    async def test_other_providers_refs_are_declined(self, fake_modal: FakeModal) -> None:
+        capability = ModalSandbox[None]()
+        assert await capability.get_sandbox(_run_context(), SandboxRef(provider='e2b', sandbox_id='x')) is None
+
+    async def test_destroy_without_a_handle_is_a_no_op(self, fake_modal: FakeModal) -> None:
+        # Modal's `sandbox_timeout` is the backstop for a run whose teardown happens where
+        # the handle does not live.
+        capability = ModalSandbox[None]()
+        await capability.destroy_sandbox(_run_context(), SandboxRef(provider='modal', sandbox_id='sb-gone'))
         assert fake_modal.sandboxes == []
 
-    async def test_attached_sandbox_not_terminated(self, fake_modal: FakeModal) -> None:
-        async with _toolset(sandbox_id='sb-keep') as ts:
-            await ts.run_command('echo hi')
+    async def test_attached_sandbox_is_used_but_not_created_or_terminated(self, fake_modal: FakeModal) -> None:
+        capability = ModalSandbox[None](sandbox_id='sb-keep')
+        ctx = _run_context()
+        ref = await capability.create_sandbox(ctx)
+        assert ref == SandboxRef(provider='modal', sandbox_id='sb-keep')
+        # Naming an existing sandbox provisions nothing.
+        assert fake_modal.sandboxes == []
+
+        await capability.get_sandbox(ctx, ref)
+        await capability.destroy_sandbox(ctx, ref)
         assert fake_modal.attach_ids == ['sb-keep']
         assert fake_modal.sandboxes[0].terminated is False
         assert fake_modal.sandboxes[0].detached is True
 
-    async def test_error_exit_still_terminates_the_sandbox(self, fake_modal: FakeModal) -> None:
-        # The owned sandbox is torn down on the error exit path too, not only on clean
-        # exit: a run that dies mid-task must not leave its sandbox billing until the
-        # server-side backstop.
-        with pytest.raises(RuntimeError, match='body boom'):
-            async with _toolset() as ts:
-                await ts.run_command('echo hi')
-                raise RuntimeError('body boom')
-        assert fake_modal.sandboxes[0].terminated is True
+    async def test_attaching_to_a_dead_sandbox_fails(self, fake_modal: FakeModal) -> None:
+        # Connecting must fail rather than silently provision a replacement.
+        fake_modal.attach_poll_result = 0
+        capability = ModalSandbox[None](sandbox_id='sb-gone')
+        ctx = _run_context()
+        ref = await capability.create_sandbox(ctx)
+        with pytest.raises(ModalSandboxUnavailableError):
+            await capability.get_sandbox(ctx, ref)
+
+    async def test_two_runs_do_not_share_one_handle(self, fake_modal: FakeModal) -> None:
+        # Runs sharing an attached sandbox each connect for themselves, so one run's
+        # teardown cannot detach the other's connection.
+        capability = ModalSandbox[None](sandbox_id='sb-keep')
+        first = replace(_run_context(), run_id='run-1')
+        second = replace(_run_context(), run_id='run-2')
+        ref = await capability.create_sandbox(first)
+        first_backend = await capability.get_sandbox(first, ref)
+        second_backend = await capability.get_sandbox(second, ref)
+        assert first_backend is not second_backend
+
+        await capability.destroy_sandbox(first, ref)
         assert fake_modal.sandboxes[0].detached is True
-
-
-class TestInjectedSession:
-    async def test_uses_caller_session_without_opening_or_terminating(self, fake_modal: FakeModal) -> None:
-        fake_modal.responder = lambda argv, timeout: ('hi\n', '', 0)
-        async with ModalSandboxSession() as session:
-            # The caller opened exactly one sandbox.
-            assert len(fake_modal.sandboxes) == 1
-            async with _toolset(session=session) as ts:
-                assert await ts.run_command('echo hi') == '[stdout]\nhi'
-            # The run reused the caller's sandbox (no new one) and left it running.
-            assert len(fake_modal.sandboxes) == 1
-            assert fake_modal.sandboxes[0].terminated is False
-        # Closing the caller-owned session terminates its sandbox.
-        assert fake_modal.sandboxes[0].terminated is True
-
-    async def test_unopened_session_fails_at_run_start(self, fake_modal: FakeModal) -> None:
-        # A session the caller never entered must fail clearly when the run starts.
-        session = ModalSandboxSession()
-        with pytest.raises(ModalSandboxError, match='injected session is not open'):
-            async with _toolset(session=session):
-                pass  # pragma: no cover
-
-    async def test_for_run_carries_the_session(self, fake_modal: FakeModal) -> None:
-        async with ModalSandboxSession() as session:
-            original = ModalSandbox[None](session=session).get_toolset()
-            assert _is_abstract_toolset(original)
-            fresh = await original.for_run(_run_context())
-            async with fresh:
-                assert isinstance(fresh, _ModalSandboxTools)
-                await fresh.run_command('echo hi')
-            # The per-run clone reused the injected session rather than opening its own.
-            assert len(fake_modal.sandboxes) == 1
-            assert fake_modal.sandboxes[0].terminated is False
+        assert fake_modal.sandboxes[1].detached is False
 
 
 class TestCapability:
@@ -691,37 +722,6 @@ class TestCapability:
             ModalSandbox(sandbox_id='sb-keep', workdir='/work')
         assert 'max_command_timeout' not in str(exc.value)
 
-    async def test_session_with_only_defaults_is_allowed(self, fake_modal: FakeModal) -> None:
-        async with ModalSandboxSession() as session:
-            cap = ModalSandbox(session=session)
-            assert cap.session is session
-
-    async def test_session_rejects_sandbox_id(self, fake_modal: FakeModal) -> None:
-        async with ModalSandboxSession() as session:
-            with pytest.raises(ValueError, match='sandbox_id cannot be combined with `session`'):
-                ModalSandbox(session=session, sandbox_id='sb-keep')
-
-    async def test_session_rejects_owned_settings(self, fake_modal: FakeModal) -> None:
-        async with ModalSandboxSession() as session:
-            with pytest.raises(ValueError, match='image cannot be combined with `session`'):
-                ModalSandbox(session=session, image='ubuntu:22.04')
-
-    async def test_session_rejects_env(self, fake_modal: FakeModal) -> None:
-        async with ModalSandboxSession() as session:
-            with pytest.raises(ValueError, match='env cannot be combined with `session`'):
-                ModalSandbox(session=session, env={'A': 'b'})
-
-    async def test_session_rejecting_sandbox_timeout_points_at_max_command_timeout(self, fake_modal: FakeModal) -> None:
-        async with ModalSandboxSession() as session:
-            with pytest.raises(ValueError, match='set `max_command_timeout`'):
-                ModalSandbox(session=session, sandbox_timeout=600)
-
-    async def test_injected_session_instructions_say_persists(self, fake_modal: FakeModal) -> None:
-        async with ModalSandboxSession() as session:
-            instructions = ModalSandbox(session=session).get_instructions()
-            assert instructions is not None
-            assert 'persists across runs' in instructions
-
     def test_instructions_enabled_by_default(self) -> None:
         instructions = ModalSandbox().get_instructions()
         assert instructions is not None
@@ -770,7 +770,7 @@ class TestCapability:
 
     def test_owned_rejects_ceiling_above_sandbox_timeout(self) -> None:
         # In owned mode a command cannot outlive the sandbox, so a higher ceiling is a
-        # dead value; in attach/injected modes it is the documented escape hatch.
+        # dead value; in attach mode it is the documented escape hatch.
         with pytest.raises(ValueError, match='cannot exceed sandbox_timeout'):
             ModalSandbox(sandbox_timeout=300, max_command_timeout=600)
 
@@ -784,7 +784,7 @@ class TestCapability:
 
         assert Exported is ModalSandbox
         assert 'ModalSandboxToolset' not in modal_sandbox.__all__
-        assert 'ModalSandboxExecResult' in modal_sandbox.__all__
+        assert 'ModalSandboxBackend' in modal_sandbox.__all__
         assert pydantic_ai_harness.ModalSandbox is ModalSandbox
 
     @pytest.mark.anyio(backends=['asyncio'])

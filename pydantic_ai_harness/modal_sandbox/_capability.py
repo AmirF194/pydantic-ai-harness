@@ -4,23 +4,25 @@ from __future__ import annotations
 
 import math
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from pydantic_ai.capabilities import AbstractCapability
-from pydantic_ai.tools import AgentDepsT
+from pydantic_ai.sandboxes import SandboxBackend, SandboxRef
+from pydantic_ai.tools import AgentDepsT, RunContext
 from pydantic_ai.toolsets import AgentToolset
 
-from pydantic_ai_harness.modal_sandbox._session import (
+from pydantic_ai_harness.modal_sandbox._backend import (
     DEFAULT_APP_NAME as _DEFAULT_APP_NAME,
 )
-from pydantic_ai_harness.modal_sandbox._session import (
+from pydantic_ai_harness.modal_sandbox._backend import (
     DEFAULT_IMAGE as _DEFAULT_IMAGE,
 )
-from pydantic_ai_harness.modal_sandbox._session import (
+from pydantic_ai_harness.modal_sandbox._backend import (
     DEFAULT_SANDBOX_TIMEOUT as _DEFAULT_SANDBOX_TIMEOUT,
 )
-from pydantic_ai_harness.modal_sandbox._session import (
-    ModalSandboxSession,
+from pydantic_ai_harness.modal_sandbox._backend import (
+    PROVIDER,
+    ModalSandboxBackend,
 )
 from pydantic_ai_harness.modal_sandbox._tool_output import DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES
 from pydantic_ai_harness.modal_sandbox._toolset import ModalSandboxToolset
@@ -52,15 +54,17 @@ _ATTACHED_INSTRUCTIONS = (
 class ModalSandbox(AbstractCapability[AgentDepsT]):
     """Access to an isolated cloud sandbox powered by [Modal](https://modal.com).
 
-    Gives the agent tools to run commands and manage files inside a Modal sandbox,
-    a place to execute untrusted or model-generated code without touching the host.
-    By default each run gets a fresh sandbox created from `image`. When the run ends,
-    the capability requests termination and waits for a bounded period;
-    `sandbox_timeout` is the server-side cleanup backstop. To keep one sandbox across
-    runs, either set `sandbox_id` to attach
-    to a sandbox you manage elsewhere, or pass a `session` you own (an open
-    `ModalSandboxSession`) so you control its lifetime and can read its `sandbox_id`.
-    The capability never opens or terminates a `session` you pass.
+    Supplies the run's [`sandbox`][pydantic_ai.tools.RunContext.sandbox] and gives the agent
+    tools to run commands and manage files inside it, a place to execute untrusted or
+    model-generated code without touching the host. By default each run gets a fresh sandbox
+    created from `image`, terminated when the run ends; `sandbox_timeout` is the server-side
+    cleanup backstop. Set `sandbox_id` to attach to a sandbox you manage elsewhere, which the
+    capability uses but never terminates.
+
+    Because the capability supplies the sandbox rather than owning a private connection, the
+    tools work against whatever sandbox the run ends up with: a `sandbox=` run argument (or a
+    sandbox from an earlier capability in the list) wins over this one, and the tools use that
+    instead.
 
     Requires the `modal` extra (`uv add "pydantic-ai-harness[modal]"`) and Modal
     credentials, configured as for the Modal CLI: run `modal token new` once, or set
@@ -82,19 +86,10 @@ class ModalSandbox(AbstractCapability[AgentDepsT]):
     sandbox_id: str | None = None
     """Attach to an existing sandbox by id instead of creating one. Attached sandboxes are not terminated.
 
-    Use this to reuse a sandbox created elsewhere (e.g. via the Modal CLI). The settings
-    that only apply when creating a sandbox (`image`, `app_name`, `create_app_if_missing`,
-    `sandbox_timeout`, `workdir`, `env`) cannot be combined with `sandbox_id`.
-    """
-
-    session: ModalSandboxSession | None = None
-    """Use a sandbox session you own and keep open across runs, instead of a per-run one.
-
-    Pass an already-entered `ModalSandboxSession` to reuse one sandbox across runs while
-    controlling its lifetime yourself: the capability uses it but never opens or terminates
-    it. Cannot be combined with `sandbox_id` or the owned-sandbox creation settings (the
-    session already owns those). Like `sandbox_id`, a shared session is not concurrency-safe
-    across overlapping runs.
+    Use this to reuse a sandbox created elsewhere (e.g. via the Modal CLI) across runs. The
+    settings that only apply when creating a sandbox (`image`, `app_name`,
+    `create_app_if_missing`, `sandbox_timeout`, `workdir`, `env`) cannot be combined with it.
+    Like any shared sandbox, it is not concurrency-safe across overlapping runs.
     """
 
     app_name: str = _DEFAULT_APP_NAME
@@ -115,8 +110,8 @@ class ModalSandbox(AbstractCapability[AgentDepsT]):
     env: Mapping[str, str] | None = None
     """Environment variables to set in an owned sandbox.
 
-    Owned sandboxes only. To inject secrets or env into an attached or injected sandbox,
-    set them when you create that sandbox yourself (e.g. with `modal.Secret`).
+    Owned sandboxes only. To inject secrets or env into an attached sandbox, set them when you
+    create that sandbox yourself (e.g. with `modal.Secret`).
     """
 
     default_command_timeout: float = 60.0
@@ -135,21 +130,20 @@ class ModalSandbox(AbstractCapability[AgentDepsT]):
     this caps how long that worst case can be. An owned command cannot outlive
     `sandbox_timeout` anyway, so the default ceiling is exact for owned sandboxes.
 
-    For an attached or injected sandbox the fallback is still `sandbox_timeout`, which is
-    pinned to its default (300s) in those modes because the capability does not know the
-    real lifetime of a sandbox it did not create. So every command there is capped at 300s
-    unless you set `max_command_timeout` to the value the sandbox actually allows.
+    For an attached sandbox the fallback is still `sandbox_timeout`, which is pinned to its
+    default (300s) there because the capability does not know the real lifetime of a sandbox
+    it did not create. So every command there is capped at 300s unless you set
+    `max_command_timeout` to the value the sandbox actually allows.
     """
 
     max_output_bytes: int = DEFAULT_MAX_BYTES
     """Maximum payload retained per command stream or file read, measured in UTF-8 bytes.
 
-    For commands the cap applies to stdout and stderr separately, both client-side (each
-    stream retains at most this many bytes after Modal delivers each transport chunk) and
-    in the tool output, so a large stderr cannot crowd out stdout. Labels, truncation
-    notes, continuation offsets, timeouts, and exit codes add a small amount beyond this
-    payload limit. Whichever of `max_output_bytes` and `max_output_lines` is reached
-    first wins.
+    For commands the cap applies to stdout and stderr separately, so a large stderr cannot
+    crowd out stdout. Labels, truncation notes, continuation offsets, timeouts, and exit codes
+    add a small amount beyond this payload limit. Whichever of `max_output_bytes` and
+    `max_output_lines` is reached first wins. This bounds what reaches the model, not what
+    crosses the wire: the sandbox protocol delivers a command's whole output.
     """
 
     max_output_lines: int = DEFAULT_MAX_LINES
@@ -163,9 +157,9 @@ class ModalSandbox(AbstractCapability[AgentDepsT]):
     max_read_bytes: int = _DEFAULT_MAX_READ_BYTES
     """Largest file `read_file` will read whole; larger files are refused with a hint to use shell tools.
 
-    Modal has no bounded file-read API. The tool checks metadata before reading and checks
-    the returned byte count again, but a file that grows between those operations can
-    briefly exceed this value in client memory before it is rejected.
+    The tool checks metadata before reading and checks the returned byte count again, but a
+    file that grows between those operations can briefly exceed this value in client memory
+    before it is rejected.
     """
 
     instructions: str | None = None
@@ -177,33 +171,33 @@ class ModalSandbox(AbstractCapability[AgentDepsT]):
     wrapping with `PrefixTools`, so the tool names in the text match the prefixed ones.
     """
 
+    _backends: dict[tuple[str | None, str], ModalSandboxBackend] = field(
+        default_factory=dict[tuple[str | None, str], ModalSandboxBackend], init=False, repr=False, compare=False
+    )
+    """Live handles keyed by `(run_id, sandbox_id)`.
+
+    `get_sandbox` receives only a serializable `SandboxRef`, so without this every run would
+    look the sandbox up again to use it and a third time to tear it down. Keying by run rather
+    than by sandbox alone keeps two runs sharing one attached sandbox from detaching each
+    other's connection.
+    """
+
     def __post_init__(self) -> None:
         """Reject settings that the chosen mode would ignore, so a dead value can't mislead.
 
-        There are three modes: owned (the default), attach (`sandbox_id`), and injected
-        (`session`). Attach and injected both reuse an existing sandbox, so the owned-only
-        creation settings have no effect there; `session` also subsumes `sandbox_id`. Rather
-        than ignore a conflicting value, fail at construction with the names to remove.
+        There are two modes: owned (the default) and attach (`sandbox_id`). Attach reuses an
+        existing sandbox, so the owned-only creation settings have no effect there. Rather than
+        ignore a conflicting value, fail at construction with the names to remove.
         """
         self._validate_configuration()
         if self.env is not None:
             self.env = dict(self.env)
 
-        if self.session is not None:
-            conflicts = self._non_default_owned_settings()
-            if self.sandbox_id is not None:
-                conflicts.append('sandbox_id')
-            if conflicts:
-                raise ValueError(
-                    f'{", ".join(conflicts)} cannot be combined with `session`, which already owns '
-                    'the sandbox and its configuration.' + self._command_ceiling_hint(conflicts)
-                )
-            return
         if self.sandbox_id is None:
             # Owned mode: a command cannot outlive the sandbox, so a ceiling above the
             # sandbox lifetime is a dead value -- reject it like the other mode conflicts.
-            # In attach/injected modes a higher ceiling is the documented escape hatch for
-            # sandboxes whose real lifetime exceeds the pinned default, so no check there.
+            # In attach mode a higher ceiling is the documented escape hatch for sandboxes
+            # whose real lifetime exceeds the pinned default, so no check there.
             ceiling = self.max_command_timeout
             if ceiling is not None and ceiling > self.sandbox_timeout:
                 raise ValueError(
@@ -246,7 +240,7 @@ class ModalSandbox(AbstractCapability[AgentDepsT]):
             raise ValueError(f'instructions must be a string or None, got {self.instructions!r}.')
 
     def _command_ceiling_hint(self, rejected: list[str]) -> str:
-        """Redirect a rejected `sandbox_timeout` to the setting that works in reuse modes.
+        """Redirect a rejected `sandbox_timeout` to the setting that works in attach mode.
 
         `sandbox_timeout` is the natural-but-wrong reach for "let commands run longer" on a
         reused sandbox (it only sizes an owned sandbox's lifetime). The per-command ceiling
@@ -275,30 +269,66 @@ class ModalSandbox(AbstractCapability[AgentDepsT]):
         """Explain the sandbox to the model, unless overridden or disabled via `instructions`."""
         if self.instructions is not None:
             return self.instructions or None
-        # A reused sandbox (attach or injected session) can carry files from earlier runs;
-        # only a per-run owned sandbox starts clean each time.
-        reused = self.sandbox_id is not None or self.session is not None
-        template = _ATTACHED_INSTRUCTIONS if reused else _OWNED_INSTRUCTIONS
+        # An attached sandbox can carry files from earlier runs; only a per-run owned sandbox
+        # starts clean each time.
+        template = _ATTACHED_INSTRUCTIONS if self.sandbox_id is not None else _OWNED_INSTRUCTIONS
         # Report the deadline the toolset will actually apply (quantized and clamped, see
         # `ModalSandboxToolset._command_timeout`), so the numbers cannot contradict behavior.
         ceiling = self.max_command_timeout if self.max_command_timeout is not None else self.sandbox_timeout
         default_timeout = min(max(1, math.ceil(self.default_command_timeout)), ceiling)
         return template.format(default_timeout=default_timeout, max_timeout=ceiling)
 
-    def get_toolset(self) -> AgentToolset[AgentDepsT]:
-        """Build and return the Modal sandbox toolset."""
-        return ModalSandboxToolset[AgentDepsT](
+    async def create_sandbox(self, ctx: RunContext[AgentDepsT]) -> SandboxRef:
+        """Provision this run's Modal sandbox, or name the one to attach to.
+
+        Modal has no create-or-reuse key for sandboxes, so an owned sandbox is created on every
+        call. Under a durable engine that retries this unit after a crash, the sandbox from the
+        abandoned attempt is left to its own `sandbox_timeout`.
+        """
+        if self.sandbox_id is not None:
+            # Attach mode contributes an identity without provisioning anything; `get_sandbox`
+            # connects to it and `destroy_sandbox` leaves it running.
+            return SandboxRef(provider=PROVIDER, sandbox_id=self.sandbox_id)
+        backend = await ModalSandboxBackend.create(
             image=self.image,
-            sandbox_id=self.sandbox_id,
             app_name=self.app_name,
             create_app_if_missing=self.create_app_if_missing,
             sandbox_timeout=self.sandbox_timeout,
             workdir=self.workdir,
+            env=self.env,
+        )
+        self._backends[(ctx.run_id, backend.sandbox_id)] = backend
+        return SandboxRef(provider=PROVIDER, sandbox_id=backend.sandbox_id)
+
+    async def get_sandbox(self, ctx: RunContext[AgentDepsT], ref: SandboxRef) -> SandboxBackend | None:
+        """Connect to a Modal sandbox by reference, reusing this run's handle when it has one."""
+        if ref.provider != PROVIDER:
+            return None
+        key = (ctx.run_id, ref.sandbox_id)
+        backend = self._backends.get(key)
+        if backend is None:
+            backend = await ModalSandboxBackend.connect(ref.sandbox_id)
+            self._backends[key] = backend
+        return backend
+
+    async def destroy_sandbox(self, ctx: RunContext[AgentDepsT], ref: SandboxRef) -> None:
+        """Terminate an owned sandbox and release this run's handle to it.
+
+        An attached sandbox is only disconnected from: its owner decides when it goes away. A
+        handle this process never held (a run that resumed elsewhere) leaves Modal's
+        `sandbox_timeout` as the backstop.
+        """
+        backend = self._backends.pop((ctx.run_id, ref.sandbox_id), None)
+        if backend is not None:
+            await backend.close(terminate=self.sandbox_id is None)
+
+    def get_toolset(self) -> AgentToolset[AgentDepsT]:
+        """Build and return the Modal sandbox toolset."""
+        return ModalSandboxToolset[AgentDepsT](
+            sandbox_timeout=self.sandbox_timeout,
             default_command_timeout=self.default_command_timeout,
             max_command_timeout=self.max_command_timeout,
             max_output_bytes=self.max_output_bytes,
             max_output_lines=self.max_output_lines,
             max_read_bytes=self.max_read_bytes,
-            env=self.env,
-            session=self.session,
         )
