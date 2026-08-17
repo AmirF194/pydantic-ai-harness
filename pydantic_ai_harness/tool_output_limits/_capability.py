@@ -288,12 +288,12 @@ class ToolOutputLimits(AbstractCapability[AgentDepsT]):
             return _Unit(binary=True, text=None, data=to_bytes(value), value=value, suffix=suffix)
         if self.serializer is not None and not isinstance(value, str):
             try:
-                text = self.serializer(value)
+                text = _ensure_text(self.serializer(value))
             except Exception:
                 # An after-hook exception would abort the run and lose the tool's output,
                 # so a broken serializer degrades to the default rendering instead.
                 warnings.warn(
-                    'ToolOutputLimits: serializer raised; falling back to compact JSON.',
+                    'ToolOutputLimits: serializer raised or returned non-text; falling back to compact JSON.',
                     stacklevel=2,
                 )
                 text = to_text(value)
@@ -454,6 +454,13 @@ class ToolOutputLimits(AbstractCapability[AgentDepsT]):
         )
         run = await agent.run(prompt, usage=ctx.usage)
         return run.output.strip()
+
+
+def _ensure_text(rendered: object) -> str:
+    """Reject non-`str` serializer output (e.g. `to_json` bytes without `.decode()`)."""
+    if not isinstance(rendered, str):
+        raise TypeError(f'serializer returned {type(rendered).__name__}')
+    return rendered
 
 
 def _select_action(bands: Sequence[Band], size: int) -> Action | None:

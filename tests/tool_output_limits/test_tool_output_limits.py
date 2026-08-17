@@ -26,6 +26,7 @@ from pydantic_ai.models.function import AgentInfo, FunctionModel
 from pydantic_ai.models.test import TestModel
 from pydantic_ai.tools import ToolDefinition
 from pydantic_ai.usage import RunUsage
+from pydantic_core import to_json
 
 from pydantic_ai_harness.tool_output_limits import (
     Band,
@@ -504,6 +505,15 @@ class TestSpill:
             serializer=broken,
         )
         with pytest.warns(UserWarning, match='serializer raised'):
+            out = await _run(cap, {'rows': list(range(100))})
+        assert isinstance(out, str) and out.startswith('{"rows":[0,1,')
+
+    async def test_serializer_non_text_return_warns_and_falls_back_to_compact(self):
+        cap: ToolOutputLimits[object] = ToolOutputLimits(
+            bands=[Band(over=10, action=Truncate(max_chars=20, strategy=TruncationStrategy.head))],
+            serializer=lambda value: to_json(value, indent=2),  # type: ignore[arg-type,return-value]
+        )
+        with pytest.warns(UserWarning, match='non-text'):
             out = await _run(cap, {'rows': list(range(100))})
         assert isinstance(out, str) and out.startswith('{"rows":[0,1,')
 

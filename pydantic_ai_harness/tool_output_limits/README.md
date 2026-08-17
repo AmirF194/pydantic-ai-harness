@@ -123,7 +123,7 @@ ToolOutputLimits(serializer=json_lines)  # top-level list: one record per line
 
 `indented_json` renders indent-2 JSON, so fields land on separate lines and
 `read_tool_result` can slice and `pattern`-filter them. `json_lines` renders a sequence
-(other than a string or a byte payload) as one compact JSON object per line (JSON Lines), so
+(other than a string or a byte payload) as one compact JSON value per line (JSON Lines), so
 line offsets map directly to items; other values fall back to `indented_json`. Both presets
 escape the Unicode line separators that `str.splitlines` breaks on, so a line read back is
 always a whole item or field.
@@ -132,7 +132,8 @@ Any `(value) -> str` callable can be supplied; `Serializer` is the exported alia
 capability serializes each structured return once: measurement, band selection, previews,
 stored bytes, and read-back all use the same text, which means an indented layout measures
 larger than compact JSON and can reach a band the compact form would not. If the callable
-raises, the capability warns and falls back to compact JSON for that return. Strings and
+raises or returns non-text, the capability warns and falls back to compact JSON for that
+return. Strings and
 binary payloads never pass through the serializer, and a structured return below the
 smallest band threshold passes through as the original object.
 

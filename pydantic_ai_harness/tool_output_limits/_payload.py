@@ -92,7 +92,7 @@ def indented_json(value: object) -> str:
 
 
 def json_lines(value: object) -> str:
-    """Serializer preset: render a sequence as JSON Lines, one compact object per line.
+    """Serializer preset: render a sequence as JSON Lines, one compact JSON value per line.
 
     Line N is item N, so `read_tool_result` offsets and limits map directly to items and a
     `pattern` match returns whole items; an empty sequence renders as an empty string.
