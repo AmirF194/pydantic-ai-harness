@@ -1,10 +1,17 @@
+---
+title: Background Tools
+description: Run selected tools as fire-and-forget asyncio tasks -- the agent gets an immediate acknowledgment, keeps working, and receives the result as a follow-up message when the task completes.
+---
+
 # Background Tools
 
-Run selected tools as fire-and-forget asyncio tasks, so the agent can keep working while they finish.
+`BackgroundTools` runs selected tools as fire-and-forget asyncio tasks, so the agent can keep
+working while they finish. The model gets an immediate acknowledgment string in place of the
+tool result, and the real result (or error) arrives later as a follow-up message it can act on.
 
 [Source](https://github.com/pydantic/pydantic-ai-harness/tree/main/pydantic_ai_harness/background_tools/)
 
-> While Pydantic AI Harness is on 0.x releases, the API may change between minor releases; when it does, deprecation warnings and release-note migration guidance tell you (or your agent) exactly how to upgrade. See the [version policy](https://github.com/pydantic/pydantic-ai-harness#version-policy).
+> While Pydantic AI Harness is on 0.x releases, the API may change between minor releases; when it does, deprecation warnings and release-note migration guidance tell you (or your agent) exactly how to upgrade. See the [version policy](index.md#version-policy).
 
 ## The problem
 

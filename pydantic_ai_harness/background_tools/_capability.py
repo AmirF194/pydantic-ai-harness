@@ -59,9 +59,8 @@ class BackgroundTools(AbstractCapability[AgentDepsT]):
     ```
 
     Combine with [`SetToolMetadata`][pydantic_ai.capabilities.SetToolMetadata] to mark
-    every tool from a specific MCP server, or with `FunctionToolset.with_metadata(...)`
-    to mark a whole toolset. Or pass a name list / predicate via `tools=...` to ignore
-    metadata entirely.
+    several tools at once, or with `FunctionToolset.with_metadata(...)` to mark a whole
+    toolset. Or pass a name list / predicate via `tools=...` to ignore metadata entirely.
     """
 
     tools: ToolSelector[AgentDepsT] = field(default_factory=lambda: {'background': True})

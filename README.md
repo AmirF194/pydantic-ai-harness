@@ -185,6 +185,7 @@ How the agent thinks and divides the work.
 | [Subagents](pydantic_ai_harness/subagents/) | Harness | Delegate self-contained tasks to named child agents |
 | [Dynamic Workflow](pydantic_ai_harness/dynamic_workflow/) | Harness | The model orchestrates sub-agents from one Python script: fan-out, chain, vote in a single tool call, with hard `max_agent_calls` budgets |
 | [Advisor](pydantic_ai_harness/advisor/) | Harness | Let an executor consult a stronger model mid-run |
+| [Background Tools](pydantic_ai_harness/background_tools/) | Harness | Run selected tools as fire-and-forget tasks; results arrive as follow-up messages when they complete |
 
 ### Context management
 
@@ -240,7 +241,6 @@ Outside the loop: how runs persist, survive failures, and get observed and confi
 | [Instrumentation](https://ai.pydantic.dev/capabilities/instrumentation/) | Core | OpenTelemetry GenAI spans for every model and tool call; the raw material for [Logfire](https://pydantic.dev/logfire) traces |
 | [Managed Prompt](pydantic_ai_harness/logfire/) | Harness | Back instructions with a [Logfire](https://pydantic.dev/logfire)-managed prompt; version and roll out without redeploying |
 | [Thread Executor](https://ai.pydantic.dev/capabilities/thread-executor/) | Core | Run sync tools on a shared thread pool |
-| [Background Tools](pydantic_ai_harness/background_tools/) | Harness | Run selected tools as fire-and-forget tasks; results arrive as follow-up messages when they complete |
 
 Core also ships loop-customization capabilities for production servers: [Select Model](https://ai.pydantic.dev/capabilities/select-model/), [Resolve Model ID](https://ai.pydantic.dev/capabilities/resolve-model-id/), [Prepare Tools / Prepare Output Tools](https://ai.pydantic.dev/capabilities/prepare-tools/), [Prefix Tools](https://ai.pydantic.dev/capabilities/prefix-tools/), [Set Tool Metadata](https://ai.pydantic.dev/capabilities/set-tool-metadata/), [Include Tool Return Schemas](https://ai.pydantic.dev/capabilities/include-tool-return-schemas/), [Process History](https://ai.pydantic.dev/capabilities/process-history/), [Process Event Stream](https://ai.pydantic.dev/capabilities/process-event-stream/), [Reinject System Prompt](https://ai.pydantic.dev/capabilities/reinject-system-prompt/), and [Raise Content Filter Error](https://ai.pydantic.dev/capabilities/raise-content-filter-error/).
 
