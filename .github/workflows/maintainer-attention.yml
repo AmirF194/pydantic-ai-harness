@@ -1,0 +1,33 @@
+name: Maintainer attention
+
+on:
+  schedule:
+    - cron: '10 */6 * * *'
+  workflow_dispatch: {}
+
+permissions: {}
+
+jobs:
+  triage:
+    permissions:
+      actions: read
+      checks: read
+      contents: read
+      issues: write
+      pull-requests: write
+    uses: pydantic/pydantic-ai/.github/workflows/pydantic-ai-attention-triage.lock.yml@592d476c350b342d46403c08f4c3769b48aa2fbf
+    secrets:
+      MINIMAX_API_KEY: ${{ secrets.MINIMAX_API_KEY }}
+
+  operations:
+    needs: triage
+    # Existing attention requests still need reminders when a classifier run
+    # fails, so only cancellation prevents reconciliation.
+    if: ${{ !cancelled() }}
+    permissions:
+      contents: read
+      issues: write
+      pull-requests: write
+    uses: pydantic/pydantic-ai/.github/workflows/issue-pr-attention-monitor.yml@592d476c350b342d46403c08f4c3769b48aa2fbf
+    secrets:
+      PYDANTIC_AI_TRIAGE_SLACK_WEBHOOK_URL: ${{ secrets.PYDANTIC_AI_TRIAGE_SLACK_WEBHOOK_URL }}
