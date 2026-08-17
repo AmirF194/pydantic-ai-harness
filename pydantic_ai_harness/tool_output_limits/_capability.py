@@ -149,8 +149,7 @@ class ToolOutputLimits(AbstractCapability[AgentDepsT]):
     """Render a structured (non-string, non-binary) return to the text that is measured,
     previewed, spilled, and read back. Defaults to compact JSON, which puts the whole value
     on one line; the `indented_json` and `json_lines` presets make large spills pageable by
-    line through `read_tool_result`. The callable must be deterministic, so an identical
-    return reduces to identical bytes and keeps the prompt prefix stable."""
+    line through `read_tool_result`."""
 
     _store: OverflowStore = field(init=False, repr=False)
     _bands: list[Band] = field(init=False, repr=False)
@@ -288,7 +287,16 @@ class ToolOutputLimits(AbstractCapability[AgentDepsT]):
         if is_binary(value):
             return _Unit(binary=True, text=None, data=to_bytes(value), value=value, suffix=suffix)
         if self.serializer is not None and not isinstance(value, str):
-            text = self.serializer(value)
+            try:
+                text = self.serializer(value)
+            except Exception:
+                # An after-hook exception would abort the run and lose the tool's output,
+                # so a broken serializer degrades to the default rendering instead.
+                warnings.warn(
+                    'ToolOutputLimits: serializer raised; falling back to compact JSON.',
+                    stacklevel=2,
+                )
+                text = to_text(value)
         else:
             text = to_text(value)
         if self.strip_ansi:

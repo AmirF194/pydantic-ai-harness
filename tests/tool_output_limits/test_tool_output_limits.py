@@ -149,11 +149,20 @@ class TestPayloadHelpers:
     def test_json_lines_list(self):
         assert json_lines([{'a': 1}, {'b': 2}]) == '{"a":1}\n{"b":2}'
 
-    def test_json_lines_non_list_falls_back_to_indented(self):
+    def test_json_lines_non_sequence_falls_back_to_indented(self):
         assert json_lines({'a': 1}) == '{\n  "a": 1\n}'
+
+    def test_json_lines_tuple_is_a_sequence(self):
+        assert json_lines(({'a': 1}, {'b': 2})) == '{"a":1}\n{"b":2}'
 
     def test_json_lines_empty_list(self):
         assert json_lines([]) == ''
+
+    def test_presets_escape_line_separator_chars(self):
+        rendered = json_lines([{'text': 'a\N{LINE SEPARATOR}b'}, {'ok': True}])
+        assert rendered.splitlines() == ['{"text":"a\\u2028b"}', '{"ok":true}']
+        indented = indented_json({'text': 'a\N{PARAGRAPH SEPARATOR}b\x85c'})
+        assert indented.splitlines() == ['{', '  "text": "a\\u2029b\\u0085c"', '}']
 
     def test_measure_chars_and_tokens(self):
         assert measure('x' * 100, over_tokens=False, tokenizer=None) == 100
@@ -459,10 +468,44 @@ class TestSpill:
         assert isinstance(out, ToolReturn)
         handle = out.metadata['overflow_handle']
         assert await store.read(handle) == json_lines(records).encode('utf-8')
-        page_1 = await _read_slice(store, handle, 0, 1, False, None)
-        page_2 = await _read_slice(store, handle, 1, 1, False, None)
-        assert '"record_id":0' in page_1
-        assert '"record_id":1' in page_2
+        toolset = cap.get_toolset()
+        assert toolset is not None
+        read = toolset.tools[READ_TOOL_NAME].function  # type: ignore[union-attr]
+        page_1 = await read(_make_ctx(), handle, offset=0, limit=1)  # type: ignore[attr-defined]
+        page_2 = await read(_make_ctx(), handle, offset=1, limit=1)  # type: ignore[attr-defined]
+        assert '"record_id":0' in page_1 and '"record_id":1' not in page_1
+        assert '"record_id":1' in page_2 and '"record_id":0' not in page_2
+
+    async def test_spill_serializer_inside_tool_return_envelope(self, tmp_path: Path):
+        store = LocalFileStore(base_dir=tmp_path)
+        cap: ToolOutputLimits[object] = ToolOutputLimits(
+            bands=[Band(over=5, action=Spill())], serializer=json_lines, store=store
+        )
+        out = await _run(cap, ToolReturn(return_value=[{'record_id': 1}, {'record_id': 2}], metadata={'orig': True}))
+        assert isinstance(out, ToolReturn)
+        assert out.metadata['orig'] is True
+        assert await store.read(out.metadata['overflow_handle']) == b'{"record_id":1}\n{"record_id":2}'
+
+    async def test_serializer_layout_reaches_band_compact_would_not(self):
+        value = {'a': 1, 'b': 2, 'c': 3}
+        bands = [Band(over=25, action=Truncate(max_chars=10, strategy=TruncationStrategy.head))]
+        plain: ToolOutputLimits[object] = ToolOutputLimits(bands=bands)
+        assert await _run(plain, value) is value
+        cap: ToolOutputLimits[object] = ToolOutputLimits(bands=bands, serializer=indented_json)
+        out = await _run(cap, value)
+        assert isinstance(out, str) and out.startswith('{\n  "a": 1')
+
+    async def test_serializer_error_warns_and_falls_back_to_compact(self):
+        def broken(value: object) -> str:
+            raise RuntimeError('boom')
+
+        cap: ToolOutputLimits[object] = ToolOutputLimits(
+            bands=[Band(over=10, action=Truncate(max_chars=20, strategy=TruncationStrategy.head))],
+            serializer=broken,
+        )
+        with pytest.warns(UserWarning, match='serializer raised'):
+            out = await _run(cap, {'rows': list(range(100))})
+        assert isinstance(out, str) and out.startswith('{"rows":[0,1,')
 
     async def test_spill_serializer_skips_strings(self, tmp_path: Path):
         store = LocalFileStore(base_dir=tmp_path)
