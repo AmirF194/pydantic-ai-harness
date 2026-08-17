@@ -14,9 +14,20 @@ For any code change:
 ## Task Routing
 
 - New or changed capability API: `capability-authoring.md`
+- Working on (or refreshing) a capability that wraps an external service, image,
+  or CLI: `capability-authoring.md` "External-Service Assumptions And Refresh"
 - New or changed tests: `testing-capabilities.md`
 - Unsure whether behavior belongs in harness or Pydantic AI core: `core-boundary.md`
+- Adding a retry, fallback or error-handling field to a capability that takes a
+  pluggable dependency: `capability-authoring.md` "Policy Lives In The Pluggable
+  Component"
+- README, `docs/` pages, or capability READMEs: `docs-conventions.md`
 - Review, pre-PR check, or final self-check: `review-checklist.md`
+- Commands/parsers, processes/containers, network endpoints, resource cleanup,
+  output limits, or CI trust boundaries: `review-checklist.md` "Executable
+  Boundaries" before implementation and review
+- Adding a link to an open issue in a docs page, a README, or source:
+  `review-checklist.md` "Issue References"
 
 ## Exemplar
 
@@ -36,7 +47,7 @@ Pydantic AI toolsets.
 
 ## Pydantic AI References
 
-- Capabilities: <https://pydantic.dev/docs/ai/core-concepts/capabilities/>
+- Capabilities: <https://pydantic.dev/docs/ai/capabilities/overview/>
 - Hooks: <https://pydantic.dev/docs/ai/core-concepts/hooks/>
 - Toolsets: <https://pydantic.dev/docs/ai/tools-toolsets/toolsets/>
 - Advanced tools: <https://pydantic.dev/docs/ai/tools-toolsets/tools-advanced/>

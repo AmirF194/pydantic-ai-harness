@@ -2,6 +2,10 @@
 
 Run selected tools as fire-and-forget asyncio tasks, so the agent can keep working while they finish.
 
+[Source](https://github.com/pydantic/pydantic-ai-harness/tree/main/pydantic_ai_harness/background_tools/)
+
+> While Pydantic AI Harness is on 0.x releases, the API may change between minor releases; when it does, deprecation warnings and release-note migration guidance tell you (or your agent) exactly how to upgrade. See the [version policy](https://github.com/pydantic/pydantic-ai-harness#version-policy).
+
 ## The problem
 
 Some tools take seconds to minutes -- deep research, big aggregations, sub-agent delegation. With normal tool calls the agent is blocked: it makes the call, waits, then plans its next step. Over a long task the conversation effectively serializes.
@@ -54,7 +58,7 @@ from pydantic_ai_harness import BackgroundTools
 
 agent = Agent('openai:gpt-5', capabilities=[
     MCP('https://research.example/mcp/'),
-    SetToolMetadata(predicate=lambda td: td.name.startswith('mcp_'), background=True),
+    SetToolMetadata(tools=lambda ctx, td: td.name.startswith('mcp_'), background=True),
     BackgroundTools(),
 ])
 ```
@@ -78,12 +82,11 @@ The model sees the task ID alongside the result so it can correlate against the 
 
 ## Limitations
 
-- **Streaming**: follow-up delivery requires `agent.run()` or explicit `agent_run.next()` driving. A bare `async for node in agent_run:` loop does not run `after_node_run`, so background results won't be delivered.
 - **Temporal / DBOS**: tools run inside durable activities and don't share state with the surrounding workflow. Tool-side `ctx.enqueue` calls do not currently propagate back, so background results from durable tools are lost. If you need this, file an issue.
 
 ## API
 
-```python
+```python {test="skip"}
 BackgroundTools(
     tools: ToolSelector = {'background': True},
 )
