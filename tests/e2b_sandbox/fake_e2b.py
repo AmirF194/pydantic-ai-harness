@@ -1,59 +1,51 @@
-"""In-memory E2B async SDK fake used by sandbox capability tests."""
+"""A controllable fake `e2b` SDK for E2BSandbox tests.
+
+Tests never reach real E2B: a fake `e2b` module is injected into `sys.modules` (via the
+`fake_e2b` fixture in `conftest.py`), so the lazy `import e2b` inside the backend returns it.
+The fake records calls and lets each test decide what a command returns.
+
+Fidelity to the real SDK is the point. The exception classes, `FileType`, `CommandResult`,
+`CommandExitException`, and `WriteInfo` are the real ones, imported from the installed
+package, so the backend's `isinstance` checks and its unwrapping of a non-zero exit are
+exercised against the types production raises. Signatures are closed, every await suspends,
+a command handle accumulates output before `wait()` returns (as the SDK's event pump does),
+a non-zero exit raises rather than returns, and a missing path raises E2B's own filesystem
+exception. Flattering the code under test here would hide production failures.
+"""
 
 from __future__ import annotations
 
-import os
 import posixpath
-import re
-import shlex
-import shutil
-import signal
-import subprocess
-import tempfile
 import types
 from collections.abc import Callable
-from dataclasses import dataclass
-from pathlib import Path
-from typing import Literal, overload
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING, Literal, Protocol
 
 import anyio
-from typing_extensions import Self
+import anyio.lowlevel
+from e2b import CommandExitException, CommandResult, FileType, WriteInfo
+from e2b.exceptions import (
+    AuthenticationException,
+    FileNotFoundException,
+    SandboxException,
+    SandboxNotFoundException,
+    TimeoutException,
+)
+
+__all__ = (
+    'FakeCommandCall',
+    'FakeCreateCall',
+    'FakeE2B',
+    'FakeEntryInfo',
+    'FakeSandbox',
+)
+
+# A responder maps (command line, deadline) to (stdout, stderr, exit_code).
+Responder = Callable[[str, 'float | None'], 'tuple[str, str, int]']
 
 
-class AuthenticationException(Exception):
-    """Fake E2B authentication failure."""
-
-
-class SandboxException(Exception):
-    """Fake generic E2B failure."""
-
-
-class SandboxNotFoundException(SandboxException):
-    """Fake missing E2B sandbox failure."""
-
-
-class FileNotFoundException(SandboxException):
-    """Fake missing E2B file failure."""
-
-
-class TimeoutException(SandboxException):
-    """Fake command timeout."""
-
-
-class CommandExitException(SandboxException):
-    """Fake non-zero command result.
-
-    Field order matches the real SDK's `CommandResult` dataclass (`stderr, stdout,
-    exit_code, error`, with `error` required), so positional construction cannot
-    silently swap streams relative to a real `e2b` install.
-    """
-
-    def __init__(self, stderr: str, stdout: str, exit_code: int, error: str | None) -> None:
-        self.stderr = stderr
-        self.stdout = stdout
-        self.exit_code = exit_code
-        self.error = error
-        super().__init__()
+def _echo_responder(command: str, timeout: float | None) -> tuple[str, str, int]:
+    return f'{command}\n', '', 0
 
 
 @dataclass(frozen=True)
@@ -71,329 +63,268 @@ class FakeCommandCall:
     command: str
     background: bool
     cwd: str | None
+    envs: dict[str, str] | None
     timeout: float | None
 
 
 @dataclass(frozen=True)
-class FakeCommandResult:
-    stdout: str
-    stderr: str
-    exit_code: int
-    error: str | None = None
-
-
-@dataclass(frozen=True)
-class FakeFileType:
-    value: str
-
-
-@dataclass(frozen=True)
 class FakeEntryInfo:
+    """The `e2b.EntryInfo` members the backend reads.
+
+    A subset rather than the real dataclass, which also carries mode, permissions, owner,
+    group, and timestamps that no code here looks at. The `if TYPE_CHECKING` block below pins
+    this subset against the real type so a drift in E2B's entry shape fails the type check.
+    """
+
     name: str
     path: str
-    type: FakeFileType | None
+    type: FileType | None
     size: int
 
 
-class FakeFileStream:
-    """Async byte stream whose chunking is configurable."""
-
-    def __init__(self, data: bytes, chunk_size: int) -> None:
-        self._data = data
-        self._chunk_size = chunk_size
-        self._index = 0
-
-    def __aiter__(self) -> Self:
-        return self
-
-    async def __anext__(self) -> bytes:
-        if self._index >= len(self._data):
-            raise StopAsyncIteration
-        chunk = self._data[self._index : self._index + self._chunk_size]
-        self._index += self._chunk_size
-        return chunk
-
-    async def __aenter__(self) -> Self:
-        return self
-
-    async def __aexit__(self, *args: object) -> None:
-        return None
-
-
 class FakeCommandHandle:
-    """Background command handle matching the portion Harness consumes."""
+    """Mirrors `e2b.AsyncCommandHandle` for the members the backend uses.
 
-    def __init__(
-        self,
-        control: FakeE2B,
-        *,
-        result: FakeCommandResult,
-        wait_error: Exception | None,
-    ) -> None:
+    Output is accumulated at construction rather than at `wait()`, the way the SDK's event
+    pump fills its chunk lists as data arrives: that is what makes `stdout` readable after a
+    deadline kill cancels the wait.
+    """
+
+    def __init__(self, control: FakeE2B, *, pid: int, stdout: str, stderr: str, exit_code: int) -> None:
         self._control = control
-        self._result = result
-        self._wait_error = wait_error
-        self.pid = 4242
-        self.killed = False
+        self._pid = pid
+        self._stdout = stdout
+        self._stderr = stderr
+        self._exit_code = exit_code
 
-    async def wait(self) -> FakeCommandResult:
-        if self._control.wait_hangs:
+    @property
+    def pid(self) -> int:
+        return self._pid
+
+    @property
+    def stdout(self) -> str:
+        return self._stdout
+
+    @property
+    def stderr(self) -> str:
+        return self._stderr
+
+    async def wait(self) -> CommandResult:
+        # A real wait suspends; yield so a test can cancel it and so concurrent tool calls
+        # actually interleave.
+        await anyio.lowlevel.checkpoint()
+        if self._control.wait_error is not None:
+            raise self._control.wait_error
+        if self._control.command_hangs:
             await anyio.sleep_forever()
-        if self._wait_error is not None:
-            raise self._wait_error
-        if self._result.exit_code:
+        if self._exit_code != 0:
+            # The real SDK raises on a non-zero exit instead of returning a result.
             raise CommandExitException(
-                self._control.sdk_stderr,
-                self._control.sdk_stdout,
-                self._result.exit_code,
-                f'exit status {self._result.exit_code}',
+                stderr=self._stderr,
+                stdout=self._stdout,
+                exit_code=self._exit_code,
+                error=f'exit status {self._exit_code}',
             )
-        return self._result
-
-    async def kill(self) -> bool:
-        self.killed = True
-        if self._control.handle_kill_error is not None:
-            raise self._control.handle_kill_error
-        return True
-
-
-class LocalCommandHandle(FakeCommandHandle):
-    """Handle for the focused real-shell capture-wrapper reproduction."""
-
-    def __init__(
-        self,
-        control: FakeE2B,
-        *,
-        process: subprocess.Popen[bytes],
-        local_dir: Path,
-        remote_dir: str,
-        filesystem: FakeFilesystem,
-    ) -> None:
-        super().__init__(
-            control,
-            result=FakeCommandResult('', '', 0),
-            wait_error=TimeoutException('deadline'),
-        )
-        self.pid = process.pid
-        self._process = process
-        self._local_dir = local_dir
-        self._remote_dir = remote_dir
-        self._filesystem = filesystem
-
-    async def wait(self) -> FakeCommandResult:
-        # Fire the deadline only after the wrapper has flushed the output the test
-        # expects; a real deadline fires on the clock, which a unit test cannot race.
-        with anyio.fail_after(5):
-            for name, expected in self._control.local_partial_expectations.items():
-                target = self._local_dir / name
-                while not target.exists() or target.read_bytes() != expected:
-                    await anyio.sleep(0.01)
-        return await super().wait()
-
-    async def kill(self) -> bool:
-        try:
-            if self._process.poll() is None:  # pragma: no branch - the test command remains asleep until killed
-                os.killpg(self._process.pid, signal.SIGKILL)
-                self._process.wait()
-            for name in ('stdout.partial', 'stderr.partial'):
-                source = self._local_dir / name
-                if source.exists():  # pragma: no branch - the wrapper creates both prefix files before waiting
-                    self._filesystem.files[posixpath.join(self._remote_dir, name)] = source.read_bytes()
-        finally:
-            shutil.rmtree(self._local_dir, ignore_errors=True)
-        return await super().kill()
-
-
-class FakeFilesystem:
-    """Dictionary-backed E2B filesystem."""
-
-    def __init__(self, control: FakeE2B) -> None:
-        self._control = control
-        self.files: dict[str, bytes] = {}
-        self.stat_sizes: dict[str, int] = {}
-        self.listings: dict[str, list[FakeEntryInfo]] = {}
-        self.removed: list[str] = []
-        self.read_formats: list[str] = []
-        self.read_stream_idle_timeouts: list[float | None] = []
-
-    async def get_info(self, path: str) -> FakeEntryInfo:
-        if self._control.info_error is not None:
-            raise self._control.info_error
-        if path not in self.files and path not in self.stat_sizes:
-            raise FileNotFoundException(path)
-        size = self.stat_sizes.get(path, len(self.files.get(path, b'')))
-        return FakeEntryInfo(posixpath.basename(path), path, FakeFileType('file'), size)
-
-    async def read(
-        self,
-        path: str,
-        format: Literal['stream'],
-        *,
-        stream_idle_timeout: float | None = None,
-    ) -> FakeFileStream:
-        self.read_formats.append(format)
-        self.read_stream_idle_timeouts.append(stream_idle_timeout)
-        if self._control.read_error is not None:
-            raise self._control.read_error
-        try:
-            data = self.files[path]
-        except KeyError as e:
-            raise FileNotFoundException(path) from e
-        return FakeFileStream(data, self._control.file_chunk_size)
-
-    async def write(self, path: str, data: str | bytes) -> object:
-        if self._control.write_error is not None:
-            raise self._control.write_error
-        self.files[path] = data.encode() if isinstance(data, str) else data
-        return object()
-
-    async def list(self, path: str, depth: int | None = 1) -> list[FakeEntryInfo]:
-        del depth
-        if self._control.list_error is not None:
-            raise self._control.list_error
-        return list(self.listings.get(path, []))
-
-    async def remove(self, path: str) -> None:
-        self.removed.append(path)
-        if self._control.remove_error is not None:
-            raise self._control.remove_error
-        for target in [target for target in self.files if target == path or target.startswith(f'{path}/')]:
-            del self.files[target]
+        return CommandResult(stderr=self._stderr, stdout=self._stdout, exit_code=self._exit_code, error=None)
 
 
 class FakeCommands:
-    """Command manager that simulates Harness's capture wrapper."""
+    """Mirrors `sandbox.commands`: command execution and per-command kill."""
 
     def __init__(self, sandbox: FakeSandbox, control: FakeE2B) -> None:
         self._sandbox = sandbox
         self._control = control
         self.calls: list[FakeCommandCall] = []
         self.handles: list[FakeCommandHandle] = []
-
-    @overload
-    async def run(
-        self,
-        command: str,
-        *,
-        background: Literal[True],
-        cwd: str | None = None,
-        timeout: float | None = 60,
-    ) -> FakeCommandHandle: ...  # pragma: no cover
-
-    @overload
-    async def run(
-        self,
-        command: str,
-        *,
-        background: Literal[False] | None = None,
-        cwd: str | None = None,
-        timeout: float | None = 60,
-    ) -> FakeCommandResult: ...  # pragma: no cover
+        self.killed_pids: list[int] = []
 
     async def run(
         self,
-        command: str,
-        *,
+        cmd: str,
         background: bool | None = None,
+        envs: dict[str, str] | None = None,
+        user: str | None = None,
         cwd: str | None = None,
         timeout: float | None = 60,
-    ) -> FakeCommandHandle | FakeCommandResult:
-        is_background = background is True
-        self.calls.append(FakeCommandCall(command, is_background, cwd, timeout))
+    ) -> FakeCommandHandle | CommandResult:
+        # Closed signature on purpose: the real `run` rejects unknown kwargs, so the fake must
+        # too, or a bad kwarg in the backend would only fail in production.
+        del user
+        await anyio.lowlevel.checkpoint()
+        self.calls.append(FakeCommandCall(cmd, background is True, cwd, envs, timeout))
         if self._control.run_error is not None:
             raise self._control.run_error
-        if not is_background:
-            if self._control.kill_process_error is not None:
-                raise self._control.kill_process_error
-            return FakeCommandResult('', '', 0)
-
-        command_parts = shlex.split(command)
-        wrapper_path = command_parts[command_parts.index('/bin/bash') + 1]
-        temp_dir = posixpath.dirname(wrapper_path)
-        command_text = self._sandbox.files.files[f'{temp_dir}/command.sh'].decode()
-        wrapper = self._sandbox.files.files[wrapper_path].decode()
-        if self._control.execute_capture_wrapper:
-            local_dir = Path(tempfile.mkdtemp(prefix='pydantic-ai-harness-test-'))
-            local_wrapper = wrapper.replace(temp_dir, str(local_dir))
-            (local_dir / 'command.sh').write_text(command_text)
-            (local_dir / 'capture.sh').write_text(local_wrapper)
-            process = subprocess.Popen(
-                ['/bin/bash', str(local_dir / 'capture.sh')],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                start_new_session=True,
-            )
-            handle = LocalCommandHandle(
-                self._control,
-                process=process,
-                local_dir=local_dir,
-                remote_dir=temp_dir,
-                filesystem=self._sandbox.files,
-            )
-            self.handles.append(handle)
-            return handle
-        tail_match = re.search(r'tail -c (\d+)', wrapper)
-        prefix_match = re.search(r'dd bs=1 count=(\d+)', wrapper)
-        if tail_match is None or prefix_match is None:  # pragma: no cover - asserts Harness's private wrapper contract
-            raise AssertionError('Harness capture wrapper did not contain the byte limits')
-        byte_limit = int(tail_match.group(1))
-        if int(prefix_match.group(1)) != byte_limit + 1:  # pragma: no cover - asserts private wrapper contract
-            raise AssertionError('Harness prefix capture must hold one byte past the tail limit')
-        stdout, stderr, exit_code = self._control.responder(command_text, int(timeout or 0))
-        if not self._control.omit_capture:
-            if isinstance(self._control.wait_error, TimeoutException):
-                # A killed pipeline flushes only the incrementally written prefix;
-                # the tail/count files die empty with the process group.
-                self._write_partial(temp_dir, 'stdout', stdout, byte_limit)
-                self._write_partial(temp_dir, 'stderr', stderr, byte_limit)
-            else:
-                self._write_capture(temp_dir, 'stdout', stdout, byte_limit)
-                self._write_capture(temp_dir, 'stderr', stderr, byte_limit)
-        for name, data in self._control.capture_overrides.items():
-            self._sandbox.files.files[posixpath.join(temp_dir, name)] = data
-        result = FakeCommandResult(
-            self._control.sdk_stdout,
-            self._control.sdk_stderr,
-            exit_code,
-            None if exit_code == 0 else f'exit status {exit_code}',
+        stdout, stderr, exit_code = self._control.responder(cmd, timeout)
+        handle = FakeCommandHandle(
+            self._control,
+            pid=self._control.next_pid + len(self.handles),
+            stdout=stdout,
+            stderr=stderr,
+            exit_code=exit_code,
         )
-        handle = FakeCommandHandle(self._control, result=result, wait_error=self._control.wait_error)
         self.handles.append(handle)
-        return handle
+        if background is True:
+            return handle
+        return await handle.wait()  # pragma: no cover - the backend always starts in background
 
-    def _write_capture(self, temp_dir: str, stream: str, text: str, byte_limit: int) -> None:
-        data = text.encode()
-        self._sandbox.files.files[f'{temp_dir}/{stream}'] = data[-byte_limit:]
-        count = b'invalid' if self._control.invalid_count else str(len(data)).encode()
-        if not self._control.omit_count:
-            self._sandbox.files.files[f'{temp_dir}/{stream}.count'] = count
+    async def kill(self, pid: int, request_timeout: float | None = None) -> bool:
+        del request_timeout
+        await anyio.lowlevel.checkpoint()
+        self.killed_pids.append(pid)
+        if self._control.kill_command_error is not None:
+            raise self._control.kill_command_error
+        return True
 
-    def _write_partial(self, temp_dir: str, stream: str, text: str, byte_limit: int) -> None:
-        data = text.encode()
-        self._sandbox.files.files[f'{temp_dir}/{stream}.partial'] = data[: byte_limit + 1]
+
+class FakeFilesystem:
+    """Mirrors `sandbox.files`: an in-memory tree the tests can drive and inspect."""
+
+    def __init__(self, control: FakeE2B) -> None:
+        self._control = control
+        self.files: dict[str, bytes] = {}
+        self.directories: set[str] = set()
+        self.removed: list[str] = []
+        self.listed: list[str] = []
+        # Lets a test report a large size for a path without allocating the bytes.
+        self.stat_sizes: dict[str, int] = {}
+
+    async def read(
+        self,
+        path: str,
+        format: Literal['bytes'],
+        user: str | None = None,
+        request_timeout: float | None = None,
+        gzip: bool = False,
+    ) -> bytearray:
+        del user, request_timeout, gzip
+        await self._check(path)
+        # The backend only asks for bytes; anything else would be a silent behavior change.
+        assert format == 'bytes', f'unexpected read format {format!r}'
+        if path not in self.files:
+            raise FileNotFoundException(path)
+        # Real E2B hands back a `bytearray` for the `bytes` format.
+        return bytearray(self.files[path])
+
+    async def write(
+        self,
+        path: str,
+        data: str | bytes,
+        user: str | None = None,
+        request_timeout: float | None = None,
+    ) -> WriteInfo:
+        del user, request_timeout
+        await self._check(path)
+        self.files[path] = data.encode() if isinstance(data, str) else data
+        self._add_parents(path)
+        return WriteInfo(name=posixpath.basename(path), type=FileType.FILE, path=path)
+
+    async def get_info(self, path: str, user: str | None = None, request_timeout: float | None = None) -> FakeEntryInfo:
+        del user, request_timeout
+        await self._check(path)
+        return self._entry(path)
+
+    async def list(
+        self,
+        path: str,
+        depth: int | None = 1,
+        user: str | None = None,
+        request_timeout: float | None = None,
+    ) -> list[FakeEntryInfo]:
+        del user, request_timeout
+        await self._check(path)
+        assert depth == 1, f'unexpected list depth {depth!r}'
+        self.listed.append(path)
+        if not await self._exists(path):
+            raise FileNotFoundException(path)
+        children = {
+            posixpath.join(path, name)
+            for entry in (*self.files, *self.directories)
+            if entry != path and entry.startswith(f'{path.rstrip("/")}/')
+            for name in (entry[len(path.rstrip('/')) + 1 :].split('/')[0],)
+        }
+        return [self._entry(child) for child in sorted(children)]
+
+    async def exists(self, path: str, user: str | None = None, request_timeout: float | None = None) -> bool:
+        del user, request_timeout
+        await self._check(path)
+        return await self._exists(path)
+
+    async def make_dir(self, path: str, user: str | None = None, request_timeout: float | None = None) -> bool:
+        del user, request_timeout
+        await self._check(path)
+        created = path not in self.directories
+        self.directories.add(path)
+        self._add_parents(path)
+        return created
+
+    async def remove(self, path: str, user: str | None = None, request_timeout: float | None = None) -> None:
+        del user, request_timeout
+        await self._check(path)
+        if not await self._exists(path):
+            raise FileNotFoundException(path)
+        self.removed.append(path)
+        prefix = f'{path.rstrip("/")}/'
+        for target in [target for target in self.files if target == path or target.startswith(prefix)]:
+            del self.files[target]
+        for directory in [d for d in self.directories if d == path or d.startswith(prefix)]:
+            self.directories.discard(directory)
+
+    async def _exists(self, path: str) -> bool:
+        return path in self.files or path in self.directories or path in self.stat_sizes
+
+    def _entry(self, path: str) -> FakeEntryInfo:
+        if path in self.directories:
+            return FakeEntryInfo(name=posixpath.basename(path), path=path, type=FileType.DIR, size=0)
+        if path not in self.files and path not in self.stat_sizes:
+            raise FileNotFoundException(path)
+        size = self.stat_sizes.get(path, len(self.files.get(path, b'')))
+        return FakeEntryInfo(name=posixpath.basename(path), path=path, type=FileType.FILE, size=size)
+
+    def _add_parents(self, path: str) -> None:
+        parent = posixpath.dirname(path)
+        while parent and parent != '/':
+            self.directories.add(parent)
+            parent = posixpath.dirname(parent)
+
+    async def _check(self, path: str) -> None:
+        # Real E2B's filesystem API only accepts absolute paths; assert it here so a
+        # regression that let a relative path through unresolved fails in the fake the way it
+        # would in prod, instead of silently keying the in-memory store on a relative path.
+        assert posixpath.isabs(path), f'E2B filesystem requires an absolute path, got {path!r}'
+        await anyio.lowlevel.checkpoint()
+        if self._control.fs_error is not None:
+            raise self._control.fs_error
 
 
 class FakeSandbox:
-    """Fake async sandbox instance."""
+    """Mirrors `e2b.AsyncSandbox` for the members the backend uses."""
 
     def __init__(self, control: FakeE2B, sandbox_id: str) -> None:
         self._control = control
         self.sandbox_id = sandbox_id
         self.files = FakeFilesystem(control)
         self.commands = FakeCommands(self, control)
-        self.kill_calls = 0
+        self.killed = False
 
     async def kill(self) -> bool:
-        self.kill_calls += 1
+        await anyio.lowlevel.checkpoint()
         if self._control.kill_hangs:
             await anyio.sleep_forever()
         if self._control.kill_error is not None:
             raise self._control.kill_error
+        self.killed = True
         return True
+
+    async def is_running(self, request_timeout: float | None = None) -> bool:
+        del request_timeout
+        await anyio.lowlevel.checkpoint()
+        if self._control.is_running_error is not None:
+            raise self._control.is_running_error
+        return self._control.sandbox_is_running and not self.killed
 
 
 class FakeAsyncSandboxFactory:
-    """Fake `AsyncSandbox` class methods."""
+    """Mirrors the `AsyncSandbox.create` / `AsyncSandbox.connect` class methods."""
 
     def __init__(self, control: FakeE2B) -> None:
         self._control = control
@@ -412,59 +343,126 @@ class FakeAsyncSandboxFactory:
         )
         if self._control.create_hangs:
             await anyio.sleep_forever()
+        await anyio.lowlevel.checkpoint()
         if self._control.create_error is not None:
             raise self._control.create_error
-        sandbox = FakeSandbox(self._control, f'sbx-{len(self._control.sandboxes) + 1}')
-        self._control.sandboxes.append(sandbox)
-        return sandbox
+        return self._control.new_sandbox(f'sbx-{len(self._control.sandboxes) + 1}')
 
     async def connect(self, sandbox_id: str, timeout: int | None = None) -> FakeSandbox:
         self._control.connect_calls.append((sandbox_id, timeout))
+        await anyio.lowlevel.checkpoint()
         if self._control.connect_error is not None:
             raise self._control.connect_error
-        sandbox = FakeSandbox(self._control, sandbox_id)
-        self._control.sandboxes.append(sandbox)
+        return self._control.new_sandbox(sandbox_id)
+
+
+@dataclass
+class FakeE2B:
+    """Control surface for the injected fake `e2b` module."""
+
+    responder: Responder = _echo_responder
+    sandboxes: list[FakeSandbox] = field(default_factory=list[FakeSandbox])
+    create_calls: list[FakeCreateCall] = field(default_factory=list[FakeCreateCall])
+    connect_calls: list[tuple[str, int | None]] = field(default_factory=list[tuple[str, 'int | None']])
+    create_error: Exception | None = None
+    create_hangs: bool = False
+    connect_error: Exception | None = None
+    kill_error: Exception | None = None
+    kill_hangs: bool = False
+    run_error: Exception | None = None
+    wait_error: Exception | None = None
+    command_hangs: bool = False
+    kill_command_error: Exception | None = None
+    fs_error: Exception | None = None
+    is_running_error: Exception | None = None
+    sandbox_is_running: bool = True
+    next_pid: int = 4242
+
+    def __post_init__(self) -> None:
+        self.module = self._build_module()
+
+    def new_sandbox(self, sandbox_id: str) -> FakeSandbox:
+        sandbox = FakeSandbox(self, sandbox_id)
+        self.sandboxes.append(sandbox)
         return sandbox
 
+    @property
+    def auth_type(self) -> type[Exception]:
+        return AuthenticationException
 
-class FakeE2B:
-    """Control surface plus a module-shaped E2B SDK fake."""
+    @property
+    def sandbox_gone_type(self) -> type[Exception]:
+        """E2B `SandboxNotFoundException`: the sandbox does not exist -- terminal."""
+        return SandboxNotFoundException
 
-    def __init__(self) -> None:
-        self.sandboxes: list[FakeSandbox] = []
-        self.create_calls: list[FakeCreateCall] = []
-        self.connect_calls: list[tuple[str, int | None]] = []
-        self.responder: Callable[[str, int], tuple[str, str, int]] = lambda command, timeout: ('', '', 0)
-        self.create_error: Exception | None = None
-        self.connect_error: Exception | None = None
-        self.kill_error: Exception | None = None
-        self.kill_hangs = False
-        self.create_hangs = False
-        self.run_error: Exception | None = None
-        self.kill_process_error: Exception | None = None
-        self.wait_error: Exception | None = None
-        self.handle_kill_error: Exception | None = None
-        self.write_error: Exception | None = None
-        self.read_error: Exception | None = None
-        self.info_error: Exception | None = None
-        self.list_error: Exception | None = None
-        self.remove_error: Exception | None = None
-        self.wait_hangs = False
-        self.omit_capture = False
-        self.omit_count = False
-        self.invalid_count = False
-        self.capture_overrides: dict[str, bytes] = {}
-        self.execute_capture_wrapper = False
-        self.local_partial_expectations: dict[str, bytes] = {}
-        self.sdk_stdout = ''
-        self.sdk_stderr = ''
-        self.file_chunk_size = 4
+    @property
+    def ambiguous_type(self) -> type[Exception]:
+        """E2B `TimeoutException`: an unanswered request, whether the sandbox is alive or gone."""
+        return TimeoutException
 
-        self.module = types.ModuleType('e2b')
-        setattr(self.module, 'AsyncSandbox', FakeAsyncSandboxFactory(self))
-        setattr(self.module, 'AuthenticationException', AuthenticationException)
-        setattr(self.module, 'CommandExitException', CommandExitException)
-        setattr(self.module, 'FileNotFoundException', FileNotFoundException)
-        setattr(self.module, 'SandboxException', SandboxException)
-        setattr(self.module, 'SandboxNotFoundException', SandboxNotFoundException)
-        setattr(self.module, 'TimeoutException', TimeoutException)
+    @property
+    def error_type(self) -> type[Exception]:
+        return SandboxException
+
+    def _build_module(self) -> types.ModuleType:
+        module = types.ModuleType('e2b')
+        module.AsyncSandbox = FakeAsyncSandboxFactory(self)  # type: ignore[attr-defined]
+        # The real classes, so the backend's `isinstance` checks and its unwrapping of a
+        # non-zero exit run against exactly what production raises.
+        module.AuthenticationException = AuthenticationException  # type: ignore[attr-defined]
+        module.CommandExitException = CommandExitException  # type: ignore[attr-defined]
+        module.CommandResult = CommandResult  # type: ignore[attr-defined]
+        module.FileNotFoundException = FileNotFoundException  # type: ignore[attr-defined]
+        module.FileType = FileType  # type: ignore[attr-defined]
+        module.SandboxException = SandboxException  # type: ignore[attr-defined]
+        module.SandboxNotFoundException = SandboxNotFoundException  # type: ignore[attr-defined]
+        module.TimeoutException = TimeoutException  # type: ignore[attr-defined]
+        return module
+
+
+if TYPE_CHECKING:
+    import e2b
+
+    class _EntryInfoSurface(Protocol):
+        """The `e2b.EntryInfo` members the backend reads.
+
+        Pinned against both the fake and the real SDK type below, so a fake that drifts from
+        E2B's own entry shape fails the type check instead of at the next live run.
+        """
+
+        @property
+        def name(self) -> str: ...
+
+        @property
+        def path(self) -> str: ...
+
+        @property
+        def type(self) -> FileType | None: ...
+
+        @property
+        def size(self) -> int: ...
+
+    class _CommandHandleSurface(Protocol):
+        """The `e2b.AsyncCommandHandle` members the backend reads.
+
+        `stdout` / `stderr` are the accumulated output the deadline path reports, so a fake
+        that stopped exposing them would hide the timeout behavior entirely.
+        """
+
+        @property
+        def pid(self) -> int: ...
+
+        @property
+        def stdout(self) -> str: ...
+
+        @property
+        def stderr(self) -> str: ...
+
+        async def wait(self) -> CommandResult: ...
+
+    _fake_entry_conforms: _EntryInfoSurface = FakeEntryInfo(name='n', path='/n', type=FileType.FILE, size=0)
+    _real_entry_conforms: _EntryInfoSurface = e2b.EntryInfo.__new__(e2b.EntryInfo)
+    _fake_handle_conforms: _CommandHandleSurface = FakeCommandHandle(
+        FakeE2B(), pid=1, stdout='', stderr='', exit_code=0
+    )
+    _real_handle_conforms: _CommandHandleSurface = e2b.AsyncCommandHandle.__new__(e2b.AsyncCommandHandle)

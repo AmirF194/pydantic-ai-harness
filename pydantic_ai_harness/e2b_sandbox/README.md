@@ -1,23 +1,26 @@
 # E2B Sandbox
 
-`E2BSandbox` gives a Pydantic AI agent an isolated cloud computer for running
-model-generated commands and working with files. Use it for coding, tests, data
-processing, and other workloads that should not execute on the application host.
+`E2BSandbox` gives an agent an isolated cloud computer for running commands and
+working with files. Use it for coding, tests, data processing, and other tasks
+that should not execute model-generated commands on the application host.
 
-Every agent run gets a fresh [E2B sandbox](https://e2b.dev/docs) by default. The
-capability also supports attaching to an existing sandbox or injecting a session
-that the application keeps open across several runs.
+The capability supplies the run's
+[sandbox](https://pydantic.dev/docs/ai/sandbox/) from an
+[E2B sandbox](https://e2b.dev/docs), and adds shell and file tools that work in
+it. By default, every agent run gets a fresh sandbox created from a template,
+killed when the run ends. You can also attach an existing sandbox and reuse it
+across runs.
 
 ## Quick start
 
-Install Harness with its E2B extra, then set an E2B API key:
+Install the `e2b` extra and set an API key:
 
 ```bash
 uv add "pydantic-ai-harness[e2b]"
 export E2B_API_KEY=...
 ```
 
-Add the capability to an agent:
+Add `E2BSandbox` to the agent:
 
 ```python
 from pydantic_ai import Agent
@@ -28,152 +31,191 @@ agent = Agent(
     capabilities=[E2BSandbox(template='base')],
 )
 
-result = agent.run_sync('Create a Python script that prints the first ten primes and run it.')
+result = agent.run_sync('Create a Python script and run its tests.')
 print(result.output)
 ```
 
-The capability contributes four tools:
+During the run, the agent can create files, inspect its working directory, run
+commands, and react to command failures. The sandbox is separate from the host
+filesystem and process space.
+
+## Tools
 
 | Tool | Purpose |
-| --- | --- |
-| `run_command` | Run a Bash command and return labelled, bounded stdout and stderr. |
-| `read_file` | Stream a UTF-8 text file with bounded memory and line paging. |
-| `write_file` | Write UTF-8 text to a file. |
-| `list_directory` | List directory entries, marking directories with `/`. |
+|---|---|
+| `run_command` | Run a shell command in the sandbox. Pipes, redirection, `&&`, and globs work. Returns labelled stdout/stderr plus an exit code on failure. |
+| `read_file` | Read a text file from the sandbox. |
+| `write_file` | Write text to a file (creating parent directories). |
+| `list_directory` | List a directory's entries (directories shown with a trailing `/`). |
 
-A non-zero command exit is reported to the model instead of raised. Recoverable
-service and filesystem errors become `ModelRetry`; an expired or missing
-sandbox raises `E2BSandboxUnavailableError`, and rejected credentials raise
-`E2BSandboxAuthError`.
+Output is labelled with `[stdout]` / `[stderr]` markers and an `[exit code: N]`
+line on non-zero exit. Each command stream (and each file read) is truncated
+separately by `max_output_bytes` (UTF-8 bytes) and `max_output_lines` (lines),
+whichever is hit first, so a large stderr cannot crowd out stdout and the labels
+always survive. Labels, truncation or continuation notes, and command status add
+a small amount beyond those payload limits. For commands the **tail** is kept, so
+errors survive truncation; file reads keep the head and return the next `offset`
+to page from. A non-zero exit from `run_command` is reported, not raised, so the
+model can react to it; file-tool failures (missing path, etc.) come back as a
+retry prompt.
 
-## Logfire
+`max_output_bytes` and `max_output_lines` bound what reaches the model, not what
+crosses the wire: the sandbox protocol delivers a command's whole output, and
+E2B's SDK accumulates it in the command handle, so a command that floods stdout
+is capped after the transfer, not during it. Bound it in-command
+(`| tail -c 10000`) when the transfer itself matters. E2B decodes command output
+as UTF-8 with replacement characters, so binary output is reported rather than
+crashing the run.
 
-E2B lifecycle and tool operations use the active Pydantic AI OpenTelemetry
-tracer. With Pydantic AI instrumentation enabled, Logfire shows:
+`run_command` runs through E2B's shell; `read_file`, `write_file`, and
+`list_directory` go through the sandbox filesystem API (no shell), so writes
+stream the content rather than passing it as a command argument, and parent
+directories are created on write. A relative path given to a file tool is
+resolved against the sandbox working directory (`workdir`, or the template's own,
+discovered once with `pwd` and cached) and normalized, keeping both views of the
+tree consistent. Resolution is a spelling convenience, not confinement: isolation
+is the sandbox's job.
 
-- `e2b.sandbox.create`, `e2b.sandbox.connect`, and `e2b.sandbox.kill`
-- `e2b.sandbox.run_command`, `read_file`, `write_file`, and `list_directory`
-- sandbox ID, template, lifecycle mode, outcome, exit code, timeout, truncation,
-  file size, and directory entry count
+Because the tools read the run's sandbox rather than owning a connection, they
+also work against any other backend the run attached (a `sandbox=` run argument,
+or another capability's sandbox). Behavior that only E2B reports -- the output
+that preceded a deadline kill, the terminal error taxonomy -- degrades to what
+that backend reports.
 
-Harness does not add commands, paths, file contents, stdout, or stderr to its
-`e2b.*` span attributes, and disables automatic exception events on those spans
-so provider error messages do not reintroduce that content. Pydantic AI's own
-tool spans can include tool arguments and results, so set `include_content=False`
-when those values must stay out of telemetry:
+## How commands run
+
+E2B executes every command through `/bin/bash -l -c`, which has two consequences
+worth knowing:
+
+- An argv sequence has no direct E2B equivalent, so `E2BSandboxBackend.run`
+  quotes it with `shlex.join` into a single shell word string. The shell still
+  parses the result, but the quoting keeps each element one literal word.
+- Bash login startup files run before every command. Keep them silent in custom
+  templates: their output is part of the command's output.
+
+## Failure handling
+
+Failures split into two kinds:
+
+- **Recoverable** -- a bad path, a command that exits non-zero, a transient
+  sandbox-side error. These come back to the model as a retry (`ModelRetry`) or,
+  for `run_command`, as reported output it can react to. Retrying can plausibly
+  work, so the run continues.
+- **Terminal** -- the sandbox itself is gone (killed, or expired at its
+  `sandbox_timeout`), raising `E2BSandboxUnavailableError`, or the credentials
+  were rejected, raising `E2BSandboxAuthError`. Re-running the command cannot fix
+  these, so the tool lets them propagate (both are `E2BSandboxTerminalError`
+  subclasses) and the run ends with an actionable message instead of looping the
+  model against a dead sandbox. If owned runs legitimately hit the lifetime,
+  raise `sandbox_timeout`.
+
+E2B reports an envd request the sandbox never answered as a timeout whether the
+sandbox is merely slow or already gone, so a failure of that shape is classified
+by asking E2B whether the sandbox is still running before deciding which of the
+two kinds it is.
+
+A command that hits its deadline raises `E2BSandboxCommandTimeoutError`, a
+builtin `TimeoutError` carrying the output produced before the kill.
+`run_command` turns it back into that output plus a `[timed out after Ns]` note.
+A missing path raises the builtin `FileNotFoundError`, which the file tools report
+as a retry.
+
+## Sandbox lifetime
+
+The capability implements Pydantic AI's sandbox lifecycle hooks: `create_sandbox`
+provisions the environment at the start of a run, `get_sandbox` connects to it,
+and `destroy_sandbox` tears it down when the run ends (including on failure).
+
+By default the capability is **owned**: each run creates a fresh sandbox and kills
+it when the run ends. Teardown waits for confirmation for a bounded period; if
+E2B's control plane does not respond, `sandbox_timeout` remains the server-side
+cleanup backstop. Each owned run spins up its own sandbox, so expect a cold-start
+cost per run, and the sandbox is provisioned even if the model never calls a
+sandbox tool.
+
+E2B has no create-or-reuse key for sandboxes, so a durable engine that retries the
+provisioning step after a crash creates a second one; the abandoned sandbox is
+left to its own `sandbox_timeout`.
+
+**Attach** to a sandbox you manage elsewhere (e.g. created via the E2B dashboard
+or SDK) by id, to reuse it across runs. It is never killed by the capability:
 
 ```python
-import logfire
-from pydantic_ai import Agent
 from pydantic_ai_harness.e2b_sandbox import E2BSandbox
 
-logfire.configure()
-logfire.instrument_pydantic_ai(include_content=False)
-
-agent = Agent(
-    'anthropic:claude-sonnet-4-6',
-    capabilities=[E2BSandbox()],
-)
+E2BSandbox(sandbox_id='sbx-abc123', max_command_timeout=600)
 ```
 
-Without Pydantic AI instrumentation, capability-managed sessions use the run's
-no-op tracer and the added operation spans have negligible overhead. A directly
-constructed `E2BSandboxSession` instead defaults to the global OpenTelemetry
-tracer, so its lifecycle spans reach any globally configured provider; pass
-`tracer=` to override that.
+Attaching to a **paused** sandbox resumes it: E2B treats connect as "resume if
+needed", so a paused environment comes back with its filesystem intact rather
+than failing the run.
 
-## Lifecycle
+The capability cannot see an attached sandbox's real lifetime, so each command
+there is capped at 300s unless `max_command_timeout` raises the ceiling.
 
-The default mode is **owned**. A new sandbox is created as the run enters the
-toolset and killed when the run exits, even if the model never calls a sandbox
-tool. `sandbox_timeout` is the E2B-side lifetime backstop.
+An attached sandbox is not concurrency-safe across overlapping runs: they share
+one filesystem and one process space. Use separate sandboxes for runs that overlap
+in time.
 
-Attach to a sandbox managed elsewhere by ID:
-
-```python
-from pydantic_ai_harness.e2b_sandbox import E2BSandbox
-
-capability = E2BSandbox(sandbox_id='sbx_existing')
-```
-
-The capability connects for each run and leaves the sandbox running afterward.
-Creation settings such as `template`, `env`, and `sandbox_timeout` cannot be
-combined with `sandbox_id`.
-
-Inject a session to reuse one sandbox across runs while controlling its lifetime:
+To control the environment yourself, create the backend and pass it to the run
+instead of adding the capability's lifecycle:
 
 ```python
 from pydantic_ai import Agent
-from pydantic_ai_harness.e2b_sandbox import E2BSandbox, E2BSandboxSession
+from pydantic_ai_harness.e2b_sandbox import E2BSandbox, E2BSandboxBackend
 
-async with E2BSandboxSession(template='base', sandbox_timeout=1800) as session:
+backend = await E2BSandboxBackend.create(template='base', sandbox_timeout=1800)
+try:
     agent = Agent(
         'anthropic:claude-sonnet-4-6',
-        capabilities=[E2BSandbox(session=session, max_command_timeout=600)],
+        capabilities=[E2BSandbox(sandbox_id=backend.sandbox_id, max_command_timeout=600)],
     )
-    await agent.run('Install the project dependencies.')
-    await agent.run('Run the test suite in the same sandbox.')
+    await agent.run('clone the repo and install deps')   # same sandbox...
+    await agent.run('run the test suite')                # ...reused across runs
+finally:
+    await backend.close(terminate=True)
 ```
 
-The injected session must already be open. The capability uses it but never
-opens or kills it. Reused sandboxes share one filesystem and process space, so
-do not use the same session for overlapping runs that require isolation.
+## Cancellation
 
-## Command output and file-read bounds
+E2B's own command `timeout` bounds the output stream rather than the command: when
+it expires the SDK stops listening and the command keeps running. The backend
+therefore owns the deadline itself, and kills the command when it expires or when
+the caller is cancelled:
 
-The E2B Python SDK buffers process output in the command handle. Harness
-redirects its capture wrapper's own streams away from the SDK, captures command
-stdout and stderr inside the sandbox, and reads every capture artifact through a
-bounded stream. Each command stream retains at most `max_output_bytes`, then the
-model-facing result applies `max_output_bytes` and `max_output_lines` again.
-Truncation is marked and stream labels are preserved.
+- Every `run_command` carries a deadline (`default_command_timeout`, or the
+  per-call `timeout_seconds`, capped by `max_command_timeout`, which defaults to
+  `sandbox_timeout`). At the deadline the command is killed and the output it
+  produced first is reported to the model.
+- A cancelled run kills the command on its way out rather than leaving it running.
+  The kill is best effort; if the request fails, the sandbox's own lifetime is the
+  backstop.
+- The kill signals the command's own process. A process the command started in the
+  background is not reached by that signal, and lives until the sandbox is torn
+  down. For an owned run that is the end of the run.
+- When an owned run ends or is cancelled, the capability kills the sandbox and
+  waits for a bounded period. `sandbox_timeout` remains the server-side backstop
+  if the request cannot be confirmed.
+- An attached sandbox is never killed by the capability (its owner controls that).
 
-E2B starts commands through `/bin/bash -l -c` before Harness's command-level
-redirection runs. Output emitted by Bash login startup files can therefore reach
-the SDK outside this bound. A command can modify its user login files for later
-calls, so `max_output_bytes` is not a hard SDK-memory ceiling in a reused
-sandbox. Keep login profiles silent in E2B templates. A hard bound for startup
-output requires a public E2B raw-exec or no-buffer command API.
+## Lower-level access
 
-A completed command returns the bounded tail. The tail pipeline flushes only
-when the streams close, so a timed-out command instead returns a bounded prefix
-(at most `max_output_bytes`) captured incrementally and marked as truncated to
-the first bytes. The truncation flag is exact: the prefix capture retains one
-byte past the limit to tell "exactly full" from "cut off".
+`E2BSandbox` is the main entry point. The toolset is an implementation detail.
+`E2BSandboxBackend` is public: it implements Pydantic AI's
+[`SandboxBackend`](https://pydantic.dev/docs/ai/sandbox/) protocol over an E2B
+sandbox, including `SupportsFilesystem` and `SupportsStart`, so it can be passed
+to any run or used directly.
 
-This capture wrapper requires Bash, `setsid`, `mkfifo`, `cat`, `dd`, `wc`,
-`tee`, and GNU `tail`. E2B's standard `base` template supplies them. Custom
-templates must retain those programs.
+```python
+from pydantic_ai_harness.e2b_sandbox import E2BSandboxBackend
 
-`read_file` checks metadata and then streams at most `max_read_bytes + 1` bytes,
-so a file that grows after the metadata check still cannot create an unbounded
-client buffer. Large files are refused with a hint to slice them using
-`run_command`. `list_directory` materializes E2B's complete listing before it
-truncates the displayed result.
-
-## Timeouts and cancellation
-
-`default_command_timeout` applies when the model omits `timeout_seconds`.
-`max_command_timeout` caps model-supplied values. In owned mode a command cannot
-outlive `sandbox_timeout`; attached or injected modes use a 300-second ceiling
-unless `max_command_timeout` is set explicitly.
-
-When E2B reports a timeout or the client wait is cancelled, Harness makes
-best-effort attempts to kill both the command's process group and its E2B command
-handle. Exiting an owned session also kills the whole sandbox; a sandbox that is
-already gone counts as cleaned up. If the kill request itself fails, the run
-keeps its result: Harness emits a `RuntimeWarning` naming the sandbox id and the
-`sandbox_timeout` backstop, and the session keeps the sandbox reference so
-`close()` can be retried. The E2B async SDK uses asyncio internally, so real E2B
-runs require an asyncio event loop.
-
-## Durable execution
-
-`E2BSandbox` cannot currently be combined with Pydantic AI's Temporal, DBOS, or
-Prefect durability capabilities. Its run-scoped E2B client and sandbox lifecycle
-cannot safely cross or replay activity, step, or task boundaries. Harness rejects
-that combination when the agent is constructed and when durability capabilities
-are supplied for a single run, before a sandbox or tool call is started.
+backend = await E2BSandboxBackend.create(template='base')
+try:
+    result = await backend.run(['echo', 'hello'])
+    print(result.stdout, result.exit_code)
+finally:
+    await backend.close(terminate=True)
+```
 
 ## Configuration
 
@@ -181,55 +223,99 @@ are supplied for a single run, before a sandbox or tool call is started.
 from pydantic_ai_harness.e2b_sandbox import E2BSandbox
 
 E2BSandbox(
-    template=None,                    # E2B template name/id; None uses E2B's default
-    sandbox_id=None,                  # attach instead of creating a sandbox
-    session=None,                     # caller-owned, already-open E2BSandboxSession
-    sandbox_timeout=300,              # owned sandbox lifetime in seconds
-    workdir='/home/user',             # command cwd and base for relative file paths
-    env=None,                         # environment variables for owned sandboxes
-    metadata=None,                    # E2B metadata for owned sandboxes
-    allow_internet_access=True,       # network access for owned sandboxes
-    default_command_timeout=60.0,     # default per-command timeout
-    max_command_timeout=None,         # hard per-command ceiling
-    max_output_bytes=50 * 1024,       # retained payload per stream or file result
-    max_output_lines=2000,            # retained lines per stream or file result
-    max_read_bytes=5 * 1024 * 1024,   # streamed file-read memory bound
-    instructions=None,                # None: defaults; '': disabled; str: custom
+    template=None,                # E2B template name/id for owned sandboxes; None uses E2B's default
+    sandbox_id=None,              # attach to an existing sandbox instead of creating one
+    sandbox_timeout=300,          # max lifetime (seconds) of an owned sandbox
+    workdir=None,                 # working directory for commands (the template's own when None)
+    env=None,                     # environment variables for an owned sandbox (dict)
+    metadata=None,                # E2B metadata recorded on an owned sandbox (dict)
+    allow_internet_access=True,   # whether an owned sandbox may reach the internet
+    default_command_timeout=60.0, # default timeout for one run_command (seconds)
+    max_command_timeout=None,     # hard ceiling for one command; None -> sandbox_timeout
+    max_output_bytes=50 * 1024,   # per-stream payload cap in UTF-8 bytes before annotations
+    max_output_lines=2000,        # per-stream payload line cap before annotations
+    max_read_bytes=5 * 1024 * 1024,  # refuse read_file on files larger than this
+    instructions=None,            # None: default usage instructions; '': none; str: your own
 )
 ```
 
-`template`, `sandbox_timeout`, `env`, `metadata`, and
-`allow_internet_access` cannot be combined with `sandbox_id`. An injected
-`session` additionally rejects `sandbox_id` and a non-default `workdir`, because
-the caller-owned session already controls those settings. These conflicts fail
-during capability construction.
+Settings that only apply when creating a sandbox (`template`, `sandbox_timeout`,
+`env`, `metadata`, `allow_internet_access`) cannot be combined with `sandbox_id`;
+these conflicts fail at construction instead of being ignored. `workdir` is the
+exception: E2B sets the working directory per command rather than at creation, so
+it still applies to an attached sandbox.
 
-## Composition
+The default instructions state the tools, the command timeout, and its ceiling;
+set `instructions=''` to add none, or pass your own text (needed when prefixing,
+see below).
 
-Do not combine `E2BSandbox` with another unprefixed capability that provides
-`run_command`, `read_file`, `write_file`, or `list_directory`. Pydantic AI
-rejects duplicate tool names. Use `PrefixTools` and custom instructions when an
-agent needs both:
+`read_file` loads a file fully before returning a window of it, so it refuses
+files larger than `max_read_bytes` and tells the model to slice them with a shell
+command (`head`, `tail`, `sed -n`, `grep`) instead. That guard reads the size from
+a `stat` first and checks the returned byte count again. A file that grows between
+those calls can temporarily exceed the limit in client memory before it is
+rejected. The guard is not a defense against special or virtual files whose
+reported size is misleading, because the filesystem API exposes no bounded read.
+Use `run_command` with a bounded shell command for those paths.
+
+`list_directory` reads the whole directory listing before capping it (E2B has no
+streaming list API), so listing a directory with a very large number of entries
+costs memory proportional to the entry count. Point the model at a narrowed
+`run_command` (`ls | head`, `find -maxdepth`) for directories that big.
+
+## Not yet supported
+
+- Streaming command output to the model: `run_command` returns once the command
+  finishes (or hits its deadline), not incrementally. `E2BSandboxBackend` does not
+  implement `SupportsStream` either: E2B delivers live output through callbacks its
+  own event pump awaits, with no async iterator behind them, so a `stream()` here
+  could only be a replay of buffered output.
+- E2B features beyond commands and files: PTYs, port forwarding, snapshots, volume
+  mounts, and MCP servers are reachable through the underlying
+  `E2BSandboxBackend.sandbox` object, but the capability exposes none of them.
+- Spilling full output to a file: truncated file reads end with the next `offset`
+  to page from and oversized files get a shell-slice hint (`head`, `tail`,
+  `sed -n`); truncated command output gets a truncation marker. Nothing is written
+  to a file in the sandbox for the model to open. This is a deliberate choice for
+  now.
+
+E2B's async SDK is asyncio-native (its command handles are asyncio tasks), so the
+capability requires an asyncio event loop and does not run under trio.
+
+## Composing with other capabilities
+
+Do not combine this capability with another unprefixed capability that registers
+`run_command`, `read_file`, `write_file`, or `list_directory` (e.g. the Shell or
+FileSystem capabilities). Pydantic AI rejects duplicate tool names. If an agent
+needs both sets of tools, prefix one of the capabilities:
 
 ```python
 from pydantic_ai.capabilities import PrefixTools
+
 from pydantic_ai_harness.e2b_sandbox import E2BSandbox
 
 sandbox = PrefixTools(
     wrapped=E2BSandbox(
-        instructions='Use the e2b_-prefixed tools for work in the E2B sandbox.',
+        instructions=(
+            'You have an E2B cloud sandbox. Use the e2b_-prefixed tools to run '
+            'shell commands and manage files in it.'
+        )
     ),
     prefix='e2b',
 )
 ```
 
-Prefixing changes tool names but does not rewrite default instructions.
+Prefixing renames the tools (`e2b_run_command`, ...) but does not rewrite the
+capability's default instructions, which name the unprefixed tools -- pass
+`instructions` with text that matches the prefixed names.
 
-## Agent specs
+## Agent spec (YAML/JSON)
 
-Register `E2BSandbox` as a custom capability type when loading an agent spec:
+`E2BSandbox` works with Pydantic AI's
+[agent spec](https://pydantic.dev/docs/ai/core-concepts/agent-spec/):
 
 ```yaml
+# agent.yaml
 model: anthropic:claude-sonnet-4-6
 capabilities:
   - E2BSandbox:
@@ -244,26 +330,11 @@ from pydantic_ai_harness.e2b_sandbox import E2BSandbox
 agent = Agent.from_file('agent.yaml', custom_capability_types=[E2BSandbox])
 ```
 
-## Lower-level session
-
-`E2BSandboxSession` is public for applications that need explicit lifecycle and
-byte-oriented access:
-
-```python
-from pydantic_ai_harness.e2b_sandbox import E2BSandboxSession
-
-async with E2BSandboxSession(template='base') as session:
-    result = await session.exec('echo hello', timeout=30, max_output_bytes=50 * 1024)
-    print(result.stdout, result.returncode)
-```
-
 ## Further reading
 
+- [E2B documentation](https://e2b.dev/docs)
 - [E2B Python SDK](https://github.com/e2b-dev/E2B/tree/main/packages/python-sdk)
-- [Pydantic AI Logfire integration](https://pydantic.dev/docs/ai/logfire/)
 - [Pydantic AI capabilities](https://pydantic.dev/docs/ai/core-concepts/capabilities/)
+- [Pydantic AI toolsets](https://pydantic.dev/docs/ai/tools-toolsets/toolsets/)
 - [E2B Sandbox source code](https://github.com/pydantic/pydantic-ai-harness/tree/main/pydantic_ai_harness/e2b_sandbox/)
 - [Pydantic AI Harness version policy](https://github.com/pydantic/pydantic-ai-harness#version-policy)
-
-The API may change between releases while Pydantic AI Harness is on 0.x
-versions.

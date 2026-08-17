@@ -1,7 +1,7 @@
 """Presentation helpers for E2B sandbox file and command output.
 
-Pure formatting stays separate from E2B I/O so output behavior can be tested
-without provisioning an E2B sandbox.
+Pure formatting stays separate from the E2B I/O layer so output behavior can be
+tested without provisioning a sandbox.
 
 `read_file`-style tools want `render_file_window` (line-addressable, head-first, with a
 continuation offset). Free-form command output wants `truncate_output` (tail-first, so
@@ -47,7 +47,7 @@ def format_size(num_bytes: int) -> str:
     return f'{num_bytes / (1024 * 1024):.1f}MB'
 
 
-def _tail_bytes(line: str, max_bytes: int) -> str:  # pragma: no cover - session output is already byte-bounded
+def _tail_bytes(line: str, max_bytes: int) -> str:
     """Return the last `max_bytes` UTF-8 bytes of `line`, dropping any partial leading char."""
     return line.encode('utf-8')[-max_bytes:].decode('utf-8', errors='ignore')
 
@@ -55,9 +55,10 @@ def _tail_bytes(line: str, max_bytes: int) -> str:  # pragma: no cover - session
 def guard_read_size(size_bytes: int, *, max_bytes: int) -> None:
     """Refuse to read a file larger than `max_bytes`, pointing the model at shell tools.
 
-    The E2B `read_file` tool should not transfer or decode an oversized file just to
-    return a small slice. The caller supplies the size from E2B metadata, and the actual
-    read remains bounded separately to handle a growth race.
+    A `read_file`-style tool loads the whole file before windowing it, so an oversized
+    file would transfer and decode in full just to return a small slice. This is provider
+    agnostic: the caller supplies the size (however its backend reports it) and the policy
+    lives here so every backend refuses the same way.
 
     Raises:
         ModelRetry: if the file is too large, telling the model to read part of it instead.
@@ -92,7 +93,7 @@ def truncate(
     # rather than vanish. For `head` (file reads) we cannot show a useful prefix of an
     # arbitrary line, so omit it and let the caller point the model at a shell slice.
     if lines and len(lines[0].encode('utf-8')) > max_bytes:
-        if direction == 'tail':  # pragma: no cover - session output is already byte-bounded
+        if direction == 'tail':
             return TruncationResult(truncated_lines=[_tail_bytes(lines[0], max_bytes)], truncated_by='bytes')
         return TruncationResult(truncated_lines=[], truncated_by='bytes', first_line_exceeded=True)
 
@@ -123,15 +124,12 @@ def truncate_output(
     max_lines: int = DEFAULT_MAX_LINES,
     max_bytes: int = DEFAULT_MAX_BYTES,
     direction: Literal['head', 'tail'] = 'tail',
-    already_truncated: bool = False,
 ) -> str:
     """Cap free-form tool output (e.g. shell) and mark it when anything was dropped.
 
     Unlike `render_file_window`, this output is not line-addressable, so the model gets a
     marker rather than a continuation offset. Defaults to `tail`: command errors and exit
-    status live at the end. `already_truncated` says an upstream reader dropped bytes at
-    the same byte cap before `text` got here, so the cut is marked even when what remains
-    fits the caps.
+    status live at the end.
     """
     lines = text.split('\n')
     # A trailing newline yields a final '' element; drop it so the caps count real lines
@@ -144,7 +142,7 @@ def truncate_output(
         # "truncated to the first ..." marker would imply content that is not there.
         return f'[... first line exceeds the {format_size(max_bytes)} limit, output omitted ...]'
     body = '\n'.join(result.truncated_lines)
-    if not result.truncated and not already_truncated:
+    if not result.truncated:
         return body
     kept = 'last' if direction == 'tail' else 'first'
     # Name the cap that actually fired so "50KB" is not reported when the line cap stopped us.
