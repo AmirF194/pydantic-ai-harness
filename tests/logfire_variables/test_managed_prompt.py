@@ -213,6 +213,24 @@ async def test_records_variable_resolution_span(capfire: CaptureLogfire) -> None
     )
 
 
+def _normalize_resolution_span_nesting(attributes: dict[str, Any]) -> None:
+    """Collapse the resolution-span attributes that depend on whether it nests under the run span.
+
+    pydantic/pydantic-ai#6492 makes the agent run span bracket capability preparation, so the
+    resolution span becomes a child of the run span rather than an orphan root: a trace is active
+    so `targeting_key` gets the rollout fallback, the run's baggage supplies `gen_ai.agent.name`,
+    and `logfire.json_schema` follows the `targeting_key` type. Normalize all three to the
+    orphan-root shape so the snapshot below holds on both pydantic-ai versions.
+    """
+    targeting_key = attributes['targeting_key']
+    assert targeting_key == 'null' or targeting_key.startswith('trace_id:'), targeting_key
+    attributes['targeting_key'] = 'null'
+    assert attributes.pop('gen_ai.agent.name', None) in (None, 'agent')
+    attributes['logfire.json_schema'] = attributes['logfire.json_schema'].replace(
+        '"targeting_key":{}', '"targeting_key":{"type":"null"}'
+    )
+
+
 async def test_baggage_propagates_to_run_and_child_spans(capfire: CaptureLogfire) -> None:
     # `Instrumentation` produces the agent run / model request / tool spans; `ManagedPrompt`
     # runs outermost so its `logfire.variables.prompt__baggage_slug` baggage lands on all of them.
@@ -228,7 +246,11 @@ async def test_baggage_propagates_to_run_and_child_spans(capfire: CaptureLogfire
 
     await agent.run('hello')
 
-    assert span_attributes(capfire) == snapshot(
+    spans = span_attributes(capfire)
+    assert spans[0]['name'] == 'Resolve variable prompt__baggage_slug'
+    _normalize_resolution_span_nesting(spans[0]['attributes'])
+
+    assert spans == snapshot(
         [
             {
                 'name': 'Resolve variable prompt__baggage_slug',
