@@ -1515,6 +1515,21 @@ class TestNameResolutionBlocking:
         )
         assert page.goto_calls == []
 
+    async def test_a_host_the_resolver_cannot_encode_is_a_refusal(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # `getaddrinfo` encodes the name with the stdlib idna codec, which raises a
+        # `UnicodeError` for an empty or over-long label. The lookup happens before
+        # the operation exists, so an escaping exception would end the run.
+        async def unencodable(host: str) -> tuple[str, ...]:
+            raise UnicodeError('label empty or too long')
+
+        monkeypatch.setattr(toolset_module, '_getaddrinfo', unencodable)
+        page = _FakePage()
+        result = await _toolset(page).navigate('http://a..com/')
+        assert result == (
+            'Error: host that did not resolve, so the private-address block could not clear it: http://a..com/'
+        )
+        assert page.goto_calls == []
+
 
 class TestResolutionIsBounded:
     """The lookup runs before an operation's deadline exists, so it carries its own."""
@@ -3041,11 +3056,41 @@ class TestCredentialsStayOutOfTelemetry:
             'https://app.example.com/cb#access_token=REDACTED&state=x'
         )
 
+    def test_the_prefixed_oauth_parameters_are_redacted_too(self) -> None:
+        # The pattern anchors a name at `?`, `&` or `#`, so the bare `secret` and
+        # `token` entries never match these spellings.
+        assert toolset_module._without_credentials('https://id.example.com/t?client_secret=a&oauth_token=b&x=1') == (
+            'https://id.example.com/t?client_secret=REDACTED&oauth_token=REDACTED&x=1'
+        )
+
     def test_a_url_urlsplit_rejects_is_still_cleaned(self) -> None:
         # Chromium accepts hosts the stdlib parser raises on, so the strip cannot
         # depend on parsing succeeding.
         assert toolset_module._without_credentials('http://user:pw@[::1/x') == 'http://[::1/x'
         assert toolset_module._without_credentials('https://example.com/a@b') == 'https://example.com/a@b'
+
+
+class TestErrorMessagesLoseTheirCredentials:
+    """Playwright quotes the URL it was working on, and its errors reach the model verbatim."""
+
+    async def test_an_interpolated_playwright_error_is_redacted(self) -> None:
+        page = _FakePage(
+            goto_error=PlaywrightError('Page.goto: net::ERR_UNSAFE_PORT at https://example.com/cb?code=SECRET')
+        )
+        result = await _toolset(page).navigate('https://example.com/')
+        assert result == (
+            'Error: navigate failed: Page.goto: net::ERR_UNSAFE_PORT at https://example.com/cb?code=REDACTED'
+        )
+
+    async def test_a_failed_element_read_is_redacted(self) -> None:
+        page = _FakePage(inner_text_error=PlaywrightError('waiting for https://example.com/api?token=SECRET'))
+        result = await _toolset(page).get_text('h1')
+        assert result == "Error getting text from 'h1': waiting for https://example.com/api?token=REDACTED"
+
+    async def test_a_script_error_is_redacted(self) -> None:
+        page = _FakePage(evaluate_raises=PlaywrightError('TypeError at https://example.com/app.js?sig=SECRET'))
+        result = await _toolset(page).execute_js('boom()')
+        assert result == 'JS error: TypeError at https://example.com/app.js?sig=REDACTED'
 
 
 class TestWebSocketEgress:
@@ -3137,6 +3182,43 @@ class _HangingClickMousePage(_FakePage):
         self.mouse = _HangingClickMouse()
 
 
+class _Clock:
+    """A monotonic clock the test moves by hand, so a slow stage costs no real time."""
+
+    def __init__(self) -> None:
+        self.seconds = 1_000.0
+
+    def __call__(self) -> float:
+        return self.seconds
+
+    def advance(self, seconds: float) -> None:
+        self.seconds += seconds
+
+
+class _SlowLoadPage(_FakePage):
+    """A page whose navigation takes six seconds of the fake clock."""
+
+    def __init__(self, clock: _Clock) -> None:
+        super().__init__()
+        self._clock = clock
+
+    async def goto(self, url: str, *, timeout: float | None = None) -> None:
+        self._clock.advance(6.0)
+        await super().goto(url, timeout=timeout)
+
+
+class _SlowSettlePage(_FakePage):
+    """A page that settles six seconds after the action that navigated it."""
+
+    def __init__(self, clock: _Clock) -> None:
+        super().__init__()
+        self._clock = clock
+
+    async def wait_for_load_state(self, state: str, *, timeout: float | None = None) -> None:
+        self._clock.advance(6.0)
+        await super().wait_for_load_state(state, timeout=timeout)
+
+
 class TestOperationDeadline:
     async def test_each_stage_gets_what_is_left_not_the_whole_budget(self) -> None:
         class _SlowGotoPage(_FakePage):
@@ -3171,6 +3253,85 @@ class TestOperationDeadline:
 
         result = await _toolset(_SlowClickPage()).click('button#go', timeout_ms=1000)
         assert result.startswith('Error: click timed out after 1000ms.')
+
+    async def test_a_slow_load_does_not_starve_the_reads_that_follow_it(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # Six seconds of loading leaves nothing of the five-second action budget, so
+        # a trailing read bounded by that one would fail on a page that loaded fine.
+        clock = _Clock()
+        monkeypatch.setattr(toolset_module, 'monotonic', clock)
+        page = _SlowLoadPage(clock)
+        result = await _toolset(page).navigate('https://example.com/')
+        assert result == 'URL: https://example.com/\nTitle: Example\n\nHello body'
+        body_deadline = page.timeouts['inner_text']
+        assert body_deadline is not None and body_deadline > 10_000
+
+    async def test_a_slow_settle_does_not_starve_the_read_after_a_click(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        clock = _Clock()
+        monkeypatch.setattr(toolset_module, 'monotonic', clock)
+        page = _SlowSettlePage(clock)
+        result = await _toolset(page).click('button#go')
+        assert result == "Clicked 'button#go'. URL: https://example.com/\n\nHello body"
+        body_deadline = page.timeouts['inner_text']
+        assert body_deadline is not None and body_deadline > 10_000
+
+
+class _HangingContext:
+    """A browser context whose new page never opens."""
+
+    async def new_page(self) -> _FakePage:
+        await asyncio.Event().wait()
+        return _FakePage()  # pragma: no cover -- unreachable; the wait is cancelled
+
+
+class _HangingContextBrowser(_FakePlaywrightBrowser):
+    """A browser that connects and then never opens a context."""
+
+    async def new_context(
+        self,
+        *,
+        storage_state: StorageState | None = None,
+        service_workers: str | None = None,
+        accept_downloads: bool | None = None,
+    ) -> _FakeBrowserContext:
+        await asyncio.Event().wait()
+        return _FakeBrowserContext(self._page)  # pragma: no cover -- unreachable; the wait is cancelled
+
+
+class _HangingContextChromium(_FakeChromium):
+    async def launch(
+        self, *, headless: bool, chromium_sandbox: bool = False, timeout: int | None = None
+    ) -> _FakePlaywrightBrowser:
+        return _HangingContextBrowser(self._page)
+
+
+class _HangingTabPage(_FakePage):
+    """A tab that never comes to the front and never closes."""
+
+    async def bring_to_front(self) -> None:
+        await asyncio.Event().wait()
+
+    async def close(self) -> None:
+        await asyncio.Event().wait()
+
+
+class TestLaunchIsBounded:
+    """Starting a browser happens inside a tool call, holding the operation lock."""
+
+    async def test_a_context_that_never_opens_becomes_a_bounded_error(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        page = _FakePage()
+        cm = _FakeDriverCM(_FakeDriver(_HangingContextChromium(page)))
+        monkeypatch.setattr(toolset_module, 'async_playwright', lambda: cm)
+        session = PlaywrightBrowserSession(launch_timeout_ms=20)
+        async with session:
+            result = await PlaywrightBrowserToolset[None](session=session).get_text()
+        assert result.startswith('Error: get_text timed out')
+
+    async def test_a_zero_launch_timeout_still_means_no_deadline(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        page = _FakePage()
+        _install_fake_driver(monkeypatch, page)
+        session = PlaywrightBrowserSession(launch_timeout_ms=0)
+        async with session:
+            assert await session.ensure_page() is page
 
 
 class TestEgressPolicy:
@@ -3237,6 +3398,14 @@ class TestEgressPolicy:
         with pytest.raises(UserError, match='wildcard'):
             toolset_module.EgressPolicy(blocked_domains=['*.ads.example.com'])
 
+    def test_a_leading_dot_entry_is_refused_at_construction(self) -> None:
+        # `.example.com` matches neither the host nor the `.example.com` suffix test,
+        # so it reads as a configured allowlist while admitting nothing.
+        with pytest.raises(UserError, match='starts with a dot'):
+            toolset_module.EgressPolicy(allowed_domains=['.example.com'])
+        with pytest.raises(UserError, match='starts with a dot'):
+            toolset_module.EgressPolicy(blocked_domains=['.ads.example.com'])
+
     def test_a_subclass_decides_what_the_fields_cannot(self) -> None:
         class FontsFromAnywhere(toolset_module.EgressPolicy):
             def refuse(self, request: toolset_module.EgressRequest) -> str | None:
@@ -3253,6 +3422,18 @@ class TestEgressPolicy:
     def test_describe_drops_the_subdomain_phrase_when_they_are_off(self) -> None:
         policy = toolset_module.EgressPolicy(allowed_domains=['example.com'], include_subdomains=False)
         assert 'subdomains' not in policy.describe()
+
+    def test_describe_names_a_reach_that_is_not_the_default(self) -> None:
+        # A locked-down or narrowed allowlist reads the same as the default one
+        # unless the description says what it bounds, and the instructions then
+        # promise the model a reach the guards do not grant.
+        assert 'allowlist bounds' not in toolset_module.EgressPolicy(allowed_domains=['example.com']).describe()
+        locked = toolset_module.EgressPolicy(
+            allowed_domains=['example.com'], allowlist_reach=frozenset(get_args(toolset_module.RequestKind))
+        )
+        assert 'allowlist bounds data, navigation, subframe, subresource' in locked.describe()
+        bounds_nothing = toolset_module.EgressPolicy(allowed_domains=['example.com'], allowlist_reach=frozenset())
+        assert 'allowlist bounds nothing' in bounds_nothing.describe()
 
     def test_describe_names_what_the_model_may_reach(self) -> None:
         policy = toolset_module.EgressPolicy(allowed_domains=['example.com'], blocked_domains=['ads.example.com'])
@@ -3342,6 +3523,34 @@ class TestSpanOutcome:
         (span,) = exporter.get_finished_spans()
         assert span.attributes is not None and span.attributes['browser.outcome'] == 'error'
         assert 'url.full' not in span.attributes
+
+    async def test_a_refusal_opens_its_own_span(self) -> None:
+        # A call the egress policy turns away never reaches a page, and a trace that
+        # showed only the calls that did would not show it happened at all.
+        page = _FakePage()
+        session = PlaywrightBrowserSession(policy=toolset_module.EgressPolicy(allowed_domains=['example.com']))
+        session.page = page
+        session.pages = [page]
+        tracer, exporter = _recording_tracer()
+        session.tracer = tracer
+        result = await _toolset(page, session=session).navigate('https://evil.example/')
+        assert result == 'Error: domain not in allowed_domains: https://evil.example/'
+        (span,) = exporter.get_finished_spans()
+        assert span.name == 'browser navigate'
+        assert span.attributes is not None and span.attributes['browser.outcome'] == 'error'
+        assert 'url.full' not in span.attributes
+
+    async def test_the_span_names_the_tab_the_operation_ended_on(self) -> None:
+        page = _FakePage()
+        popup = _FakePage(url='https://example.com/popup')
+        session = PlaywrightBrowserSession()
+        session.page = page
+        session.pages = [page, popup]
+        tracer, exporter = _recording_tracer()
+        session.tracer = tracer
+        await _toolset(page, session=session).tabs('select', 1)
+        (span,) = exporter.get_finished_spans()
+        assert span.attributes is not None and span.attributes['url.full'] == 'https://example.com/popup'
 
     async def test_the_log_tools_open_their_own_span(self) -> None:
         page = _FakePage()
@@ -3560,6 +3769,29 @@ class TestTabs:
         toolset = PlaywrightBrowserToolset[None](session=session)
         assert await toolset.tabs('list') == 'No tabs open.'
         assert await toolset.tabs('close') == "Error: the active tab has closed. Open one with tabs('new')."
+
+    async def test_switching_to_a_tab_that_never_fronts_is_bounded(self) -> None:
+        # `bring_to_front`, `new_page` and `close` take no timeout of their own, so
+        # without the operation's deadline they hold the lock for the rest of the run.
+        page = _FakePage()
+        session = self._session(page)
+        session.pages.append(_HangingTabPage(url='https://example.com/stuck'))
+        result = await _toolset(page, session=session, action_timeout_ms=20).tabs('select', 1)
+        assert result.startswith('Error: tabs timed out after 20ms.')
+
+    async def test_closing_a_tab_that_never_closes_is_bounded(self) -> None:
+        page = _FakePage()
+        session = self._session(page)
+        session.pages.append(_HangingTabPage(url='https://example.com/stuck'))
+        result = await _toolset(page, session=session, action_timeout_ms=20).tabs('close', 1)
+        assert result.startswith('Error: tabs timed out after 20ms.')
+
+    async def test_opening_a_tab_that_never_appears_is_bounded(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        page = _FakePage()
+        session = self._session(page)
+        monkeypatch.setattr(session, '_context', _HangingContext())
+        result = await _toolset(page, session=session, action_timeout_ms=20).tabs('new')
+        assert result.startswith('Error: tabs timed out after 20ms.')
 
     async def test_a_tab_that_closes_itself_leaves_the_list(self, monkeypatch: pytest.MonkeyPatch) -> None:
         page = _FakePage()

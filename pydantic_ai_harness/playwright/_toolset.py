@@ -7,42 +7,42 @@ installed package and the linked sources before changing version, selector, or
 teardown handling; bump the date when a fact still holds, update code and date
 together when it changed. Pinned in the `[playwright]` extra as
 `playwright>=1.61.0` (pyproject.toml). Every fact below was verified against
-1.61.0, and the signature-checkable ones re-verified against 1.62.0 on 2026-08-10.
+1.61.0, and the signature-checkable ones re-verified against 1.62.0 on 2026-08-18.
 
 - `page.aria_snapshot(mode='ai')` returns an agent-oriented tree whose nodes carry
   `[ref=eN]` handles. `mode` accepts `Literal['ai', 'default'] | None` through
   1.62.0; the `ref` attributes have shipped since Playwright 1.52. Verified
-  2026-08-10.
+  2026-08-18.
   Source: <https://playwright.dev/python/docs/aria-snapshots>. Re-check:
   `inspect.signature(playwright.async_api.Page.aria_snapshot)` still offers 'ai'.
 - The `aria-ref=eN` handles from that snapshot are resolvable by the `aria-ref=`
   selector engine, so they can be passed straight to `page.click` / `page.fill`.
-  Verified 2026-07-24 (engine present in the bundled driver `coreBundle.js`).
+  Verified 2026-08-18 (engine present in the bundled driver `coreBundle.js`).
   Source: <https://playwright.dev/python/docs/other-locators>. Re-check: pass a
   `snapshot` ref back into `click` against a live page, or grep the installed
   driver bundle for `aria-ref`.
 - `browser.new_context(service_workers='block')` disables page service workers;
   the option is `Literal['allow', 'block'] | None` through 1.62.0. Verified
-  2026-08-10.
+  2026-08-18.
   Source: <https://playwright.dev/python/docs/api/class-browsercontext>
   (`serviceWorkers` option). Re-check: inspect the `service_workers` parameter of
   `Browser.new_context`.
 - `new_context` accepts downloads by default; `accept_downloads=False` refuses
   them, so a page cannot write attachments to the host's temporary storage.
-  Verified 2026-08-11 (parameter documented as "Defaults to `true` where all the
+  Verified 2026-08-18 (parameter documented as "Defaults to `true` where all the
   downloads are accepted"). Source:
   <https://playwright.dev/python/docs/api/class-browser#browser-new-context>.
   Re-check: `inspect.getdoc(Browser.new_context)` still states that default.
 - `TargetClosedError` is not re-exported from `playwright.async_api` through
   1.62.0; it lives at `playwright._impl._errors`. A driver-raised instance only
   carries `.name`, so `isinstance` is the reliable discriminator. Verified
-  2026-08-10.
+  2026-08-18.
   Source: <https://github.com/microsoft/playwright-python> (async_api `__init__`).
   Re-check: `hasattr(playwright.async_api, 'TargetClosedError')` (expect `False`);
   if it becomes `True`, switch to the public import.
 - Missing-binary detection uses `chromium.executable_path` plus an on-disk
   `os.path.exists` check; the install command is `python -m playwright install
-  chromium`. Verified 2026-07-24. Source:
+  chromium`. Verified 2026-08-18. Source:
   <https://playwright.dev/python/docs/browsers#install-browsers>. Re-check:
   confirm `BrowserType.executable_path` exists and `playwright install chromium`
   still fetches the binary.
@@ -50,7 +50,7 @@ together when it changed. Pinned in the `[playwright]` extra as
   `timeout=0` disables the deadline (the toolset treats 0 the same way in
   `_await_with_timeout`). The defaults here deliberately split that number in two:
   a missed element is usually a wrong selector and should fail fast, while a page
-  load legitimately takes longer. Verified 2026-07-24
+  load legitimately takes longer. Verified 2026-08-18
   (`DEFAULT_PLAYWRIGHT_TIMEOUT_IN_MILLISECONDS = 30000` in `_impl/_helper.py`).
   Source: <https://playwright.dev/python/docs/api/class-page#page-set-default-timeout>.
   Re-check: grep the installed package for `DEFAULT_PLAYWRIGHT_TIMEOUT`.
@@ -58,13 +58,13 @@ together when it changed. Pinned in the `[playwright]` extra as
   frame they came from: the ref carries the frame sequence and the driver jumps to
   that frame before matching (`_jumpToAriaRefFrameIfNeeded` in the bundled
   driver). Plain CSS selectors do not cross frames, so a snapshot ref is the only
-  handle that reaches embedded content. Verified 2026-08-12 against a real
+  handle that reaches embedded content. Verified 2026-08-18 against a real
   Chromium (read and click inside a cross-origin child frame).
   Source: <https://playwright.dev/python/docs/other-locators>. Re-check: grep the
   driver bundle for `_jumpToAriaRefFrameIfNeeded`.
 - A request aborted by a context route reaches `requestfailed` with the failure
   text `net::ERR_FAILED`, which is what lets the guard's own entry (carrying the
-  reason) stand alone in the event log. Verified 2026-08-12 against a real
+  reason) stand alone in the event log. Verified 2026-08-18 against a real
   Chromium: a refused navigation produced exactly one recorded event. Source:
   <https://playwright.dev/python/docs/api/class-route#route-abort> (`errorCode`
   defaults to `failed`). Re-check: the private-address scenario in
@@ -72,27 +72,27 @@ together when it changed. Pinned in the `[playwright]` extra as
 - Attaching any `page.on('dialog')` handler takes Playwright out of its
   auto-dismiss behavior: the dialog then blocks the page until the handler calls
   `accept`/`dismiss`, so every path through the handler has to answer. Verified
-  2026-08-12. Source: <https://playwright.dev/python/docs/dialogs>. Re-check: the
+  2026-08-18. Source: <https://playwright.dev/python/docs/dialogs>. Re-check: the
   dialog scenario in `scripts/playwright_smoke.py`.
 - A page a site opens (`window.open`, `target="_blank"`) arrives on the opener's
   `popup` event and belongs to the same `BrowserContext`, so the context's route
   guard and storage state already cover it. Its `url` at event time is usually
-  still `about:blank`. Verified 2026-08-12. Source:
+  still `about:blank`. Verified 2026-08-18. Source:
   <https://playwright.dev/python/docs/pages#handling-new-pages>. Re-check: the
   tab scenario in `scripts/playwright_smoke.py`.
 - `locator.press_sequentially(text, timeout=...)` types key by key, unlike
   `page.fill`, which sets the value and dispatches no key events. Verified
-  2026-08-12 against 1.62.0. Source:
+  2026-08-18 against 1.62.0. Source:
   <https://playwright.dev/python/docs/input#type-characters>. Re-check:
   `inspect.signature(playwright.async_api.Locator.press_sequentially)`.
 - `wait_for_selector(state='hidden')` is satisfied by an element that is hidden
   *or* absent, so a frame that never contained it reports success immediately --
   which is why the disappearance wait requires every frame rather than the first.
-  Verified 2026-08-12 against 1.62.0. Source:
+  Verified 2026-08-18 against 1.62.0. Source:
   <https://playwright.dev/python/docs/api/class-page#page-wait-for-selector>.
   Re-check: the `state` parameter still accepts `'hidden'`.
 - `frame.inner_text('body')` reads a child frame the page-level call cannot see;
-  `page.wait_for_selector` matches in the main frame only. Verified 2026-08-12
+  `page.wait_for_selector` matches in the main frame only. Verified 2026-08-18
   against a real Chromium. Source:
   <https://playwright.dev/python/docs/frames>. Re-check: the iframe scenario in
   `scripts/playwright_smoke.py`.
@@ -324,6 +324,14 @@ class _Deadlines:
     call spend its deadline once per stage: `navigate(timeout_ms=2000)` waits on a
     goto, a load state, a title, a body read and a screenshot, and would be
     entitled to 2 seconds each.
+
+    Both count down from that one start, which decides which budget each stage
+    takes: a page load may legitimately spend the whole navigation budget, and
+    the action budget is long gone by then, so the reads that follow it would get
+    1ms and fail on arrival. Every stage after a completed `_settle` -- and in
+    `navigate`, everything after the `goto` -- is therefore bounded by
+    `navigation`, the budget that allowed for the time already spent. Stages
+    before or without a navigation keep `action`.
     """
 
     action_ms: int
@@ -398,7 +406,8 @@ def is_blocked_address(host: str) -> bool:
     metadata endpoint), carrier-grade NAT, reserved, and multicast ranges. This
     classifies a host string, so it sees IP literals and the loopback hostnames
     `localhost` / `*.localhost`; a name pointing at a private address is caught by
-    `EgressPolicy.decide` resolving it first and passing the answers to `refuse`.
+    `PlaywrightBrowserSession.decide` resolving it first and passing the answers
+    to `refuse`.
     Neither is rebinding-proof, since Chromium resolves the name again before it
     connects (https://github.com/pydantic/pydantic-ai-harness/issues/415).
     A trailing dot is stripped so the fully-qualified spelling gets the same
@@ -442,7 +451,10 @@ async def _resolve_host(host: str) -> tuple[str, ...] | None:
     one and then handing Chromium a private address would otherwise be a way past
     the block. So an unanswered lookup is a refusal, which also costs little when
     the failure is honest: a name this process cannot resolve is one the browser is
-    about to fail on too.
+    about to fail on too. A host the resolver cannot even encode counts as
+    unanswered for the same reason: `getaddrinfo` raises a `UnicodeError` for an
+    empty or over-long label (`a..com`), and that is a verdict, not a crash the
+    caller should carry.
 
     The cache is a duplicate of one Chromium keeps anyway, so it is kept short and
     small. It cannot make the block airtight: Chromium resolves the name a second
@@ -460,7 +472,7 @@ async def _resolve_host(host: str) -> tuple[str, ...] | None:
         return cached[1]
     try:
         addresses = await asyncio.wait_for(_getaddrinfo(host), _RESOLUTION_TIMEOUT_SECONDS)
-    except (OSError, asyncio.TimeoutError):
+    except (OSError, UnicodeError, asyncio.TimeoutError):
         return None
     if len(_resolution_cache) >= _RESOLUTION_CACHE_MAX:
         _resolution_cache.clear()
@@ -626,6 +638,11 @@ class EgressPolicy:
                         f'{field_name} entry {entry!r} contains a wildcard, which never matches a host. '
                         'Write the bare domain: subdomains are included unless include_subdomains=False.'
                     )
+                if entry.startswith('.'):
+                    raise UserError(
+                        f'{field_name} entry {entry!r} starts with a dot, which never matches a host. '
+                        'Write the bare domain: subdomains are included unless include_subdomains=False.'
+                    )
 
     def refuse(self, request: EgressRequest) -> str | None:
         """Why the browser must not make this request, or `None` to allow it.
@@ -694,6 +711,11 @@ class EgressPolicy:
                 domains += ' (and their subdomains)'
         else:
             domains = 'none'
+        if self.allowed_domains is not None and self.allowlist_reach != DEFAULT_ALLOWLIST_REACH:
+            # Named only when it is not the default, so the model is told what the
+            # allowlist actually bounds rather than being left with the reach the
+            # default sentence implies.
+            domains += f' (allowlist bounds {", ".join(sorted(self.allowlist_reach)) or "nothing"})'
         if self.blocked_domains:
             domains += f', except {", ".join(self.blocked_domains)}'
         if self.block_private_addresses:
@@ -707,9 +729,11 @@ _CREDENTIAL_PARAMETERS = (
     'apikey',
     'auth',
     'awsaccesskeyid',
+    'client_secret',
     'code',
     'id_token',
     'key',
+    'oauth_token',
     'password',
     'pwd',
     'refresh_token',
@@ -726,7 +750,9 @@ _CREDENTIAL_PARAMETERS = (
 Names rather than whole query strings: which endpoint a page called is what makes
 a recorded request useful, and the OTel HTTP conventions redact known-sensitive
 parameters rather than dropping the query. The list covers the OAuth grant and
-the signed-URL parameters of the major clouds.
+the signed-URL parameters of the major clouds. Prefixed spellings are listed in
+full because the pattern anchors a name at `?`, `&` or `#`, so `secret` does not
+cover `client_secret`.
 """
 
 _USERINFO = re.compile(r'(?<![\w.+-])([a-zA-Z][\w+.\-]*://)[^/?#\s@]*@')
@@ -1171,6 +1197,13 @@ class PlaywrightBrowserSession:
         launch that failed is retried on the next tool call, and re-entering the
         context manager would start a second driver connection and leave the first
         one running until teardown.
+
+        Each step runs under `launch_timeout_ms` -- the connect through
+        Playwright's own `timeout`, the rest through `_bounded` -- because all of
+        it happens inside a tool call holding the operation lock: a browser that
+        accepts the connection and then never opens a context would stall the run
+        with no deadline of its own. The auto-install download inside `_connect`
+        is the documented exception.
         """
         assert self._driver_cm is not None
         if self._driver is None:
@@ -1181,7 +1214,7 @@ class PlaywrightBrowserSession:
         # latest handle; a close that fails keeps the handle so teardown can try again.
         if self._browser is not None:
             stale = self._browser
-            await stale.close()
+            await self._bounded(stale.close())
             self._browser = None
         browser = await self._connect(self._driver)
         if browser is None:
@@ -1193,20 +1226,37 @@ class PlaywrightBrowserSession:
         # are blocked to keep all traffic on the routable path. Downloads are refused
         # because no tool exposes them: accepting them only lets a page write to the
         # host's temporary storage for the length of the run.
-        context = await browser.new_context(
-            storage_state=self._storage_state,
-            service_workers='block',
-            accept_downloads=False,
+        context = await self._bounded(
+            browser.new_context(
+                storage_state=self._storage_state,
+                service_workers='block',
+                accept_downloads=False,
+            )
         )
         self._context = context
-        page = await context.new_page()
+        page = await self._bounded(context.new_page())
         if self.policy.enforced():
-            await context.route('**/*', self._route_guard)
+            await self._bounded(context.route('**/*', self._route_guard))
             # A network route never sees a WebSocket, so sockets get a guard of their own.
-            await context.route_web_socket('**/*', self._websocket_guard)
+            await self._bounded(context.route_web_socket('**/*', self._websocket_guard))
         self._wire_page(page)
         self.pages.append(page)
         self.page = page
+
+    async def _bounded(self, awaitable: Awaitable[_T]) -> _T:
+        """Run a setup step that has no `timeout` parameter under `launch_timeout_ms`.
+
+        A configured `0` keeps Playwright's meaning of "no deadline", the same way
+        the per-call deadlines treat it.
+        """
+        if self._launch_timeout_ms == 0:
+            return await awaitable
+        try:
+            return await asyncio.wait_for(awaitable, self._launch_timeout_ms / 1000)
+        except asyncio.TimeoutError as exc:
+            # Raised as a Playwright timeout so the tools map it like any other
+            # deadline they already handle.
+            raise PlaywrightTimeoutError(f'Timeout {self._launch_timeout_ms}ms exceeded.') from exc
 
     async def _connect(self, pw: PlaywrightDriver) -> PlaywrightBrowserHandle | None:
         """Attach to or start a browser, or record why none is available.
@@ -1657,6 +1707,9 @@ class PlaywrightBrowserToolset(FunctionToolset[AgentDepsT]):
         result the model can react to rather than raised to abort the run.
         `timeout_ms` is the deadline the call actually ran under, so a per-call
         override is reported accurately.
+
+        Playwright quotes the URL it was working on, call log included, so the
+        interpolated message is cleaned like any other URL that reaches the model.
         """
         if isinstance(exc, PlaywrightTimeoutError):
             return (
@@ -1674,7 +1727,7 @@ class PlaywrightBrowserToolset(FunctionToolset[AgentDepsT]):
                 f'Error: {action} failed: the browser or page was closed unexpectedly. '
                 'Browser tools may be unavailable for the rest of this run.'
             )
-        return f'Error: {action} failed: {exc}'
+        return f'Error: {action} failed: {_without_credentials(str(exc))}'
 
     def _deadlines(self, timeout_ms: int | None) -> _Deadlines:
         """Resolve the deadlines an operation runs under.
@@ -1810,21 +1863,37 @@ class PlaywrightBrowserToolset(FunctionToolset[AgentDepsT]):
                 finally:
                     # Recorded whether or not the operation succeeded: which page a
                     # failed action was on is the part that makes it diagnosable.
-                    if page is not None:
-                        span.set_attribute('url.full', _without_credentials(page.url))
+                    # The session's active page rather than the one acquired above,
+                    # because `tabs` can have moved it, and the span should name the
+                    # tab the operation left rather than the one it started on.
+                    ended_on = self._session.page if self._session.page is not None else page
+                    if ended_on is not None:
+                        span.set_attribute('url.full', _without_credentials(ended_on.url))
                     self._session.operation_span = None
 
-    async def _refuse(self, timeout_ms: int | None, message: str) -> str:
+    async def _refuse(self, action: str, timeout_ms: int | None, message: str) -> str:
         """Return a bounded refusal without acquiring a page.
 
         A rejected argument must not start a browser, so these refusals happen
         before `_in_operation`. The deadline is still validated first, so a call
         that is wrong in both ways reports the same error either way.
+
+        The refusal still opens the operation's span: a call the egress policy or
+        an argument check turned away is something the agent did, and a trace
+        showing only the calls that reached a page would not show it. There is no
+        page, so no `url.full`.
         """
         async with self._operation_lock:
             if (error := self._timeout_error(timeout_ms)) is not None:
                 return error
-            return self._error(message)
+            with self._session.tracer.start_as_current_span(
+                f'browser {action}', attributes={'browser.action': action, 'browser.outcome': 'ok'}
+            ) as span:
+                self._session.operation_span = span
+                try:
+                    return self._error(message)
+                finally:
+                    self._session.operation_span = None
 
     async def _settle(self, page: _Page, action: str, deadlines: _Deadlines) -> str | None:
         """Let the navigation finish, then re-check where it landed.
@@ -1855,18 +1924,20 @@ class PlaywrightBrowserToolset(FunctionToolset[AgentDepsT]):
             # Not redacted, unlike the URLs below: this one is the argument the model
             # just passed, so echoing it tells it nothing it did not write, and a
             # refusal that hid the userinfo would hide what was refused.
-            return await self._refuse(timeout_ms, f'Error: {reason}: {url}')
+            return await self._refuse('navigate', timeout_ms, f'Error: {reason}: {url}')
 
         async def _navigate(page: _Page, deadlines: _Deadlines) -> str | ToolReturn[str]:
             await page.goto(url, timeout=deadlines.navigation)
             if (blocked := await self._settle(page, 'navigate', deadlines)) is not None:
                 return blocked
-            title = await self._await_with_timeout(page.title(), deadlines.action)
-            text = await self._page_text(page, deadlines.action)
+            # Everything past the load runs on the navigation budget: the action one
+            # is already spent by any page that took more than a moment to arrive.
+            title = await self._await_with_timeout(page.title(), deadlines.navigation)
+            text = await self._page_text(page, deadlines.navigation)
             result = self._truncate_output(f'URL: {_without_credentials(page.url)}\nTitle: {title}\n\n{text}')
             if not self._screenshot_on_navigate:
                 return result
-            png = await page.screenshot(timeout=deadlines.action)
+            png = await page.screenshot(timeout=deadlines.navigation)
             if (oversized := self._oversized_screenshot_error(png)) is not None:
                 return self._truncate_output_keeping(result, oversized)
             return ToolReturn(result, content=[BinaryContent(data=png, media_type='image/png')])
@@ -1904,7 +1975,9 @@ class PlaywrightBrowserToolset(FunctionToolset[AgentDepsT]):
                 await page.click(selector, timeout=deadlines.action)
             if (blocked := await self._settle(page, 'click', deadlines)) is not None:
                 return blocked
-            text = await self._page_text(page, deadlines.action)
+            # The read follows a navigation the click may have triggered, so it takes
+            # the budget that allowed for it rather than what is left of the action's.
+            text = await self._page_text(page, deadlines.navigation)
             return self._truncate_output(f"Clicked '{selector}'. URL: {_without_credentials(page.url)}\n\n{text}")
 
         return await self._in_operation('click', timeout_ms, _click)
@@ -1970,7 +2043,7 @@ class PlaywrightBrowserToolset(FunctionToolset[AgentDepsT]):
             # box), so the result is settled and re-checked like a click.
             if (blocked := await self._settle(page, 'press_key', deadlines)) is not None:
                 return blocked
-            return self._truncate_output(f"Pressed '{key}'.\n\n{await self._page_text(page, deadlines.action)}")
+            return self._truncate_output(f"Pressed '{key}'.\n\n{await self._page_text(page, deadlines.navigation)}")
 
         return await self._in_operation('press_key', timeout_ms, _press_key)
 
@@ -1996,7 +2069,7 @@ class PlaywrightBrowserToolset(FunctionToolset[AgentDepsT]):
             selected = await page.select_option(selector, values, timeout=deadlines.action)
             if (blocked := await self._settle(page, 'select_option', deadlines)) is not None:
                 return blocked
-            text = await self._page_text(page, deadlines.action)
+            text = await self._page_text(page, deadlines.navigation)
             return self._truncate_output(f"Selected {selected} in '{selector}'.\n\n{text}")
 
         return await self._in_operation('select_option', timeout_ms, _select_option)
@@ -2069,7 +2142,7 @@ class PlaywrightBrowserToolset(FunctionToolset[AgentDepsT]):
             except Exception as exc:
                 # Named after the selector rather than the action: which selector failed
                 # is the part the model needs to act on.
-                return self._error(f"Error getting text from '{selector}': {exc}")
+                return self._error(f"Error getting text from '{selector}': {_without_credentials(str(exc))}")
             return self._truncate_output(text)
 
         return await self._in_operation('get_text', timeout_ms, _get_text)
@@ -2112,7 +2185,7 @@ class PlaywrightBrowserToolset(FunctionToolset[AgentDepsT]):
         move = moves.get(direction.lower())
         if move is None:
             return await self._refuse(
-                timeout_ms, f'Error: invalid direction {direction!r}; use up/down/left/right/top/bottom'
+                'scroll', timeout_ms, f'Error: invalid direction {direction!r}; use up/down/left/right/top/bottom'
             )
         delta = deltas.get(direction.lower())
 
@@ -2151,9 +2224,8 @@ class PlaywrightBrowserToolset(FunctionToolset[AgentDepsT]):
                 return self._truncate_output('No previous page in browser history.')
             if (blocked := await self._settle(page, 'go_back', deadlines)) is not None:
                 return blocked
-            return self._truncate_output(
-                f'Went back. URL: {_without_credentials(page.url)}\n\n{await self._page_text(page, deadlines.action)}'
-            )
+            text = await self._page_text(page, deadlines.navigation)
+            return self._truncate_output(f'Went back. URL: {_without_credentials(page.url)}\n\n{text}')
 
         return await self._in_operation('go_back', timeout_ms, _go_back, governed_by_navigation=True)
 
@@ -2174,9 +2246,8 @@ class PlaywrightBrowserToolset(FunctionToolset[AgentDepsT]):
                 return self._truncate_output('No next page in browser history.')
             if (blocked := await self._settle(page, 'go_forward', deadlines)) is not None:
                 return blocked
-            return self._truncate_output(
-                f'Went forward. URL: {_without_credentials(page.url)}\n\n{await self._page_text(page, deadlines.action)}'
-            )
+            text = await self._page_text(page, deadlines.navigation)
+            return self._truncate_output(f'Went forward. URL: {_without_credentials(page.url)}\n\n{text}')
 
         return await self._in_operation('go_forward', timeout_ms, _go_forward, governed_by_navigation=True)
 
@@ -2205,7 +2276,7 @@ class PlaywrightBrowserToolset(FunctionToolset[AgentDepsT]):
                 # failures are picked out by type and left to the operation's mapper.
                 raise
             except Exception as exc:
-                return self._error(f'JS error: {exc}')
+                return self._error(f'JS error: {_without_credentials(str(exc))}')
             try:
                 blocked = await self._enforce_navigation_policy(page, 'execute_js', deadlines.navigation)
             except PlaywrightError as exc:
@@ -2254,12 +2325,12 @@ class PlaywrightBrowserToolset(FunctionToolset[AgentDepsT]):
         invalid = 'Error: wait_for requires exactly one of selector or text.'
         if text is not None:
             if selector is not None:
-                return await self._refuse(timeout_ms, invalid)
+                return await self._refuse('wait_for', timeout_ms, invalid)
             query = f'text={text}'
         elif selector is not None:
             query = selector
         else:
-            return await self._refuse(timeout_ms, invalid)
+            return await self._refuse('wait_for', timeout_ms, invalid)
 
         async def _wait_for(page: _Page, deadlines: _Deadlines) -> str:
             await self._wait_in_any_frame(page, query, deadlines.action, gone=gone)
@@ -2361,7 +2432,9 @@ class PlaywrightBrowserToolset(FunctionToolset[AgentDepsT]):
             text, or a bounded error string.
         """
         if action not in ('list', 'select', 'close', 'new'):
-            return await self._refuse(None, f'Error: unknown tabs action {action!r}; use list, select, close or new.')
+            return await self._refuse(
+                'tabs', None, f'Error: unknown tabs action {action!r}; use list, select, close or new.'
+            )
 
         async def _tabs(page: _Page, deadlines: _Deadlines) -> str:
             session = self._session
@@ -2370,7 +2443,10 @@ class PlaywrightBrowserToolset(FunctionToolset[AgentDepsT]):
             if action == 'new':
                 if len(session.pages) >= _MAX_TABS:
                     return self._error(f'Error: the tab limit of {_MAX_TABS} is reached. Close one first.')
-                await session.open_tab()
+                # The three tab mutations drive Playwright calls that take no
+                # `timeout` of their own, so the operation's deadline is applied
+                # around them rather than left to the driver.
+                await self._await_with_timeout(session.open_tab(), deadlines.action)
                 return self._truncate_output(
                     f'Opened blank tab {len(session.pages) - 1} and made it active. Load it with navigate.'
                 )
@@ -2385,12 +2461,12 @@ class PlaywrightBrowserToolset(FunctionToolset[AgentDepsT]):
                 if len(session.pages) == 1:
                     return self._error('Error: the last tab cannot be closed.')
                 closing = session.pages[target]
-                await session.close_tab(closing)
+                await self._await_with_timeout(session.close_tab(closing), deadlines.action)
                 # The session repoints only when the tab that closed was the active
                 # one; otherwise the operation keeps acting on the page it started on.
                 active = page if closing is not page else session.pages[-1]
                 return self._truncate_output(f'Closed tab {target}. Active tab is now {session.pages.index(active)}.')
-            selected = await session.activate(session.pages[target])
+            selected = await self._await_with_timeout(session.activate(session.pages[target]), deadlines.action)
             if (blocked := await self._enforce_navigation_policy(selected, 'tabs', deadlines.navigation)) is not None:
                 return blocked
             text = await self._page_text(selected, deadlines.action)

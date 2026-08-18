@@ -8,7 +8,7 @@ recorded in the `_toolset` module docstring.
 from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from pydantic_ai import AgentRunResult, RunContext
 from pydantic_ai.capabilities import AbstractCapability, WrapRunHandler
@@ -84,9 +84,7 @@ class PlaywrightBrowser(AbstractCapability[AgentDepsT]):
     calls within a run. Reach for it when
     the lighter web tools fall short: pages behind login/session cookies,
     JavaScript-rendered SPAs, and interactive multi-step flows. For query-based
-    research prefer
-    [`ExaSearch`][pydantic_ai_harness.exa.ExaSearch]; for a static URL prefer a
-    web-fetch tool.
+    research prefer a web-search tool; for a static URL prefer a web-fetch tool.
 
     ```python
     from pydantic_ai import Agent
@@ -167,14 +165,14 @@ class PlaywrightBrowser(AbstractCapability[AgentDepsT]):
     """
 
     block_private_addresses: bool = True
-    """Refuse navigation to private, loopback, link-local, and other reserved IP literals.
+    """Refuse addresses that are not globally routable, for every request kind in every frame.
 
     Covers the cloud metadata endpoint (`169.254.169.254`), loopback
     (`127.0.0.1`, `::1`, `localhost`), and the RFC 1918 ranges, independent of
-    `allowed_domains` -- open egress still cannot reach them. Only IP literals
-    and `localhost` names are matched; hostnames are not resolved (see the
-    egress note above). Set `False` when the agent should reach a local app or
-    an internal dashboard.
+    `allowed_domains` -- open egress still cannot reach them. A hostname is
+    resolved first, so a name pointing at one of those addresses is refused too,
+    as is one whose lookup does not answer (see the egress note above). Set
+    `False` when the agent should reach a local app or an internal dashboard.
     """
 
     screenshot_on_navigate: bool = False
@@ -319,7 +317,7 @@ class PlaywrightBrowser(AbstractCapability[AgentDepsT]):
 
         return _instructions
 
-    async def wrap_run(self, ctx: RunContext[AgentDepsT], *, handler: WrapRunHandler) -> AgentRunResult[AgentDepsT]:
+    async def wrap_run(self, ctx: RunContext[AgentDepsT], *, handler: WrapRunHandler) -> AgentRunResult[Any]:
         """Hold the run's browser session open, and release it however the run ends.
 
         Chromium starts on the first browser-tool call, not here, so a run that
