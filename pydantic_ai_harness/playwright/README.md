@@ -11,6 +11,8 @@ JavaScript-rendered SPAs, and interactive multi-step flows.
 
 [Source](https://github.com/pydantic/pydantic-ai-harness/tree/main/pydantic_ai_harness/playwright/)
 
+> While Pydantic AI Harness is on 0.x releases, the API may change between minor releases; when it does, deprecation warnings and release-note migration guidance tell you (or your agent) exactly how to upgrade. See the [version policy](https://github.com/pydantic/pydantic-ai-harness#version-policy).
+
 > [!NOTE]
 > This README covers driving the browser from the host model: typed,
 > deterministic actions, one tool call at a time. To hand an open-ended goal to
@@ -25,7 +27,7 @@ The `playwright` extra pulls in Playwright, and Chromium is a separate binary
 download:
 
 ```bash
-pip install 'pydantic-ai-harness[playwright]'
+uv add "pydantic-ai-harness[playwright]"
 playwright install chromium
 ```
 
@@ -108,14 +110,15 @@ not known in advance.
 Every tool acts on the active tab. A `target="_blank"` link, a sign-in popup or a
 payment step opens a second one, which stays open rather than being closed:
 `tabs('list')` shows what is open and `tabs('select', index)` moves there. A
-session keeps up to eight tabs; past that a newly opened one is closed and
-recorded. A page dialog (`alert`, `confirm`, `prompt`) blocks the page until it
-is answered, and is dismissed unless `handle_next_dialog(accept=True)` was called
+session keeps up to eight tabs: past that, a tab the page opens is closed and
+recorded, while `tabs('new')` is refused and asks the model to close one first.
+A page dialog (`alert`, `confirm`, `prompt`) blocks the page until it is
+answered, and is dismissed unless `handle_next_dialog(accept=True)` was called
 before the action that opened it -- that call covers one dialog, not the rest of
 the run.
 
 `screenshot` (and the optional `screenshot_on_navigate` attachment) return the
-image as [`BinaryContent`](https://ai.pydantic.dev/api/messages/#pydantic_ai.messages.BinaryContent)
+image as [`BinaryContent`](https://pydantic.dev/docs/ai/api/pydantic-ai/messages/#pydantic_ai.messages.BinaryContent)
 rather than a base64 string, so vision models see the image natively instead of
 a wall of base64 in the text context. A capture over 5 MB (typically a full-page
 screenshot of a long page) is returned as a bounded error instead of image
@@ -297,7 +300,7 @@ between tool calls.
   page did during that operation is attached as span events: console output,
   uncaught script errors, responses, requests the egress policy refused, dialogs
   the page opened, and tabs it opened. The spans go to the run's own tracer, so an agent
-  instrumented for [Logfire](https://logfire.pydantic.dev/docs/) reports them with everything
+  instrumented for [Logfire](https://pydantic.dev/docs/ai/integrations/logfire/) reports them with everything
   else.
 - The agent can read the same log through `console_messages` and
   `network_requests`, which is often how it recovers from a page that renders
@@ -374,7 +377,8 @@ those addresses does not get past it. Set `block_private_addresses=False` when
 the agent should reach a local app or an internal dashboard.
 
 With `allowed_domains=None` (the default) the agent can reach any public URL.
-**When the agent may act on untrusted input, set `allowed_domains` to an explicit allowlist.** Each entry matches its exact host and any subdomain -- `example.com`
+When the agent may act on untrusted input, set `allowed_domains` to an explicit
+allowlist. Each entry matches its exact host and any subdomain -- `example.com`
 reaches `api.example.com` -- compared in the ASCII form Chromium itself uses, so
 an internationalized host and its `xn--` spelling get the same verdict. An entry
 written as a wildcard (`*.example.com`) raises at construction: it would match no
@@ -459,6 +463,9 @@ class FontsFromAnywhere(EgressPolicy):
 
 Returning `None` allows the request; returning a string refuses it and records
 that string as the reason, which the model can read through `network_requests`.
+An override that narrows what `refuse` allows should override `describe` too:
+`describe` is what the model is told about its reach, and it reads only the
+fields.
 
 Neither policy is a general security boundary. Microsoft's own playwright-mcp
 disclaims its origin filter the same way. A page can still signal outward through
@@ -473,8 +480,3 @@ For untrusted-input scenarios, run the browser in a container or VM with an
 egress firewall, or front it with a proxy, and pair it with the harness's
 tool-approval hooks for consequential actions. Treat these as defense in depth,
 not a guarantee.
-
-## Stability
-
-This capability is available today and its API may change as the harness
-evolves. Pin the harness version if you need a stable surface.

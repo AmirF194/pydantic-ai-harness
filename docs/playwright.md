@@ -32,7 +32,7 @@ The `playwright` extra pulls in Playwright, and Chromium is a separate binary
 download:
 
 ```bash
-pip install 'pydantic-ai-harness[playwright]'
+uv add "pydantic-ai-harness[playwright]"
 playwright install chromium
 ```
 
@@ -119,14 +119,15 @@ not known in advance.
 Every tool acts on the active tab. A `target="_blank"` link, a sign-in popup or a
 payment step opens a second one, which stays open rather than being closed:
 `tabs('list')` shows what is open and `tabs('select', index)` moves there. A
-session keeps up to eight tabs; past that a newly opened one is closed and
-recorded. A page dialog (`alert`, `confirm`, `prompt`) blocks the page until it
-is answered, and is dismissed unless `handle_next_dialog(accept=True)` was called
+session keeps up to eight tabs: past that, a tab the page opens is closed and
+recorded, while `tabs('new')` is refused and asks the model to close one first.
+A page dialog (`alert`, `confirm`, `prompt`) blocks the page until it is
+answered, and is dismissed unless `handle_next_dialog(accept=True)` was called
 before the action that opened it -- that call covers one dialog, not the rest of
 the run.
 
 `screenshot` (and the optional `screenshot_on_navigate` attachment) return the
-image as [`BinaryContent`](/ai/api/messages/#pydantic_ai.messages.BinaryContent)
+image as [`BinaryContent`](/ai/api/pydantic-ai/messages/#pydantic_ai.messages.BinaryContent)
 rather than a base64 string, so vision models see the image natively instead of
 a wall of base64 in the text context. A capture over 5 MB (typically a full-page
 screenshot of a long page) is returned as a bounded error instead of image
@@ -308,7 +309,7 @@ between tool calls.
   page did during that operation is attached as span events: console output,
   uncaught script errors, responses, requests the egress policy refused, dialogs
   the page opened, and tabs it opened. The spans go to the run's own tracer, so an agent
-  instrumented for [Logfire](/ai/guides/logfire/) reports them with everything
+  instrumented for [Logfire](/ai/integrations/logfire/) reports them with everything
   else.
 - The agent can read the same log through `console_messages` and
   `network_requests`, which is often how it recovers from a page that renders
@@ -440,7 +441,7 @@ fields cover a denylist (`blocked_domains`, which wins over everything and reach
 every request kind), apex-only matching (`include_subdomains=False`), and which
 kinds the allowlist bounds (`allowlist_reach`).
 
-```python {test="skip"}
+```python
 from typing import get_args
 
 from pydantic_ai_harness.playwright import EgressPolicy, PlaywrightBrowser, RequestKind
@@ -458,7 +459,7 @@ For a decision the fields do not describe, subclass and override `refuse`. It is
 given the URL, the kind, Playwright's own `resource_type`, the method, and whether
 the request is the main frame's own document:
 
-```python {test="skip"}
+```python
 from pydantic_ai_harness.playwright import EgressPolicy, EgressRequest
 
 
@@ -471,6 +472,9 @@ class FontsFromAnywhere(EgressPolicy):
 
 Returning `None` allows the request; returning a string refuses it and records
 that string as the reason, which the model can read through `network_requests`.
+An override that narrows what `refuse` allows should override `describe` too:
+`describe` is what the model is told about its reach, and it reads only the
+fields.
 
 Neither policy is a general security boundary. Microsoft's own playwright-mcp
 disclaims its origin filter the same way. A page can still signal outward through
@@ -485,11 +489,6 @@ For untrusted-input scenarios, run the browser in a container or VM with an
 egress firewall, or front it with a proxy, and pair it with the harness's
 tool-approval hooks for consequential actions. Treat these as defense in depth,
 not a guarantee.
-
-## Stability
-
-This capability is available today and its API may change as the harness
-evolves. Pin the harness version if you need a stable surface.
 
 ## API reference
 
