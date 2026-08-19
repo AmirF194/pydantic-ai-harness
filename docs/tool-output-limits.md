@@ -159,16 +159,17 @@ ToolOutputLimits(serializer=json_lines)  # top-level list: one record per line
 (other than a string or a byte payload) as one compact JSON value per line (JSON Lines), so
 line offsets map directly to items; other values fall back to `indented_json`. Both presets
 escape the Unicode line separators that `str.splitlines` breaks on, so a line read back is
-always a whole item or field.
+always a whole item or field. A tool that wraps its records in a mapping (say
+`{'items': [...]}`) gets the `indented_json` fallback; return the list directly, or supply
+a serializer that unwraps it, to get line-per-record paging.
 
 Any `(value) -> str` callable can be supplied; `Serializer` is the exported alias. The
 capability serializes each structured return once: measurement, band selection, previews,
 stored bytes, and read-back all use the same text, which means an indented layout measures
 larger than compact JSON and can reach a band the compact form would not. If the callable
 raises or returns non-text, the capability warns and falls back to compact JSON for that
-return. Strings and
-binary payloads never pass through the serializer, and a structured return below the
-smallest band threshold passes through as the original object.
+return. Strings and binary payloads never pass through the serializer, and a structured
+return below the smallest band threshold passes through as the original object.
 
 ## Spill store
 
