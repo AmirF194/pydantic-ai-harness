@@ -381,6 +381,7 @@ class _FakePage:
         self.popup_handlers: list[Callable[[_FakePage], None]] = []
         self.typed: list[tuple[str, str]] = []
         self.wait_states: list[str | None] = []
+        self.wait_queries: list[str] = []
         self.brought_to_front = 0
         self.closed = False
 
@@ -475,6 +476,7 @@ class _FakePage:
     ) -> object:
         self.timeouts['wait_for_selector'] = timeout
         self.wait_states.append(state)
+        self.wait_queries.append(selector)
         if self._wait_for_error is not None:
             raise self._wait_for_error
         return None
@@ -1779,7 +1781,16 @@ class TestWaitFor:
     async def test_wait_for_text_uses_text_engine(self) -> None:
         page = _FakePage(body='dynamic text')
         result = await _toolset(page).wait_for(text='Submit')
-        assert result == "Found 'text=Submit'.\n\ndynamic text"
+        assert result == "Found 'Submit'.\n\ndynamic text"
+        assert page.wait_queries == [':text("Submit")']
+
+    async def test_wait_for_text_is_inert_selector_input(self) -> None:
+        # Interpolated after `text=`, a `>>` reads as a selector chain and a quote
+        # flips exact matching, so the wait would miss text that is on the page.
+        page = _FakePage(body='dynamic text')
+        result = await _toolset(page).wait_for(text='Home >> "Products" \\ more')
+        assert result.startswith('Found \'Home >> "Products" \\ more\'.')
+        assert page.wait_queries == [':text("Home >> \\"Products\\" \\\\ more")']
 
     async def test_wait_for_requires_exactly_one_argument(self) -> None:
         toolset = _toolset(_FakePage())
@@ -2687,7 +2698,7 @@ class TestEmbeddedFrames:
         page = _FakePage(body='Conference', wait_for_error=PlaywrightTimeoutError('Timeout 5000ms exceeded.'))
         page.frames.append(_FakeFrameContent(text='late content'))
         result = await _toolset(page).wait_for(text='late content')
-        assert result.startswith("Found 'text=late content'.")
+        assert result.startswith("Found 'late content'.")
 
     async def test_wait_for_reports_the_timeout_when_no_frame_matches(self) -> None:
         page = _FakePage(wait_for_error=PlaywrightTimeoutError('Timeout 5000ms exceeded.'))
@@ -3405,6 +3416,12 @@ class TestEgressPolicy:
             toolset_module.EgressPolicy(allowed_domains=['.example.com'])
         with pytest.raises(UserError, match='starts with a dot'):
             toolset_module.EgressPolicy(blocked_domains=['.ads.example.com'])
+        # Checked as `_matches` will read it: surrounding whitespace must not
+        # slip a dodged entry past the same validation.
+        with pytest.raises(UserError, match='starts with a dot'):
+            toolset_module.EgressPolicy(allowed_domains=[' .example.com'])
+        with pytest.raises(UserError, match='wildcard'):
+            toolset_module.EgressPolicy(blocked_domains=[' *.example.com '])
 
     def test_a_subclass_decides_what_the_fields_cannot(self) -> None:
         class FontsFromAnywhere(toolset_module.EgressPolicy):

@@ -633,6 +633,9 @@ class EgressPolicy:
     def __post_init__(self) -> None:
         for field_name in ('allowed_domains', 'blocked_domains'):
             for entry in getattr(self, field_name) or ():
+                # Validated as `_matches` will read it, so an entry that only
+                # differs by surrounding whitespace cannot dodge a check.
+                entry = entry.strip()
                 if '*' in entry:
                     raise UserError(
                         f'{field_name} entry {entry!r} contains a wildcard, which never matches a host. '
@@ -2326,16 +2329,25 @@ class PlaywrightBrowserToolset(FunctionToolset[AgentDepsT]):
         if text is not None:
             if selector is not None:
                 return await self._refuse('wait_for', timeout_ms, invalid)
-            query = f'text={text}'
+            # Quoted inside `:text()` rather than interpolated after `text=`, where
+            # the selector grammar would read a `>>` in the text as a chain and a
+            # quote as an exact-match toggle. `:text` keeps the substring matching
+            # `text=` has, and the quotes make the value inert.
+            escaped = text.replace('\\', '\\\\').replace('"', '\\"')
+            query = f':text("{escaped}")'
         elif selector is not None:
             query = selector
         else:
             return await self._refuse('wait_for', timeout_ms, invalid)
 
+        # The engine query matches; the caller's own argument is what the result
+        # echoes, so the model reads back what it asked for.
+        label = selector if selector is not None else text
+
         async def _wait_for(page: _Page, deadlines: _Deadlines) -> str:
             await self._wait_in_any_frame(page, query, deadlines.action, gone=gone)
             settled = 'Gone' if gone else 'Found'
-            return self._truncate_output(f"{settled} '{query}'.\n\n{await self._page_text(page, deadlines.action)}")
+            return self._truncate_output(f"{settled} '{label}'.\n\n{await self._page_text(page, deadlines.action)}")
 
         return await self._in_operation('wait_for', timeout_ms, _wait_for)
 
