@@ -149,6 +149,23 @@ class TestMcpCheckpointing:
         assert server.tool_calls == [('add', {'a': 2, 'b': 3})]
         assert replay.invoked == []
 
+    async def test_raw_checkpoint_from_the_reference_package_replays(self) -> None:
+        # `pydantic-ai-absurd` stores a tool's return value directly rather than the wrapped form,
+        # so a run started there and resumed here finds a raw checkpoint under the same step name.
+        server = FakeMCPToolset(id='calc')
+        agent = Agent(_add_then_done_model(), name='calc', toolsets=[server], capabilities=[AbsurdDurability()])
+
+        step = 'calc__mcp_server__calc.call_tool'
+        ctx = FakeAsyncTaskContext(store={step: 99})
+        with absurd_task_context(ctx):
+            result = await agent.run('add 2 and 3')
+
+        assert result.output == 'summed'
+        # The seeded checkpoint answered the call, so the server was never asked to add anything.
+        assert server.tool_calls == []
+        returned = [part.content for m in result.all_messages() for part in m.parts if isinstance(part, ToolReturnPart)]
+        assert returned == [99]
+
 
 class TestFakeServerModelsImplicitSessions:
     async def test_io_without_an_open_session_opens_an_implicit_one(self) -> None:

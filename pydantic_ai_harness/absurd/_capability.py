@@ -6,8 +6,11 @@ checkpoints an agent's I/O -- model requests, MCP calls, and function tool calls
 the last completed step instead of restarting the run.
 
 The step names and checkpoint payload shapes are kept byte-compatible with the
-`pydantic-ai-absurd` package by Marcelo Trylesinski, so a run started under one
-package can resume under the other.
+`pydantic-ai-absurd` package by Marcelo Trylesinski, in one direction: a run
+started under that package can resume here, because a recording it wrote is read
+back as-is. The reverse does not hold -- this module stores a tool result inside a
+control-flow wrapper, which `pydantic-ai-absurd` would hand to the model as the
+tool result.
 """
 
 from __future__ import annotations
@@ -20,14 +23,13 @@ except ImportError as _import_error:  # pragma: no cover
         'you can use the `absurd` optional group -- `pip install "pydantic-ai-harness[absurd]"`'
     ) from _import_error
 
-import copy
 from collections.abc import Callable, Mapping, Sequence
 from contextlib import AbstractContextManager
-from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, ClassVar, Literal
+from dataclasses import dataclass, fields
+from typing import TYPE_CHECKING, Any, ClassVar, Literal, get_args
 
 from absurd_sdk import AsyncTaskContext, JsonValue, get_current_context
-from pydantic import TypeAdapter
+from pydantic import TypeAdapter, ValidationError
 from pydantic_ai import FunctionToolset, ToolsetTool
 from pydantic_ai.agent import EventStreamHandler, ParallelExecutionMode
 from pydantic_ai.agent.abstract import AbstractAgent
@@ -36,9 +38,13 @@ from pydantic_ai.durable_exec._base import BaseDurabilityCapability
 from pydantic_ai.durable_exec._runtime_toolsets import RuntimeToolsetKind
 from pydantic_ai.durable_exec._toolset import (
     CallToolResult,
+    DurableDynamicToolset,
     DurableFunctionToolset,
     DurableMCPToolset,
+    DynamicToolsResult,
     ToolConfig,
+    call_dynamic_tool,
+    get_dynamic_tools,
     resolve_tool_durable_config,
     unwrap_tool_call_result,
     wrap_tool_call_result,
@@ -51,7 +57,6 @@ from pydantic_ai.run import AgentRunResult
 from pydantic_ai.tools import AgentDepsT, RunContext, ToolDefinition
 from pydantic_ai.toolsets import AbstractToolset, WrapperToolset
 from pydantic_ai.toolsets._dynamic import DynamicToolset
-from pydantic_ai.toolsets.external import TOOL_SCHEMA_VALIDATOR
 
 if TYPE_CHECKING:
     from pydantic_ai.mcp import MCPToolset
@@ -76,6 +81,7 @@ _ENGINE_NAME = 'Absurd'
 _TOOL_CONFIG_KEY = 'absurd'
 _TOOL_CONFIG_LABEL = 'Absurd step config'
 _NO_FALLBACK_CONFIG: Mapping[str, ToolConfig] = {}
+_ALLOWED_PARALLEL_EXECUTION_MODES: tuple[str, ...] = get_args(AbsurdParallelExecutionMode)
 
 _Instructions = str | InstructionPart | Sequence[str | InstructionPart] | None
 _DurableRunContextScope = Callable[[RunContext[AgentDepsT]], AbstractContextManager[RunContext[AgentDepsT]]]
@@ -84,8 +90,18 @@ _response_adapter: TypeAdapter[ModelResponse] = TypeAdapter(ModelResponse)
 _events_adapter: TypeAdapter[list[ModelResponseStreamEvent]] = TypeAdapter(list[ModelResponseStreamEvent])
 _call_tool_result_adapter: TypeAdapter[CallToolResult] = TypeAdapter(CallToolResult)
 _tool_defs_adapter: TypeAdapter[dict[str, ToolDefinition]] = TypeAdapter(dict[str, ToolDefinition])
-_tool_def_adapter: TypeAdapter[ToolDefinition] = TypeAdapter(ToolDefinition)
 _instructions_adapter: TypeAdapter[_Instructions] = TypeAdapter(_Instructions)
+_dynamic_tools_adapter: TypeAdapter[DynamicToolsResult] = TypeAdapter(DynamicToolsResult)
+
+_WRAPPER_KINDS: frozenset[str] = frozenset(
+    # `CallToolResult` is an annotated union of dataclasses, each tagged by the string default of
+    # its `kind` field. Reading the tags off the union keeps them in step with it when a wrapper is
+    # added or renamed.
+    field.default
+    for member in get_args(get_args(CallToolResult)[0])
+    for field in fields(member)
+    if field.name == 'kind' and isinstance(field.default, str)
+)
 
 
 def _current_async_task_context() -> AsyncTaskContext | None:
@@ -122,8 +138,30 @@ def _serialize_call_tool_result(result: CallToolResult) -> JsonValue:
     return _call_tool_result_adapter.dump_python(result, mode='json')
 
 
-def _deserialize_call_tool_result(payload: JsonValue) -> CallToolResult:
-    return _call_tool_result_adapter.validate_python(payload)
+def _unwrap_checkpointed_call_tool_result(payload: JsonValue) -> Any:
+    """Unwrap a checkpointed tool result, passing a raw pre-wrapper recording through.
+
+    Every wrapper in `CallToolResult` carries a `kind` tag, so a payload carrying none of those
+    tags was certainly not written by `wrap_tool_call_result`: it is the tool's return value stored
+    directly, as `pydantic-ai-absurd` and earlier versions of this capability wrote it. A run
+    started there can resume here, so such a payload is returned unchanged instead of failing to
+    decode. A payload that does carry a wrapper tag but fails to decode is a different story --
+    it claimed to be a wrapper, so the decode error is raised rather than handing the envelope
+    itself to the model as the tool result.
+
+    The test only holds one way. A raw recording that happens to be a dict with a `kind` matching
+    a wrapper tag is read as a wrapper. Nothing in a JSON store tells the two apart, and the payload
+    shapes are a stable persistence format, so there is no marker to add that would make the test
+    exact.
+    """
+    try:
+        result = _call_tool_result_adapter.validate_python(payload)
+    except ValidationError:
+        kind = payload.get('kind') if isinstance(payload, dict) else None
+        if isinstance(kind, str) and kind in _WRAPPER_KINDS:
+            raise
+        return payload
+    return unwrap_tool_call_result(result)
 
 
 def _reject_model_id_hash(model_id: str) -> None:
@@ -141,6 +179,21 @@ def _reject_model_id_hash(model_id: str) -> None:
             f'Model id {model_id!r} contains {"#"!r}, which Absurd uses to disambiguate repeated '
             'step names. Folded into the model step name it would collide with that suffix. Choose '
             'a model id without `#`.'
+        )
+
+
+def _reject_tool_name_hash(tool_name: str) -> None:
+    """Reject a tool name containing `#`.
+
+    Same collision as `_reject_model_id_hash`: function-tool and dynamic-toolset calls are
+    checkpointed under a `.call_tool:{tool_name}` step name, so a tool named `foo#2` would land on
+    the checkpoint Absurd assigns to the second call of a tool named `foo`.
+    """
+    if '#' in tool_name:
+        raise UserError(
+            f'Tool name {tool_name!r} contains {"#"!r}, which Absurd uses to disambiguate repeated '
+            'step names. Folded into the tool call step name it would collide with that suffix. '
+            'Rename the tool without `#`.'
         )
 
 
@@ -200,6 +253,7 @@ def _build_function_toolset(
     ) -> Any:
         task_ctx = _current_async_task_context()
         assert task_ctx is not None  # pragma: no cover - only called inside a durable context
+        _reject_tool_name_hash(tool_name)
 
         async def _inner() -> JsonValue:
             with durable_run_context_scope(ctx) as step_ctx:
@@ -207,13 +261,15 @@ def _build_function_toolset(
             return _serialize_call_tool_result(result)
 
         payload = await task_ctx.step(f'{name}.call_tool:{tool_name}', _inner)
-        return unwrap_tool_call_result(_deserialize_call_tool_result(payload))
+        return _unwrap_checkpointed_call_tool_result(payload)
 
     return DurableFunctionToolset(
         toolset,
         in_durable_context=_in_durable_context,
         call_tool_operation=call_tool_operation,
         resolve_tool_config=_resolve_function_tool_config,
+        # Entering a `FunctionToolset` is a no-op -- it holds no connection or session -- so there
+        # is nothing to keep open for the run.
         lifecycle='enter-never',
     )
 
@@ -266,7 +322,7 @@ def _build_mcp_toolset(
             return _serialize_call_tool_result(result)
 
         payload = await task_ctx.step(f'{name}.call_tool', _inner)
-        return unwrap_tool_call_result(_deserialize_call_tool_result(payload))
+        return _unwrap_checkpointed_call_tool_result(payload)
 
     return DurableMCPToolset(
         toolset,
@@ -285,183 +341,61 @@ def _build_mcp_toolset(
     )
 
 
-class _AbsurdDynamicToolset(WrapperToolset[AgentDepsT]):
-    """Durable wrapper for a construction-time `DynamicToolset`.
-
-    A `DynamicToolset` resolves its inner toolset lazily per run (or per run step) by calling a
-    user factory, which may do I/O. Left unwrapped, that resolution and the inner tool calls run
-    inline in task code and re-run on recovery. This wrapper moves them into Absurd steps, mirroring
-    the shape of `pydantic_ai.durable_exec.temporal._dynamic_toolset.TemporalDynamicToolset` (there
-    is no shared core primitive for durable dynamic toolsets, so, as Temporal does, the wrapper is
-    engine-local): `get_tools` resolves the toolset inside one step and checkpoints its tool
-    definitions and instructions; `call_tool` re-resolves inside its own step and checkpoints the
-    result. On replay each step is served from its checkpoint, so the factory and the tool are not
-    re-invoked.
-
-    Outside a task the wrapper is transparent and delegates to the wrapped `DynamicToolset`.
-    """
-
-    def __init__(
-        self,
-        wrapped: DynamicToolset[AgentDepsT],
-        *,
-        step_name_prefix: str,
-        in_durable_context: Callable[[], bool],
-        durable_run_context_scope: _DurableRunContextScope[AgentDepsT],
-    ) -> None:
-        super().__init__(wrapped)
-        # `wrapped.id` may be `None` here: the base capability calls `_wrap_leaf_toolset` before it
-        # rejects an id-less leaf, and the name is never used in that case (binding raises first).
-        self._name = f'{step_name_prefix}__dynamic_toolset__{wrapped.id}'
-        self._in_durable_context = in_durable_context
-        self._durable_run_context_scope = durable_run_context_scope
-        # Set by `get_tools`, read by `get_instructions` in the same run step. Lives on the per-run
-        # copy so concurrent runs of the shared bound wrapper do not clobber each other.
-        self._run_instructions: _Instructions = None
-
-    @property
-    def id(self) -> str:
-        assert self.wrapped.id is not None
-        return self.wrapped.id
-
-    def visit_and_replace(
-        self, visitor: Callable[[AbstractToolset[AgentDepsT]], AbstractToolset[AgentDepsT]]
-    ) -> AbstractToolset[AgentDepsT]:
-        # A durable wrapper is a barrier: it must not be descended into and re-wrapped, so it returns
-        # itself rather than the `WrapperToolset` default (which would `replace(...)` and fail this
-        # keyword-only constructor). Mirrors core's `DurableToolsetBase`. No public composition
-        # currently revisits an already-swapped leaf, so this is a defensive guard.
-        return self  # pragma: no cover
-
-    def _run_copy(self, wrapped: AbstractToolset[AgentDepsT]) -> _AbsurdDynamicToolset[AgentDepsT]:
-        run_copy = copy.copy(self)
-        run_copy.wrapped = wrapped
-        run_copy._run_instructions = None
-        return run_copy
-
-    async def for_run(self, ctx: RunContext[AgentDepsT]) -> AbstractToolset[AgentDepsT]:
-        if not self._in_durable_context():
-            new_wrapped = await self.wrapped.for_run(ctx)
-            return self if new_wrapped is self.wrapped else self._run_copy(new_wrapped)
-        # Resolution is deferred into the durable `get_tools`/`call_tool` steps; only isolate the
-        # per-run instructions slot from the process-shared bound wrapper.
-        return self._run_copy(self.wrapped)
-
-    async def for_run_step(self, ctx: RunContext[AgentDepsT]) -> AbstractToolset[AgentDepsT]:
-        if not self._in_durable_context():
-            new_wrapped = await self.wrapped.for_run_step(ctx)
-            return self if new_wrapped is self.wrapped else self._run_copy(new_wrapped)
-        return self
-
-    async def get_tools(self, ctx: RunContext[AgentDepsT]) -> dict[str, ToolsetTool[AgentDepsT]]:
-        if not self._in_durable_context():
-            return await super().get_tools(ctx)
-        task_ctx = _current_async_task_context()
-        assert task_ctx is not None  # pragma: no cover - gated by `_in_durable_context`
-
-        async def _inner() -> JsonValue:
-            with self._durable_run_context_scope(ctx) as step_ctx:
-                run_toolset = await self.wrapped.for_run(step_ctx)
-                async with run_toolset:
-                    resolved = await run_toolset.for_run_step(step_ctx)
-                    tools = await resolved.get_tools(step_ctx)
-                    instructions = await resolved.get_instructions(step_ctx)
-                return {
-                    'tools': {
-                        tool_name: {
-                            'tool_def': _tool_def_adapter.dump_python(tool.tool_def, mode='json'),
-                            'max_retries': tool.max_retries,
-                        }
-                        for tool_name, tool in tools.items()
-                    },
-                    'instructions': _instructions_adapter.dump_python(instructions, mode='json'),
-                }
-
-        payload = await task_ctx.step(f'{self._name}.get_tools', _inner)
-        assert isinstance(payload, dict)
-        self._run_instructions = _instructions_adapter.validate_python(payload['instructions'])
-        tools_payload = payload['tools']
-        assert isinstance(tools_payload, dict)
-        return {tool_name: self._tool_from_payload(info) for tool_name, info in tools_payload.items()}
-
-    def _tool_from_payload(self, info: JsonValue) -> ToolsetTool[AgentDepsT]:
-        assert isinstance(info, dict)
-        max_retries = info['max_retries']
-        assert isinstance(max_retries, int)
-        return ToolsetTool(
-            toolset=self,
-            tool_def=_tool_def_adapter.validate_python(info['tool_def']),
-            max_retries=max_retries,
-            args_validator=TOOL_SCHEMA_VALIDATOR,
-        )
-
-    async def get_instructions(self, ctx: RunContext[AgentDepsT]) -> _Instructions:
-        if not self._in_durable_context():
-            return await super().get_instructions(ctx)
-        # Collected by `get_tools`, which the framework runs earlier in each run step.
-        return self._run_instructions
-
-    async def _resolve_validate_call(self, name: str, tool_args: dict[str, Any], ctx: RunContext[AgentDepsT]) -> Any:
-        """Re-resolve the dynamic toolset, re-validate the args, and call the tool.
-
-        The outer tool the agent holds carries `TOOL_SCHEMA_VALIDATOR` (a pass-through), so args are
-        not validated upstream. Re-validate them here with the re-resolved inner tool's real
-        validator, exactly as the non-durable path would, so typed args are coerced and invalid args
-        raise a `ValidationError` (which `ToolManager` turns into a retry prompt) rather than reaching
-        the function raw. Mirrors Temporal's `_call_tool_in_activity`.
-        """
-        run_toolset = await self.wrapped.for_run(ctx)
-        async with run_toolset:
-            resolved = await run_toolset.for_run_step(ctx)
-            tools = await resolved.get_tools(ctx)
-            inner_tool = tools.get(name)
-            if inner_tool is None:  # pragma: no cover - factory returned a different toolset
-                raise UserError(
-                    f'Tool {name!r} not found in dynamic toolset {self.id!r} when re-resolving it '
-                    'inside the durable step. The toolset factory returned a different toolset than '
-                    'when the tool was listed.'
-                )
-            args_dict = inner_tool.args_validator.validate_python(tool_args)
-            return await resolved.call_tool(name, args_dict, ctx, inner_tool)
-
-    async def call_tool(
-        self, name: str, tool_args: dict[str, Any], ctx: RunContext[AgentDepsT], tool: ToolsetTool[AgentDepsT]
-    ) -> Any:
-        if not self._in_durable_context():
-            return await super().call_tool(name, tool_args, ctx, tool)
-        # The outer tool's metadata was checkpointed by `get_tools`, so the config is replay-stable.
-        # A populated dict config raises here; `False` opts the tool out of checkpointing and runs it
-        # inline (un-checkpointed) through a fresh resolution, the same meaning as for a plain
-        # function tool.
-        config = _resolve_function_tool_config(tool, name)
-        if config is False:
-            return await self._resolve_validate_call(name, tool_args, ctx)
-        task_ctx = _current_async_task_context()
-        assert task_ctx is not None  # pragma: no cover - gated by `_in_durable_context`
-
-        async def _inner() -> JsonValue:
-            # A `ValidationError` from arg re-validation is deterministic and pure, so it propagates
-            # out of the step uncaught: no checkpoint slot is claimed and `ToolManager` converts it to
-            # a retry prompt. `wrap_tool_call_result` still captures `ModelRetry`/approval/deferral.
-            with self._durable_run_context_scope(ctx) as step_ctx:
-                result = await wrap_tool_call_result(self._resolve_validate_call(name, tool_args, step_ctx))
-            return _serialize_call_tool_result(result)
-
-        payload = await task_ctx.step(f'{self._name}.call_tool:{name}', _inner)
-        return unwrap_tool_call_result(_deserialize_call_tool_result(payload))
-
-
 def _build_dynamic_toolset(
     toolset: DynamicToolset[AgentDepsT],
     *,
     step_name_prefix: str,
     durable_run_context_scope: _DurableRunContextScope[AgentDepsT],
-) -> _AbsurdDynamicToolset[AgentDepsT]:
-    return _AbsurdDynamicToolset(
+) -> DurableDynamicToolset[AgentDepsT]:
+    name = f'{step_name_prefix}__dynamic_toolset__{toolset.id}'
+
+    async def get_tools_operation(ctx: RunContext[AgentDepsT]) -> DynamicToolsResult:
+        task_ctx = _current_async_task_context()
+        assert task_ctx is not None  # pragma: no cover - only called inside a durable context
+
+        async def _inner() -> JsonValue:
+            with durable_run_context_scope(ctx) as step_ctx:
+                result = await get_dynamic_tools(toolset, step_ctx)
+            return _dynamic_tools_adapter.dump_python(result, mode='json')
+
+        payload = await task_ctx.step(f'{name}.get_tools', _inner)
+        return _dynamic_tools_adapter.validate_python(payload)
+
+    async def call_tool_operation(
+        tool_name: str,
+        tool_args: dict[str, Any],
+        ctx: RunContext[AgentDepsT],
+        tool: ToolsetTool[AgentDepsT],
+        config: Mapping[str, Any],
+    ) -> Any:
+        task_ctx = _current_async_task_context()
+        assert task_ctx is not None  # pragma: no cover - only called inside a durable context
+        _reject_tool_name_hash(tool_name)
+
+        async def _inner() -> JsonValue:
+            # `call_dynamic_tool` re-validates the args against the re-resolved tool, and
+            # `wrap_tool_call_result` only captures control-flow exceptions, so a `ValidationError`
+            # from that re-validation propagates out of the step uncaught and `ToolManager` converts
+            # it to a retry prompt. The failing step still claims its checkpoint slot -- Absurd
+            # claims it when the step is entered, before the body runs -- which is safe because the
+            # failure is deterministic: a replay reaches the same step, fails the same way, and
+            # claims the same slot, so every later step name lines up with its checkpoint.
+            with durable_run_context_scope(ctx) as step_ctx:
+                result = await wrap_tool_call_result(call_dynamic_tool(toolset, tool_name, tool_args, step_ctx))
+            return _serialize_call_tool_result(result)
+
+        payload = await task_ctx.step(f'{name}.call_tool:{tool_name}', _inner)
+        return _unwrap_checkpointed_call_tool_result(payload)
+
+    return DurableDynamicToolset(
         toolset,
-        step_name_prefix=step_name_prefix,
         in_durable_context=_in_durable_context,
-        durable_run_context_scope=durable_run_context_scope,
+        get_tools_operation=get_tools_operation,
+        call_tool_operation=call_tool_operation,
+        resolve_tool_config=_resolve_function_tool_config,
+        # The wrapped toolset is only a factory, so there is nothing to enter for the run: each
+        # step enters the toolset it resolves.
+        lifecycle='enter-never',
     )
 
 
@@ -483,14 +417,16 @@ class AbsurdDurability(BaseDurabilityCapability[AgentDepsT]):
     to the agent. Step results are stored in Postgres as JSON, so a checkpointed tool's return
     value must be JSON-serializable.
 
-    Step names and checkpoint payload shapes are compatible with the `pydantic-ai-absurd` package,
-    so a run can migrate between the two.
+    Step names and checkpoint payload shapes are compatible with the `pydantic-ai-absurd` package
+    in one direction: a run started under that package can resume here, but a run started here
+    should not be resumed under it, because it would hand this capability's result wrapper to the
+    model as the tool result.
 
     Example:
         ```python {test="skip"}
         from absurd_sdk import AsyncAbsurd, AsyncTaskContext, JsonValue
         from pydantic_ai import Agent
-        from pydantic_ai_harness.absurd import AbsurdDurability
+        from pydantic_ai_harness import AbsurdDurability
 
         absurd = AsyncAbsurd('postgresql://localhost/absurd', queue_name='agents')
         agent = Agent('openai:gpt-5.6-sol', name='analyst', capabilities=[AbsurdDurability()])
@@ -535,14 +471,22 @@ class AbsurdDurability(BaseDurabilityCapability[AgentDepsT]):
             name: Unique agent name used as the prefix for every checkpoint step. Defaults to the
                 agent's `name` when the capability is bound.
             parallel_execution_mode: Tool-call execution mode applied for a run inside a task.
-                Defaults to `'sequential'`. `'parallel'` is excluded by type because it emits
-                tool-result and event-handler steps in completion order, which races with Absurd's
-                encounter-order step naming; see `AbsurdParallelExecutionMode` for the full
-                invariant. Outside a task the agent's configured mode is left untouched.
+                Defaults to `'sequential'`. `'parallel'` is excluded by type and rejected here,
+                because it emits tool-result and event-handler steps in completion order, which
+                races with Absurd's encounter-order step naming; see
+                `AbsurdParallelExecutionMode` for the full invariant. Outside a task the agent's
+                configured mode is left untouched.
         """
         super().__init__(models=models, event_stream_handler=event_stream_handler, name=name)
         for model_id in models or {}:
             _reject_model_id_hash(model_id)
+        # The type excludes `'parallel'`, but an untyped caller can still reach the mode whose
+        # completion-order steps race with encounter-order step naming.
+        if parallel_execution_mode not in _ALLOWED_PARALLEL_EXECUTION_MODES:
+            allowed = ' or '.join(repr(mode) for mode in _ALLOWED_PARALLEL_EXECUTION_MODES)
+            raise UserError(
+                f'{parallel_execution_mode!r} is not a supported {_ENGINE_NAME} parallel execution mode. Use {allowed}.'
+            )
         self._parallel_execution_mode: ParallelExecutionMode = parallel_execution_mode
         self._default_model_id: str | None = None
 
@@ -619,6 +563,9 @@ class AbsurdDurability(BaseDurabilityCapability[AgentDepsT]):
         model_id = self._model_id_for_request(ctx, request_context)
         if model_id is not None and model_id == self._default_model_id:
             model_id = None
+        if model_id is not None:
+            # A runtime `agent.run(model=...)` string never passed through the `models=` check.
+            _reject_model_id_hash(model_id)
         step_suffix = '' if model_id is None else f'.{model_id}'
         model = request_context.model
 

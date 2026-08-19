@@ -45,7 +45,7 @@ prefixes every checkpoint step.
 ```python {test="skip"}
 from absurd_sdk import AsyncAbsurd, AsyncTaskContext, JsonValue
 from pydantic_ai import Agent
-from pydantic_ai_harness.absurd import AbsurdDurability
+from pydantic_ai_harness import AbsurdDurability
 
 absurd = AsyncAbsurd('postgresql://localhost/absurd', queue_name='agents')
 agent = Agent('openai:gpt-5.6-sol', name='analyst', capabilities=[AbsurdDurability()])
@@ -108,9 +108,11 @@ checkpoint and lines up on replay.
 - The agent's `name` and a toolset's `id` are part of every step name, so they should not be
   changed once the durable agent has been deployed to production: a rename orphans the checkpoints
   of in-flight tasks, which resume under the old names and re-run their steps from the start.
-- A registered model id (a `models=` key) is folded into the model step name, so it must not
-  contain `#`, the character Absurd uses to disambiguate repeated step names. A `#` in a model id
-  is rejected with a `UserError`.
+- Model ids and the tool names of function and dynamic toolsets are folded into their step names,
+  so none of those may contain `#`, the character Absurd uses to disambiguate repeated step names.
+  A `models=` key, a runtime `run(model=...)` string, or such a tool name containing `#` is rejected
+  with a `UserError`. An MCP tool name is not folded in (its step name is just `.call_tool`), so it
+  carries no such restriction.
 - A checkpointed tool's return value is stored in Postgres as JSON, so it must be JSON-serializable.
 - Code running inside a checkpointed step cannot call `RunContext.enqueue()` or `RunContext.cancel()`.
   Those mutations would be missing when Absurd replays the stored result, so the capability raises
@@ -130,9 +132,9 @@ checkpoint and lines up on replay.
 
 `parallel_execution_mode` defaults to `'sequential'`. Set it to `'parallel_ordered_events'` to run
 tool calls concurrently while emitting their result events in model-call order. Plain `'parallel'`
-is not supported: it emits tool-result and event-handler steps in completion order, which can assign
-Absurd's encounter-order checkpoint suffixes differently on replay. Outside an Absurd task, the
-capability leaves the agent's configured execution mode unchanged.
+is rejected with a `UserError`: it emits tool-result and event-handler steps in completion order,
+which can assign Absurd's encounter-order checkpoint suffixes differently on replay. Outside an
+Absurd task, the capability leaves the agent's configured execution mode unchanged.
 
 ## Per-tool opt-out
 
@@ -143,7 +145,7 @@ checkpoint would add more overhead than it saves.
 ```python {test="skip"}
 from pydantic_ai import Agent
 from pydantic_ai.toolsets import FunctionToolset
-from pydantic_ai_harness.absurd import AbsurdDurability
+from pydantic_ai_harness import AbsurdDurability
 
 tools = FunctionToolset(id='math')
 
@@ -182,9 +184,11 @@ does not run a second time.
 ## Checkpoint format compatibility
 
 The step names and the checkpoint payload shapes are byte-compatible with the `pydantic-ai-absurd`
-package (the standalone Absurd integration by Marcelo Trylesinski), so a run started under one
-package can resume under the other. Treat the step names and payload shapes as a stable persistence
-format.
+package (the standalone Absurd integration by Marcelo Trylesinski) in one direction: a run started
+under that package can resume here, because a recording it wrote is read back as-is. The reverse
+does not hold -- this capability stores a tool result inside a control-flow wrapper, which
+`pydantic-ai-absurd` would hand to the model as the tool result. Treat the step names and payload
+shapes as a stable persistence format.
 
 ## Relation to Step Persistence
 

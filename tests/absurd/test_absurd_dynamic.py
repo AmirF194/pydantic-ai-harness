@@ -121,7 +121,9 @@ class TestDynamicToolsetCheckpointing:
         assert 'Be terse.' in repr(payload['instructions'])
         assert any(instr is not None and 'Be terse.' in instr for instr in seen_instructions)
 
-    async def test_transparent_outside_task(self) -> None:
+    async def test_raw_checkpoint_from_the_reference_package_replays(self) -> None:
+        # `pydantic-ai-absurd` stores a tool's return value directly rather than the wrapped form,
+        # so a run started there and resumed here finds a raw checkpoint under the same step name.
         factory_calls = {'n': 0}
         tool_calls = {'n': 0}
         agent = Agent(
@@ -131,10 +133,48 @@ class TestDynamicToolsetCheckpointing:
             capabilities=[AbsurdDurability()],
         )
 
+        step = 'd__dynamic_toolset__dyn.call_tool:greet'
+        ctx = FakeAsyncTaskContext(store={step: 'hi from the other package'})
+        with absurd_task_context(ctx):
+            result = await agent.run('greet ada')
+
+        assert result.output == 'done'
+        assert tool_calls['n'] == 0
+        returned = [part.content for m in result.all_messages() for part in m.parts if isinstance(part, ToolReturnPart)]
+        assert returned == ['hi from the other package']
+
+    async def test_transparent_outside_task(self) -> None:
+        factory_calls = {'n': 0}
+        tool_calls = {'n': 0}
+        seen_instructions: list[str | None] = []
+
+        def fn(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+            seen_instructions.append(info.instructions)
+            if any(isinstance(p, ToolReturnPart) for m in messages for p in m.parts):
+                return ModelResponse(parts=[TextPart(content='done')])
+            return ModelResponse(parts=[ToolCallPart(tool_name='greet', args={'name': 'ada'})])
+
+        agent = Agent(
+            FunctionModel(fn, model_name='fn'),
+            name='d',
+            toolsets=[_dynamic_toolset(factory_calls, tool_calls, instructions='Be terse.')],
+            capabilities=[AbsurdDurability()],
+        )
+
         result = await agent.run('greet ada')
 
         assert result.output == 'done'
         assert tool_calls['n'] == 1
+        # Off the durable path the resolved toolset's instructions still reach the model.
+        assert any(instr is not None and 'Be terse.' in instr for instr in seen_instructions)
+
+        # Nothing is cached across runs: a second run resolves the factory again.
+        first_factory_calls = factory_calls['n']
+        second = await agent.run('greet ada')
+
+        assert second.output == 'done'
+        assert factory_calls['n'] > first_factory_calls
+        assert tool_calls['n'] == 2
 
 
 class TestDynamicToolsetErrors:
@@ -149,6 +189,31 @@ class TestDynamicToolsetErrors:
                 toolsets=[DynamicToolset(build)],
                 capabilities=[AbsurdDurability()],
             )
+
+    async def test_tool_name_with_hash_is_rejected(self) -> None:
+        def build(ctx: RunContext[object]) -> FunctionToolset[object]:
+            inner: FunctionToolset[object] = FunctionToolset(id='inner')
+
+            @inner.tool_plain(name='greet#2')
+            def greet() -> str:  # pragma: no cover - rejected before the step runs
+                return 'hi'
+
+            return inner
+
+        def model_fn(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+            return ModelResponse(parts=[ToolCallPart(tool_name='greet#2', args={})])
+
+        agent = Agent(
+            FunctionModel(model_fn, model_name='fn'),
+            name='d',
+            toolsets=[DynamicToolset(build, id='dyn')],
+            capabilities=[AbsurdDurability()],
+        )
+
+        ctx = FakeAsyncTaskContext()
+        with absurd_task_context(ctx):
+            with pytest.raises(UserError, match='Tool name .* contains'):
+                await agent.run('greet')
 
     async def test_runtime_dynamic_toolset_rejected_inside_task(self) -> None:
         factory_calls = {'n': 0}
@@ -318,3 +383,58 @@ class TestDynamicToolsetPerToolConfig:
         with absurd_task_context(ctx):
             with pytest.raises(UserError, match='take no per-tool options'):
                 await agent.run('double it')
+
+
+class TestDynamicCheckpointFormat:
+    async def test_get_tools_payload_matches_the_pinned_shape(self) -> None:
+        # A core dataclass owns this payload, so pin its serialized shape here: a change to it is a
+        # change to the persistence format, which orphans the checkpoints of in-flight tasks.
+        factory_calls = {'n': 0}
+        tool_calls = {'n': 0}
+        agent = Agent(
+            FunctionModel(
+                lambda messages, info: ModelResponse(parts=[TextPart(content='done')]),
+                model_name='fn',
+            ),
+            name='d',
+            toolsets=[_dynamic_toolset(factory_calls, tool_calls, instructions='Be terse.')],
+            capabilities=[AbsurdDurability()],
+        )
+
+        ctx = FakeAsyncTaskContext()
+        with absurd_task_context(ctx):
+            result = await agent.run('hi')
+
+        assert result.output == 'done'
+        assert ctx.stored['d__dynamic_toolset__dyn.get_tools'] == {
+            'tools': {
+                'greet': {
+                    'tool_def': {
+                        'name': 'greet',
+                        'description': None,
+                        'parameters_json_schema': {
+                            'additionalProperties': False,
+                            'properties': {'name': {'type': 'string'}},
+                            'required': ['name'],
+                            'type': 'object',
+                        },
+                        'return_schema': {'type': 'string'},
+                        'include_return_schema': None,
+                        'outer_typed_dict_key': None,
+                        'strict': None,
+                        'sequential': False,
+                        'timeout': None,
+                        'kind': 'function',
+                        'tool_kind': None,
+                        'defer_loading': False,
+                        'metadata': None,
+                        'toolset_id': None,
+                        'capability_id': None,
+                        'unless_native': None,
+                        'with_native': None,
+                    },
+                    'max_retries': 1,
+                }
+            },
+            'instructions': [{'content': 'Be terse.', 'dynamic': False, 'part_kind': 'instruction'}],
+        }

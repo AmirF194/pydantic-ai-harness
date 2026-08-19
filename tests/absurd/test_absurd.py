@@ -20,6 +20,7 @@ pytest.importorskip('absurd_sdk')
 from absurd_sdk import JsonValue
 from pydantic_ai import Agent
 from pydantic_ai.agent import ParallelExecutionMode
+from pydantic_ai.capabilities import ResolveModelId
 from pydantic_ai.exceptions import ModelRetry, UserError
 from pydantic_ai.messages import (
     AgentStreamEvent,
@@ -180,17 +181,93 @@ class TestFunctionTool:
         assert first.output == second.output == 'done'
         assert replay.invoked == []
 
+    async def test_raw_checkpoint_from_the_reference_package_replays(self) -> None:
+        # `pydantic-ai-absurd` stores a tool's return value directly rather than the wrapped form,
+        # so a run started there and resumed here finds a raw checkpoint under the same step name.
+        calls = {'n': 0}
+        toolset = FunctionToolset(id='billing')
+
+        @toolset.tool_plain
+        def charge_card(amount: int) -> str:  # pragma: no cover - served from the seeded checkpoint
+            calls['n'] += 1
+            return f'charged {amount}'
+
+        agent = Agent(
+            _tool_then_done_model('charge_card', {'amount': 7}),
+            name='pay',
+            toolsets=[toolset],
+            capabilities=[AbsurdDurability()],
+        )
+
+        step = 'pay__function_toolset__billing.call_tool:charge_card'
+        ctx = FakeAsyncTaskContext(store={step: 'charged 99'})
+        with absurd_task_context(ctx):
+            result = await agent.run('charge it')
+
+        assert result.output == 'done'
+        assert calls['n'] == 0
+        assert ctx.invoked == ['pay__model.request', 'pay__model.request#2']
+        returned = [part.content for m in result.all_messages() for part in m.parts if isinstance(part, ToolReturnPart)]
+        assert returned == ['charged 99']
+
+    async def test_checkpoint_claiming_a_wrapper_kind_is_not_passed_through_raw(self) -> None:
+        # A payload carrying a wrapper `kind` claimed to be a wrapper, so failing to decode it is a
+        # real error, not a pre-wrapper recording: the envelope itself must never reach the model as
+        # the tool's result. The decode error travels the same road as any other tool-call
+        # `ValidationError` and comes back to the model as a retry prompt.
+        calls = {'n': 0}
+        toolset = FunctionToolset(id='billing')
+
+        @toolset.tool_plain
+        def charge_card(amount: int) -> str:  # pragma: no cover - the model stops after the retry
+            calls['n'] += 1
+            return f'charged {amount}'
+
+        agent = Agent(
+            _tool_then_done_model('charge_card', {'amount': 7}),
+            name='pay',
+            toolsets=[toolset],
+            capabilities=[AbsurdDurability()],
+        )
+
+        step = 'pay__function_toolset__billing.call_tool:charge_card'
+        # A real wrapper kind, but missing the `result` the `tool_return` wrapper requires.
+        ctx = FakeAsyncTaskContext(store={step: {'kind': 'tool_return'}})
+        with absurd_task_context(ctx):
+            result = await agent.run('charge it')
+
+        parts = [part for m in result.all_messages() for part in m.parts]
+        assert not any(isinstance(part, ToolReturnPart) for part in parts)
+        retries = [part for part in parts if isinstance(part, RetryPromptPart)]
+        assert len(retries) == 1
+        assert 'result' in repr(retries[0].content)
+
+    async def test_tool_name_with_hash_is_rejected(self) -> None:
+        toolset = FunctionToolset(id='tools')
+
+        @toolset.tool_plain(name='ping#2')
+        def ping() -> str:  # pragma: no cover - rejected before the step runs
+            return 'pong'
+
+        agent = Agent(
+            _tool_then_done_model('ping#2', {}), name='h', toolsets=[toolset], capabilities=[AbsurdDurability()]
+        )
+
+        with absurd_task_context(FakeAsyncTaskContext()):
+            with pytest.raises(UserError, match='Tool name .* contains'):
+                await agent.run('ping it')
+
     @pytest.mark.parametrize(('operation', 'error_name'), [('enqueue', r'ctx\.enqueue\(\)'), ('cancel', 'cancel')])
     async def test_checkpointed_tool_rejects_run_context_mutation(self, operation: str, error_name: str) -> None:
         toolset = FunctionToolset(id='mutating')
 
         @toolset.tool
-        def mutate_run(ctx: RunContext[object]) -> str:
+        def mutate_run(ctx: RunContext[object]) -> None:
+            # Both branches raise inside the step, so the tool never returns.
             if operation == 'enqueue':
                 ctx.enqueue('security instruction')
             else:
                 ctx.cancel()
-            return 'mutated'
 
         agent = Agent(
             _tool_then_done_model('mutate_run', {}),
@@ -393,6 +470,44 @@ class TestModelSelection:
         with pytest.raises(UserError, match='contains'):
             AbsurdDurability(models={'cheap#2': FunctionModel(lambda m, i: ModelResponse(parts=[]), model_name='c')})
 
+    async def test_runtime_model_id_with_hash_is_rejected(self) -> None:
+        # A `run(model=...)` string never passes through the `models=` check, so the same collision
+        # has to be caught where the id is folded into the step name.
+        cheap = FunctionModel(lambda m, i: ModelResponse(parts=[TextPart(content='cheap')]), model_name='cheap')
+        agent = Agent(
+            _text_model(),
+            name='sw',
+            capabilities=[
+                ResolveModelId(lambda ctx, model_id: cheap if model_id == 'cheap#2' else None),
+                AbsurdDurability(),
+            ],
+        )
+
+        with absurd_task_context(FakeAsyncTaskContext()):
+            with pytest.raises(UserError, match='Model id .* contains'):
+                await agent.run('hi', model='cheap#2')
+
+    async def test_string_default_model_with_hash_is_allowed(self) -> None:
+        # The default model's id is never folded into the step name, so it cannot collide with
+        # Absurd's `#` counter suffix and the `#` guard does not apply to it. The suffix is
+        # suppressed before the guard runs, so the step keeps the plain unsuffixed name.
+        cheap = FunctionModel(lambda m, i: ModelResponse(parts=[TextPart(content='cheap')]), model_name='cheap')
+        agent = Agent(
+            'cheap#2',
+            name='hashdef',
+            capabilities=[
+                ResolveModelId(lambda ctx, model_id: cheap if model_id == 'cheap#2' else None),
+                AbsurdDurability(),
+            ],
+        )
+
+        ctx = FakeAsyncTaskContext()
+        with absurd_task_context(ctx):
+            result = await agent.run('hi')
+
+        assert result.output == 'cheap'
+        assert list(ctx.stored) == ['hashdef__model.request']
+
     async def test_string_default_model_gets_unsuffixed_step_name(self) -> None:
         agent = Agent('test', name='strdef', capabilities=[AbsurdDurability()])
 
@@ -474,6 +589,11 @@ class TestSyncContext:
 
 
 class TestParallelExecutionMode:
+    async def test_parallel_mode_is_rejected(self) -> None:
+        # `'parallel'` is outside the declared type, but an untyped caller can still pass it.
+        with pytest.raises(UserError, match=r"'parallel' is not a supported .*Use 'sequential'"):
+            AbsurdDurability(parallel_execution_mode='parallel')  # pyright: ignore[reportArgumentType]
+
     async def test_parallel_execution_mode_applied_during_run(self, monkeypatch: pytest.MonkeyPatch) -> None:
         agent = Agent(
             _text_model(), name='a', capabilities=[AbsurdDurability(parallel_execution_mode='parallel_ordered_events')]
