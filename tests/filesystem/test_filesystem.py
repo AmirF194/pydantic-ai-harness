@@ -892,6 +892,22 @@ class TestResolveSymlinkLoop:
         with pytest.raises(ModelRetry, match='symlink loop'):
             await toolset.read_file('hello.txt')
 
+    @pytest.mark.parametrize('op', ['read_file', 'list_directory', 'search_files', 'find_files', 'file_info'])
+    async def test_real_symlink_loop_is_reported(
+        self, toolset: FileSystemToolset[None], fs_root: Path, op: str
+    ) -> None:
+        (fs_root / 'loop').symlink_to(fs_root / 'loop')
+        calls = {
+            'read_file': lambda: toolset.read_file('loop'),
+            'list_directory': lambda: toolset.list_directory('loop'),
+            'search_files': lambda: toolset.search_files('text', path='loop'),
+            'find_files': lambda: toolset.find_files('*', path='loop'),
+            'file_info': lambda: toolset.file_info('loop'),
+        }
+
+        with pytest.raises(ModelRetry, match="Path 'loop' resolves through a symlink loop"):
+            await calls[op]()
+
 
 class TestReadSideOSErrors:
     # `Path.is_file`/`exists` propagate ENAMETOOLONG on 3.10 through 3.13 and

@@ -232,11 +232,17 @@ class FileSystemToolset(FunctionToolset[AgentDepsT]):
         try:
             candidate = (self._root / path).resolve()
         except RuntimeError as e:
-            # Python 3.10-3.12 signal a symlink loop this way. On 3.13+ `resolve`
-            # returns without complaint, so only operations that go on to touch
-            # the path reach `ELOOP`; `exists`/`is_file` report a loop as absent,
-            # so the read operations answer "not found" there instead. See #617.
+            # Python 3.10-3.12 signal a symlink loop this way.
             raise ModelRetry(f'Path {path!r} resolves through a symlink loop.') from e
+
+        if not candidate.exists():
+            try:
+                candidate.stat()
+            except OSError as e:
+                # Python 3.13+ suppresses `ELOOP` in `resolve` and `exists`, so
+                # probe the path before treating it as missing.
+                if e.errno == errno.ELOOP:
+                    raise ModelRetry(f'Path {path!r} resolves through a symlink loop.') from e
         real = Path(os.path.realpath(candidate))
         if not real.is_relative_to(self._real_root):
             raise PermissionError(f'Path {path!r} resolves outside the root directory.')
