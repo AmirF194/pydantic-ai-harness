@@ -53,6 +53,10 @@ so the agent gets the error message back and can adjust rather than aborting
 the run. Failures the model can do nothing about, such as a full or read-only
 disk, still abort.
 
+When an OS error supplies a filename, `FileSystem` reports it relative to
+`root_dir`; paths outside `root_dir` become `<outside-workspace>`. `file_info`
+applies the same rule to absolute symlink targets.
+
 ## Security model
 
 - **Containment.** Paths resolve relative to `root_dir`; anything resolving

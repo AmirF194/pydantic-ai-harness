@@ -84,6 +84,9 @@ acp = [
 exa = [
     "exa-py>=2.16.0",
 ]
+youdotcom = [
+    "youdotcom>=3.1.1,<4",
+]
 mongodb = [
     "pymongo>=4.17.0",
 ]
@@ -96,6 +99,12 @@ browser-use = [
 stackone = [
     "fastmcp>=3.4.5,<4",
     "pydantic-ai-slim[mcp]>=2.18.0",
+]
+prompt-injection-defender = [
+    "stackone-defender>=0.7.3,<0.8 ; python_full_version >= '3.11'",
+]
+prompt-injection-defender-ml = [
+    "stackone-defender[onnx]>=0.7.3,<0.8 ; python_full_version >= '3.11'",
 ]
 
 [project.urls]
