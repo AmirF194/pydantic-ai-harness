@@ -142,34 +142,28 @@ escape sequences from text returns before measuring and reducing.
 
 ## Pageable structured spills
 
-Structured returns serialize as compact JSON, which puts the whole value on one line, so the
-line-based `read_tool_result` tool cannot page through a large spilled list. The `serializer`
-setting replaces that rendering for structured (non-string, non-binary) returns. Two presets
-cover the common layouts:
+A spilled structured return is stored as compact JSON: one long line. `read_tool_result`
+pages by line, so page 1 returns the whole payload and page 2 is empty. Setting `serializer`
+stores the value in a layout with real lines instead:
 
 ```python
 from pydantic_ai_harness.tool_output_limits import ToolOutputLimits, indented_json, json_lines
 
-ToolOutputLimits(serializer=indented_json)  # indented JSON: one field per line
-ToolOutputLimits(serializer=json_lines)  # top-level list: one record per line
+ToolOutputLimits(serializer=indented_json)  # one field per line
+ToolOutputLimits(serializer=json_lines)  # one record per line
 ```
 
-`indented_json` renders indent-2 JSON, so fields land on separate lines and
-`read_tool_result` can slice and `pattern`-filter them. `json_lines` renders a sequence
-(other than a string or a byte payload) as one compact JSON value per line (JSON Lines), so
-line offsets map directly to items; other values fall back to `indented_json`. Both presets
-escape the Unicode line separators that `str.splitlines` breaks on, so a line read back is
-always a whole item or field. A tool that wraps its records in a mapping (say
-`{'items': [...]}`) gets the `indented_json` fallback; return the list directly, or supply
-a serializer that unwraps it, to get line-per-record paging.
+Use `json_lines` for tools that return lists of records: line N is record N, so page offsets
+and `pattern` matches line up with whole records. Anything that is not a list-like sequence
+falls back to `indented_json` -- including a list wrapped in a dict, so return the list
+directly for per-record paging. Use `indented_json` for everything else.
 
-Any `(value) -> str` callable can be supplied; `Serializer` is the exported alias. The
-capability serializes each structured return once: measurement, band selection, previews,
-stored bytes, and read-back all use the same text, which means an indented layout measures
-larger than compact JSON and can reach a band the compact form would not. If the callable
-raises or returns non-text, the capability warns and falls back to compact JSON for that
-return. Strings and binary payloads never pass through the serializer, and a structured
-return below the smallest band threshold passes through as the original object.
+Any `(value) -> str` callable works too, but prefer the presets: they escape the Unicode
+line separators (U+0085/U+2028/U+2029) that would otherwise knock read-back offsets off the
+line grid. The serialized text is also what gets measured, so an indented layout can cross
+a size band that compact JSON would not. Strings and binary returns are never serialized,
+returns below the smallest band pass through untouched, and a serializer that raises or
+returns non-text warns and falls back to compact JSON rather than losing the tool output.
 
 ## Spill store
 
