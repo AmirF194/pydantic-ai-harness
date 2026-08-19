@@ -857,6 +857,42 @@ class TestCodeMode:
 
             assert result.return_value == 4_999_950_000
 
+    async def test_temporal_subclass_disables_duration_but_keeps_memory_limit(self) -> None:
+        """A Temporal subclass outside its package remains replay-safe without removing the heap cap."""
+
+        class TemporalDurability(AbstractCapability[None]):
+            in_durable_context = True
+
+        TemporalDurability.__module__ = 'pydantic_ai.durable_exec.temporal'
+
+        class CustomTemporalDurability(TemporalDurability):
+            pass
+
+        CustomTemporalDurability.__module__ = '__main__'
+        wrapper = CodeMode[object](
+            resource_limits={'max_duration_secs': 0.001, 'max_memory': 8 * 1024 * 1024}
+        ).get_wrapper_toolset(_build_function_toolset(add))
+        assert isinstance(wrapper, CodeModeToolset)
+        ctx = await build_ctx(None, wrapper)
+        ctx.capabilities['temporal'] = CustomTemporalDurability()
+        tools = await wrapper.get_tools(ctx)
+
+        result = await wrapper.call_tool(
+            'run_code',
+            {'code': 'total = 0\nfor item in range(100_000):\n    total += item\ntotal'},
+            ctx,
+            tools['run_code'],
+        )
+
+        assert result.return_value == 4_999_950_000
+        with pytest.raises(ModelRetry, match='memory limit exceeded'):
+            await wrapper.call_tool(
+                'run_code',
+                {'code': 'values = [0] * 50_000_000\nlen(values)'},
+                ctx,
+                tools['run_code'],
+            )
+
     async def test_ordinary_runtime_error_does_not_mention_restart(self) -> None:
         """A plain exception keeps the message it always had; the hint is not bolted onto everything."""
         wrapper = CodeMode[object]().get_wrapper_toolset(_build_function_toolset(add))

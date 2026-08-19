@@ -93,7 +93,7 @@ class _TemporalDurability(Protocol):
 def _in_temporal_workflow(ctx: RunContext[object]) -> bool:
     """Whether this tool call runs in a Temporal workflow without importing its optional extra."""
     return any(
-        type(capability).__module__.startswith('pydantic_ai.durable_exec.temporal')
+        any(base.__module__.startswith('pydantic_ai.durable_exec.temporal') for base in type(capability).__mro__)
         and isinstance(capability, _TemporalDurability)
         and capability.in_durable_context
         for capability in ctx.capabilities.values()
