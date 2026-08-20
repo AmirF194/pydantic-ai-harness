@@ -4,6 +4,9 @@ Run selected tools as in-process fire-and-forget asyncio tasks, so the agent can
 
 [Source](https://github.com/pydantic/pydantic-ai-harness/tree/main/pydantic_ai_harness/background_tools/)
 
+> [!WARNING]
+> `RunContext.enqueue()` is generally safe from synchronous tools, but a tool selected for background execution must not call it. `BackgroundTools` lets the agent continue while the synchronous tool runs in a worker thread, so its enqueue can race the pending-message drain and be lost. Return the tool's final value instead; `BackgroundTools` delivers it as the follow-up message. Exclude a tool from `BackgroundTools` if it needs to enqueue messages itself.
+
 > While Pydantic AI Harness is on 0.x releases, the API may change between minor releases; when it does, deprecation warnings and release-note migration guidance tell you (or your agent) exactly how to upgrade. See the [version policy](https://github.com/pydantic/pydantic-ai-harness#version-policy).
 
 ## The problem
@@ -95,6 +98,7 @@ through it; they are reported as text failures instead.
 
 ## Limitations
 
+- **Enqueuing from a background tool**: unsupported and not detected at runtime. Return the final value instead, or exclude the tool from `BackgroundTools` if it needs to call `ctx.enqueue()`.
 - **Streaming**: `run_stream()` completes on the model's final response and does not take the extra model turn that delivers late results, so background results are only guaranteed with `agent.run()` or a driven `agent.iter()` loop.
 - **Result guardrails**: Background tool results do not pass through [Guardrails](https://pydantic.dev/docs/ai/harness/guardrails/) result guards. Treat background tools as incompatible with result guards unless the tool screens sensitive output itself.
 - **Durable execution (Temporal / DBOS)**: spawning asyncio tasks inside a durable workflow is not replay-safe and this capability is untested there; don't combine them yet.

@@ -62,6 +62,13 @@ class BackgroundTools(AbstractCapability[AgentDepsT]):
     request, or redirects the agent to a fresh request if it would otherwise end,
     so the model receives the result and can act on it while the run remains active.
 
+    Warning:
+        `RunContext.enqueue()` is generally safe from synchronous tools, but tools
+        selected for background execution must not call it. This capability lets the
+        agent continue while the synchronous tool runs in a worker thread, so its
+        enqueue can race the pending-message drain and be lost. Return the tool's
+        value instead; this capability enqueues the follow-up message.
+
     ```python
     import asyncio
 
