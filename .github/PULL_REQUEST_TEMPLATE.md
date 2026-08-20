@@ -21,4 +21,5 @@ Fixes #
 - [ ] Tests added/updated for new behavior
 - [ ] `make lint && make typecheck && make test` passes locally (don't stress about CI -- we'll help)
 - [ ] `pyproject.toml` and `uv.lock` are unchanged, or a maintainer added `dependencies:approved` to the current head
+- [ ] The [version policy](https://github.com/pydantic/pydantic-ai-harness#version-policy) is followed: patches stay compatible; minor breaks include migration guidance
 - [ ] Docstrings use single backticks (not RST double backticks)

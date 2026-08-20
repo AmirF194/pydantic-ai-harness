@@ -181,6 +181,9 @@ need.
   `docs:` prefix -- that belongs on the commit subject, not the title. Merged titles predating this
   rule carry prefixes; follow the rule, not the back catalogue.
 
+When you submit a PR, include the [PR template](.github/PULL_REQUEST_TEMPLATE.md) and fill in the
+issue number. The user must check the "AI generated code" checkbox manually in the GitHub UI.
+
 ## Pushing changes
 
 **A restriction is a conclusion you earn from a real failure, not a field you read.** Never report an
