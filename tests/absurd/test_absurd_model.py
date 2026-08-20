@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import AsyncIterable, AsyncIterator
 
+import anyio
 import pytest
 
 pytest.importorskip('absurd_sdk')
@@ -91,11 +92,19 @@ class TestConcurrentRuns:
             with absurd_task_context(task_ctx):
                 return (await agent.run('run')).output
 
-        first = asyncio.create_task(run_in_context(FakeAsyncTaskContext()))
-        second = asyncio.create_task(run_in_context(FakeAsyncTaskContext()))
-        await started.wait()
-        release.set()
-        assert await asyncio.gather(first, second) == ['ok', 'ok']
+        results: list[str] = []
+
+        async def run_and_record(task_ctx: FakeAsyncTaskContext) -> None:
+            results.append(await run_in_context(task_ctx))
+
+        async with anyio.create_task_group() as task_group:
+            task_group.start_soon(run_and_record, FakeAsyncTaskContext())
+            task_group.start_soon(run_and_record, FakeAsyncTaskContext())
+            with anyio.fail_after(5):
+                await started.wait()
+            release.set()
+
+        assert results == ['ok', 'ok']
 
     async def test_distinct_names_are_allowed_in_same_task_context(self) -> None:
         started = asyncio.Event()
@@ -113,12 +122,20 @@ class TestConcurrentRuns:
         agent_a = Agent(FunctionModel(model_fn), name='a', capabilities=[AbsurdDurability()])
         agent_b = Agent(FunctionModel(model_fn), name='b', capabilities=[AbsurdDurability()])
         ctx = FakeAsyncTaskContext()
-        with absurd_task_context(ctx):
-            first = asyncio.create_task(agent_a.run('run'))
-            second = asyncio.create_task(agent_b.run('run'))
-            await started.wait()
+        results: list[str] = []
+
+        async def run_and_record(agent: Agent[object, str]) -> None:
+            with absurd_task_context(ctx):
+                results.append((await agent.run('run')).output)
+
+        async with anyio.create_task_group() as task_group:
+            task_group.start_soon(run_and_record, agent_a)
+            task_group.start_soon(run_and_record, agent_b)
+            with anyio.fail_after(5):
+                await started.wait()
             release.set()
-            assert [result.output for result in await asyncio.gather(first, second)] == ['ok', 'ok']
+
+        assert results == ['ok', 'ok']
 
     async def test_run_namespace_is_released_after_failure(self) -> None:
         attempts = 0
