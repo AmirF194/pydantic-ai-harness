@@ -131,6 +131,12 @@ checkpoint and lines up on replay.
 - Code running inside a checkpointed step cannot call `RunContext.enqueue()` or `RunContext.cancel()`.
   Those mutations would be missing when Absurd replays the stored result, so the capability raises
   a `UserError`. Enqueue from non-checkpointed task code, or cancel the Absurd task instead.
+- Sibling model-request hooks run outside Absurd's model-request step and run again when the task
+  handler replays. Do not compose `AbsurdDurability` with stateful hooks that write external state,
+  including `SpendLimits`:
+  a stored model response can make the hook apply the same effect again without another provider
+  request. A shared replay-safe hook boundary is tracked in
+  [pydantic-ai#7176](https://github.com/pydantic/pydantic-ai/issues/7176).
 - The executing toolsets are fixed when the agent is constructed. Passing an executing toolset
   per-run via `run(toolsets=...)` inside a task raises a `UserError`, because a runtime toolset has
   no registered steps and would re-run its side effects on recovery. Non-executing toolsets such as
