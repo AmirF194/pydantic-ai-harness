@@ -387,9 +387,8 @@ class TestBackgroundTools:
         finally:
             release.set()
             await asyncio.wait_for(finished.wait(), timeout=1)
-            if not run.done():
-                with pytest.raises(asyncio.CancelledError):
-                    await asyncio.wait_for(run, timeout=1)
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(run, timeout=1)
 
     async def test_cancellation_token_cancels_live_tasks(self) -> None:
         cancel_seen = asyncio.Event()
