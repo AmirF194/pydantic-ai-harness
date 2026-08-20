@@ -80,6 +80,9 @@ resume under Harness when the agent and toolset names are unchanged. Harness sto
 control-flow outcomes in a versioned v1 envelope; the standalone integration cannot read those
 newer control-flow checkpoints.
 
+Successful dictionary results containing the reserved marker are escaped internally and still
+round-trip as raw values.
+
 `DynamicToolset` is not supported because its resolution and tool calls are not checkpointed.
 
 ## API

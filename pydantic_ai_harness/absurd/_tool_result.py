@@ -16,18 +16,28 @@ _ENVELOPE_VERSION = 1
 _result_adapter: TypeAdapter[CallToolResult] = TypeAdapter(CallToolResult)
 
 
-def serialize_tool_call_result(result: CallToolResult) -> JsonValue | ToolReturn | ToolReturnContent:
-    """Serialize a result, retaining standalone's raw shape for successful calls."""
-    if isinstance(result, _ToolReturn):
-        return result.result
-    if isinstance(result, _ToolContentResult):
-        return result.result
+def _serialize_enveloped_result(result: CallToolResult) -> JsonValue:
     return {
         _ENVELOPE_KEY: {
             'version': _ENVELOPE_VERSION,
             'result': _result_adapter.dump_python(result, mode='json'),
         }
     }
+
+
+def serialize_tool_call_result(result: CallToolResult) -> JsonValue | ToolReturn | ToolReturnContent:
+    """Serialize a result, retaining standalone's raw shape for successful calls."""
+    if isinstance(result, _ToolReturn):
+        raw_result = result.result
+        if isinstance(raw_result, dict) and _ENVELOPE_KEY in raw_result:
+            return _serialize_enveloped_result(result)
+    elif isinstance(result, _ToolContentResult):
+        raw_result = result.result
+        if isinstance(raw_result, dict) and _ENVELOPE_KEY in raw_result:
+            return _serialize_enveloped_result(result)
+    else:
+        return _serialize_enveloped_result(result)
+    return raw_result  # pyright: ignore[reportUnknownVariableType]
 
 
 def unwrap_tool_call_checkpoint(payload: JsonValue) -> JsonValue:

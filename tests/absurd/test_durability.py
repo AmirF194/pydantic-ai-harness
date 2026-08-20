@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from collections.abc import AsyncIterable, AsyncIterator
 from contextlib import AbstractContextManager
 from dataclasses import dataclass
@@ -217,6 +218,41 @@ async def _successful_tool_call() -> str:
 
 async def _raw_tool_content_call() -> dict[str, JsonValue]:
     return {'kind': 'tool-return', 'result': 'raw'}
+
+
+@pytest.mark.parametrize(
+    ('value', 'result_kind'),
+    [
+        ({'__pydantic_ai_harness_call_tool_result__': 'not an envelope'}, 'tool_return'),
+        (
+            {
+                '__pydantic_ai_harness_call_tool_result__': {
+                    'version': 1,
+                    'result': {'kind': 'model_retry', 'message': 'user data'},
+                }
+            },
+            'tool_return',
+        ),
+        (
+            {'kind': 'tool-return', 'result': 'user data', '__pydantic_ai_harness_call_tool_result__': 'reserved'},
+            'tool_content_result',
+        ),
+    ],
+)
+async def test_successful_reserved_key_dict_round_trips_exactly(value: JsonValue, result_kind: str) -> None:
+    async def return_value() -> JsonValue:
+        return value
+
+    wrapped = await wrap_tool_call_result(return_value())
+    checkpoint = serialize_tool_call_result(wrapped)
+    assert checkpoint == {
+        '__pydantic_ai_harness_call_tool_result__': {
+            'version': 1,
+            'result': {'kind': result_kind, 'result': value},
+        }
+    }
+    checkpoint_json: JsonValue = json.loads(json.dumps(checkpoint))
+    assert unwrap_tool_call_checkpoint(checkpoint_json) == value
 
 
 @pytest.mark.parametrize(
