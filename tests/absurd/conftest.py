@@ -12,7 +12,7 @@ from __future__ import annotations
 import json
 from collections.abc import Awaitable, Callable, Generator
 from contextlib import contextmanager
-from typing import TypeVar, cast
+from typing import TypeVar
 
 import pytest
 
@@ -58,11 +58,11 @@ class FakeAsyncTaskContext(AsyncTaskContext):
     async def step(self, name: str, fn: Callable[[], Awaitable[R]]) -> R:
         checkpoint_name = self._get_checkpoint_name(name)
         if checkpoint_name in self._store:
-            return cast(R, self._store[checkpoint_name])
+            return self._store[checkpoint_name]  # pyright: ignore[reportReturnType]
         self.invoked.append(checkpoint_name)
-        stored = cast(JsonValue, json.loads(json.dumps(await fn())))
+        stored: JsonValue = json.loads(json.dumps(await fn()))  # pyright: ignore[reportAny]
         self._store[checkpoint_name] = stored
-        return cast(R, stored)
+        return stored  # pyright: ignore[reportReturnType]
 
     def replay(self) -> FakeAsyncTaskContext:
         """A fresh context hydrated from the stored checkpoints, as Absurd does on a retry.
@@ -70,7 +70,8 @@ class FakeAsyncTaskContext(AsyncTaskContext):
         The encounter counter resets (a new attempt reaches the steps from the top), while the
         stored checkpoints carry over, so `step` serves them without re-running `fn`.
         """
-        return FakeAsyncTaskContext(store=cast('dict[str, JsonValue]', json.loads(json.dumps(self._store))))
+        store: dict[str, JsonValue] = json.loads(json.dumps(self._store))  # pyright: ignore[reportAny]
+        return FakeAsyncTaskContext(store=store)
 
 
 class FakeSyncTaskContext(TaskContext):

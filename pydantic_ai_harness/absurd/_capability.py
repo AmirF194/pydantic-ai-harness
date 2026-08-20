@@ -5,12 +5,10 @@ checkpoints an agent's I/O -- model requests, MCP calls, and function tool calls
 -- into Absurd steps (`ctx.step(...)`), so a worker crash mid-run resumes from
 the last completed step instead of restarting the run.
 
-The step names and checkpoint payload shapes are kept byte-compatible with the
-`pydantic-ai-absurd` package by Marcelo Trylesinski, in one direction: a run
-started under that package can resume here, because a recording it wrote is read
-back as-is. The reverse does not hold -- this module stores a tool result inside a
-control-flow wrapper, which `pydantic-ai-absurd` would hand to the model as the
-tool result.
+Step names are byte-compatible with the `pydantic-ai-absurd` package by Marcelo
+Trylesinski. A run started there can resume here because raw tool-result
+checkpoints are accepted unchanged. New tool-result checkpoints use a versioned
+envelope for control-flow wrappers, so the reverse does not hold.
 """
 
 from __future__ import annotations
@@ -25,11 +23,11 @@ except ImportError as _import_error:  # pragma: no cover
 
 from collections.abc import Callable, Mapping, Sequence
 from contextlib import AbstractContextManager
-from dataclasses import dataclass, fields
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, ClassVar, Literal, get_args
 
 from absurd_sdk import AsyncTaskContext, JsonValue, get_current_context
-from pydantic import TypeAdapter, ValidationError
+from pydantic import TypeAdapter
 from pydantic_ai import FunctionToolset, ToolsetTool
 from pydantic_ai.agent import EventStreamHandler, ParallelExecutionMode
 from pydantic_ai.agent.abstract import AbstractAgent
@@ -46,7 +44,7 @@ from pydantic_ai.durable_exec._toolset import (
     call_dynamic_tool,
     get_dynamic_tools,
     resolve_tool_durable_config,
-    unwrap_tool_call_result,
+    unwrap_recorded_tool_call_result,
     wrap_tool_call_result,
 )
 from pydantic_ai.durable_exec._utils import DurableModel, StreamedActivityResult, capture_event_stream
@@ -80,6 +78,8 @@ calls and event-handler steps alike -- lines up on replay."""
 _ENGINE_NAME = 'Absurd'
 _TOOL_CONFIG_KEY = 'absurd'
 _TOOL_CONFIG_LABEL = 'Absurd step config'
+_CALL_TOOL_RESULT_ENVELOPE_KEY = '__pydantic_ai_harness_call_tool_result__'
+_CALL_TOOL_RESULT_ENVELOPE_VERSION = 1
 _NO_FALLBACK_CONFIG: Mapping[str, ToolConfig] = {}
 _ALLOWED_PARALLEL_EXECUTION_MODES: tuple[str, ...] = get_args(AbsurdParallelExecutionMode)
 
@@ -92,16 +92,6 @@ _call_tool_result_adapter: TypeAdapter[CallToolResult] = TypeAdapter(CallToolRes
 _tool_defs_adapter: TypeAdapter[dict[str, ToolDefinition]] = TypeAdapter(dict[str, ToolDefinition])
 _instructions_adapter: TypeAdapter[_Instructions] = TypeAdapter(_Instructions)
 _dynamic_tools_adapter: TypeAdapter[DynamicToolsResult] = TypeAdapter(DynamicToolsResult)
-
-_WRAPPER_KINDS: frozenset[str] = frozenset(
-    # `CallToolResult` is an annotated union of dataclasses, each tagged by the string default of
-    # its `kind` field. Reading the tags off the union keeps them in step with it when a wrapper is
-    # added or renamed.
-    field.default
-    for member in get_args(get_args(CallToolResult)[0])
-    for field in fields(member)
-    if field.name == 'kind' and isinstance(field.default, str)
-)
 
 
 def _current_async_task_context() -> AsyncTaskContext | None:
@@ -135,33 +125,35 @@ def _deserialize_response(payload: JsonValue) -> ModelResponse:
 
 
 def _serialize_call_tool_result(result: CallToolResult) -> JsonValue:
-    return _call_tool_result_adapter.dump_python(result, mode='json')
+    # The outer marker distinguishes this wrapper from a legacy raw dictionary whose `kind` and
+    # `result` fields happen to match one of the wrapper dataclasses.
+    return {
+        _CALL_TOOL_RESULT_ENVELOPE_KEY: {
+            'version': _CALL_TOOL_RESULT_ENVELOPE_VERSION,
+            'result': _call_tool_result_adapter.dump_python(result, mode='json'),
+        }
+    }
 
 
 def _unwrap_checkpointed_call_tool_result(payload: JsonValue) -> Any:
-    """Unwrap a checkpointed tool result, passing a raw pre-wrapper recording through.
+    """Unwrap a current checkpoint, passing any un-enveloped legacy recording through unchanged.
 
-    Every wrapper in `CallToolResult` carries a `kind` tag, so a payload carrying none of those
-    tags was certainly not written by `wrap_tool_call_result`: it is the tool's return value stored
-    directly, as `pydantic-ai-absurd` and earlier versions of this capability wrote it. A run
-    started there can resume here, so such a payload is returned unchanged instead of failing to
-    decode. A payload that does carry a wrapper tag but fails to decode is a different story --
-    it claimed to be a wrapper, so the decode error is raised rather than handing the envelope
-    itself to the model as the tool result.
-
-    The test only holds one way. A raw recording that happens to be a dict with a `kind` matching
-    a wrapper tag is read as a wrapper. Nothing in a JSON store tells the two apart, and the payload
-    shapes are a stable persistence format, so there is no marker to add that would make the test
-    exact.
+    Older Absurd integrations stored the raw tool result directly. The outer envelope is required
+    because a raw dictionary such as `{'kind': 'tool_return', 'result': 'x'}` is otherwise
+    indistinguishable from a serialized `CallToolResult` wrapper.
     """
-    try:
-        result = _call_tool_result_adapter.validate_python(payload)
-    except ValidationError:
-        kind = payload.get('kind') if isinstance(payload, dict) else None
-        if isinstance(kind, str) and kind in _WRAPPER_KINDS:
-            raise
+    if not isinstance(payload, dict):
         return payload
-    return unwrap_tool_call_result(result)
+    if _CALL_TOOL_RESULT_ENVELOPE_KEY not in payload:
+        return payload
+    envelope = payload.get(_CALL_TOOL_RESULT_ENVELOPE_KEY)
+    if not isinstance(envelope, dict):
+        raise UserError('Malformed Absurd tool-result checkpoint envelope: expected an object.')
+    version = envelope.get('version')
+    if type(version) is not int or version != _CALL_TOOL_RESULT_ENVELOPE_VERSION:
+        raise UserError(f'Unsupported Absurd tool-result checkpoint envelope version: {version!r}.')
+    result = _call_tool_result_adapter.validate_python(envelope.get('result'))
+    return unwrap_recorded_tool_call_result(result)
 
 
 def _reject_model_id_hash(model_id: str) -> None:
@@ -300,8 +292,7 @@ def _build_mcp_toolset(
 
         async def _inner() -> JsonValue:
             with durable_run_context_scope(ctx) as step_ctx:
-                async with toolset:
-                    return _instructions_adapter.dump_python(await toolset.get_instructions(step_ctx), mode='json')
+                return _instructions_adapter.dump_python(await toolset.get_instructions(step_ctx), mode='json')
 
         payload = await task_ctx.step(f'{name}.get_instructions', _inner)
         return _instructions_adapter.validate_python(payload)
@@ -417,10 +408,10 @@ class AbsurdDurability(BaseDurabilityCapability[AgentDepsT]):
     to the agent. Step results are stored in Postgres as JSON, so a checkpointed tool's return
     value must be JSON-serializable.
 
-    Step names and checkpoint payload shapes are compatible with the `pydantic-ai-absurd` package
-    in one direction: a run started under that package can resume here, but a run started here
-    should not be resumed under it, because it would hand this capability's result wrapper to the
-    model as the tool result.
+    Step names are compatible with the `pydantic-ai-absurd` package. A run started under that
+    package can resume here because raw tool-result checkpoints are accepted unchanged. New
+    tool-result checkpoints use a versioned envelope for control-flow wrappers, so a run started
+    here should not be resumed under the standalone package.
 
     Example:
         ```python {test="skip"}

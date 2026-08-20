@@ -30,10 +30,18 @@ queue. The schema SQL and the queue helpers ship with the upstream project; see 
 [Absurd repository](https://github.com/earendil-works/absurd) for the schema file and setup steps.
 
 ```python {test="skip"}
+import asyncio
+
 from absurd_sdk import AsyncAbsurd
 
 absurd = AsyncAbsurd('postgresql://localhost/absurd', queue_name='agents')
-await absurd.create_queue()
+
+
+async def main():
+    await absurd.create_queue()
+
+
+asyncio.run(main())
 ```
 
 ## Quick start
@@ -43,6 +51,8 @@ across a producer that spawns tasks and a worker that executes them. The agent n
 prefixes every checkpoint step.
 
 ```python {test="skip"}
+import asyncio
+
 from absurd_sdk import AsyncAbsurd, AsyncTaskContext, JsonValue
 from pydantic_ai import Agent
 from pydantic_ai_harness import AbsurdDurability
@@ -58,11 +68,15 @@ async def analyse(params: JsonValue, ctx: AsyncTaskContext) -> JsonValue:
     return {'output': result.output}
 
 
-# Producer: enqueue a task.
-await absurd.spawn('analyse', {'prompt': 'Summarize the Q3 report.'})
+async def main():
+    # Producer: enqueue a task.
+    await absurd.spawn('analyse', {'prompt': 'Summarize the Q3 report.'})
 
-# Worker: claim and run tasks (in its own process). `start_worker` polls continuously.
-await absurd.start_worker()
+    # Worker: claim and run tasks (in its own process). `start_worker` polls continuously.
+    await absurd.start_worker()
+
+
+asyncio.run(main())
 ```
 
 The task handler runs inside an `AsyncTaskContext`, which is how the capability knows to checkpoint.
@@ -183,12 +197,14 @@ does not run a second time.
 
 ## Checkpoint format compatibility
 
-The step names and the checkpoint payload shapes are byte-compatible with the `pydantic-ai-absurd`
-package (the standalone Absurd integration by Marcelo Trylesinski) in one direction: a run started
-under that package can resume here, because a recording it wrote is read back as-is. The reverse
-does not hold -- this capability stores a tool result inside a control-flow wrapper, which
-`pydantic-ai-absurd` would hand to the model as the tool result. Treat the step names and payload
-shapes as a stable persistence format.
+The step names are byte-compatible with the `pydantic-ai-absurd` package (the standalone Absurd
+integration by Marcelo Trylesinski). A run started under that package can resume here because this
+capability accepts its raw tool-result checkpoints unchanged. New tool-result checkpoints use a
+versioned envelope so control-flow results can be distinguished from raw dictionaries with the same
+shape. The reverse does not hold: `pydantic-ai-absurd` would hand that envelope to the model as the
+tool result. Treat the step names and this capability's payload shapes as a stable persistence
+format. The top-level `__pydantic_ai_harness_call_tool_result__` key is reserved for this envelope;
+a raw checkpoint written by another integration cannot use that key as its tool result.
 
 ## Relation to Step Persistence
 

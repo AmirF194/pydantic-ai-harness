@@ -181,9 +181,45 @@ class TestFunctionTool:
         assert first.output == second.output == 'done'
         assert replay.invoked == []
 
+    async def test_wrapper_shaped_tool_result_round_trips(self) -> None:
+        calls = {'n': 0}
+        toolset = FunctionToolset(id='tools')
+        wrapper_shaped_result: JsonValue = {'kind': 'tool_return', 'result': 'raw value'}
+
+        @toolset.tool_plain
+        def return_dict() -> dict[str, str]:
+            calls['n'] += 1
+            return {'kind': 'tool_return', 'result': 'raw value'}
+
+        agent = Agent(
+            _tool_then_done_model('return_dict', {}),
+            name='wrapped',
+            toolsets=[toolset],
+            capabilities=[AbsurdDurability()],
+        )
+
+        ctx = FakeAsyncTaskContext()
+        with absurd_task_context(ctx):
+            first = await agent.run('go')
+        replay = ctx.replay()
+        with absurd_task_context(replay):
+            second = await agent.run('go')
+
+        assert calls['n'] == 1
+        for result in (first, second):
+            returned = [
+                part.content
+                for message in result.all_messages()
+                for part in message.parts
+                if isinstance(part, ToolReturnPart)
+            ]
+            assert returned == [wrapper_shaped_result]
+
     async def test_raw_checkpoint_from_the_reference_package_replays(self) -> None:
         # `pydantic-ai-absurd` stores a tool's return value directly rather than the wrapped form,
         # so a run started there and resumed here finds a raw checkpoint under the same step name.
+        # The `kind` field is deliberately the same as the old wrapper's discriminator: the
+        # capability must preserve this dictionary instead of unwrapping it.
         calls = {'n': 0}
         toolset = FunctionToolset(id='billing')
 
@@ -200,7 +236,8 @@ class TestFunctionTool:
         )
 
         step = 'pay__function_toolset__billing.call_tool:charge_card'
-        ctx = FakeAsyncTaskContext(store={step: 'charged 99'})
+        legacy_result: JsonValue = {'kind': 'tool_return', 'result': 'charged 99'}
+        ctx = FakeAsyncTaskContext(store={step: legacy_result})
         with absurd_task_context(ctx):
             result = await agent.run('charge it')
 
@@ -208,13 +245,11 @@ class TestFunctionTool:
         assert calls['n'] == 0
         assert ctx.invoked == ['pay__model.request', 'pay__model.request#2']
         returned = [part.content for m in result.all_messages() for part in m.parts if isinstance(part, ToolReturnPart)]
-        assert returned == ['charged 99']
+        assert returned == [legacy_result]
 
-    async def test_checkpoint_claiming_a_wrapper_kind_is_not_passed_through_raw(self) -> None:
-        # A payload carrying a wrapper `kind` claimed to be a wrapper, so failing to decode it is a
-        # real error, not a pre-wrapper recording: the envelope itself must never reach the model as
-        # the tool's result. The decode error travels the same road as any other tool-call
-        # `ValidationError` and comes back to the model as a retry prompt.
+    async def test_malformed_current_wrapper_is_not_passed_through_raw(self) -> None:
+        # A malformed current envelope must still fail validation. Un-enveloped values, including
+        # dictionaries carrying a legacy wrapper discriminator, are raw tool results.
         calls = {'n': 0}
         toolset = FunctionToolset(id='billing')
 
@@ -232,7 +267,16 @@ class TestFunctionTool:
 
         step = 'pay__function_toolset__billing.call_tool:charge_card'
         # A real wrapper kind, but missing the `result` the `tool_return` wrapper requires.
-        ctx = FakeAsyncTaskContext(store={step: {'kind': 'tool_return'}})
+        ctx = FakeAsyncTaskContext(
+            store={
+                step: {
+                    '__pydantic_ai_harness_call_tool_result__': {
+                        'version': 1,
+                        'result': {'kind': 'tool_return'},
+                    }
+                }
+            }
+        )
         with absurd_task_context(ctx):
             result = await agent.run('charge it')
 
@@ -241,6 +285,32 @@ class TestFunctionTool:
         retries = [part for part in parts if isinstance(part, RetryPromptPart)]
         assert len(retries) == 1
         assert 'result' in repr(retries[0].content)
+
+    @pytest.mark.parametrize(
+        ('envelope', 'error'),
+        [
+            ('not an object', 'Malformed'),
+            ({'version': True, 'result': {'kind': 'tool_return', 'result': 'x'}}, 'Unsupported'),
+            ({'version': 1.0, 'result': {'kind': 'tool_return', 'result': 'x'}}, 'Unsupported'),
+            ({'version': 2, 'result': {'kind': 'tool_return', 'result': 'x'}}, 'Unsupported'),
+        ],
+    )
+    async def test_invalid_current_envelope_is_rejected(self, envelope: JsonValue, error: str) -> None:
+        toolset = FunctionToolset(id='tools')
+
+        @toolset.tool_plain
+        def ping() -> str:  # pragma: no cover - served from the seeded checkpoint
+            return 'pong'
+
+        agent = Agent(
+            _tool_then_done_model('ping', {}), name='bad', toolsets=[toolset], capabilities=[AbsurdDurability()]
+        )
+        step = 'bad__function_toolset__tools.call_tool:ping'
+        ctx = FakeAsyncTaskContext(store={step: {'__pydantic_ai_harness_call_tool_result__': envelope}})
+
+        with absurd_task_context(ctx):
+            with pytest.raises(UserError, match=error):
+                await agent.run('go')
 
     async def test_tool_name_with_hash_is_rejected(self) -> None:
         toolset = FunctionToolset(id='tools')
@@ -300,7 +370,12 @@ class TestModelRetry:
             first = await agent.run('go')
         step = 'retry__function_toolset__tools.call_tool:flaky'
         # The raised `ModelRetry` crossed the checkpoint as a serialized value, not an exception.
-        assert ctx.stored[step] == {'message': 'nope, try again', 'kind': 'model_retry'}
+        assert ctx.stored[step] == {
+            '__pydantic_ai_harness_call_tool_result__': {
+                'version': 1,
+                'result': {'message': 'nope, try again', 'kind': 'model_retry'},
+            }
+        }
         assert first.output == 'done'
         assert calls['n'] == 1
 
@@ -738,8 +813,18 @@ class TestParallelOrderedEventsDeterminism:
 
         assert first.output == 'done'
         # `#1` is the first-scheduled call ('first'), even though it completed last.
-        assert ctx.stored[step] == {'result': 'first', 'kind': 'tool_return'}
-        assert ctx.stored[f'{step}#2'] == {'result': 'second', 'kind': 'tool_return'}
+        assert ctx.stored[step] == {
+            '__pydantic_ai_harness_call_tool_result__': {
+                'version': 1,
+                'result': {'result': 'first', 'kind': 'tool_return'},
+            }
+        }
+        assert ctx.stored[f'{step}#2'] == {
+            '__pydantic_ai_harness_call_tool_result__': {
+                'version': 1,
+                'result': {'result': 'second', 'kind': 'tool_return'},
+            }
+        }
 
         # On replay the slots must map the same way: results are served from the checkpoint, not
         # swapped, regardless of which call finishes first.
@@ -748,8 +833,18 @@ class TestParallelOrderedEventsDeterminism:
             second = await agent.run('go')
 
         assert second.output == 'done'
-        assert replay.stored[step] == {'result': 'first', 'kind': 'tool_return'}
-        assert replay.stored[f'{step}#2'] == {'result': 'second', 'kind': 'tool_return'}
+        assert replay.stored[step] == {
+            '__pydantic_ai_harness_call_tool_result__': {
+                'version': 1,
+                'result': {'result': 'first', 'kind': 'tool_return'},
+            }
+        }
+        assert replay.stored[f'{step}#2'] == {
+            '__pydantic_ai_harness_call_tool_result__': {
+                'version': 1,
+                'result': {'result': 'second', 'kind': 'tool_return'},
+            }
+        }
         assert replay.invoked == []
 
 

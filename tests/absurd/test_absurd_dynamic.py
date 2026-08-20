@@ -326,7 +326,12 @@ class TestDynamicToolsetArgValidation:
         with absurd_task_context(ctx):
             first = await agent.run('greet')
         step = 'd__dynamic_toolset__dyn.call_tool:greet'
-        assert ctx.stored[step] == {'message': 'nope', 'kind': 'model_retry'}
+        assert ctx.stored[step] == {
+            '__pydantic_ai_harness_call_tool_result__': {
+                'version': 1,
+                'result': {'message': 'nope', 'kind': 'model_retry'},
+            }
+        }
         assert first.output == 'done'
         assert attempts['n'] == 1
 

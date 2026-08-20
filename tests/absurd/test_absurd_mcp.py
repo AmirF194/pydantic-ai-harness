@@ -96,6 +96,7 @@ class FakeMCPToolset(MCPToolset[object]):
         return {'add': self.tool_for_tool_def(tool_def, ctx=ctx)}
 
     async def get_instructions(self, ctx: RunContext[object]) -> InstructionPart | None:
+        await self._require_session()
         if not self.include_instructions or self._instructions_text is None:
             return None
         return InstructionPart(content=self._instructions_text)
@@ -193,7 +194,7 @@ class TestMcpSessionLifecycle:
 
         assert result.output == 'summed'
         assert server.implicit_sessions == 0
-        assert server.enter_count >= 1
+        assert server.enter_count == 1
 
     async def test_transparent_run_also_reuses_one_session(self) -> None:
         # Outside a task the capability is transparent, but the wrapper still enters the server, so
