@@ -499,6 +499,17 @@ class AbsurdDurability(BaseDurabilityCapability[AgentDepsT]):
         self._default_model_id = agent.model if isinstance(agent.model, str) else None
         self._register_toolsets(agent)
 
+    def get_wrapper_toolset(self, toolset: AbstractToolset[AgentDepsT]) -> AbstractToolset[AgentDepsT] | None:
+        """Register construction-time toolsets added through an agent decorator after binding."""
+        # `@agent.toolset(...)` can add a construction-time dynamic toolset after this capability
+        # was bound. Register those additions before applying the per-run wrapper, otherwise the
+        # toolset is treated as construction-owned by `_reject_runtime_toolsets` but remains
+        # unwrapped and its calls bypass durable steps.
+        # Capability hooks run on the bound copy created by `for_agent`.
+        if self._agent is not None:  # pragma: no branch
+            self._register_toolsets(self._agent)
+        return super().get_wrapper_toolset(toolset)
+
     def _wrap_leaf_toolset(self, ts: AbstractToolset[AgentDepsT]) -> WrapperToolset[AgentDepsT] | None:
         if isinstance(ts, FunctionToolset):
             return _build_function_toolset(

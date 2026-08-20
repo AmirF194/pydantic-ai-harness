@@ -94,6 +94,42 @@ class TestDynamicToolsetCheckpointing:
         assert factory_calls['n'] == first_factory_calls
         assert tool_calls['n'] == 1
 
+    async def test_decorated_toolset_added_after_binding_is_checkpointed(self, absurd_client: AsyncAbsurd) -> None:
+        factory_calls = {'n': 0}
+        tool_calls = {'n': 0}
+        agent = Agent(
+            _greet_then_done_model(),
+            name='d',
+            capabilities=[AbsurdDurability()],
+        )
+
+        @agent.toolset(id='decorated')
+        def build(ctx: RunContext[object]) -> FunctionToolset[object]:
+            factory_calls['n'] += 1
+            inner = FunctionToolset[object](id='inner')
+
+            @inner.tool_plain
+            def greet(name: str) -> str:
+                tool_calls['n'] += 1
+                return f'hi {name}'
+
+            return inner
+
+        async with running_task_context(absurd_client, 'decorated-dynamic', max_attempts=2) as ctx:
+            result = await agent.run('greet ada')
+
+        assert result.output == 'done'
+        assert tool_calls['n'] == 1
+        first_factory_calls = factory_calls['n']
+        task_id = ctx.task_id
+
+        async with reenter_running_task(absurd_client, task_id):
+            replay = await agent.run('greet ada')
+
+        assert replay.output == 'done'
+        assert factory_calls['n'] == first_factory_calls
+        assert tool_calls['n'] == 1
+
     async def test_dynamic_toolset_instructions_checkpointed(self, absurd_client: AsyncAbsurd) -> None:
         factory_calls = {'n': 0}
         tool_calls = {'n': 0}
