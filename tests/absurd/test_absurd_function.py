@@ -1,8 +1,9 @@
 """Tests for function-tool execution and result serialization in `AbsurdDurability`.
 
 The cases map to `pydantic-ai-absurd/tests/test_function_toolset.py` and
-`pydantic-ai-absurd/tests/test_durability.py`. They use `FakeAsyncTaskContext` for deterministic
-unit coverage; real PostgreSQL replay coverage lives in `test_absurd_postgres.py`.
+`pydantic-ai-absurd/tests/test_durability.py`. Ordinary tool replay cases use the real
+PostgreSQL-backed task context; fake contexts are reserved for deterministic validation and edge
+cases.
 """
 
 from __future__ import annotations
@@ -11,7 +12,7 @@ import pytest
 
 pytest.importorskip('absurd_sdk')
 
-from absurd_sdk import JsonValue
+from absurd_sdk import AsyncAbsurd, JsonValue
 from pydantic_ai import Agent
 from pydantic_ai.exceptions import ModelRetry, UserError
 from pydantic_ai.messages import (
@@ -24,13 +25,14 @@ from pydantic_ai.toolsets import ExternalToolset, FunctionToolset
 from pydantic_ai_harness.absurd import AbsurdDurability
 
 from ._helpers import _text_model, _tool_then_done_model
+from ._postgres import reenter_running_task, running_task_context
 from .conftest import FakeAsyncTaskContext, absurd_task_context
 
 pytestmark = pytest.mark.anyio
 
 
 class TestFunctionTool:
-    async def test_replay_does_not_rerun_checkpointed_tool(self) -> None:
+    async def test_replay_does_not_rerun_checkpointed_tool(self, absurd_client: AsyncAbsurd) -> None:
         calls = {'n': 0}
         toolset = FunctionToolset(id='billing')
 
@@ -46,18 +48,15 @@ class TestFunctionTool:
             capabilities=[AbsurdDurability()],
         )
 
-        ctx = FakeAsyncTaskContext()
-        with absurd_task_context(ctx):
+        async with running_task_context(absurd_client, 'pay', max_attempts=2) as ctx:
             first = await agent.run('charge it')
-        assert 'pay__function_toolset__billing.call_tool:charge_card' in ctx.stored
+            task_id = ctx.task_id
 
-        replay = ctx.replay()
-        with absurd_task_context(replay):
+        async with reenter_running_task(absurd_client, task_id):
             second = await agent.run('charge it')
 
         assert calls['n'] == 1
         assert first.output == second.output == 'done'
-        assert replay.invoked == []
 
     async def test_wrapper_shaped_tool_result_round_trips(self) -> None:
         calls = {'n': 0}
@@ -230,7 +229,7 @@ class TestFunctionTool:
 
 
 class TestModelRetry:
-    async def test_model_retry_crosses_checkpoint_and_replays(self) -> None:
+    async def test_model_retry_crosses_checkpoint_and_replays(self, absurd_client: AsyncAbsurd) -> None:
         calls = {'n': 0}
         toolset = FunctionToolset(id='tools')
 
@@ -243,28 +242,18 @@ class TestModelRetry:
             _tool_then_done_model('flaky', {}), name='retry', toolsets=[toolset], capabilities=[AbsurdDurability()]
         )
 
-        ctx = FakeAsyncTaskContext()
-        with absurd_task_context(ctx):
+        async with running_task_context(absurd_client, 'retry', max_attempts=2) as ctx:
             first = await agent.run('go')
-        step = 'retry__function_toolset__tools.call_tool:flaky'
-        # The raised `ModelRetry` crossed the checkpoint as a serialized value, not an exception.
-        assert ctx.stored[step] == {
-            '__pydantic_ai_harness_call_tool_result__': {
-                'version': 1,
-                'result': {'message': 'nope, try again', 'kind': 'model_retry'},
-            }
-        }
+            task_id = ctx.task_id
         assert first.output == 'done'
         assert calls['n'] == 1
 
-        replay = ctx.replay()
-        with absurd_task_context(replay):
+        async with reenter_running_task(absurd_client, task_id):
             second = await agent.run('go')
 
         # On replay the stored `ModelRetry` is re-raised without re-running the tool.
         assert calls['n'] == 1
         assert second.output == 'done'
-        assert replay.invoked == []
 
 
 class TestPerToolOptOut:

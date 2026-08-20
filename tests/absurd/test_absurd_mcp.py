@@ -3,7 +3,8 @@
 The MCP extra (`mcp`/`fastmcp`) may be absent, so the module `importorskip`s it. A lightweight
 `FakeMCPToolset` stands in for a real server: it is a genuine `MCPToolset` subclass (so the
 capability's `isinstance` wrapping and `tool_for_tool_def` rebuild apply) whose wire methods return
-in-memory results, which keeps the test off Docker and the network.
+in-memory results. The ordinary checkpoint tests still use a real PostgreSQL-backed Absurd task
+context; the fake server avoids Docker and network transport setup.
 """
 
 from __future__ import annotations
@@ -15,6 +16,7 @@ pytest.importorskip('pydantic_ai.mcp')
 
 from typing import Any
 
+from absurd_sdk import AsyncAbsurd
 from pydantic_ai import Agent, ToolsetTool
 from pydantic_ai.exceptions import UserError
 from pydantic_ai.mcp import MCPToolset
@@ -31,7 +33,11 @@ from pydantic_ai.tools import RunContext, ToolDefinition
 
 from pydantic_ai_harness.absurd import AbsurdDurability
 
-from .conftest import FakeAsyncTaskContext, absurd_task_context
+from ._postgres import reenter_running_task, running_task_context
+from .conftest import (
+    FakeAsyncTaskContext,
+    absurd_task_context,
+)
 
 pytestmark = pytest.mark.anyio
 
@@ -65,6 +71,8 @@ class FakeMCPToolset(MCPToolset[object]):
         self._instructions_text = instructions
         self._tool_metadata = tool_metadata
         self.tool_calls: list[tuple[str, dict[str, Any]]] = []
+        self.get_tools_calls = 0
+        self.get_instructions_calls = 0
         self.enter_count = 0
         self._session_depth = 0
         self.implicit_sessions = 0
@@ -87,6 +95,7 @@ class FakeMCPToolset(MCPToolset[object]):
 
     async def get_tools(self, ctx: RunContext[object]) -> dict[str, ToolsetTool[object]]:
         await self._require_session()
+        self.get_tools_calls += 1
         tool_def = ToolDefinition(
             name='add',
             description='Add two integers.',
@@ -97,6 +106,7 @@ class FakeMCPToolset(MCPToolset[object]):
 
     async def get_instructions(self, ctx: RunContext[object]) -> InstructionPart | None:
         await self._require_session()
+        self.get_instructions_calls += 1
         if not self.include_instructions or self._instructions_text is None:
             return None
         return InstructionPart(content=self._instructions_text)
@@ -120,35 +130,27 @@ def _add_then_done_model() -> FunctionModel:
 
 
 class TestMcpCheckpointing:
-    async def test_get_tools_get_instructions_and_call_tool_checkpointed(self) -> None:
+    async def test_replay_does_not_repeat_mcp_operations(self, absurd_client: AsyncAbsurd) -> None:
         server = FakeMCPToolset(id='calc', instructions='Use the calculator.', include_instructions=True)
         agent = Agent(_add_then_done_model(), name='calc', toolsets=[server], capabilities=[AbsurdDurability()])
 
-        ctx = FakeAsyncTaskContext()
-        with absurd_task_context(ctx):
-            result = await agent.run('add 2 and 3')
-
-        assert result.output == 'summed'
-        assert server.tool_calls == [('add', {'a': 2, 'b': 3})]
-        assert 'calc__mcp_server__calc.get_tools' in ctx.stored
-        assert 'calc__mcp_server__calc.get_instructions' in ctx.stored
-        assert 'calc__mcp_server__calc.call_tool' in ctx.stored
-
-    async def test_replay_does_not_rehit_server(self) -> None:
-        server = FakeMCPToolset(id='calc', instructions='Use the calculator.', include_instructions=True)
-        agent = Agent(_add_then_done_model(), name='calc', toolsets=[server], capabilities=[AbsurdDurability()])
-
-        ctx = FakeAsyncTaskContext()
-        with absurd_task_context(ctx):
+        async with running_task_context(absurd_client, 'mcp-replay', max_attempts=2) as ctx:
             first = await agent.run('add 2 and 3')
 
-        replay = ctx.replay()
-        with absurd_task_context(replay):
+        first_tool_calls = server.tool_calls.copy()
+        first_get_tools_calls = server.get_tools_calls
+        first_get_instructions_calls = server.get_instructions_calls
+        assert first_tool_calls == [('add', {'a': 2, 'b': 3})]
+        assert first_get_tools_calls > 0
+        assert first_get_instructions_calls > 0
+
+        async with reenter_running_task(absurd_client, ctx.task_id):
             second = await agent.run('add 2 and 3')
 
         assert first.output == second.output == 'summed'
-        assert server.tool_calls == [('add', {'a': 2, 'b': 3})]
-        assert replay.invoked == []
+        assert server.tool_calls == first_tool_calls
+        assert server.get_tools_calls == first_get_tools_calls
+        assert server.get_instructions_calls == first_get_instructions_calls
 
     async def test_raw_checkpoint_from_the_reference_package_replays(self) -> None:
         # `pydantic-ai-absurd` stores a tool's return value directly rather than the wrapped form,

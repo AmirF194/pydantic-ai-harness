@@ -1,8 +1,8 @@
 """Composition test: `CodeMode` under `AbsurdDurability`.
 
 `AbsurdDurability` is transparent outside a task, so a passing run alone proves nothing about
-durability. The test runs inside a `FakeAsyncTaskContext` and drives a full `run_code` execution
-whose generated code calls an underlying function tool, then asserts the inner tool call is
+durability. The test runs inside a real PostgreSQL-backed Absurd task context and drives `run_code`
+with generated code that calls an underlying function tool. It then asserts the inner tool call is
 checkpointed as its own step and served from the checkpoint on replay.
 
 Both extras can be absent on a CI leg, so the module `importorskip`s `absurd_sdk` and
@@ -16,6 +16,7 @@ import pytest
 pytest.importorskip('absurd_sdk')
 pytest.importorskip('pydantic_monty')
 
+from absurd_sdk import AsyncAbsurd
 from pydantic_ai import Agent
 from pydantic_ai.messages import (
     ModelRequest,
@@ -31,17 +32,10 @@ from pydantic_ai.toolsets._dynamic import DynamicToolset  # pyright: ignore[repo
 
 from pydantic_ai_harness import CodeMode
 from pydantic_ai_harness.absurd import AbsurdDurability
-from tests.absurd.conftest import (  # pyright: ignore[reportMissingTypeStubs]
-    FakeAsyncTaskContext,
-    absurd_task_context,
-)
+
+from ._postgres import reenter_running_task, running_task_context
 
 pytestmark = pytest.mark.anyio
-
-
-@pytest.fixture
-def anyio_backend() -> str:
-    return 'asyncio'
 
 
 def _code_model(messages: list[ModelRequest | ModelResponse], info: AgentInfo) -> ModelResponse:
@@ -64,7 +58,10 @@ def _code_model(messages: list[ModelRequest | ModelResponse], info: AgentInfo) -
 
 
 class TestCodeModeUnderAbsurd:
-    async def test_inner_sandboxed_tool_call_is_checkpointed(self) -> None:
+    async def test_inner_sandboxed_tool_call_is_checkpointed(
+        self,
+        absurd_client: AsyncAbsurd,
+    ) -> None:
         calls = {'n': 0}
         toolset = FunctionToolset(id='tools')
 
@@ -80,33 +77,26 @@ class TestCodeModeUnderAbsurd:
             capabilities=[CodeMode(), AbsurdDurability()],
         )
 
-        ctx = FakeAsyncTaskContext()
-        with absurd_task_context(ctx):
+        async with running_task_context(absurd_client, 'code-mode-function', max_attempts=2) as ctx:
             first = await agent.run('go')
 
         assert first.output == 'done: results for x'
         assert calls['n'] == 1
-        # CodeMode dispatches each sandbox tool call through its wrapped toolset, which
-        # AbsurdDurability (the innermost capability) already swapped to the durable wrapper.
-        # So the `search` call made from inside `run_code` is checkpointed as its own step,
-        # the same as a direct tool call would be.
-        tool_step = 'composed__function_toolset__tools.call_tool:search'
-        assert tool_step in ctx.stored
-        assert tool_step in ctx.invoked
-        assert 'composed__model.request' in ctx.stored
-
-        replay = ctx.replay()
-        with absurd_task_context(replay):
+        # CodeMode dispatches each sandbox tool call through the wrapped toolset. On replay the
+        # persisted inner result must therefore prevent the function from running again.
+        async with reenter_running_task(absurd_client, ctx.task_id):
             second = await agent.run('go')
 
         # The `run_code` body is plain task-body Python and re-runs on replay, so it calls
         # `search` again, but the durable step short-circuits to the stored result: the tool
-        # function does not run a second time and the model is not re-called.
+        # function does not run a second time.
         assert second.output == 'done: results for x'
         assert calls['n'] == 1
-        assert replay.invoked == []
 
-    async def test_dynamic_toolset_inner_call_is_checkpointed(self) -> None:
+    async def test_dynamic_toolset_inner_call_is_checkpointed(
+        self,
+        absurd_client: AsyncAbsurd,
+    ) -> None:
         # A construction-time dynamic toolset composed under CodeMode: the durable dynamic wrapper
         # checkpoints resolution and the inner tool call, and the sandbox dispatches through it.
         calls = {'n': 0}
@@ -128,19 +118,13 @@ class TestCodeModeUnderAbsurd:
             capabilities=[CodeMode(), AbsurdDurability()],
         )
 
-        ctx = FakeAsyncTaskContext()
-        with absurd_task_context(ctx):
+        async with running_task_context(absurd_client, 'code-mode-dynamic', max_attempts=2) as ctx:
             first = await agent.run('go')
 
         assert first.output == 'done: results for x'
         assert calls['n'] == 1
-        assert 'composed__dynamic_toolset__dyn.get_tools' in ctx.stored
-        assert 'composed__dynamic_toolset__dyn.call_tool:search' in ctx.stored
-
-        replay = ctx.replay()
-        with absurd_task_context(replay):
+        async with reenter_running_task(absurd_client, ctx.task_id):
             second = await agent.run('go')
 
         assert second.output == 'done: results for x'
         assert calls['n'] == 1
-        assert replay.invoked == []

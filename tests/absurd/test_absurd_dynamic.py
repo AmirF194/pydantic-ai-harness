@@ -2,7 +2,8 @@
 
 A `DynamicToolset` resolves its inner toolset lazily from a user factory. The capability moves that
 resolution and the inner tool calls into Absurd steps, so on replay the factory and the tool are not
-re-invoked. Behavior is driven through `Agent(..., capabilities=[...])` inside a `FakeAsyncTaskContext`.
+re-invoked. Ordinary checkpoint tests use a real PostgreSQL-backed Absurd task context; the fake
+context remains for checkpoint format and error-path tests below.
 """
 
 from __future__ import annotations
@@ -11,6 +12,7 @@ import pytest
 
 pytest.importorskip('absurd_sdk')
 
+from absurd_sdk import AsyncAbsurd
 from pydantic_ai import Agent
 from pydantic_ai.exceptions import ModelRetry, UserError
 from pydantic_ai.messages import (
@@ -28,7 +30,11 @@ from pydantic_ai.toolsets._dynamic import DynamicToolset  # pyright: ignore[repo
 
 from pydantic_ai_harness.absurd import AbsurdDurability
 
-from .conftest import FakeAsyncTaskContext, absurd_task_context
+from ._postgres import reenter_running_task, running_task_context
+from .conftest import (
+    FakeAsyncTaskContext,
+    absurd_task_context,
+)
 
 pytestmark = pytest.mark.anyio
 
@@ -61,7 +67,7 @@ def _dynamic_toolset(
 
 
 class TestDynamicToolsetCheckpointing:
-    async def test_resolution_and_tool_call_checkpointed(self) -> None:
+    async def test_resolution_and_tool_call_checkpointed(self, absurd_client: AsyncAbsurd) -> None:
         factory_calls = {'n': 0}
         tool_calls = {'n': 0}
         agent = Agent(
@@ -71,19 +77,15 @@ class TestDynamicToolsetCheckpointing:
             capabilities=[AbsurdDurability()],
         )
 
-        ctx = FakeAsyncTaskContext()
-        with absurd_task_context(ctx):
+        async with running_task_context(absurd_client, 'dynamic-resolution', max_attempts=2) as ctx:
             result = await agent.run('greet ada')
 
         assert result.output == 'done'
         assert tool_calls['n'] == 1
-        assert 'd__dynamic_toolset__dyn.get_tools' in ctx.stored
-        assert 'd__dynamic_toolset__dyn.call_tool:greet' in ctx.stored
-
+        task_id = ctx.task_id
         first_factory_calls = factory_calls['n']
 
-        replay = ctx.replay()
-        with absurd_task_context(replay):
+        async with reenter_running_task(absurd_client, task_id):
             second = await agent.run('greet ada')
 
         assert second.output == 'done'
@@ -91,9 +93,8 @@ class TestDynamicToolsetCheckpointing:
         # inner tool runs again.
         assert factory_calls['n'] == first_factory_calls
         assert tool_calls['n'] == 1
-        assert replay.invoked == []
 
-    async def test_dynamic_toolset_instructions_checkpointed(self) -> None:
+    async def test_dynamic_toolset_instructions_checkpointed(self, absurd_client: AsyncAbsurd) -> None:
         factory_calls = {'n': 0}
         tool_calls = {'n': 0}
         seen_instructions: list[str | None] = []
@@ -109,17 +110,23 @@ class TestDynamicToolsetCheckpointing:
             capabilities=[AbsurdDurability()],
         )
 
-        ctx = FakeAsyncTaskContext()
-        with absurd_task_context(ctx):
+        async with running_task_context(absurd_client, 'dynamic-instructions', max_attempts=2) as ctx:
             result = await agent.run('hi')
 
         assert result.output == 'done'
         # The resolved toolset's instructions are captured in the `get_tools` checkpoint and reach
         # the model.
-        payload = ctx.stored['d__dynamic_toolset__dyn.get_tools']
-        assert isinstance(payload, dict)
-        assert 'Be terse.' in repr(payload['instructions'])
+        task_id = ctx.task_id
+        first_factory_calls = factory_calls['n']
+        first_instruction_count = len(seen_instructions)
         assert any(instr is not None and 'Be terse.' in instr for instr in seen_instructions)
+
+        async with reenter_running_task(absurd_client, task_id):
+            replay = await agent.run('hi')
+
+        assert replay.output == 'done'
+        assert factory_calls['n'] == first_factory_calls
+        assert len(seen_instructions) == first_instruction_count
 
     async def test_raw_checkpoint_from_the_reference_package_replays(self) -> None:
         # `pydantic-ai-absurd` stores a tool's return value directly rather than the wrapped form,
@@ -296,7 +303,7 @@ class TestDynamicToolsetArgValidation:
         assert result.output == 'done'
         assert tool_calls == [7]
 
-    async def test_model_retry_from_dynamic_tool_round_trips(self) -> None:
+    async def test_model_retry_from_dynamic_tool_round_trips(self, absurd_client: AsyncAbsurd) -> None:
         attempts = {'n': 0}
 
         def build(ctx: RunContext[object]) -> FunctionToolset[object]:
@@ -322,27 +329,17 @@ class TestDynamicToolsetArgValidation:
             capabilities=[AbsurdDurability()],
         )
 
-        ctx = FakeAsyncTaskContext()
-        with absurd_task_context(ctx):
+        async with running_task_context(absurd_client, 'dynamic-retry', max_attempts=2) as ctx:
             first = await agent.run('greet')
-        step = 'd__dynamic_toolset__dyn.call_tool:greet'
-        assert ctx.stored[step] == {
-            '__pydantic_ai_harness_call_tool_result__': {
-                'version': 1,
-                'result': {'message': 'nope', 'kind': 'model_retry'},
-            }
-        }
         assert first.output == 'done'
         assert attempts['n'] == 1
 
-        replay = ctx.replay()
-        with absurd_task_context(replay):
+        async with reenter_running_task(absurd_client, ctx.task_id):
             second = await agent.run('greet')
 
         # The stored `ModelRetry` is re-raised without re-running the tool.
         assert second.output == 'done'
         assert attempts['n'] == 1
-        assert replay.invoked == []
 
 
 class TestDynamicToolsetPerToolConfig:

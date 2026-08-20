@@ -1,8 +1,9 @@
 """Tests for replay, retry, and parallel execution in `AbsurdDurability`.
 
 The cases map to `pydantic-ai-absurd/tests/test_replay.py` and
-`pydantic-ai-absurd/tests/test_durability.py`. They use `FakeAsyncTaskContext` for deterministic
-unit coverage; real PostgreSQL replay coverage lives in `test_absurd_postgres.py`.
+`pydantic-ai-absurd/tests/test_durability.py`. Ordinary replay and retry cases use the real
+PostgreSQL-backed task context; fake contexts are reserved for deterministic validation and edge
+cases.
 """
 
 from __future__ import annotations
@@ -14,6 +15,7 @@ import pytest
 
 pytest.importorskip('absurd_sdk')
 
+from absurd_sdk import AsyncAbsurd
 from pydantic_ai import Agent
 from pydantic_ai.agent import ParallelExecutionMode
 from pydantic_ai.exceptions import UserError
@@ -30,13 +32,14 @@ from pydantic_ai.toolsets import FunctionToolset
 from pydantic_ai_harness.absurd import AbsurdDurability
 
 from ._helpers import _text_model
+from ._postgres import reenter_running_task, running_task_context
 from .conftest import FakeAsyncTaskContext, absurd_task_context
 
 pytestmark = pytest.mark.anyio
 
 
 class TestCrashMidRunRetry:
-    async def test_model_step_served_from_checkpoint_while_failed_tool_reruns(self) -> None:
+    async def test_model_step_served_from_checkpoint_while_failed_tool_reruns(self, absurd_client: AsyncAbsurd) -> None:
         # The core value prop: the model step completes and is checkpointed, then a tool raises a
         # real (non-`ModelRetry`) error that fails the task. On retry, Absurd replays: the model
         # step is served from its checkpoint (model not called again) while the tool re-runs.
@@ -60,30 +63,19 @@ class TestCrashMidRunRetry:
 
         agent = Agent(FunctionModel(model_fn), name='crash', toolsets=[toolset], capabilities=[AbsurdDurability()])
 
-        model_step = 'crash__model.request'
-        tool_step = 'crash__function_toolset__tools.call_tool:flaky'
-
-        ctx = FakeAsyncTaskContext()
-        with absurd_task_context(ctx):
+        async with running_task_context(absurd_client, 'crash', max_attempts=2) as ctx:
             with pytest.raises(RuntimeError, match='worker died mid-tool'):
                 await agent.run('go')
-
-        # The model step checkpointed before the tool ran; the failed tool step did not.
-        assert model_step in ctx.stored
-        assert tool_step not in ctx.stored
+            task_id = ctx.task_id
         assert model_calls['n'] == 1
         assert tool_attempts['n'] == 1
 
-        replay = ctx.replay()
-        with absurd_task_context(replay):
+        async with reenter_running_task(absurd_client, task_id):
             result = await agent.run('go')
 
         assert result.output == 'done'
-        # The first model request was served from its checkpoint (not re-invoked); the tool re-ran
-        # and the second model turn is a fresh step.
-        assert model_step not in replay.invoked
-        assert tool_step in replay.invoked
-        assert f'{model_step}#2' in replay.invoked
+        # The first model request was served from its PostgreSQL checkpoint (not re-invoked); the
+        # tool re-ran and the second model turn was a fresh step.
         assert model_calls['n'] == 2
         assert tool_attempts['n'] == 2
 
@@ -140,31 +132,29 @@ class TestParallelExecutionMode:
 
 
 class TestRepeatedStepNames:
-    async def test_two_runs_in_one_task_disambiguate_by_encounter_order(self) -> None:
+    async def test_two_runs_in_one_task_disambiguate_by_encounter_order(self, absurd_client: AsyncAbsurd) -> None:
         # A single task handler that runs the agent twice: the second run's model step reuses the
         # same step name, so Absurd's encounter-order counter records it under a `#2` suffix.
         counter = {'calls': 0}
         agent = Agent(_text_model(counter), name='a', capabilities=[AbsurdDurability()])
 
-        ctx = FakeAsyncTaskContext()
-        with absurd_task_context(ctx):
+        async with running_task_context(absurd_client, 'repeated', max_attempts=2) as ctx:
             first = await agent.run('hi')
             second = await agent.run('hi again')
+            task_id = ctx.task_id
 
         assert first.output == second.output == 'ok'
-        assert 'a__model.request' in ctx.stored
-        assert 'a__model.request#2' in ctx.stored
 
-        replay = ctx.replay()
-        with absurd_task_context(replay):
-            await agent.run('hi')
-            await agent.run('hi again')
+        async with reenter_running_task(absurd_client, task_id):
+            replayed_first = await agent.run('hi')
+            replayed_second = await agent.run('hi again')
 
         assert counter['calls'] == 2
-        assert replay.invoked == []
+        assert replayed_first.output == replayed_second.output == 'ok'
 
-    async def test_same_tool_called_twice_in_one_response(self) -> None:
+    async def test_same_tool_called_twice_in_one_response(self, absurd_client: AsyncAbsurd) -> None:
         calls: list[int] = []
+        model_calls = {'n': 0}
         toolset = FunctionToolset(id='tools')
 
         @toolset.tool_plain
@@ -173,6 +163,7 @@ class TestRepeatedStepNames:
             return f'charged {amount}'
 
         def model_fn(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+            model_calls['n'] += 1
             answered = any(isinstance(p, ToolReturnPart) for m in messages for p in m.parts)
             if answered:
                 return ModelResponse(parts=[TextPart(content='done')])
@@ -185,15 +176,20 @@ class TestRepeatedStepNames:
 
         agent = Agent(FunctionModel(model_fn), name='pay', toolsets=[toolset], capabilities=[AbsurdDurability()])
 
-        ctx = FakeAsyncTaskContext()
-        with absurd_task_context(ctx):
+        async with running_task_context(absurd_client, 'repeated-tool', max_attempts=2) as ctx:
             result = await agent.run('charge both')
+            task_id = ctx.task_id
 
         assert result.output == 'done'
         assert calls == [1, 2]
-        step = 'pay__function_toolset__tools.call_tool:charge'
-        assert step in ctx.stored
-        assert f'{step}#2' in ctx.stored
+        assert model_calls['n'] == 2
+
+        async with reenter_running_task(absurd_client, task_id):
+            replayed = await agent.run('charge both')
+
+        assert replayed.output == 'done'
+        assert calls == [1, 2]
+        assert model_calls['n'] == 2
 
 
 class TestParallelOrderedEventsDeterminism:

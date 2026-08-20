@@ -1,9 +1,9 @@
 """Tests for model checkpointing and run integration in `AbsurdDurability`.
 
 The cases map to `pydantic-ai-absurd/tests/test_model.py`,
-`pydantic-ai-absurd/tests/test_agent.py`, and `pydantic-ai-absurd/tests/test_durability.py`. They
-use `FakeAsyncTaskContext` for deterministic unit coverage; real PostgreSQL replay coverage lives
-in `test_absurd_postgres.py`.
+`pydantic-ai-absurd/tests/test_agent.py`, and `pydantic-ai-absurd/tests/test_durability.py`. The
+ordinary checkpoint/replay cases use the real PostgreSQL-backed task context; fake contexts are
+reserved for deterministic validation and edge cases.
 """
 
 from __future__ import annotations
@@ -15,7 +15,7 @@ import pytest
 
 pytest.importorskip('absurd_sdk')
 
-from absurd_sdk import JsonValue
+from absurd_sdk import AsyncAbsurd, JsonValue
 from pydantic_ai import Agent
 from pydantic_ai.capabilities import ResolveModelId
 from pydantic_ai.exceptions import UserError
@@ -35,6 +35,7 @@ from pydantic_ai.toolsets import FunctionToolset
 from pydantic_ai_harness.absurd import AbsurdDurability
 
 from ._helpers import _text_model
+from ._postgres import reenter_running_task, running_task_context
 from .conftest import FakeAsyncTaskContext, FakeSyncTaskContext, absurd_task_context
 
 pytestmark = pytest.mark.anyio
@@ -140,47 +141,40 @@ class TestConcurrentRuns:
 
 
 class TestModelRequestCheckpoint:
-    async def test_request_checkpointed_and_replay_serves_cache(self) -> None:
+    async def test_request_checkpointed_and_replay_serves_cache(self, absurd_client: AsyncAbsurd) -> None:
         counter = {'calls': 0}
         agent = Agent(_text_model(counter), name='a', capabilities=[AbsurdDurability()])
 
-        ctx = FakeAsyncTaskContext()
-        with absurd_task_context(ctx):
+        async with running_task_context(absurd_client, 'model', max_attempts=2) as ctx:
             first = await agent.run('hi')
-        assert 'a__model.request' in ctx.stored
-        assert ctx.invoked == ['a__model.request']
+            task_id = ctx.task_id
 
-        replay = ctx.replay()
-        with absurd_task_context(replay):
+        async with reenter_running_task(absurd_client, task_id):
             second = await agent.run('hi')
 
         assert counter['calls'] == 1
         assert first.output == second.output == 'ok'
-        assert replay.invoked == []
 
 
 class TestStreaming:
-    async def test_stream_checkpointed_and_replayed(self) -> None:
+    async def test_stream_checkpointed_and_replayed(self, absurd_client: AsyncAbsurd) -> None:
         counter = {'calls': 0}
         agent = Agent(_text_model(counter), name='stream', capabilities=[AbsurdDurability()])
 
-        ctx = FakeAsyncTaskContext()
-        with absurd_task_context(ctx):
+        async with running_task_context(absurd_client, 'stream', max_attempts=2) as ctx:
             async with agent.run_stream('hi') as result:
                 first_out = await result.get_output()
+            task_id = ctx.task_id
         assert first_out == 'ok'
-        assert 'stream__model.request_stream' in ctx.stored
 
-        replay = ctx.replay()
-        with absurd_task_context(replay):
+        async with reenter_running_task(absurd_client, task_id):
             async with agent.run_stream('hi') as result:
                 replay_out = await result.get_output()
 
         assert replay_out == 'ok'
         assert counter['calls'] == 1
-        assert replay.invoked == []
 
-    async def test_handler_sees_live_events_and_stream_replays_equal(self) -> None:
+    async def test_handler_sees_live_events_and_stream_replays_equal(self, absurd_client: AsyncAbsurd) -> None:
         live_events: list[AgentStreamEvent] = []
 
         async def handler(run_ctx: RunContext[object], stream: AsyncIterable[AgentStreamEvent]) -> None:
@@ -192,22 +186,22 @@ class TestStreaming:
             _text_model(counter), name='stream', capabilities=[AbsurdDurability(event_stream_handler=handler)]
         )
 
-        ctx = FakeAsyncTaskContext()
-        with absurd_task_context(ctx):
+        async with running_task_context(absurd_client, 'stream-events', max_attempts=2) as ctx:
             async with agent.run_stream_events('hi') as stream:
                 first_events = [event async for event in stream]
+            task_id = ctx.task_id
 
         # The model-stream events were delivered live to the handler inside the request_stream step.
         assert any(isinstance(event, (PartStartEvent, PartDeltaEvent)) for event in live_events)
-        assert 'stream__model.request_stream' in ctx.stored
+        live_event_count = len(live_events)
 
-        replay = ctx.replay()
-        with absurd_task_context(replay):
+        async with reenter_running_task(absurd_client, task_id):
             async with agent.run_stream_events('hi') as stream:
                 replay_events = [event async for event in stream]
 
         assert counter['calls'] == 1
         assert replay_events == first_events
+        assert len(live_events) == live_event_count
 
 
 class TestModelSelection:
@@ -309,14 +303,17 @@ class TestSyncContext:
 
 
 class TestEventStreamHandler:
-    async def test_handler_events_are_checkpointed(self) -> None:
+    async def test_handler_events_are_checkpointed(self, absurd_client: AsyncAbsurd) -> None:
         events: list[AgentStreamEvent] = []
+        model_calls = {'n': 0}
+        greet_calls = {'n': 0}
 
         async def handler(run_ctx: RunContext[object], stream: AsyncIterable[AgentStreamEvent]) -> None:
             async for event in stream:
                 events.append(event)
 
         async def stream_fn(messages: list[ModelMessage], info: AgentInfo) -> AsyncIterator[str | DeltaToolCalls]:
+            model_calls['n'] += 1
             if len(messages) == 1:
                 yield {0: DeltaToolCall(name='greet', json_args='{}')}
             else:
@@ -326,6 +323,7 @@ class TestEventStreamHandler:
 
         @toolset.tool_plain
         def greet() -> str:
+            greet_calls['n'] += 1
             return 'hello'
 
         agent = Agent(
@@ -335,17 +333,27 @@ class TestEventStreamHandler:
             capabilities=[AbsurdDurability(event_stream_handler=handler)],
         )
 
-        ctx = FakeAsyncTaskContext()
-        with absurd_task_context(ctx):
+        async with running_task_context(absurd_client, 'event-handler', max_attempts=2) as ctx:
             result = await agent.run('hi')
+            task_id = ctx.task_id
 
         assert result.output == 'done'
         assert any(isinstance(event, FunctionToolCallEvent) for event in events)
-        assert 'ev__event_stream_handler' in ctx.stored
+        event_count = len(events)
+        assert model_calls['n'] == 2
+        assert greet_calls['n'] == 1
+
+        async with reenter_running_task(absurd_client, task_id):
+            replayed = await agent.run('hi')
+
+        assert replayed.output == 'done'
+        assert len(events) == event_count
+        assert model_calls['n'] == 2
+        assert greet_calls['n'] == 1
 
 
 class TestCancelSuspendedResponse:
-    async def test_cancel_suspended_response_is_checkpointed(self) -> None:
+    async def test_cancel_suspended_response_is_checkpointed(self, absurd_client: AsyncAbsurd) -> None:
         # Drive the cancel through a real run: the model first returns a `'suspended'` response, so
         # the agent re-issues it as a continuation; the continuation request then fails, and the
         # graph tears down the suspended job via `cancel_suspended_response`, which Absurd checkpoints.
@@ -362,14 +370,21 @@ class TestCancelSuspendedResponse:
 
         agent = Agent(CancellableModel(fn, model_name='fn'), name='a', capabilities=[AbsurdDurability()])
 
-        ctx = FakeAsyncTaskContext()
-        with absurd_task_context(ctx):
+        async with running_task_context(absurd_client, 'cancel-suspended', max_attempts=2) as ctx:
             with pytest.raises(RuntimeError, match='continuation failed'):
                 await agent.run('hi')
+            task_id = ctx.task_id
 
         assert len(cancelled) == 1
         assert cancelled[0].state == 'suspended'
-        assert 'a__model.cancel_suspended_response' in ctx.stored
+
+        async with reenter_running_task(absurd_client, task_id):
+            with pytest.raises(RuntimeError, match='continuation failed'):
+                await agent.run('hi')
+
+        # The continuation request must re-run because it failed before checkpointing, while the
+        # cancellation callback is served from its PostgreSQL checkpoint.
+        assert len(cancelled) == 1
 
 
 class TestCheckpointFormat:

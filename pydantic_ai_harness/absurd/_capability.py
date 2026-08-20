@@ -17,8 +17,9 @@ try:
     import absurd_sdk  # noqa: F401  # pyright: ignore[reportUnusedImport]
 except ImportError as _import_error:  # pragma: no cover
     raise ImportError(
-        'Please install the `absurd-sdk` package to use the Absurd durability capability, '
-        'you can use the `absurd` optional group -- `pip install "pydantic-ai-harness[absurd]"`'
+        'The Absurd durability capability requires the `absurd` extra. '
+        'Install it with `pip install "pydantic-ai-harness[absurd]"` or '
+        '`uv add "pydantic-ai-harness[absurd]"`.'
     ) from _import_error
 
 from collections.abc import Callable, Mapping, Sequence
