@@ -137,7 +137,7 @@ dev = [
     "pytest-recording>=0.13.4",
     "mongomock-motor>=0.0.36",
     "redis>=6.0.0",
-    "testcontainers[postgres]>=4.14",
+    "testcontainers[postgres]>=4.15",
     "pydantic-ai-slim[anthropic]",
     "pydantic-ai-slim[mcp]>=2.28.0",
     "pydantic-ai-slim[openai]",
