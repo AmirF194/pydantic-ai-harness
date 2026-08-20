@@ -13,7 +13,8 @@ from pydantic import TypeAdapter
 from pydantic_ai import Agent, ModelMessage, ModelResponse
 from pydantic_ai.agent import ParallelExecutionMode
 from pydantic_ai.capabilities import AbstractCapability
-from pydantic_ai.exceptions import UserError
+from pydantic_ai.durable_exec._toolset import wrap_tool_call_result
+from pydantic_ai.exceptions import ApprovalRequired, CallDeferred, ModelRetry, ToolFailed, UserError
 from pydantic_ai.messages import (
     AgentStreamEvent,
     FunctionToolCallEvent,
@@ -25,10 +26,14 @@ from pydantic_ai.messages import (
 from pydantic_ai.models import Model, ModelRequestContext, ModelRequestParameters, ModelResolutionContext
 from pydantic_ai.models.function import AgentInfo, DeltaToolCall, FunctionModel
 from pydantic_ai.tools import RunContext
-from pydantic_ai.toolsets import ExternalToolset, FunctionToolset
+from pydantic_ai.toolsets import DynamicToolset, ExternalToolset, FunctionToolset
 from pydantic_ai.usage import RunUsage
 
 from pydantic_ai_harness.absurd import AbsurdDurability
+from pydantic_ai_harness.absurd._tool_result import (
+    serialize_tool_call_result,
+    unwrap_tool_call_checkpoint,
+)
 from pydantic_ai_harness.absurd._utils import current_async_context
 
 from .conftest import reenter_running_task, running_task_context
@@ -43,7 +48,7 @@ class _LogicalModelResolver(AbstractCapability[object]):
     async def resolve_model_id(self, ctx: ModelResolutionContext[object], *, model_id: str) -> Model | None:
         if model_id == 'platform-default':
             return self.target
-        return None
+        return None  # pragma: no cover - resolver deliberately declines unrelated model IDs
 
 
 def _text_model(calls: dict[str, int] | None = None) -> FunctionModel:
@@ -61,7 +66,7 @@ def _text_model(calls: dict[str, int] | None = None) -> FunctionModel:
 
 
 async def _noop(params: JsonValue, ctx: AsyncTaskContext) -> JsonValue:
-    return None
+    return None  # pragma: no cover - task body is not entered by these agent-run tests
 
 
 def _tool_model(tool_name: str, args: dict[str, JsonValue]) -> FunctionModel:
@@ -76,6 +81,19 @@ def _tool_model(tool_name: str, args: dict[str, JsonValue]) -> FunctionModel:
 async def test_requires_agent_name() -> None:
     with pytest.raises(UserError, match='unique `name`'):
         Agent(_text_model(), capabilities=[AbsurdDurability()])
+
+
+def test_construction_dynamic_toolset_is_rejected() -> None:
+    def build_toolset(ctx: RunContext[object]) -> FunctionToolset[object] | None:
+        return None  # pragma: no cover - construction rejects the dynamic toolset before resolution
+
+    with pytest.raises(UserError, match='DynamicToolset is not supported.*not checkpointed'):
+        Agent(
+            _text_model(),
+            name='dynamic-toolset',
+            toolsets=[DynamicToolset(build_toolset, id='dynamic')],
+            capabilities=[AbsurdDurability()],
+        )
 
 
 async def test_duplicate_explicit_toolset_ids_are_rejected() -> None:
@@ -124,6 +142,126 @@ async def test_function_toolset_is_transparent_outside_task() -> None:
     assert calls['calls'] == 1
 
 
+async def test_function_tool_control_flow_is_checkpointed_and_replayed(absurd: AsyncAbsurd) -> None:
+    calls = {'calls': 0}
+    toolset = FunctionToolset[object](id='billing')
+
+    @toolset.tool_plain
+    def flaky() -> str:
+        calls['calls'] += 1
+        if calls['calls'] == 1:
+            raise ModelRetry('try again')
+        return 'recovered'
+
+    agent = Agent[object, str](
+        _tool_model('flaky', {}),
+        name='control-flow',
+        toolsets=[toolset],
+        capabilities=[AbsurdDurability()],
+    )
+    absurd.register_task(name='control-flow')(_noop)
+
+    async with running_task_context(absurd, 'control-flow', max_attempts=2) as ctx:
+        first = await agent.run('go')
+        task_id = ctx.task_id
+        checkpoint = ctx._checkpoint_cache['control-flow__function_toolset__billing.call_tool:flaky']
+        assert checkpoint == {
+            '__pydantic_ai_harness_call_tool_result__': {
+                'version': 1,
+                'result': {'message': 'try again', 'kind': 'model_retry'},
+            }
+        }
+
+    async with reenter_running_task(absurd, task_id):
+        replay = await agent.run('go')
+
+    assert first.output == replay.output == 'done'
+    assert calls['calls'] == 2
+
+
+@pytest.mark.parametrize(
+    ('payload', 'error'),
+    [
+        ({'__pydantic_ai_harness_call_tool_result__': 'not an object'}, 'Malformed'),
+        (
+            {'__pydantic_ai_harness_call_tool_result__': {'version': True, 'result': None}},
+            'Unsupported',
+        ),
+        (
+            {'__pydantic_ai_harness_call_tool_result__': {'version': 2, 'result': None}},
+            'Unsupported',
+        ),
+    ],
+)
+def test_tool_result_checkpoint_rejects_malformed_envelopes(payload: JsonValue, error: str) -> None:
+    with pytest.raises(UserError, match=error):
+        unwrap_tool_call_checkpoint(payload)
+
+
+def test_tool_result_checkpoint_preserves_raw_legacy_value() -> None:
+    raw: JsonValue = {'kind': 'tool_return', 'result': 'legacy'}
+    assert unwrap_tool_call_checkpoint(raw) == raw
+
+
+async def test_successful_tool_result_retains_standalone_raw_shape() -> None:
+    scalar_result = await wrap_tool_call_result(_successful_tool_call())
+    assert serialize_tool_call_result(scalar_result) == 'ok'
+
+    raw_result = await wrap_tool_call_result(_raw_tool_content_call())
+    assert serialize_tool_call_result(raw_result) == {'kind': 'tool-return', 'result': 'raw'}
+
+
+async def _successful_tool_call() -> str:
+    return 'ok'
+
+
+async def _raw_tool_content_call() -> dict[str, JsonValue]:
+    return {'kind': 'tool-return', 'result': 'raw'}
+
+
+@pytest.mark.parametrize(
+    ('exception', 'expected'),
+    [
+        (ModelRetry('retry'), {'message': 'retry', 'kind': 'model_retry'}),
+        (
+            ApprovalRequired(metadata={'request_id': 'approval'}),
+            {'metadata': {'request_id': 'approval'}, 'kind': 'approval_required'},
+        ),
+        (
+            CallDeferred(metadata={'request_id': 'deferred'}),
+            {'metadata': {'request_id': 'deferred'}, 'kind': 'call_deferred'},
+        ),
+        (ToolFailed('failed'), {'message': 'failed', 'kind': 'tool_failed'}),
+    ],
+)
+async def test_control_flow_tool_results_round_trip(
+    exception: ModelRetry | ApprovalRequired | CallDeferred | ToolFailed, expected: dict[str, JsonValue]
+) -> None:
+    async def raise_exception() -> None:
+        raise exception
+
+    wrapped = await wrap_tool_call_result(raise_exception())
+    assert serialize_tool_call_result(wrapped) == {
+        '__pydantic_ai_harness_call_tool_result__': {'version': 1, 'result': expected}
+    }
+    payload: JsonValue = {'__pydantic_ai_harness_call_tool_result__': {'version': 1, 'result': expected}}
+
+    with pytest.raises(type(exception)) as raised:
+        unwrap_tool_call_checkpoint(payload)
+    if isinstance(exception, ApprovalRequired):
+        assert isinstance(raised.value, ApprovalRequired)
+        assert raised.value.metadata == exception.metadata
+    elif isinstance(exception, CallDeferred):
+        assert isinstance(raised.value, CallDeferred)
+        assert raised.value.metadata == exception.metadata
+    elif isinstance(exception, ModelRetry):
+        assert isinstance(raised.value, ModelRetry)
+        assert raised.value.message == exception.message
+    else:
+        assert isinstance(raised.value, ToolFailed)
+        assert raised.value.message == exception.message
+
+
 async def test_same_function_toolset_instance_is_wrapped_once() -> None:
     toolset = FunctionToolset[object](id='shared')
     agent = Agent(_text_model(), name='shared-toolset', toolsets=[toolset, toolset], capabilities=[AbsurdDurability()])
@@ -147,7 +285,9 @@ async def test_outside_task_leaves_parallel_mode_untouched(monkeypatch: pytest.M
     recorded: list[ParallelExecutionMode] = []
     real = agent.parallel_tool_call_execution_mode
 
-    def spy(mode: ParallelExecutionMode = 'parallel') -> AbstractContextManager[None]:
+    def spy(
+        mode: ParallelExecutionMode = 'parallel',
+    ) -> AbstractContextManager[None]:  # pragma: no cover - outside-task run must not call it
         recorded.append(mode)
         return real(mode)
 
@@ -415,7 +555,9 @@ async def test_explicit_function_toolset_and_model_resolver_replay(absurd: Async
         tool_calls['calls'] += 1
         return f'charged {amount}'
 
-    def primary(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+    def primary(
+        messages: list[ModelMessage], info: AgentInfo
+    ) -> ModelResponse:  # pragma: no cover - cheap model is selected
         model_calls['primary'] += 1
         return ModelResponse(parts=[TextPart(content='primary')])
 
@@ -457,7 +599,7 @@ async def test_runtime_function_toolset_is_rejected(absurd: AsyncAbsurd) -> None
 
     @late.tool_plain
     def echo(value: str) -> str:
-        return value
+        return value  # pragma: no cover - runtime toolset is rejected before invocation
 
     async with running_task_context(absurd, 'runtime'):
         with pytest.raises(UserError, match=r'cannot be passed to `run\(toolsets=\.\.\.\)` at runtime'):
@@ -482,7 +624,7 @@ async def test_tool_name_with_hash_is_rejected(absurd: AsyncAbsurd) -> None:
 
     @toolset.tool_plain(name='bad#tool')
     def bad_tool() -> str:
-        return 'bad'
+        return 'bad'  # pragma: no cover - unsafe tool name is rejected before invocation
 
     agent = Agent[object, str](
         _tool_model('bad#tool', {}),
@@ -511,7 +653,7 @@ async def test_same_task_namespace_cannot_overlap(absurd: AsyncAbsurd) -> None:
 
     async with running_task_context(absurd, 'overlap'):
         with anyio.fail_after(5):
-            async with anyio.create_task_group() as task_group:
+            async with anyio.create_task_group() as task_group:  # pragma: no branch
                 task_group.start_soon(agent.run, 'first')
                 await started.wait()
                 with pytest.raises(UserError, match='Concurrent Absurd agent runs'):
@@ -525,7 +667,7 @@ async def test_enqueue_is_rejected_inside_checkpointed_tool(absurd: AsyncAbsurd)
     @toolset.tool
     def enqueue(ctx: RunContext[object]) -> str:
         ctx.enqueue('follow-up')
-        return 'unreachable'
+        return 'unreachable'  # pragma: no cover - enqueue raises before this return
 
     agent = Agent[object, str](
         _tool_model('enqueue', {}),

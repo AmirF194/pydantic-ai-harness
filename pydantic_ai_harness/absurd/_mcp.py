@@ -7,11 +7,13 @@ from typing import Any
 from absurd_sdk import JsonValue
 from pydantic import TypeAdapter
 from pydantic_ai import ToolsetTool, WrapperToolset
+from pydantic_ai.durable_exec._toolset import wrap_tool_call_result
 from pydantic_ai.mcp import MCPToolset
 from pydantic_ai.messages import InstructionPart
 from pydantic_ai.tools import AgentDepsT, RunContext, ToolDefinition
 from typing_extensions import Self
 
+from ._tool_result import serialize_tool_call_result, unwrap_tool_call_checkpoint
 from ._utils import current_async_context
 
 Instructions = str | InstructionPart | Sequence[str | InstructionPart] | None
@@ -57,7 +59,6 @@ class AbsurdMCPToolset(WrapperToolset[AgentDepsT]):
         super().__init__(wrapped)
         id_suffix = f'__{wrapped.id}' if wrapped.id else ''
         self._name = f'{step_name_prefix}__mcp_server{id_suffix}'
-        self._cached_tool_defs: dict[str, ToolDefinition] | None = None
         self._durable_run_context_scope = durable_run_context_scope
 
     @property
@@ -82,11 +83,6 @@ class AbsurdMCPToolset(WrapperToolset[AgentDepsT]):
         return self
 
     async def get_tools(self, ctx: RunContext[AgentDepsT]) -> dict[str, ToolsetTool[AgentDepsT]]:
-        if self._server.cache_tools and self._cached_tool_defs is not None:
-            return {
-                name: self.tool_for_tool_def(tool_def, ctx=ctx) for name, tool_def in self._cached_tool_defs.items()
-            }
-
         async def _list_tools() -> dict[str, JsonValue]:
             with self._durable_run_context_scope(ctx) as step_ctx:
                 tools = await super(AbsurdMCPToolset, self).get_tools(step_ctx)
@@ -97,10 +93,7 @@ class AbsurdMCPToolset(WrapperToolset[AgentDepsT]):
             return await super().get_tools(ctx)
         payload = await task_ctx.step(f'{self._name}.get_tools', _list_tools)
         tool_defs = _deserialize_tool_defs(payload)
-        result = {name: self.tool_for_tool_def(tool_def, ctx=ctx) for name, tool_def in tool_defs.items()}
-        if self._server.cache_tools:
-            self._cached_tool_defs = tool_defs
-        return result
+        return {name: self.tool_for_tool_def(tool_def, ctx=ctx) for name, tool_def in tool_defs.items()}
 
     async def get_instructions(self, ctx: RunContext[AgentDepsT]) -> Instructions:
         result = await super().get_instructions(ctx)
@@ -131,6 +124,8 @@ class AbsurdMCPToolset(WrapperToolset[AgentDepsT]):
 
         async def call() -> Any:
             with self._durable_run_context_scope(ctx) as step_ctx:
-                return await self._server.call_tool(name, tool_args, step_ctx, tool)
+                result = await wrap_tool_call_result(self._server.call_tool(name, tool_args, step_ctx, tool))
+                return serialize_tool_call_result(result)
 
-        return await task_ctx.step(f'{self._name}.call_tool', call)
+        payload = await task_ctx.step(f'{self._name}.call_tool', call)
+        return unwrap_tool_call_checkpoint(payload)

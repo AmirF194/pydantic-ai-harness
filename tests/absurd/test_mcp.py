@@ -6,7 +6,8 @@ from contextlib import contextmanager
 import pytest
 from absurd_sdk import AsyncAbsurd, AsyncTaskContext, JsonValue
 from fastmcp import FastMCP
-from pydantic_ai import Agent, ModelMessage, ModelResponse
+from pydantic_ai import Agent, ModelMessage, ModelResponse, ToolsetTool
+from pydantic_ai.exceptions import ModelRetry
 from pydantic_ai.mcp import MCPToolset
 from pydantic_ai.messages import TextPart, ToolCallPart, ToolReturnPart
 from pydantic_ai.models.function import AgentInfo, FunctionModel
@@ -34,7 +35,7 @@ def _mcp_model() -> FunctionModel:
 
 
 async def _noop(params: JsonValue, ctx: AsyncTaskContext) -> JsonValue:
-    return None
+    return None  # pragma: no cover - task body is not entered by these agent-run tests
 
 
 def _server(calls: dict[str, int], *, instructions: str | None = None) -> FastMCP:
@@ -73,6 +74,37 @@ async def test_wrappers_preserve_identity_and_do_not_manage_lifecycle() -> None:
         assert entered is mcp_wrapper
     assert function_wrapper.visit_and_replace(lambda value: value) is function_wrapper
     assert mcp_wrapper.visit_and_replace(lambda value: value) is mcp_wrapper
+
+
+async def test_mcp_cache_invalidation_is_observed_by_durable_discovery(absurd: AsyncAbsurd) -> None:
+    server = FastMCP('calculator')
+
+    @server.tool
+    def add(left: int, right: int) -> int:
+        return left + right  # pragma: no cover - discovery only; this test does not call the tool
+
+    toolset = MCPToolset(server)
+    wrapper = AbsurdMCPToolset(
+        toolset, step_name_prefix='cache-invalidation', durable_run_context_scope=_pass_through_scope
+    )
+    absurd.register_task(name='cache-invalidation')(_noop)
+
+    async with running_task_context(absurd, 'cache-invalidation') as ctx:
+        first = await wrapper.get_tools(_run_context())
+
+        def multiply(left: int, right: int) -> int:
+            return left * right  # pragma: no cover - discovery only; this test does not call the tool
+
+        server.add_tool(multiply)
+        toolset._invalidate_tools_cache()
+        second = await wrapper.get_tools(_run_context())
+
+        assert set(first) == {'add'}
+        assert set(second) == {'add', 'multiply'}
+        assert {
+            'cache-invalidation__mcp_server.get_tools',
+            'cache-invalidation__mcp_server.get_tools#2',
+        } <= set(ctx._checkpoint_cache)
 
 
 async def test_idless_in_process_mcp_toolset_replays(absurd: AsyncAbsurd) -> None:
@@ -131,6 +163,48 @@ async def test_explicit_mcp_toolset_replays(absurd: AsyncAbsurd) -> None:
 
     assert first.output == replay.output == 'done'
     assert calls['calls'] == 1
+
+
+async def test_mcp_tool_control_flow_is_checkpointed_and_replayed(absurd: AsyncAbsurd) -> None:
+    attempts = {'calls': 0}
+    server_calls = {'calls': 0}
+    server = _server(server_calls)
+    toolset = MCPToolset(server, id='control-flow')
+    original_call_tool = toolset.call_tool
+
+    async def flaky_call_tool(
+        name: str, tool_args: dict[str, object], ctx: RunContext[object], tool: ToolsetTool[object]
+    ) -> object:
+        attempts['calls'] += 1
+        if attempts['calls'] == 1:
+            raise ModelRetry('try again')
+        return await original_call_tool(name, tool_args, ctx, tool)
+
+    toolset.call_tool = flaky_call_tool  # type: ignore[method-assign]
+    agent = Agent[object, str](
+        _mcp_model(),
+        name='mcp-control-flow',
+        toolsets=[toolset],
+        capabilities=[AbsurdDurability()],
+    )
+    absurd.register_task(name='mcp-control-flow')(_noop)
+
+    async with running_task_context(absurd, 'mcp-control-flow', max_attempts=2) as ctx:
+        first = await agent.run('add these')
+        task_id = ctx.task_id
+        assert ctx._checkpoint_cache['mcp-control-flow__mcp_server__control-flow.call_tool'] == {
+            '__pydantic_ai_harness_call_tool_result__': {
+                'version': 1,
+                'result': {'message': 'try again', 'kind': 'model_retry'},
+            }
+        }
+
+    async with reenter_running_task(absurd, task_id):
+        replay = await agent.run('add these')
+
+    assert first.output == replay.output == 'done'
+    assert attempts['calls'] == 2
+    assert server_calls['calls'] == 1
 
 
 async def test_mcp_without_tool_cache_checkpoints_each_discovery(absurd: AsyncAbsurd) -> None:

@@ -5,10 +5,12 @@ from contextlib import AbstractContextManager
 from typing import Any
 
 from pydantic_ai import FunctionToolset, ToolsetTool, WrapperToolset
+from pydantic_ai.durable_exec._toolset import wrap_tool_call_result
 from pydantic_ai.exceptions import UserError
 from pydantic_ai.tools import AgentDepsT, RunContext
 from typing_extensions import Self
 
+from ._tool_result import serialize_tool_call_result, unwrap_tool_call_checkpoint
 from ._utils import current_async_context
 
 _DurableRunContextScope = Callable[[RunContext[AgentDepsT]], AbstractContextManager[RunContext[AgentDepsT]]]
@@ -60,6 +62,8 @@ class AbsurdFunctionToolset(WrapperToolset[AgentDepsT]):
 
         async def call() -> Any:
             with self._durable_run_context_scope(ctx) as step_ctx:
-                return await self.wrapped.call_tool(name, tool_args, step_ctx, tool)
+                result = await wrap_tool_call_result(self.wrapped.call_tool(name, tool_args, step_ctx, tool))
+                return serialize_tool_call_result(result)
 
-        return await task_ctx.step(f'{self._name}.call_tool:{name}', call)
+        payload = await task_ctx.step(f'{self._name}.call_tool:{name}', call)
+        return unwrap_tool_call_checkpoint(payload)

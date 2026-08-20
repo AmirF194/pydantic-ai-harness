@@ -74,10 +74,13 @@ capability = AbsurdDurability(parallel_execution_mode='parallel_ordered_events')
 
 ## Compatibility
 
-The step names and raw function/MCP tool-result payloads are compatible with
-`pydantic-ai-absurd`. Streamed checkpoints written by its deprecated `AbsurdAgent` are also
-readable here. A task started with one integration can therefore resume under the other when the
-agent and toolset names are unchanged.
+The step names and successful raw function/MCP tool-result payloads are compatible with
+`pydantic-ai-absurd`. A task whose checkpoints were written by the standalone integration can
+resume under Harness when the agent and toolset names are unchanged. Harness stores captured
+control-flow outcomes in a versioned v1 envelope; the standalone integration cannot read those
+newer control-flow checkpoints.
+
+`DynamicToolset` is not supported because its resolution and tool calls are not checkpointed.
 
 ## API
 

@@ -30,7 +30,7 @@ from pydantic_ai.messages import AgentStreamEvent, ModelResponse, ModelResponseS
 from pydantic_ai.models import CompletedStreamedResponse, Model, ModelRequestContext
 from pydantic_ai.run import AgentRunResult
 from pydantic_ai.tools import AgentDepsT, RunContext
-from pydantic_ai.toolsets import AbstractToolset, WrapperToolset
+from pydantic_ai.toolsets import AbstractToolset, DynamicToolset, WrapperToolset
 
 from ._function_toolset import AbsurdFunctionToolset
 from ._utils import current_async_context
@@ -101,6 +101,11 @@ class AbsurdDurability(BaseDurabilityCapability[AgentDepsT]):
         seen_ids: dict[str, AbstractToolset[AgentDepsT]] = {}
 
         def register(toolset: AbstractToolset[AgentDepsT]) -> AbstractToolset[AgentDepsT]:
+            if isinstance(toolset, DynamicToolset):
+                raise UserError(
+                    'DynamicToolset is not supported by AbsurdDurability because its resolution and tool calls '
+                    'are not checkpointed.'
+                )
             if toolset.id is not None:
                 existing = seen_ids.get(toolset.id)
                 if existing is not None and existing is not toolset:
