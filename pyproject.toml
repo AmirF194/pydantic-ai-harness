@@ -138,7 +138,6 @@ dev = [
     "mongomock-motor>=0.0.36",
     "redis>=6.0.0",
     "testcontainers[postgres]>=4.14",
-    "psycopg[binary]>=3.0.0",
     "pydantic-ai-slim[anthropic]",
     "pydantic-ai-slim[mcp]>=2.28.0",
     "pydantic-ai-slim[openai]",
