@@ -15,6 +15,7 @@ if TYPE_CHECKING:
         ClampOversizedMessages,
         ClearToolResults,
         DeduplicateFileReads,
+        FallbackCompaction,
         ReportContextUsage,
         SlidingWindowCompaction,
         SummarizingCompaction,
@@ -42,6 +43,7 @@ if TYPE_CHECKING:
     from .memory import Memory
     from .modal_sandbox import ModalSandbox
     from .planning import Planning
+    from .prompt_injection_defender import PromptInjectionDefender
     from .pydantic_ai_docs import PydanticAIDocs
     from .repo_context import RepoContext
     from .researcher import DEFAULT_RESEARCHER_INSTRUCTIONS, Researcher
@@ -54,6 +56,7 @@ if TYPE_CHECKING:
     from .system_reminders import SystemReminders
     from .tool_output_limits import ToolOutputLimits
     from .warn_on_cache_busts import WarnOnCacheBusts
+    from .youdotcom import YouResearch, YouSearch
 
 __all__ = [
     'Advisor',
@@ -71,6 +74,7 @@ __all__ = [
     'DynamicWorkflow',
     'ExaAgent',
     'ExaSearch',
+    'FallbackCompaction',
     'FileSystem',
     'GuardrailError',
     'GuardrailResult',
@@ -88,6 +92,7 @@ __all__ = [
     'OutputGuardrail',
     'OutputGuardrailFunc',
     'Planning',
+    'PromptInjectionDefender',
     'PydanticAIDocs',
     'READ_ONLY_TOOL_NAMES',
     'ReportContextUsage',
@@ -108,6 +113,8 @@ __all__ = [
     'ToolOutputLimits',
     'WarnNearLimits',
     'WarnOnCacheBusts',
+    'YouResearch',
+    'YouSearch',
 ]
 
 _CAPABILITY_EXPORTS = {
@@ -124,6 +131,7 @@ _CAPABILITY_EXPORTS = {
     'DynamicWorkflow': 'dynamic_workflow',
     'ExaAgent': 'exa',
     'ExaSearch': 'exa',
+    'FallbackCompaction': 'compaction',
     'FileSystem': 'filesystem',
     'LocalStack': 'localstack',
     'Macroscope': 'macroscope',
@@ -131,6 +139,7 @@ _CAPABILITY_EXPORTS = {
     'Memory': 'memory',
     'ModalSandbox': 'modal_sandbox',
     'Planning': 'planning',
+    'PromptInjectionDefender': 'prompt_injection_defender',
     'PydanticAIDocs': 'pydantic_ai_docs',
     'ReportContextUsage': 'compaction',
     'RepoContext': 'repo_context',
@@ -149,6 +158,8 @@ _CAPABILITY_EXPORTS = {
     'ToolOutputLimits': 'tool_output_limits',
     'WarnNearLimits': 'compaction',
     'WarnOnCacheBusts': 'warn_on_cache_busts',
+    'YouResearch': 'youdotcom',
+    'YouSearch': 'youdotcom',
 }
 
 _CONSTANT_EXPORTS = {
