@@ -88,7 +88,7 @@ through it; they are reported as text failures instead.
 - During normal completion, a would-be final answer is held until each background task delivers its follow-up
 - A run that pauses for [deferred tools](https://ai.pydantic.dev/deferred-tools/) (human-in-the-loop approval, external execution) is never held behind background work; live tasks are cancelled and background results are not delivered
 - If the run ends for any other reason with tasks still live (caller cancellation, a usage limit, an unexpected error), those tasks are cancelled and their results are dropped; delivery is conditional on the run continuing
-- Cancellation is cooperative for synchronous tools: work already running in an executor cannot be interrupted and may continue after the run ends
+- Cancellation is cooperative: async tools should propagate `CancelledError` and get up to one second to finish cleanup; handlers that suppress cancellation and synchronous executor work may continue after the run ends
 
 ## Limitations
 

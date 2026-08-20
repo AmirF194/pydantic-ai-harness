@@ -37,6 +37,8 @@ automatically as a follow-up message when the task completes. Continue working o
 things in the meantime; do not block waiting for the result.\
 """
 
+_CANCEL_DRAIN_TIMEOUT = 1.0
+
 
 def _format_background_error(error: Exception) -> str:
     """Format a background-tool error without exposing deferred-call metadata."""
@@ -91,6 +93,10 @@ class BackgroundTools(AbstractCapability[AgentDepsT]):
 
     Durable execution is rejected because in-process tasks cannot survive workflow
     replay or worker restart.
+
+    On cancellation, live tasks are cancelled and given up to one second to finish.
+    Async handlers that suppress cancellation and synchronous executor work may outlive
+    the run.
     """
 
     tools: ToolSelector[AgentDepsT] = field(default_factory=lambda: {'background': True})
@@ -188,10 +194,12 @@ class BackgroundTools(AbstractCapability[AgentDepsT]):
         try:
             return await handler()
         finally:
-            # The shield holds the drain open under anyio-scope cancellation of
-            # the run. A raw second `task.cancel()` still pierces it and abandons
-            # the drain, which is accepted: every task is already cancelled here.
+            # Give cooperative cleanup a bounded grace period. Python cannot force an
+            # async handler that suppresses cancellation, or a synchronous worker, to stop.
             with anyio.CancelScope(shield=True):
-                for task in self._tasks:
+                tasks = set(self._tasks)
+                for task in tasks:
                     task.cancel()
-                await asyncio.gather(*self._tasks, return_exceptions=True)
+                if tasks:
+                    done, _ = await asyncio.wait(tasks, timeout=_CANCEL_DRAIN_TIMEOUT)
+                    await asyncio.gather(*done, return_exceptions=True)

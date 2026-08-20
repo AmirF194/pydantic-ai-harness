@@ -8,7 +8,7 @@ from collections.abc import Callable
 
 import pytest
 from pydantic_ai import Agent, CancellationToken, RunCancelled
-from pydantic_ai.exceptions import CallDeferred, ModelRetry, ToolFailed, UserError
+from pydantic_ai.exceptions import ApprovalRequired, CallDeferred, ModelRetry, ToolFailed, UserError
 from pydantic_ai.messages import (
     ModelMessage,
     ModelRequest,
@@ -271,6 +271,7 @@ class TestBackgroundTools:
         await asyncio.wait_for(cancel_seen.wait(), timeout=1)
 
     async def test_deferred_tool_pause_wins_over_a_completed_background_result(self) -> None:
+        fast_done = asyncio.Event()
         model_calls = 0
 
         def model_fn(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
@@ -288,15 +289,19 @@ class TestBackgroundTools:
 
         @agent.tool_plain(metadata={'background': True})
         async def fast() -> str:  # pyright: ignore[reportUnusedFunction]
+            fast_done.set()
             return 'finished'
 
-        @agent.tool_plain(requires_approval=True)
-        def needs_approval() -> str:  # pyright: ignore[reportUnusedFunction]
-            return 'approved'  # pragma: no cover -- never approved in this test
+        @agent.tool_plain
+        async def needs_approval() -> str:  # pyright: ignore[reportUnusedFunction]
+            await fast_done.wait()
+            raise ApprovalRequired
 
         result = await agent.run('go')
 
         assert isinstance(result.output, DeferredToolRequests)
+        assert result.output.approvals[0].tool_name == 'needs_approval'
+        assert fast_done.is_set()
         assert model_calls == 1
 
     async def test_queued_result_is_not_delayed_by_an_unrelated_live_task(self) -> None:
@@ -351,6 +356,40 @@ class TestBackgroundTools:
             await asyncio.wait_for(agent.run('go'), timeout=0.5)
 
         await asyncio.wait_for(cancel_seen.wait(), timeout=1)
+
+    async def test_run_abort_stops_waiting_for_a_task_that_suppresses_cancellation(self) -> None:
+        started = asyncio.Event()
+        cancellation_suppressed = asyncio.Event()
+        release = asyncio.Event()
+        finished = asyncio.Event()
+        agent = Agent(_model_calling('stubborn'), capabilities=[BackgroundTools()])
+
+        @agent.tool_plain(metadata={'background': True})
+        async def stubborn() -> str:  # pyright: ignore[reportUnusedFunction]
+            started.set()
+            try:
+                await asyncio.Event().wait()
+                raise AssertionError('unreachable')  # pragma: no cover
+            except asyncio.CancelledError:
+                cancellation_suppressed.set()
+                await release.wait()
+                finished.set()
+                return 'late result'
+
+        run = asyncio.ensure_future(agent.run('go'))
+        await asyncio.wait_for(started.wait(), timeout=1)
+        run.cancel()
+
+        try:
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(asyncio.shield(run), timeout=2)
+            assert cancellation_suppressed.is_set()
+        finally:
+            release.set()
+            await asyncio.wait_for(finished.wait(), timeout=1)
+            if not run.done():
+                with pytest.raises(asyncio.CancelledError):
+                    await asyncio.wait_for(run, timeout=1)
 
     async def test_cancellation_token_cancels_live_tasks(self) -> None:
         cancel_seen = asyncio.Event()
