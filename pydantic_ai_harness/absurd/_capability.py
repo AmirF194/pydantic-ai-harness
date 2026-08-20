@@ -96,8 +96,7 @@ _dynamic_tools_adapter: TypeAdapter[DynamicToolsResult] = TypeAdapter(DynamicToo
 
 # Absurd disambiguates repeated step names by encounter order within one task. Two overlapping
 # runs using the same task context and namespace would therefore claim each other's checkpoints.
-# Keep the active context itself as the value so an object-id reuse cannot release a newer claim.
-_active_run_namespaces: dict[tuple[int, str], AsyncTaskContext] = {}
+_active_run_namespaces: set[tuple[AsyncTaskContext, str]] = set()
 _active_run_namespaces_lock = Lock()
 
 
@@ -544,7 +543,7 @@ class AbsurdDurability(BaseDurabilityCapability[AgentDepsT]):
         if agent is None or task_ctx is None:
             return await handler()
 
-        namespace_key = (id(task_ctx), self.name)
+        namespace_key = (task_ctx, self.name)
         with _active_run_namespaces_lock:
             if namespace_key in _active_run_namespaces:
                 raise UserError(
@@ -552,14 +551,13 @@ class AbsurdDurability(BaseDurabilityCapability[AgentDepsT]):
                     'in the same task context. Await one run before starting another, or use a distinct '
                     '`AbsurdDurability(name=...)` value or task context.'
                 )
-            _active_run_namespaces[namespace_key] = task_ctx
+            _active_run_namespaces.add(namespace_key)
         try:
             with agent.parallel_tool_call_execution_mode(self._parallel_execution_mode):
                 return await handler()
         finally:
             with _active_run_namespaces_lock:
-                if _active_run_namespaces.get(namespace_key) is task_ctx:
-                    del _active_run_namespaces[namespace_key]
+                _active_run_namespaces.remove(namespace_key)
 
     async def wrap_model_request(
         self, ctx: RunContext[AgentDepsT], *, request_context: ModelRequestContext, handler: WrapModelRequestHandler
