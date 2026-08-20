@@ -2423,11 +2423,15 @@ class TestHelperBranchCoverage:
         # question from what the request costs; a retry and a thinking block stay out of it.
         assert _format_messages(msgs) == ''
 
-    def test_retry_feedback_costs_what_the_system_message_it_renders_into_costs(self):
+    def test_retry_feedback_costs_what_its_feedback_text_costs_as_a_system_prompt(self):
         """It reaches the model as a mid-conversation system message, so it occupies the window.
 
         `content` is a list of error details here, which is why the estimate follows
         `model_response()` rather than `str(content)`: the model is shown the rendered text.
+
+        The per-cause sentence framing it as the harness speaking is added when the model renders
+        the part, so it is outside this equivalence -- a fixed ~10-token undercount, in an
+        estimator that counts no tool definitions at all.
         """
         from pydantic_ai.messages import RetryFeedbackPart
 

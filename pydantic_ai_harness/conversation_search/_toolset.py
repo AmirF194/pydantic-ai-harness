@@ -179,8 +179,13 @@ def _user_prompt_text(part: UserPromptPart) -> str:
     return ' '.join(texts)
 
 
-def _format_request_part(part: ModelRequestPart, *, truncate: bool) -> str | None:
-    """Render one request part to a searchable line, or `None` for non-content parts."""
+def _format_request_part(part: ModelRequestPart, *, truncate: bool) -> str | None:  # noqa: C901
+    """Render one request part to a searchable line, or `None` for non-content parts.
+
+    The complexity waiver covers the exhaustive part-type chain itself, which grows by one branch
+    every time pydantic-ai adds a part; splitting it would separate the branches from the
+    `assert_never` that keeps them exhaustive.
+    """
     if isinstance(part, UserPromptPart):
         content = _user_prompt_text(part)
         if truncate and len(content) > 500:
@@ -205,12 +210,20 @@ def _format_request_part(part: ModelRequestPart, *, truncate: bool) -> str | Non
         return f'Retry [{part.tool_name}]: {part.content}'
     if isinstance(part, RetryFeedbackPart):
         # The same feedback for a response that answered no particular call -- output validation
-        # failed, an output validator raised, or nothing usable came back. Recalling why a run
-        # changed course is the same want whether or not the retry named a tool, and indexing only
-        # the tool-bound half would make that depend on which part type pydantic-ai happened to
-        # use. Unlike the availability delta below this is prose the model read and acted on, not
-        # bookkeeping. No tool name: this part is never bound to a call.
-        return f'Retry: {part.model_response()}'
+        # failed, an output validator raised, or nothing usable came back. Its tool-bound
+        # counterpart is a `ToolReturnPart` carrying `outcome='retried'`, already indexed above, so
+        # skipping this one would make "a retry happened, and here is why" searchable only when the
+        # retry named a tool. Unlike the availability delta below, this text was in the model's
+        # context and shaped what it did next. No tool name: it is never bound to a call.
+        #
+        # `model_response()` renders a validation failure's `ErrorDetails` the way the model was
+        # shown them; `str(part.content)` would put a Python repr in the index. That rendering is a
+        # fenced JSON block per error, so the display excerpt is capped like the branches above it
+        # while the index keeps the full text.
+        feedback = part.model_response()
+        if truncate and len(feedback) > 500:
+            feedback = feedback[:500] + '...'
+        return f'Retry: {feedback}'
     if isinstance(part, SpeechPart):
         # A realtime user turn: index the spoken transcript so speech is searchable, not the
         # raw audio. `transcript` is optional, so an audio-only part contributes no text.

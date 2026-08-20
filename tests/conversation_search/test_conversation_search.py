@@ -36,6 +36,7 @@ from pydantic_ai.models.function import AgentInfo, FunctionModel
 from pydantic_ai.models.test import TestModel
 from pydantic_ai.tools import RunContext
 from pydantic_ai.usage import RunUsage
+from pydantic_core import ErrorDetails
 
 from pydantic_ai_harness import HarnessDeprecationWarning
 from pydantic_ai_harness.compaction import SlidingWindowCompaction, SummarizingCompaction
@@ -761,7 +762,10 @@ class TestSearchScope:
             ModelRequest(
                 parts=[
                     UserPromptPart(content='mango question'),
-                    RetryFeedbackPart(content='the mango field is required', cause='validation_error'),
+                    RetryFeedbackPart(
+                        content=[{'type': 'missing', 'loc': ('mango',), 'msg': 'Field required', 'input': {}}],
+                        cause='validation_error',
+                    ),
                 ]
             ),
             ModelResponse(parts=[TextPart(content='mango answer')]),
@@ -770,7 +774,31 @@ class TestSearchScope:
 
         rendered = await _search(source, 'mango')
 
-        assert 'Retry: the mango field is required' in rendered
+        # `model_response()`, not `str(part.content)`: the latter would index a Python repr of the
+        # error list rather than the rendering the model was shown.
+        assert 'Retry: ' in rendered
+        assert 'mango' in rendered
+        assert "{'type': 'missing'" not in rendered
+
+    async def test_retry_feedback_truncates_but_stays_searchable(self) -> None:
+        """A validation failure renders one fenced JSON block per error, so it can run long.
+
+        The display excerpt is capped like the other content branches while the index keeps the
+        full text, so a term past the cutoff still matches.
+        """
+        errors: list[ErrorDetails] = [
+            {'type': 'missing', 'loc': (f'field_{i}',), 'msg': 'Field required', 'input': {}} for i in range(40)
+        ]
+        errors.append({'type': 'missing', 'loc': ('rambutan',), 'msg': 'Field required', 'input': {}})
+        messages: list[ModelMessage] = [
+            ModelRequest(parts=[RetryFeedbackPart(content=errors, cause='validation_error')]),
+        ]
+        source = _StubSource({'r1': messages})
+
+        rendered = await _search(source, 'rambutan')
+
+        assert 'Retry: ' in rendered
+        assert '...' in rendered
 
     async def test_tool_availability_delta_is_not_indexed(self) -> None:
         """Tool-list bookkeeping is not conversation content, so it contributes no line.
