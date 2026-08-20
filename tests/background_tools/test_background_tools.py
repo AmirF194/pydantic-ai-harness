@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 import asyncio
+import re
 from collections.abc import Callable
 
 import pytest
 from pydantic_ai import Agent, CancellationToken, RunCancelled
-from pydantic_ai.exceptions import CallDeferred, ModelRetry, ToolFailed
+from pydantic_ai.exceptions import CallDeferred, ModelRetry, ToolFailed, UserError
 from pydantic_ai.messages import (
     ModelMessage,
     ModelRequest,
@@ -18,6 +19,7 @@ from pydantic_ai.messages import (
     UserPromptPart,
 )
 from pydantic_ai.models.function import AgentInfo, FunctionModel
+from pydantic_ai.models.test import TestModel
 from pydantic_ai.tools import DeferredToolRequests
 
 from pydantic_ai_harness import BackgroundTools
@@ -97,26 +99,24 @@ class TestBackgroundTools:
         result = await asyncio.wait_for(run, timeout=5)
 
         assert result.output == 'done'
-        assert _ack_seen(result.all_messages())
-        assert _follow_up_seen(result.all_messages(), 'completed.\nResult: researched topic')
-
-    async def test_failure_delivered_as_follow_up(self) -> None:
-        release = asyncio.Event()
-        agent = Agent(_model_calling('broken', ack_callback=release.set), capabilities=[BackgroundTools()])
-
-        @agent.tool_plain(metadata={'background': True})
-        async def broken() -> str:  # pyright: ignore[reportUnusedFunction]
-            await release.wait()
-            raise RuntimeError('boom')
-
-        result = await agent.run('go')
-
-        assert result.output == 'done'
-        assert _follow_up_seen(result.all_messages(), 'failed: boom')
+        parts = [part for message in result.all_messages() for part in message.parts]
+        ack = next(part.content for part in parts if isinstance(part, ToolReturnPart))
+        assert isinstance(ack, str)
+        match = re.search(r'\(task (?P<task_id>[^)]+)\)', ack)
+        assert match is not None
+        follow_up = next(
+            part.content
+            for part in parts
+            if isinstance(part, UserPromptPart) and isinstance(part.content, str) and 'Background tool' in part.content
+        )
+        assert follow_up == (
+            f"Background tool 'slow_research' (task {match['task_id']}) completed.\nResult: researched topic"
+        )
 
     @pytest.mark.parametrize(
         ('error_factory', 'expected'),
         [
+            (lambda: RuntimeError('boom'), 'failed: boom'),
             (lambda: ModelRetry('use different arguments'), 'failed: use different arguments'),
             (lambda: ToolFailed('service unavailable'), 'failed: service unavailable'),
             (
@@ -125,7 +125,7 @@ class TestBackgroundTools:
             ),
             (RuntimeError, 'failed: RuntimeError'),
         ],
-        ids=['retry', 'tool-failed', 'deferred', 'empty-error'],
+        ids=['runtime', 'retry', 'tool-failed', 'deferred', 'empty-error'],
     )
     async def test_control_flow_and_empty_errors_have_readable_follow_ups(
         self, error_factory: Callable[[], Exception], expected: str
@@ -270,6 +270,35 @@ class TestBackgroundTools:
         assert isinstance(result.output, DeferredToolRequests)
         await asyncio.wait_for(cancel_seen.wait(), timeout=1)
 
+    async def test_deferred_tool_pause_wins_over_a_completed_background_result(self) -> None:
+        model_calls = 0
+
+        def model_fn(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+            nonlocal model_calls
+            model_calls += 1
+            return ModelResponse(
+                parts=[ToolCallPart(tool_name='fast', args='{}'), ToolCallPart(tool_name='needs_approval', args='{}')]
+            )
+
+        agent = Agent(
+            FunctionModel(model_fn),
+            output_type=[str, DeferredToolRequests],
+            capabilities=[BackgroundTools()],
+        )
+
+        @agent.tool_plain(metadata={'background': True})
+        async def fast() -> str:  # pyright: ignore[reportUnusedFunction]
+            return 'finished'
+
+        @agent.tool_plain(requires_approval=True)
+        def needs_approval() -> str:  # pyright: ignore[reportUnusedFunction]
+            return 'approved'  # pragma: no cover -- never approved in this test
+
+        result = await agent.run('go')
+
+        assert isinstance(result.output, DeferredToolRequests)
+        assert model_calls == 1
+
     async def test_queued_result_is_not_delayed_by_an_unrelated_live_task(self) -> None:
         release = {'fast_bg': asyncio.Event(), 'slow_bg': asyncio.Event()}
 
@@ -377,18 +406,9 @@ class TestBackgroundTools:
 
         assert _ack_seen(result.all_messages())
 
-    async def test_custom_metadata_key_selector(self) -> None:
-        release = asyncio.Event()
-        agent = Agent(
-            _model_calling('custom', ack_callback=release.set), capabilities=[BackgroundTools(tools={'async': True})]
-        )
+    async def test_rejects_durable_execution(self) -> None:
+        pytest.importorskip('temporalio')
+        from pydantic_ai.durable_exec.temporal import TemporalDurability
 
-        @agent.tool_plain(metadata={'async': True})
-        async def custom() -> str:  # pyright: ignore[reportUnusedFunction]
-            await release.wait()
-            return 'value'
-
-        result = await agent.run('go')
-
-        assert result.output == 'done'
-        assert _ack_seen(result.all_messages())
+        with pytest.raises(UserError, match='does not support durable execution'):
+            Agent(TestModel(), capabilities=[BackgroundTools(), TemporalDurability()])

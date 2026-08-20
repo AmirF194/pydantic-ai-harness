@@ -1,29 +1,20 @@
 ---
 title: Background Tools
-description: Run selected tools as fire-and-forget asyncio tasks -- the agent gets an immediate acknowledgment, keeps working, and receives the result as a follow-up message when the task completes.
+description: Run selected tools concurrently -- the agent gets an immediate acknowledgment and receives the result as a follow-up message.
 ---
 
 # Background Tools
 
-`BackgroundTools` runs selected tools as in-process fire-and-forget asyncio tasks, so the agent
-can keep working while they finish. The model gets an immediate acknowledgment string in place
-of the tool result, and the real result (or error) arrives later as a follow-up message while the
-current run remains active.
+`BackgroundTools` runs selected tools concurrently with the current agent run. The model receives
+an immediate acknowledgment, keeps working, and, if the run remains active, receives the result
+as a follow-up message.
 
 [Source](https://github.com/pydantic/pydantic-ai-harness/tree/main/pydantic_ai_harness/background_tools/)
 
 !!! warning
-    `RunContext.enqueue()` is generally safe from synchronous tools, but a tool selected for background execution must not call it. `BackgroundTools` lets the agent continue while the synchronous tool runs in a worker thread, so its enqueue can race the pending-message drain and be lost. Return the tool's final value instead; `BackgroundTools` delivers it as the follow-up message. Exclude a tool from `BackgroundTools` if it needs to enqueue messages itself.
+    A tool selected for background execution must not call `ctx.enqueue()`. `BackgroundTools` lets the agent continue while a synchronous tool runs in a worker thread, so its enqueue can race the pending-message drain and be lost. Return the tool's final value instead; `BackgroundTools` delivers it as the follow-up message. Exclude a tool from `BackgroundTools` if it needs to enqueue messages itself.
 
 > While Pydantic AI Harness is on 0.x releases, the API may change between minor releases; when it does, deprecation warnings and release-note migration guidance tell you (or your agent) exactly how to upgrade. See the [version policy](index.md#version-policy).
-
-## The problem
-
-Some tools take seconds to minutes -- deep research, big aggregations, sub-agent delegation. With normal tool calls the agent is blocked: it makes the call, waits, then plans its next step. Over a long task the conversation effectively serializes.
-
-## The solution
-
-`BackgroundTools` runs the matching tool calls as background tasks. The agent receives an immediate acknowledgment and keeps working. When the work finishes while the run remains active, the result (or error) comes back into the conversation as a follow-up message: the model sees it on its next request, and an agent that was about to finish takes one more turn so the result still arrives.
 
 ## Usage
 
@@ -49,6 +40,8 @@ By default any tool with `metadata={'background': True}` runs in the background.
 `BackgroundTools(tools=...)` accepts the standard [`ToolSelector`](/ai/api/pydantic-ai/tools/#pydantic_ai.tools.ToolSelector):
 
 ```python
+from pydantic_ai_harness import BackgroundTools
+
 # By metadata key (default)
 BackgroundTools()                                 # tools with metadata={'background': True}
 BackgroundTools(tools={'background': True})       # explicit form
@@ -85,7 +78,7 @@ agent = Agent(
 
 ## Result delivery
 
-When a background tool finishes, the model receives a follow-up message:
+If the run remains active, a finished background tool produces a follow-up message:
 
 - On success: `Background tool 'X' (task <id>) completed.\nResult: <return value>`
 - On failure: `Background tool 'X' (task <id>) failed: <error message>`
@@ -99,17 +92,16 @@ through it; they are reported as text failures instead.
 ## Lifecycle and cancellation
 
 - Each agent run gets fresh task state, so concurrent runs do not share tasks
-- The run does not finish while a background task is still live: a would-be final answer is held until the task delivers its follow-up, so total run duration still includes every background task
-- A run that pauses for [deferred tools](/ai/tools-toolsets/deferred-tools/) (human-in-the-loop approval, external execution) is never held behind background work; remaining background tasks are cancelled, so their results are not delivered
+- During normal completion, a would-be final answer is held until each background task delivers its follow-up
+- A run that pauses for [deferred tools](/ai/tools-toolsets/deferred-tools/) (human-in-the-loop approval, external execution) is never held behind background work; live tasks are cancelled and background results are not delivered
 - If the run ends for any other reason with tasks still live (caller cancellation, a usage limit, an unexpected error), those tasks are cancelled and their results are dropped; delivery is conditional on the run continuing
 - Cancellation is cooperative for synchronous tools: work already running in an executor cannot be interrupted and may continue after the run ends
 
 ## Limitations
 
-- **Enqueuing from a background tool**: unsupported and not detected at runtime. Return the final value instead, or exclude the tool from `BackgroundTools` if it needs to call `ctx.enqueue()`.
 - **Streaming**: `run_stream()` completes on the model's final response and does not take the extra model turn that delivers late results, so background results are only guaranteed with `agent.run()` or a driven `agent.iter()` loop.
-- **Result guardrails**: Background tool results do not pass through [Guardrails](guardrails.md) result guards. Treat background tools as incompatible with result guards unless the tool screens sensitive output itself.
-- **Durable execution (Temporal / DBOS)**: spawning asyncio tasks inside a durable workflow is not replay-safe and this capability is untested there; don't combine them yet.
+- **Result hooks**: Background tool results do not pass through [Guardrails](guardrails.md) result guards, `ToolOutputLimits`, or other result hooks. Screen and bound the result inside the tool instead.
+- **Durable execution**: in-process tasks cannot survive workflow replay or worker restart, so this composition is rejected at agent construction.
 
 ## API
 

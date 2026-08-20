@@ -1,4 +1,4 @@
-"""Background tools capability that spawns selected tools as fire-and-forget tasks."""
+"""Background tools capability that runs selected tools concurrently."""
 
 from __future__ import annotations
 
@@ -8,7 +8,8 @@ from typing import TYPE_CHECKING, Any
 
 import anyio
 from pydantic_ai.capabilities import AbstractCapability
-from pydantic_ai.exceptions import ApprovalRequired, CallDeferred, ToolFailedError, ToolRetryError
+from pydantic_ai.durable_exec._base import BaseDurabilityCapability  # pyright: ignore[reportPrivateUsage]
+from pydantic_ai.exceptions import ApprovalRequired, CallDeferred, ToolFailedError, ToolRetryError, UserError
 from pydantic_ai.messages import ToolCallPart
 from pydantic_ai.tools import (
     AgentDepsT,
@@ -22,6 +23,7 @@ from pydantic_ai.tools import (
 if TYPE_CHECKING:
     from pydantic_ai import _agent_graph
     from pydantic_ai._instructions import AgentInstructions
+    from pydantic_ai.agent import AbstractAgent
     from pydantic_ai.capabilities.abstract import WrapRunHandler, WrapToolExecuteHandler
     from pydantic_ai.result import FinalResult
     from pydantic_ai.run import AgentRunResult
@@ -51,23 +53,22 @@ def _format_background_error(error: Exception) -> str:
 
 @dataclass
 class BackgroundTools(AbstractCapability[AgentDepsT]):
-    """Run selected tools as fire-and-forget asyncio tasks.
+    """Run selected tools concurrently with the current agent run.
 
     When the model calls a tool that matches the selector, the capability spawns the
     tool's handler in an `asyncio.Task` and immediately returns an acknowledgment
     string to the agent. When the task completes, its result (or error) is formatted as
-    text and enqueued
-    via [`RunContext.enqueue`][pydantic_ai.tools.RunContext.enqueue] as an `'asap'`
-    message -- Pydantic AI's pending message queue delivers it on the next model
-    request, or redirects the agent to a fresh request if it would otherwise end,
-    so the model receives the result and can act on it while the run remains active.
+    text and enqueued via
+    [`RunContext.enqueue`][pydantic_ai.tools.RunContext.enqueue] as an `'asap'` message.
+    Pydantic AI's pending message queue delivers it on the next model request, or
+    redirects the agent to a fresh request if it would otherwise end, so the model
+    receives the result and can act on it while the run remains active.
 
     Warning:
-        `RunContext.enqueue()` is generally safe from synchronous tools, but tools
-        selected for background execution must not call it. This capability lets the
-        agent continue while the synchronous tool runs in a worker thread, so its
-        enqueue can race the pending-message drain and be lost. Return the tool's
-        value instead; this capability enqueues the follow-up message.
+        Tools selected for background execution must not call `ctx.enqueue()`. This
+        capability lets the agent continue while a synchronous tool runs in a worker
+        thread, so its enqueue can race the pending-message drain and be lost. Return
+        the tool's value instead; this capability enqueues the follow-up message.
 
     ```python
     import asyncio
@@ -87,6 +88,9 @@ class BackgroundTools(AbstractCapability[AgentDepsT]):
     Combine with [`SetToolMetadata`][pydantic_ai.capabilities.SetToolMetadata] to mark
     several tools at once, or with `FunctionToolset.with_metadata(...)` to mark a whole
     toolset. Or pass a name list / predicate via `tools=...` to ignore metadata entirely.
+
+    Durable execution is rejected because in-process tasks cannot survive workflow
+    replay or worker restart.
     """
 
     tools: ToolSelector[AgentDepsT] = field(default_factory=lambda: {'background': True})
@@ -100,13 +104,23 @@ class BackgroundTools(AbstractCapability[AgentDepsT]):
     """
 
     _tasks: set[asyncio.Task[None]] = field(default_factory=set[asyncio.Task[None]], init=False, repr=False)
+    _completed: list[str] = field(default_factory=list[str], init=False, repr=False)
 
     def get_instructions(self) -> AgentInstructions[AgentDepsT] | None:
         return _INSTRUCTIONS
 
+    def for_agent(self, agent: AbstractAgent[AgentDepsT, object]) -> AbstractCapability[AgentDepsT]:
+        siblings: list[AbstractCapability[AgentDepsT]] = []
+        agent.root_capability.apply(siblings.append)
+        if any(isinstance(sibling, BaseDurabilityCapability) for sibling in siblings):
+            raise UserError(
+                '`BackgroundTools` does not support durable execution because in-process tasks cannot survive '
+                'workflow replay or worker restart.'
+            )
+        return self
+
     async def for_run(self, ctx: RunContext[AgentDepsT]) -> BackgroundTools[AgentDepsT]:
-        # `_tasks` is init=False, so `replace` gives the copy a fresh set:
-        # concurrent runs don't share tasks.
+        # The runtime fields are init=False, so concurrent runs do not share state.
         return replace(self)
 
     async def wrap_tool_execute(
@@ -127,10 +141,11 @@ class BackgroundTools(AbstractCapability[AgentDepsT]):
         async def _run() -> None:
             try:
                 result = await handler(args)
-                ctx.enqueue(f"Background tool '{tool_name}' (task {task_id}) completed.\nResult: {result}")
+                message = f"Background tool '{tool_name}' (task {task_id}) completed.\nResult: {result}"
             except Exception as e:
                 error = _format_background_error(e)
-                ctx.enqueue(f"Background tool '{tool_name}' (task {task_id}) failed: {error}")
+                message = f"Background tool '{tool_name}' (task {task_id}) failed: {error}"
+            self._completed.append(message)
 
         task = asyncio.create_task(_run())
         self._tasks.add(task)
@@ -150,17 +165,18 @@ class BackgroundTools(AbstractCapability[AgentDepsT]):
     ) -> _agent_graph.AgentNode[AgentDepsT, Any] | End[FinalResult[Any]]:
         from pydantic_graph import End
 
-        if not isinstance(result, End) or isinstance(result.data.output, DeferredToolRequests):
-            # A deferred-tools pause must reach the caller immediately; never hold it
-            # behind background work.
+        if isinstance(result, End) and isinstance(result.data.output, DeferredToolRequests):
+            # Background results are dropped when the run pauses.
             return result
-        # Hold `End` until a follow-up is queued, so the core pending-message drain
-        # capability (always ordered outermost, i.e. after us) redirects the run to
-        # deliver it instead of terminating. The loop re-waits if a task finished
-        # without enqueueing (e.g. it was cancelled); the queue check skips waiting
-        # when a result is already pending delivery.
-        while self._tasks and not ctx.pending_messages:
+
+        # Let the outer drain deliver anything already queued before waiting for
+        # another completion.
+        while isinstance(result, End) and self._tasks and not self._completed and not ctx.pending_messages:
             await asyncio.wait(self._tasks, return_when=asyncio.FIRST_COMPLETED)
+
+        for message in self._completed:
+            ctx.enqueue(message)
+        self._completed.clear()
         return result
 
     async def wrap_run(
