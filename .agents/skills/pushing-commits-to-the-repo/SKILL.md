@@ -22,8 +22,9 @@ contents from the count. For a feature or behavior change, use this order:
 2. **New public surface** -- List each new maintained symbol. Write `none` when there is none.
 3. **User-visible behavior** -- Show the smallest before-and-after example. Replace it with a
    call-path diff when the changed call chain explains the behavior; do not include both.
-4. **Verification** -- Link the exact proving tests from the PR diff. Put a minimal runnable
-   playground in `<details>` only when it helps reviewers reproduce the behavior.
+4. **Verification** -- Link the exact proving tests from the PR's Files changed tab so links survive
+   later pushes. Put a minimal runnable playground in `<details>` only when it helps reviewers
+   reproduce the behavior.
 5. **What changes for existing users** -- State the effect in one sentence. `Nothing` is valid.
 
 Use one collapsed `<details>` section per goal only when the PR has multiple independent goals.
@@ -51,9 +52,12 @@ Labelling needs triage permission on the repo. If it fails, quote the actual err
 concluding you lack permission.
 
 ## Before you push
+- Commit the exact state you intend to push. Leave nothing staged, unstaged or uncommitted unless
+  the user's instructions override this.
+- Never force-push an open PR branch. Push follow-up commits so previous reviews remain valid;
+  maintainers can squash them when merging.
 - Attempt the push. If it fails, read the real error — do not preemptively decide you lack
   permission from a flag or setting.
-- Leave nothing unstaged or uncommitted locally, unless the user's instructions override this.
 
 ## After you push — the loop
 1. **Watch CI to a terminal state.** Don't idle. If it fails, diagnose: fix if the failure is
