@@ -5,10 +5,10 @@ checkpoints an agent's I/O -- model requests, MCP calls, and function tool calls
 -- into Absurd steps (`ctx.step(...)`), so a worker crash mid-run resumes from
 the last completed step instead of restarting the run.
 
-Step names are byte-compatible with the `pydantic-ai-absurd` package by Marcelo
-Trylesinski. A run started there can resume here because raw tool-result
-checkpoints are accepted unchanged. New tool-result checkpoints use a versioned
-envelope for control-flow wrappers, so the reverse does not hold.
+For toolsets with explicit IDs, step names are byte-compatible with the
+`pydantic-ai-absurd` package. Raw tool-result checkpoints written by that package
+are accepted unchanged. New tool-result checkpoints use a versioned envelope for
+control-flow wrappers, so compatibility is one-way.
 """
 
 from __future__ import annotations
@@ -24,6 +24,7 @@ except ImportError as _import_error:  # pragma: no cover
 from collections.abc import Callable, Mapping, Sequence
 from contextlib import AbstractContextManager
 from dataclasses import dataclass
+from threading import Lock
 from typing import TYPE_CHECKING, Any, ClassVar, Literal, get_args
 
 from absurd_sdk import AsyncTaskContext, JsonValue, get_current_context
@@ -92,6 +93,12 @@ _call_tool_result_adapter: TypeAdapter[CallToolResult] = TypeAdapter(CallToolRes
 _tool_defs_adapter: TypeAdapter[dict[str, ToolDefinition]] = TypeAdapter(dict[str, ToolDefinition])
 _instructions_adapter: TypeAdapter[_Instructions] = TypeAdapter(_Instructions)
 _dynamic_tools_adapter: TypeAdapter[DynamicToolsResult] = TypeAdapter(DynamicToolsResult)
+
+# Absurd disambiguates repeated step names by encounter order within one task. Two overlapping
+# runs using the same task context and namespace would therefore claim each other's checkpoints.
+# Keep the active context itself as the value so an object-id reuse cannot release a newer claim.
+_active_run_namespaces: dict[tuple[int, str], AsyncTaskContext] = {}
+_active_run_namespaces_lock = Lock()
 
 
 def _current_async_task_context() -> AsyncTaskContext | None:
@@ -397,21 +404,20 @@ class AbsurdDurability(BaseDurabilityCapability[AgentDepsT]):
     Attach it via `capabilities=[AbsurdDurability()]` and call `agent.run()` inside an Absurd
     task handler: every model request, MCP call, function tool call, and dynamic-toolset
     resolution is wrapped in `ctx.step(...)`, so a worker crash mid-run resumes from the last
-    completed step instead of
-    restarting. A completed step is served from its checkpoint on replay instead of being
-    recomputed, so tokens are not re-spent on work that already finished. A step is checkpointed
-    after it runs, so a crash between a tool's side effect and its checkpoint re-runs the tool on
-    recovery: keep tool side effects idempotent. Outside a task the capability is transparent and
-    the run is a normal, non-durable agent run.
+    completed step instead of restarting. A completed step is served from its checkpoint on replay
+    instead of being recomputed, so tokens are not re-spent on work that already finished. A step
+    is checkpointed after it runs, so a crash between a tool's side effect and its checkpoint
+    re-runs the tool on recovery: keep tool side effects idempotent. Outside a task the capability
+    is transparent and the run is a normal, non-durable agent run.
 
     The capability discovers the agent's model, name, and toolsets automatically when it is bound
     to the agent. Step results are stored in Postgres as JSON, so a checkpointed tool's return
     value must be JSON-serializable.
 
-    Step names are compatible with the `pydantic-ai-absurd` package. A run started under that
-    package can resume here because raw tool-result checkpoints are accepted unchanged. New
-    tool-result checkpoints use a versioned envelope for control-flow wrappers, so a run started
-    here should not be resumed under the standalone package.
+    For toolsets with explicit IDs, step names are compatible with the `pydantic-ai-absurd`
+    package. A run started under that package can resume here because raw tool-result checkpoints
+    are accepted unchanged. New tool-result checkpoints use a versioned envelope for control-flow
+    wrappers, so a run started here should not be resumed under the standalone package.
 
     Example:
         ```python {test="skip"}
@@ -534,10 +540,26 @@ class AbsurdDurability(BaseDurabilityCapability[AgentDepsT]):
         would change ordinary non-durable runs.)
         """
         agent = self._agent
-        if agent is None or not self.in_durable_context:
+        task_ctx = _current_async_task_context()
+        if agent is None or task_ctx is None:
             return await handler()
-        with agent.parallel_tool_call_execution_mode(self._parallel_execution_mode):
-            return await handler()
+
+        namespace_key = (id(task_ctx), self.name)
+        with _active_run_namespaces_lock:
+            if namespace_key in _active_run_namespaces:
+                raise UserError(
+                    f'Concurrent Absurd agent runs with checkpoint namespace {self.name!r} are not supported '
+                    'in the same task context. Await one run before starting another, or use a distinct '
+                    '`AbsurdDurability(name=...)` value or task context.'
+                )
+            _active_run_namespaces[namespace_key] = task_ctx
+        try:
+            with agent.parallel_tool_call_execution_mode(self._parallel_execution_mode):
+                return await handler()
+        finally:
+            with _active_run_namespaces_lock:
+                if _active_run_namespaces.get(namespace_key) is task_ctx:
+                    del _active_run_namespaces[namespace_key]
 
     async def wrap_model_request(
         self, ctx: RunContext[AgentDepsT], *, request_context: ModelRequestContext, handler: WrapModelRequestHandler

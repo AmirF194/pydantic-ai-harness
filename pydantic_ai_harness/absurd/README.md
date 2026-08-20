@@ -1,7 +1,7 @@
 # Absurd Durability
 
 `AbsurdDurability` makes an agent run durable on [Absurd](https://github.com/earendil-works/absurd), a
-Postgres-based durable-execution engine by Armin Ronacher (Python SDK `absurd-sdk`). Attach the
+Postgres-based durable-execution engine (Python SDK `absurd-sdk`). Attach the
 capability and call `agent.run()` inside an Absurd task handler: every model request, MCP call, and
 function tool call is checkpointed into an Absurd step (`ctx.step(...)`), so if a worker crashes
 part-way through a run it resumes from the last completed step instead of restarting. A completed
@@ -107,6 +107,10 @@ second run's model request, or the same tool called twice in one response) is di
 Absurd's encounter-order counter (`{name}#2`, `{name}#3`, ...), so each occurrence keeps its own
 checkpoint and lines up on replay.
 
+Concurrent runs that share an active `AsyncTaskContext` and effective durability name (the
+checkpoint prefix) are rejected. Await one run before starting another, or use a distinct
+`AbsurdDurability(name=...)` value or task context. Sequential runs in one task remain supported.
+
 ## Constraints
 
 - The agent needs a `name` (or pass `name=` to `AbsurdDurability`); it prefixes every step.
@@ -123,6 +127,10 @@ checkpoint and lines up on replay.
   with a `UserError`. An MCP tool name is not folded in (its step name is just `.call_tool`), so it
   carries no such restriction.
 - A checkpointed tool's return value is stored in Postgres as JSON, so it must be JSON-serializable.
+- Set Absurd's `claim_timeout` longer than the longest checkpointed model, tool, MCP, or
+  event-handler operation. `ctx.step(...)` extends the lease only after its callback returns and
+  the checkpoint is persisted; it does not heartbeat while the callback is running. The capability
+  does not add an automatic heartbeat.
 - Code running inside a checkpointed step cannot call `RunContext.enqueue()` or `RunContext.cancel()`.
   Those mutations would be missing when Absurd replays the stored result, so the capability raises
   a `UserError`. Enqueue from non-checkpointed task code, or cancel the Absurd task instead.
@@ -199,8 +207,8 @@ does not run a second time.
 ## Checkpoint format compatibility
 
 For agents whose durable leaf toolsets have explicit IDs, the step names are byte-compatible with
-the `pydantic-ai-absurd` package (the standalone Absurd integration by Marcelo Trylesinski). A run
-started under that package can resume here because this capability accepts its raw tool-result
+the standalone `pydantic-ai-absurd` package. A run started under that package can resume here
+because this capability accepts its raw tool-result
 checkpoints unchanged. The standalone package also accepts id-less leaf toolsets; this capability
 does not. Assigning an ID changes that toolset's step names, so drain in-flight tasks before
 migrating such an agent.
