@@ -74,13 +74,15 @@ agent = Agent(
 If the run remains active, a finished background tool produces a follow-up message:
 
 - On success: `Background tool 'X' (task <id>) completed.\nResult: <return value>`
-- On failure: `Background tool 'X' (task <id>) failed: <error message>`
+- On failure: `Background tool 'X' (task <id>) failed: <error>`
 
 The task ID matches the one in the acknowledgment, so the model can tell which call each result belongs to.
 
 The follow-up is a text-only user message, not a second tool return. Return values are rendered as
 text, and control-flow results such as retries or deferred calls cannot preserve their control flow
 through it; they are reported as text failures instead.
+Expected retry and tool-failure messages are included, while unexpected exceptions are reported by
+type so their details are not exposed to the model.
 
 ## Lifecycle and cancellation
 

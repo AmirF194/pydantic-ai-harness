@@ -116,7 +116,7 @@ class TestBackgroundTools:
     @pytest.mark.parametrize(
         ('error_factory', 'expected'),
         [
-            (lambda: RuntimeError('boom'), 'failed: boom'),
+            (lambda: RuntimeError('private backend detail'), 'failed: RuntimeError'),
             (lambda: ModelRetry('use different arguments'), 'failed: use different arguments'),
             (lambda: ToolFailed('service unavailable'), 'failed: service unavailable'),
             (

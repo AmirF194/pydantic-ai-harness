@@ -41,7 +41,7 @@ _CANCEL_DRAIN_TIMEOUT = 1.0
 
 
 def _format_background_error(error: Exception) -> str:
-    """Format a background-tool error without exposing deferred-call metadata."""
+    """Format a background-tool error without exposing unexpected exception details."""
     if isinstance(error, (ApprovalRequired, CallDeferred)):
         return f'{type(error).__name__} was raised; background tools cannot defer a running task.'
     if isinstance(error, ToolRetryError):
@@ -50,7 +50,7 @@ def _format_background_error(error: Exception) -> str:
     if isinstance(error, ToolFailedError):
         content = error.tool_failed.content
         return content if isinstance(content, str) and content else type(error).__name__
-    return str(error) or type(error).__name__
+    return type(error).__name__
 
 
 @dataclass
