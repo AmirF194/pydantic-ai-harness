@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING, Any
 
 import anyio
 from pydantic_ai.capabilities import AbstractCapability
+from pydantic_ai.exceptions import ApprovalRequired, CallDeferred, ToolFailedError, ToolRetryError
 from pydantic_ai.messages import ToolCallPart
 from pydantic_ai.tools import (
     AgentDepsT,
@@ -29,10 +30,23 @@ if TYPE_CHECKING:
 
 _INSTRUCTIONS = """\
 Some tools run in the background: when you call them you'll get an immediate \
-acknowledgment, and the real result will be delivered automatically as a follow-up \
-message when the task completes. Continue working on other things in the meantime; \
-do not block waiting for the result.\
+acknowledgment. If the run remains active, the text result will be delivered \
+automatically as a follow-up message when the task completes. Continue working on other \
+things in the meantime; do not block waiting for the result.\
 """
+
+
+def _format_background_error(error: Exception) -> str:
+    """Format a background-tool error without exposing deferred-call metadata."""
+    if isinstance(error, (ApprovalRequired, CallDeferred)):
+        return f'{type(error).__name__} was raised; background tools cannot defer a running task.'
+    if isinstance(error, ToolRetryError):
+        content = error.tool_retry.content
+        return content if isinstance(content, str) and content else type(error).__name__
+    if isinstance(error, ToolFailedError):
+        content = error.tool_failed.content
+        return content if isinstance(content, str) and content else type(error).__name__
+    return str(error) or type(error).__name__
 
 
 @dataclass
@@ -41,11 +55,12 @@ class BackgroundTools(AbstractCapability[AgentDepsT]):
 
     When the model calls a tool that matches the selector, the capability spawns the
     tool's handler in an `asyncio.Task` and immediately returns an acknowledgment
-    string to the agent. When the task completes, its result (or error) is enqueued
+    string to the agent. When the task completes, its result (or error) is formatted as
+    text and enqueued
     via [`RunContext.enqueue`][pydantic_ai.tools.RunContext.enqueue] as an `'asap'`
     message -- Pydantic AI's pending message queue delivers it on the next model
     request, or redirects the agent to a fresh request if it would otherwise end,
-    so the model receives the result and can act on it.
+    so the model receives the result and can act on it while the run remains active.
 
     ```python
     import asyncio
@@ -54,7 +69,7 @@ class BackgroundTools(AbstractCapability[AgentDepsT]):
     from pydantic_ai_harness import BackgroundTools
 
     # Default: any tool with `metadata={'background': True}` runs in the background.
-    agent = Agent('openai:gpt-5', capabilities=[BackgroundTools()])
+    agent = Agent('openai:gpt-5.6-sol', capabilities=[BackgroundTools()])
 
     @agent.tool_plain(metadata={'background': True})
     async def slow_research(query: str) -> str:
@@ -107,14 +122,15 @@ class BackgroundTools(AbstractCapability[AgentDepsT]):
                 result = await handler(args)
                 ctx.enqueue(f"Background tool '{tool_name}' (task {task_id}) completed.\nResult: {result}")
             except Exception as e:
-                ctx.enqueue(f"Background tool '{tool_name}' (task {task_id}) failed: {e}")
+                error = _format_background_error(e)
+                ctx.enqueue(f"Background tool '{tool_name}' (task {task_id}) failed: {error}")
 
         task = asyncio.create_task(_run())
         self._tasks.add(task)
         task.add_done_callback(self._tasks.discard)
         return (
             f"Tool '{tool_name}' is running in background (task {task_id}). "
-            f'You will receive the result automatically when it completes. '
+            f'If this run remains active, you will receive the text result automatically when it completes. '
             f'Continue with other work in the meantime.'
         )
 
