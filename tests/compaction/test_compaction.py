@@ -2423,6 +2423,23 @@ class TestHelperBranchCoverage:
         # question from what the request costs; a retry and a thinking block stay out of it.
         assert _format_messages(msgs) == ''
 
+    def test_retry_feedback_costs_what_the_system_message_it_renders_into_costs(self):
+        """It reaches the model as a mid-conversation system message, so it occupies the window.
+
+        `content` is a list of error details here, which is why the estimate follows
+        `model_response()` rather than `str(content)`: the model is shown the rendered text.
+        """
+        from pydantic_ai.messages import RetryFeedbackPart
+
+        part = RetryFeedbackPart(
+            content=[{'type': 'missing', 'loc': ('name',), 'msg': 'Field required', 'input': {}}],
+            cause='validation_error',
+        )
+        feedback: list[ModelMessage] = [ModelRequest(parts=[part])]
+        rendered: list[ModelMessage] = [ModelRequest(parts=[SystemPromptPart(content=part.model_response())])]
+
+        assert estimate_token_count(feedback) == estimate_token_count(rendered) > 0
+
     def test_a_provider_side_tool_call_and_its_result_are_counted(self):
         """A web search runs on the provider's side and its result still lands in the context."""
         from pydantic_ai.messages import NativeToolCallPart, NativeToolReturnPart

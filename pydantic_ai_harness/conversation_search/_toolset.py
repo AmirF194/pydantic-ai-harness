@@ -22,6 +22,7 @@ from pydantic_ai.messages import (
     ModelMessage,
     ModelRequest,
     ModelRequestPart,
+    RetryFeedbackPart,
     RetryPromptPart,
     SpeechPart,
     SystemPromptPart,
@@ -202,6 +203,14 @@ def _format_request_part(part: ModelRequestPart, *, truncate: bool) -> str | Non
     if isinstance(part, RetryPromptPart):
         # A retry or validation-error prompt is worth recalling, so index it in full.
         return f'Retry [{part.tool_name}]: {part.content}'
+    if isinstance(part, RetryFeedbackPart):
+        # The same feedback for a response that answered no particular call -- output validation
+        # failed, an output validator raised, or nothing usable came back. Recalling why a run
+        # changed course is the same want whether or not the retry named a tool, and indexing only
+        # the tool-bound half would make that depend on which part type pydantic-ai happened to
+        # use. Unlike the availability delta below this is prose the model read and acted on, not
+        # bookkeeping. No tool name: this part is never bound to a call.
+        return f'Retry: {part.model_response()}'
     if isinstance(part, SpeechPart):
         # A realtime user turn: index the spoken transcript so speech is searchable, not the
         # raw audio. `transcript` is optional, so an audio-only part contributes no text.

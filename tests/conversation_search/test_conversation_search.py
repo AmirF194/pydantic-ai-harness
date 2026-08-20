@@ -20,6 +20,7 @@ from pydantic_ai.messages import (
     ModelMessage,
     ModelRequest,
     ModelResponse,
+    RetryFeedbackPart,
     RetryPromptPart,
     SpeechPart,
     SystemPromptPart,
@@ -748,6 +749,28 @@ class TestSearchScope:
         assert 'Tool [readfile]' in rendered
         assert 'Retry [readfile]: please retry' in rendered  # RetryPromptPart is searchable
         assert '...' in rendered  # truncation applied to the long tool return / args
+
+    async def test_retry_feedback_is_indexed(self) -> None:
+        """A retry that named no tool is recalled like one that did.
+
+        Why a run changed course is the same thing worth finding whether or not the retry
+        answered a particular call, so indexing only the tool-bound half would make recall
+        depend on which part type pydantic-ai reached for.
+        """
+        messages: list[ModelMessage] = [
+            ModelRequest(
+                parts=[
+                    UserPromptPart(content='mango question'),
+                    RetryFeedbackPart(content='the mango field is required', cause='validation_error'),
+                ]
+            ),
+            ModelResponse(parts=[TextPart(content='mango answer')]),
+        ]
+        source = _StubSource({'r1': messages})
+
+        rendered = await _search(source, 'mango')
+
+        assert 'Retry: the mango field is required' in rendered
 
     async def test_tool_availability_delta_is_not_indexed(self) -> None:
         """Tool-list bookkeeping is not conversation content, so it contributes no line.
