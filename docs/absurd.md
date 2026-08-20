@@ -203,14 +203,19 @@ does not run a second time.
 
 ## Checkpoint format compatibility
 
-The step names are byte-compatible with the `pydantic-ai-absurd` package (the standalone Absurd
-integration by Marcelo Trylesinski). A run started under that package can resume here because this
-capability accepts its raw tool-result checkpoints unchanged. New tool-result checkpoints use a
-versioned envelope so control-flow results can be distinguished from raw dictionaries with the same
-shape. The reverse does not hold: `pydantic-ai-absurd` would hand that envelope to the model as the
-tool result. Treat the step names and this capability's payload shapes as a stable persistence
-format. The top-level `__pydantic_ai_harness_call_tool_result__` key is reserved for this envelope;
-a raw checkpoint written by another integration cannot use that key as its tool result.
+For agents whose durable leaf toolsets have explicit IDs, the step names are byte-compatible with
+the `pydantic-ai-absurd` package (the standalone Absurd integration by Marcelo Trylesinski). A run
+started under that package can resume here because this capability accepts its raw tool-result
+checkpoints unchanged. The standalone package also accepts id-less leaf toolsets; this capability
+does not. Assigning an ID changes that toolset's step names, so drain in-flight tasks before
+migrating such an agent.
+
+New tool-result checkpoints use a versioned envelope so control-flow results can be distinguished
+from raw dictionaries with the same shape. The reverse does not hold: `pydantic-ai-absurd` would
+hand that envelope to the model as the tool result. Treat the step names and this capability's
+payload shapes as a stable persistence format. The top-level
+`__pydantic_ai_harness_call_tool_result__` key is reserved for this envelope; a raw checkpoint
+written by another integration cannot use that key as its tool result.
 
 ## Relation to Step Persistence
 
