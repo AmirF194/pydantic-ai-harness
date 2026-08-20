@@ -10,11 +10,11 @@ from pathlib import Path
 from typing import TypeVar
 from uuid import uuid4
 
-import psycopg
 import pytest
 
 pytest.importorskip('absurd_sdk')
 
+import psycopg
 from absurd_sdk import (
     AsyncAbsurd,
     AsyncTaskContext,
