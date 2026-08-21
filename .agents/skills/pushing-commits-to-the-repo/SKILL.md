@@ -68,12 +68,15 @@ hosted-review round.
    `policy-base-sha`, its merge base with the candidate as `merge-base-sha`, and the exact candidate
    commit as `candidate-head-sha`. Verify the candidate worktree is clean.
 3. From a checkout pinned to the policy-base SHA, prepare the review bundle: task or issue, full PR
-   discussion including thread state, relevant authoritative documentation, completed verification,
-   and the exact merge-base-to-candidate diff with external diff and text conversion disabled.
+   discussion including thread state, relevant settled maintainer decisions with their sources,
+   relevant authoritative documentation, completed verification, and the exact
+   merge-base-to-candidate diff with external diff and text conversion disabled.
 4. Launch the strongest locally available reviewer from that stable checkout in a fresh subagent
    with no inherited conversation. Have it follow the stable checkout's `pre-push-review` skill.
-   Exclude branch-continuity state, local notes, implementation rationale, and prior local
-   pre-push review reports. Instruct it to use only read and search tools; tool availability is not the independence guarantee.
+   Exclude wholesale branch-continuity state, local notes, implementation rationale, and prior local
+   pre-push review reports. Treat the supplied settled decisions as constraints and assess
+   conformance instead of reopening them. Instruct it to use only read and search tools; tool
+   availability is not the independence guarantee.
 5. Require actionable findings or `current at <full-candidate-head-sha>`. Triage every finding.
    Remediate valid findings and run the required verification before committing; dismiss invalid
    findings only with concrete evidence. If a finding exposes a real design choice, API trade-off,
