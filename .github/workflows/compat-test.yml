@@ -118,7 +118,8 @@ jobs:
               floors = ','.join(
                   str(clause) for clause in override.specifier if clause.operator in ('>=', '>')
               )
-              floors_only = f'{override.name}{floors}'
+              marker = f'; {override.marker}' if override.marker else ''
+              floors_only = f'{override.name}{floors}{marker}'
               if floors_only != entry:
                   print(f'{entry} -> {floors_only}')
                   text = text.replace(f"'{entry}'", f"'{floors_only}'")
