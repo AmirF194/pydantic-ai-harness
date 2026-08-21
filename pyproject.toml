@@ -152,7 +152,15 @@ style = 'pep440'
 bump = true
 
 [tool.uv]
-override-dependencies = ['anthropic>=0.108.0', 'openai>=2.45.0']
+# `browser-use` pins provider SDKs to exact versions below the floors `pydantic-ai-slim`
+# declares, so the two only resolve together under an override. An override *replaces*
+# every requirement on the package it names, so it erases upper bounds too, and the
+# `lowest-direct` floor job resolves `pydantic-ai-slim` to its floor while resolving
+# provider SDKs to the newest release this range admits. `anthropic` is therefore closed
+# at the major that the floor's `pydantic-ai-slim` predates: `anthropic>=1` is built on
+# HTTPX2, and slim only hands it an `httpx2.AsyncClient` from the release that raises its
+# own floor to match. Move this bound together with the `pydantic-ai-slim` floor below.
+override-dependencies = ['anthropic>=0.108.0,<1', 'openai>=2.45.0']
 
 
 [tool.hatch.build.targets.wheel]
