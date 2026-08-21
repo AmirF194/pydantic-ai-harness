@@ -64,7 +64,7 @@ they consume a CI and reviewer round.
 2. Capture the full review-base and candidate HEAD SHAs and verify the worktree is clean.
 3. Launch the strongest locally available reviewer in a fresh subagent with no inherited conversation
    history, and have it follow the `pre-push-review` skill. Exclude branch-continuity state, local
-   notes, implementation rationale, and prior reviews. Give it the task or issue, PR context when it
+   notes, implementation rationale, and prior local pre-push review reports. Give it the task or issue, PR context when it
    exists, exact SHAs, complete base-to-HEAD diff, and verification already run.
 4. Require actionable findings or `current at <full-candidate-head-sha>`. The reviewer must not edit
    files or post to GitHub.
