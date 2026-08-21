@@ -56,27 +56,32 @@ concluding you lack permission.
 
 ## Before you push -- independent review gate
 
-Run this gate before the first push and every later push. The gate catches semantic defects before
-they consume a CI and reviewer round.
+Run this gate before the first push and every later push. It catches semantic defects before they
+consume a CI and hosted-review round.
 
-1. Commit the exact state you intend to push. Leave nothing staged, unstaged, or uncommitted unless
-   the user's instructions override this.
-2. Capture the full review-base and candidate HEAD SHAs and verify the worktree is clean.
-3. Launch the strongest locally available reviewer from a checkout pinned to the review-base SHA
-   in a fresh subagent with no inherited conversation history. Have it follow the stable base
-   checkout's `pre-push-review` skill. Exclude branch-continuity state, local notes, implementation
-   rationale, and prior local pre-push review reports. Give it only the exact SHAs and the trusted
-   review bundle prepared by that skill.
-4. Require actionable findings or `current at <full-candidate-head-sha>`. The reviewer must not edit
-   files or post to GitHub.
-5. Remediate every valid finding, rerun affected targeted verification, and commit the fixes.
-6. After any material remediation, dispatch a different fresh subagent to review the new HEAD.
-   Material includes, but is not limited to, executable code, public behavior, tests, provider data,
-   agent instructions, workflow configuration, security boundaries, state, concurrency, and
-   serialization. Repeat until the latest fresh review reports `current at <full-candidate-head-sha>`.
+1. Run targeted verification while iterating, then run the root `AGENTS.md` mandatory pre-commit
+   checks before committing the exact state intended for push. Leave nothing staged, unstaged, or
+   uncommitted unless the user's instructions override this.
+2. Fetch the declared target branch. Capture and validate three full SHAs: the current target tip as
+   `policy-base-sha`, its merge base with the candidate as `merge-base-sha`, and the exact candidate
+   commit as `candidate-head-sha`. Verify the candidate worktree is clean.
+3. From a checkout pinned to the policy-base SHA, prepare the review bundle: task or issue, full PR
+   discussion including thread state, relevant authoritative documentation, completed verification,
+   and the exact merge-base-to-candidate diff with external diff and text conversion disabled.
+4. Launch the strongest locally available reviewer from that stable checkout in a fresh subagent
+   with no inherited conversation. Have it follow the stable checkout's `pre-push-review` skill.
+   Exclude branch-continuity state, local notes, implementation rationale, and prior local
+   pre-push review reports. Give it only read and search tools.
+5. Require actionable findings or `current at <full-candidate-head-sha>`. Triage every finding.
+   Remediate valid findings and run the required verification before committing; dismiss invalid
+   findings only with concrete evidence. After either outcome, dispatch a different fresh subagent:
+   any non-`current` verdict requires another pass. Escalate persistent disagreement.
+6. Always repeat after material remediation, including executable code, public behavior, tests,
+   provider data, agent instructions, workflow configuration, security boundaries, state,
+   concurrency, and serialization.
 
-Immediately before pushing, verify HEAD still equals the reviewed full SHA and the worktree is
-clean. Any mismatch restarts the gate.
+Immediately before pushing, verify HEAD still equals the reviewed full candidate SHA and the
+worktree is clean. Any mismatch restarts the gate.
 
 Never use the implementing agent as the reviewer. Never treat this gate as test execution.
 
@@ -108,18 +113,22 @@ These gates catch different failures; none replaces another:
    choice, an API trade-off, a behavioral default), leave a comment containing: the background,
    your reasoning, the decision that needs making, the trade-offs (pros/cons of each option), and
    your recommendation. Then **poll every 30 minutes for a reply** and continue when it lands.
-5. Repeat until CI is green, a hosted AI review covers the current HEAD, and no comment is
-   outstanding.
+5. Wait for every applicable current-HEAD check to reach an accepted terminal state; classify any
+   documented skip explicitly. Repeat until CI is green, a hosted AI review covers the current HEAD,
+   no applicable check is pending or failing, and no comment is outstanding.
 
 ## Before handing the PR back
 
 Run this final metadata check after CI and comments have settled:
 
-1. Dispatch a fresh subagent that has not worked on the PR.
+1. Dispatch a fresh no-history subagent from the stable policy-base checkout that has not worked on
+   the PR.
 2. Give it the PR URL, linked issue, current `base...HEAD` diff, final test status, title, and body.
 3. Ask it to check only the title and body against this section and the root `AGENTS.md`.
-4. Require either `current` or an exact replacement title and body.
-5. Apply every correction. Code changes restart the post-push loop; metadata-only changes do not.
-6. After a replacement, repeat the check with another fresh subagent.
+4. Require either `current` or an exact replacement title and body. The reviewer returns text only;
+   the implementing agent applies it.
+5. Apply every correction. Code changes restart the full lifecycle. Metadata-only changes skip code
+   review and CI but must wait for any applicable metadata-triggered checks and feedback.
+6. After a replacement and its checks, repeat with another fresh subagent.
 7. Hand the PR back only after the check reports `current`.
 8. Report the human-only AI-code checkbox separately.
