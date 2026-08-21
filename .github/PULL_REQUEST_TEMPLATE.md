@@ -17,6 +17,7 @@ Fixes #
 
 ## Checklist
 
+- [ ] Any **AI generated code** has been reviewed line-by-line by the human PR author, who stands by it.
 - [ ] Linked issue exists and is referenced above
 - [ ] Tests added/updated for new behavior
 - [ ] `make lint && make typecheck && make test` passes locally (don't stress about CI -- we'll help)
