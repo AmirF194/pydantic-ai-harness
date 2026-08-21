@@ -186,6 +186,10 @@ issue number. The user must check the "AI generated code" checkbox manually in t
 
 ## Pushing changes
 
+Before every push, follow the `pushing-commits-to-the-repo` skill, including its independent
+pre-push review gate. That semantic review, CI's full test and coverage matrix, and hosted AI
+reviewers are complementary gates; none replaces another.
+
 **A restriction is a conclusion you earn from a real failure, not a field you read.** Never report an
 operation as blocked, unavailable, or not-permitted based on a metadata flag, a config field, or a
 docs claim — attempt it and quote the actual error. (`maintainerCanModify: false` on a PR does *not*
