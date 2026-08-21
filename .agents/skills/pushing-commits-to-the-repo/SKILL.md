@@ -56,8 +56,9 @@ concluding you lack permission.
 
 ## Before you push -- independent review gate
 
-Run this gate before the first push and every later push. It catches semantic defects before they
-consume a CI and hosted-review round.
+Run this gate before the first push and every later push. It guarantees context independence, not
+hosted-grade hostile-content isolation, and catches semantic defects before they consume a CI and
+hosted-review round.
 
 1. Run targeted verification while iterating, then run the root `AGENTS.md` mandatory pre-commit
    checks before committing the exact state intended for push. Leave nothing staged, unstaged, or
@@ -71,7 +72,7 @@ consume a CI and hosted-review round.
 4. Launch the strongest locally available reviewer from that stable checkout in a fresh subagent
    with no inherited conversation. Have it follow the stable checkout's `pre-push-review` skill.
    Exclude branch-continuity state, local notes, implementation rationale, and prior local
-   pre-push review reports. Give it only read and search tools.
+   pre-push review reports. Instruct it to use only read and search tools; tool availability is not the independence guarantee.
 5. Require actionable findings or `current at <full-candidate-head-sha>`. Triage every finding.
    Remediate valid findings and run the required verification before committing; dismiss invalid
    findings only with concrete evidence. After either outcome, dispatch a different fresh subagent:
