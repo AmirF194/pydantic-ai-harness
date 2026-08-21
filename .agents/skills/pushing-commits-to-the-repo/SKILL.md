@@ -61,18 +61,21 @@ they consume a CI and reviewer round.
 
 1. Commit the exact state you intend to push. Leave nothing staged, unstaged, or uncommitted unless
    the user's instructions override this.
-2. Launch a fresh subagent with no inherited conversation history. For this review only, exclude
-   branch-continuity state (`issue-brief.md`, `pr-decisions.md`, and handoffs), local notes,
-   implementation rationale, and prior pre-push reviews. Stable root and directory instructions
-   still apply. Give it the live issue or task, the PR when one exists, the full diff from the PR
-   base (or default branch before a PR exists), and the verification already run.
-3. Ask for a high-judgment review against the root and directory instructions. Require actionable
-   findings or `current`. The subagent must not edit files or post to GitHub.
-4. Remediate every valid finding, rerun affected targeted verification, and commit the fixes.
-5. After any material remediation, dispatch a different fresh subagent to review the new HEAD.
+2. Capture the full review-base and candidate HEAD SHAs and verify the worktree is clean.
+3. Launch the strongest locally available reviewer in a fresh subagent with no inherited conversation
+   history, and have it follow the `pre-push-review` skill. Exclude branch-continuity state, local
+   notes, implementation rationale, and prior reviews. Give it the task or issue, PR context when it
+   exists, exact SHAs, complete base-to-HEAD diff, and verification already run.
+4. Require actionable findings or `current at <full-candidate-head-sha>`. The reviewer must not edit
+   files or post to GitHub.
+5. Remediate every valid finding, rerun affected targeted verification, and commit the fixes.
+6. After any material remediation, dispatch a different fresh subagent to review the new HEAD.
    Material includes, but is not limited to, executable code, public behavior, tests, provider data,
    agent instructions, workflow configuration, security boundaries, state, concurrency, and
-   serialization. Repeat until the latest fresh review reports `current` for the current HEAD.
+   serialization. Repeat until the latest fresh review reports `current at <full-candidate-head-sha>`.
+
+Immediately before pushing, verify HEAD still equals the reviewed full SHA and the worktree is
+clean. Any mismatch restarts the gate.
 
 Never use the implementing agent as the reviewer. Never treat this gate as test execution.
 
