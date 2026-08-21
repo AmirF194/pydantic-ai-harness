@@ -10,7 +10,8 @@ Pushing starts a loop; it does not end the task. **Work stops only when CI is gr
 hosted AI review has finished on the current HEAD, AND no comment is left unresolved.**
 
 Lifecycle: implement -> targeted verification -> commit -> independent pre-push review -> remediate
-and re-review -> push -> full CI and coverage -> hosted reviewers -> final metadata check.
+and re-review -> push -> full CI and coverage -> hosted reviewers -> docs parity when applicable ->
+final metadata check.
 
 ## When you open the PR
 
@@ -75,8 +76,11 @@ hosted-review round.
    pre-push review reports. Instruct it to use only read and search tools; tool availability is not the independence guarantee.
 5. Require actionable findings or `current at <full-candidate-head-sha>`. Triage every finding.
    Remediate valid findings and run the required verification before committing; dismiss invalid
-   findings only with concrete evidence. After either outcome, dispatch a different fresh subagent:
-   any non-`current` verdict requires another pass. Escalate persistent disagreement.
+   findings only with concrete evidence. If a finding exposes a real design choice, API trade-off,
+   or behavioral default, pause the push and give the maintainer the options, trade-offs, evidence,
+   and a recommendation; record the resulting decision. After remediation, evidence-backed
+   dismissal, or a maintainer decision, dispatch a different fresh subagent: any non-`current`
+   verdict requires another pass. Escalate persistent disagreement.
 6. Always repeat after material remediation, including executable code, public behavior, tests,
    provider data, agent instructions, workflow configuration, security boundaries, state,
    concurrency, and serialization.
@@ -117,6 +121,9 @@ These gates catch different failures; none replaces another:
 5. Wait for every applicable current-HEAD check to reach an accepted terminal state; classify any
    documented skip explicitly. Repeat until CI is green, a hosted AI review covers the current HEAD,
    no applicable check is pending or failing, and no comment is outstanding.
+6. For user-facing capability or documentation changes, run the `docs-parity-reviewer` required by
+   `agent_docs/review-checklist.md`. Treat blocking findings as merge blockers. Substantive changes
+   restart the applicable review and verification gates.
 
 ## Before handing the PR back
 
