@@ -151,7 +151,7 @@ jobs:
         run: |
           uv run --no-sync python - <<'PY'
           import tomllib
-          from importlib.metadata import requires, version
+          from importlib.metadata import metadata, requires, version
 
           from packaging.requirements import Requirement
 
@@ -161,9 +161,21 @@ jobs:
               }
 
           for distribution in ('pydantic-ai-slim', 'pydantic-graph'):
+              extras = metadata(distribution).get_all('Provides-Extra') or []
               for entry in requires(distribution) or []:
                   requirement = Requirement(entry)
                   if requirement.name not in overridden:
+                      continue
+                  # Markers gate on `extra` (how optional dependencies appear in installed
+                  # metadata -- where the provider SDK floors live) or on the environment
+                  # (`python_version < '3.14'`). Grant every extra the distribution provides,
+                  # so extra-gated floors stay checked and only requirements inactive on this
+                  # interpreter are skipped. A bare `marker.evaluate()` would return False for
+                  # every extra-gated entry and quietly skip them all.
+                  if requirement.marker is not None and not any(
+                      requirement.marker.evaluate({'extra': extra}) for extra in ('', *extras)
+                  ):
+                      print(f'{distribution}: {entry} inactive in this environment, skipped')
                       continue
                   installed = version(requirement.name)
                   assert requirement.specifier.contains(installed, prereleases=True), (
