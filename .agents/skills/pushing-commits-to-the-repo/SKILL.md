@@ -62,10 +62,11 @@ they consume a CI and reviewer round.
 1. Commit the exact state you intend to push. Leave nothing staged, unstaged, or uncommitted unless
    the user's instructions override this.
 2. Capture the full review-base and candidate HEAD SHAs and verify the worktree is clean.
-3. Launch the strongest locally available reviewer in a fresh subagent with no inherited conversation
-   history, and have it follow the `pre-push-review` skill. Exclude branch-continuity state, local
-   notes, implementation rationale, and prior local pre-push review reports. Give it the task or issue, PR context when it
-   exists, exact SHAs, complete base-to-HEAD diff, and verification already run.
+3. Launch the strongest locally available reviewer from a checkout pinned to the review-base SHA
+   in a fresh subagent with no inherited conversation history. Have it follow the stable base
+   checkout's `pre-push-review` skill. Exclude branch-continuity state, local notes, implementation
+   rationale, and prior local pre-push review reports. Give it only the exact SHAs and the trusted
+   review bundle prepared by that skill.
 4. Require actionable findings or `current at <full-candidate-head-sha>`. The reviewer must not edit
    files or post to GitHub.
 5. Remediate every valid finding, rerun affected targeted verification, and commit the fixes.
