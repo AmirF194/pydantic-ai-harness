@@ -96,12 +96,38 @@ jobs:
           pydantic-graph = { path = "${RUNNER_TEMP}/pydantic-ai/pydantic_graph", editable = true }
           EOF
 
-      # `override-dependencies` *replaces* what any dependent declares for the packages
-      # it names — it exists because `browser-use` pins provider SDKs that conflict with
-      # slim's floors — so an overridden package keeps its locked version even when the
-      # candidate raises that floor. Upgrade exactly the overridden packages, derived from
-      # `pyproject.toml` so the list cannot drift. Everything else stays at the harness's
-      # locked version: that is what keeps this a compat test rather than a latest-everything run.
+      # `override-dependencies` *replaces* what any dependent declares for the packages it
+      # names — it exists because `browser-use` pins provider SDKs to exact versions. Its
+      # upper bounds describe what the *released* pydantic-ai supports, so leaving them in
+      # place would let them veto a floor the candidate raises. Drop the upper bounds here
+      # and keep the lower ones: the candidate's own floors then decide, and `browser-use`
+      # stays overridden. Nothing else moves, which is what keeps this a compat test rather
+      # than a latest-everything run.
+      - name: Let the candidate's floors outrank the harness's upper bounds
+        run: |
+          uv run --no-project --with packaging python - <<'PY'
+          import tomllib
+          from pathlib import Path
+
+          from packaging.requirements import Requirement
+
+          harness = Path('pyproject.toml')
+          text = harness.read_text()
+          for entry in tomllib.loads(text)['tool']['uv']['override-dependencies']:
+              override = Requirement(entry)
+              floors = ','.join(
+                  str(clause) for clause in override.specifier if clause.operator in ('>=', '>')
+              )
+              floors_only = f'{override.name}{floors}'
+              if floors_only != entry:
+                  print(f'{entry} -> {floors_only}')
+                  text = text.replace(f"'{entry}'", f"'{floors_only}'")
+          harness.write_text(text)
+          PY
+
+      # `--upgrade-package`: an overridden package keeps its locked version even when the
+      # candidate raises that floor, because the lock predates the candidate. Upgrade exactly
+      # the overridden packages, derived from `pyproject.toml` so the list cannot drift.
       - name: Install the harness against the candidate
         run: |
           upgrade_overridden=$(python3 - <<'PY'
@@ -114,6 +140,37 @@ jobs:
           PY
           )
           uv sync --all-extras --group lint --group dev ${upgrade_overridden}
+
+      # The invariant this workflow exists for: every overridden package resolved to something
+      # the candidate declares it supports. Without this, an override that quietly vetoes a
+      # raised floor surfaces as a confusing failure deep inside the harness's own tests
+      # instead. The candidate's requirements are dynamic, so they are read from the installed
+      # metadata, not from its `pyproject.toml`.
+      - name: Verify the candidate's declared floors survived the resolution
+        run: |
+          uv run --no-sync python - <<'PY'
+          import tomllib
+          from importlib.metadata import requires, version
+
+          from packaging.requirements import Requirement
+
+          with open('pyproject.toml', 'rb') as f:
+              overridden = {
+                  Requirement(spec).name for spec in tomllib.load(f)['tool']['uv']['override-dependencies']
+              }
+
+          for distribution in ('pydantic-ai-slim', 'pydantic-graph'):
+              for entry in requires(distribution) or []:
+                  requirement = Requirement(entry)
+                  if requirement.name not in overridden:
+                      continue
+                  installed = version(requirement.name)
+                  assert requirement.specifier.contains(installed, prereleases=True), (
+                      f'{distribution} declares {entry!r}, but the harness resolved '
+                      f'{requirement.name}=={installed}'
+                  )
+                  print(f'{distribution}: {entry} satisfied by {requirement.name}=={installed}')
+          PY
 
       # Keep `--no-sync`: a bare `uv run` re-resolves, which would drop the targeted
       # upgrades above and restore the locked provider SDKs.
