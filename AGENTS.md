@@ -90,7 +90,8 @@ solves.
 - Python 3.10+ (target version for pyright and ruff)
 - **pyright strict** mode -- no `Any` types, full type annotations
 - **ruff**: line-length=120, single quotes, max-complexity=15
-- **100% branch coverage** required (enforced by `make testcov`)
+- CI requires 100% branch coverage from combined matrix data. A local `make testcov`
+  result covers one environment only.
 - docstrings use single backticks (markdown), not RST double backticks
 - no typecasting (`as` in TypeScript, `cast()` in Python) -- use type narrowing instead
 - prefer the most generic input types possible (reduce dependency chains)
@@ -121,17 +122,19 @@ Applies to docs, READMEs, docstrings, comments, commit messages, and PR text.
 - PRs touching `pyproject.toml` or `uv.lock` require the
   `dependencies:approved` label; pushes clear approval.
 
-## Commands
+## Local verification
+
+Run focused checks for the paths that you modify before you commit.
 
 ```bash
-make format     # ruff format
-make lint       # ruff check
-make typecheck  # pyright strict
-make test       # pytest
-make testcov    # pytest with branch coverage
+uv run ruff format --check pydantic_ai_harness/<module>.py tests/<module>.py
+uv run ruff check pydantic_ai_harness/<module>.py tests/<module>.py
+PYRIGHT_PYTHON_IGNORE_WARNINGS=1 uv run pyright pydantic_ai_harness/<module>.py tests/<module>.py
+uv run pytest tests/<capability>
 ```
 
-Always run `make lint && make typecheck && make test` before committing.
+CI runs the repository-wide format, lint, typecheck, test, and combined coverage gates.
+Do not run repository-wide commands for local verification.
 
 ## File structure
 
@@ -154,7 +157,8 @@ need.
 
 ## Testing patterns
 
-- Use `pydantic_ai.models.TestModel` for all tests (no real API calls)
+- Import `TestModel` from `pydantic_ai.models.test` for model behavior.
+- Keep real provider calls out of tests.
 - `ALLOW_MODEL_REQUESTS = False` is set globally in `conftest.py`
 - Tests use `pytest-anyio` for async support
 - Each capability test class follows: `TestCapabilityName` with methods `test_<scenario>`
@@ -173,7 +177,6 @@ need.
 ## Contributing rules for AICAs
 
 - Always link sources for any claims made during research
-- Run `make lint && make typecheck && make test` before every commit
 - Commit messages should summarize the "why", not the "what"
 - PR titles feed the release notes verbatim -- GitHub builds "What's Changed" from them. Write an
   imperative sentence naming the change, and wrap every code identifier (class names, keyword

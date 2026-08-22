@@ -5,7 +5,7 @@ helpers.
 
 ## Default Shape
 
-- Use `pydantic_ai.models.TestModel` for model behavior.
+- Import `TestModel` from `pydantic_ai.models.test` for model behavior.
 - Keep real provider calls out of tests.
 - Prefer `Agent(..., capabilities=[...])` tests for public behavior.
 - Mirror source packages under `tests/<capability>/`.
@@ -42,8 +42,10 @@ focused tests for each applicable contract:
 
 ## Coverage
 
-The project enforces 100% branch coverage with `make testcov`. Tests for a new
-capability should cover:
+CI enforces 100% branch coverage after combining matrix artifacts. `make testcov`
+runs one environment, so it cannot establish the CI combined-coverage result.
+
+Tests for a new capability should cover:
 
 - default configuration
 - important option combinations
@@ -56,12 +58,13 @@ schemas, telemetry spans, or structured tool metadata.
 
 ## Commands
 
-Run focused checks first, then broaden:
+Run focused checks for the changed paths:
 
 ```bash
 uv run pytest tests/<capability>
-make lint
-make typecheck
-make test
-make testcov
+uv run ruff format --check pydantic_ai_harness/<module>.py tests/<module>.py
+uv run ruff check pydantic_ai_harness/<module>.py tests/<module>.py
+PYRIGHT_PYTHON_IGNORE_WARNINGS=1 uv run pyright pydantic_ai_harness/<module>.py tests/<module>.py
 ```
+
+CI runs repository-wide checks and the combined coverage gate.
