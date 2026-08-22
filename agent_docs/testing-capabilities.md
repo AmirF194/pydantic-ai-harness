@@ -42,8 +42,9 @@ focused tests for each applicable contract:
 
 ## Coverage
 
-CI enforces 100% branch coverage after combining matrix artifacts. `make testcov`
-runs one environment, so it cannot establish the CI combined-coverage result.
+CI enforces 100% branch coverage after combining matrix artifacts. Do not run
+coverage locally unless CI reports a specific coverage gap. To investigate a
+reported gap, run coverage only for the flagged file or focused test.
 
 Tests for a new capability should cover:
 
@@ -58,13 +59,13 @@ schemas, telemetry spans, or structured tool metadata.
 
 ## Commands
 
-Run focused checks for the changed paths:
+Run Ruff across the repository. Run pytest and Pyright for the changed paths:
 
 ```bash
+uv run --no-sync ruff format --check .
+uv run --no-sync ruff check .
 uv run --no-sync pytest -p no:cacheprovider tests/<capability>
-uv run --no-sync ruff format --check pydantic_ai_harness/<module>.py tests/<module>.py
-uv run --no-sync ruff check pydantic_ai_harness/<module>.py tests/<module>.py
 PYRIGHT_PYTHON_IGNORE_WARNINGS=1 uv run --no-sync pyright pydantic_ai_harness/<module>.py tests/<module>.py
 ```
 
-CI runs repository-wide checks and the combined coverage gate.
+CI runs the repository-wide typecheck, test, and combined coverage gates.

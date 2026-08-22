@@ -44,16 +44,16 @@ repos:
     hooks:
       - id: lint
         name: Ruff Lint
-        entry: uv run --no-sync ruff check
+        entry: uv run --no-sync ruff check .
         types: [python]
         language: system
-        pass_filenames: true
+        pass_filenames: false
       - id: format
         name: Ruff Format
-        entry: uv run --no-sync ruff format
+        entry: uv run --no-sync ruff format .
         types: [python]
         language: system
-        pass_filenames: true
+        pass_filenames: false
       - id: typecheck
         name: Pyright
         entry: env PYRIGHT_PYTHON_IGNORE_WARNINGS=1 uv run --no-sync pyright

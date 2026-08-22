@@ -27,15 +27,8 @@ test:
 	uv run pytest
 
 testcov:
-	@coverage_file="$$(mktemp "$${TMPDIR:-/tmp}/pydantic-ai-harness-coverage.XXXXXX")" || { echo 'Could not create a coverage data file.' >&2; exit 1; }; \
-	trap 'rm -f "$$coverage_file"' EXIT; \
-	COVERAGE_FILE="$$coverage_file" uv run coverage run -m pytest; \
-	status=$$?; \
-	if [ "$$status" -eq 0 ]; then \
-		COVERAGE_FILE="$$coverage_file" uv run coverage report; \
-		status=$$?; \
-	fi; \
-	exit "$$status"
+	uv run coverage run -m pytest
+	uv run coverage report
 
 integration-localstack:
 	uv run pytest integration_tests/localstack/test_live_localstack.py

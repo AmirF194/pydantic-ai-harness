@@ -90,8 +90,9 @@ solves.
 - Python 3.10+ (target version for pyright and ruff)
 - **pyright strict** mode -- no `Any` types, full type annotations
 - **ruff**: line-length=120, single quotes, max-complexity=15
-- CI requires 100% branch coverage from combined matrix data. A local `make testcov`
-  result covers one environment only.
+- CI enforces 100% branch coverage from combined matrix data.
+- Do not run coverage locally unless CI reports a specific coverage gap.
+- Investigate a reported gap with focused coverage for the flagged file or test.
 - docstrings use single backticks (markdown), not RST double backticks
 - no typecasting (`as` in TypeScript, `cast()` in Python) -- use type narrowing instead
 - prefer the most generic input types possible (reduce dependency chains)
@@ -124,17 +125,18 @@ Applies to docs, READMEs, docstrings, comments, commit messages, and PR text.
 
 ## Local verification
 
-Run focused checks for the paths that you modify before you commit.
+Run Ruff across the repository. Run Pyright and pytest for the paths that you modify.
 
 ```bash
-uv run --no-sync ruff format --check pydantic_ai_harness/<module>.py tests/<module>.py
-uv run --no-sync ruff check pydantic_ai_harness/<module>.py tests/<module>.py
+uv run --no-sync ruff format --check .
+uv run --no-sync ruff check .
 PYRIGHT_PYTHON_IGNORE_WARNINGS=1 uv run --no-sync pyright pydantic_ai_harness/<module>.py tests/<module>.py
 uv run --no-sync pytest -p no:cacheprovider tests/<capability>
 ```
 
-CI runs the repository-wide format, lint, typecheck, test, and combined coverage gates.
-Do not run repository-wide commands for local verification.
+CI runs the repository-wide typecheck, test, and combined coverage gates.
+Do not run repository-wide Pyright, pytest, or coverage locally.
+If CI reports a coverage gap, run coverage only for the flagged file or focused test.
 
 ## File structure
 
