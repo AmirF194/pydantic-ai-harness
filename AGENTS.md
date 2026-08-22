@@ -127,10 +127,10 @@ Applies to docs, READMEs, docstrings, comments, commit messages, and PR text.
 Run focused checks for the paths that you modify before you commit.
 
 ```bash
-uv run ruff format --check pydantic_ai_harness/<module>.py tests/<module>.py
-uv run ruff check pydantic_ai_harness/<module>.py tests/<module>.py
-PYRIGHT_PYTHON_IGNORE_WARNINGS=1 uv run pyright pydantic_ai_harness/<module>.py tests/<module>.py
-uv run pytest tests/<capability>
+uv run --no-sync ruff format --check pydantic_ai_harness/<module>.py tests/<module>.py
+uv run --no-sync ruff check pydantic_ai_harness/<module>.py tests/<module>.py
+PYRIGHT_PYTHON_IGNORE_WARNINGS=1 uv run --no-sync pyright pydantic_ai_harness/<module>.py tests/<module>.py
+uv run --no-sync pytest -p no:cacheprovider tests/<capability>
 ```
 
 CI runs the repository-wide format, lint, typecheck, test, and combined coverage gates.

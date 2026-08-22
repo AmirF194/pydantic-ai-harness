@@ -61,10 +61,10 @@ schemas, telemetry spans, or structured tool metadata.
 Run focused checks for the changed paths:
 
 ```bash
-uv run pytest tests/<capability>
-uv run ruff format --check pydantic_ai_harness/<module>.py tests/<module>.py
-uv run ruff check pydantic_ai_harness/<module>.py tests/<module>.py
-PYRIGHT_PYTHON_IGNORE_WARNINGS=1 uv run pyright pydantic_ai_harness/<module>.py tests/<module>.py
+uv run --no-sync pytest -p no:cacheprovider tests/<capability>
+uv run --no-sync ruff format --check pydantic_ai_harness/<module>.py tests/<module>.py
+uv run --no-sync ruff check pydantic_ai_harness/<module>.py tests/<module>.py
+PYRIGHT_PYTHON_IGNORE_WARNINGS=1 uv run --no-sync pyright pydantic_ai_harness/<module>.py tests/<module>.py
 ```
 
 CI runs repository-wide checks and the combined coverage gate.
