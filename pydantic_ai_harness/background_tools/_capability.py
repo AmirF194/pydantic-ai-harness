@@ -66,12 +66,6 @@ class BackgroundTools(AbstractCapability[AgentDepsT]):
     redirects the agent to a fresh request if it would otherwise end, so the model
     receives the result and can act on it while the run remains active.
 
-    Warning:
-        Tools selected for background execution must not call `ctx.enqueue()`. This
-        capability lets the agent continue while a synchronous tool runs in a worker
-        thread, so its enqueue can race the pending-message drain and be lost. Return
-        the tool's value instead; this capability enqueues the follow-up message.
-
     ```python
     import asyncio
 
@@ -91,12 +85,24 @@ class BackgroundTools(AbstractCapability[AgentDepsT]):
     several tools at once, or with `FunctionToolset.with_metadata(...)` to mark a whole
     toolset. Or pass a name list / predicate via `tools=...` to ignore metadata entirely.
 
+    Warning:
+        Async tools get up to one second for cooperative cancellation cleanup.
+        Cancellation cannot stop a synchronous tool's worker thread. The function may
+        continue with the same dependencies and shared `RunContext` state after the run
+        ends, although its result is discarded. Use a cancellation-cooperative async tool
+        when work must stop with the run. An async tool that suppresses cancellation may
+        also outlive the run.
+
+        A synchronous background tool runs concurrently with the agent. Make mutable
+        dependencies and other shared state it uses thread-safe.
+
+        A synchronous background tool must not call `ctx.enqueue()`: its worker thread
+        can race the pending-message drain and lose the message. Async background tools
+        do not have this cross-thread race, but delivery still requires the run to
+        continue.
+
     Durable execution is rejected because in-process tasks cannot survive workflow
     replay or worker restart.
-
-    On cancellation, live tasks are cancelled and given up to one second to finish.
-    Async handlers that suppress cancellation and synchronous executor work may outlive
-    the run.
     """
 
     tools: ToolSelector[AgentDepsT] = field(default_factory=lambda: {'background': True})

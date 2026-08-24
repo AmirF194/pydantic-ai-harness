@@ -4,13 +4,6 @@ Run selected tools concurrently with the current agent run. The model receives a
 
 [Source](https://github.com/pydantic/pydantic-ai-harness/tree/main/pydantic_ai_harness/background_tools/)
 
-> [!WARNING]
-> A tool selected for background execution must not call `ctx.enqueue()`. `BackgroundTools` lets the agent continue while a synchronous tool runs in a worker thread, so its enqueue can race the pending-message drain and be lost. Return the tool's final value instead; `BackgroundTools` delivers it as the follow-up message. Exclude a tool from `BackgroundTools` if it needs to enqueue messages itself.
-
-> While Pydantic AI Harness is on 0.x releases, the API may change between minor releases; when it does, deprecation warnings and release-note migration guidance tell you (or your agent) exactly how to upgrade. See the [version policy](https://github.com/pydantic/pydantic-ai-harness#version-policy).
-
-## Usage
-
 ```python
 import asyncio
 
@@ -27,6 +20,8 @@ async def slow_research(query: str) -> str:
 ```
 
 By default any tool with `metadata={'background': True}` runs in the background. The agent's instructions are augmented automatically so the model knows it shouldn't block waiting for the result.
+
+> While Pydantic AI Harness is on 0.x releases, the API may change between minor releases; when it does, deprecation warnings and release-note migration guidance tell you (or your agent) exactly how to upgrade. See the [version policy](https://github.com/pydantic/pydantic-ai-harness#version-policy).
 
 ## Selecting which tools run in the background
 
@@ -76,21 +71,29 @@ If the run remains active, a finished background tool produces a follow-up messa
 - On success: `Background tool 'X' (task <id>) completed.\nResult: <return value>`
 - On failure: `Background tool 'X' (task <id>) failed: <error>`
 
-The task ID matches the one in the acknowledgment, so the model can tell which call each result belongs to.
+The task ID matches the acknowledgment. The follow-up is a text user message, not another tool
+return. Retries and deferred calls are reported as text failures. Expected tool errors include their
+message; unexpected exceptions include only their type.
 
-The follow-up is a text-only user message, not a second tool return. Return values are rendered as
-text, and control-flow results such as retries or deferred calls cannot preserve their control flow
-through it; they are reported as text failures instead.
-Expected retry and tool-failure messages are included, while unexpected exceptions are reported by
-type so their details are not exposed to the model.
+## Execution behavior
 
-## Lifecycle and cancellation
+Normal completion waits for background tasks and delivers their follow-ups. Concurrent runs track
+their tasks separately. If a run pauses for [deferred tools](https://ai.pydantic.dev/deferred-tools/)
+or ends through cancellation, a usage limit, or an error, live tasks are cancelled and their results
+are dropped. Async tools get up to one second for cooperative cancellation cleanup.
 
-- Each agent run gets fresh task state, so concurrent runs do not share tasks
-- During normal completion, a would-be final answer is held until each background task delivers its follow-up
-- A run that pauses for [deferred tools](https://ai.pydantic.dev/deferred-tools/) (human-in-the-loop approval, external execution) is never held behind background work; live tasks are cancelled and background results are not delivered
-- If the run ends for any other reason with tasks still live (caller cancellation, a usage limit, an unexpected error), those tasks are cancelled and their results are dropped; delivery is conditional on the run continuing
-- Cancellation is cooperative: async tools should propagate `CancelledError` and get up to one second to finish cleanup; handlers that suppress cancellation and synchronous executor work may continue after the run ends
+> [!WARNING]
+> Cancellation cannot stop a synchronous tool's worker thread. The function may continue with the
+> same dependencies and shared `RunContext` state after the run ends, although its result is
+> discarded. Use a cancellation-cooperative async tool when work must stop with the run.
+> An async tool that suppresses cancellation may also outlive the run.
+>
+> A synchronous background tool runs concurrently with the agent. Make mutable dependencies and
+> other shared state it uses thread-safe.
+>
+> A synchronous background tool must not call `ctx.enqueue()`: its worker thread can race the
+> pending-message drain and lose the message. Async background tools do not have this cross-thread
+> race, but delivery still requires the run to continue.
 
 ## Limitations
 
