@@ -87,13 +87,12 @@ message; unexpected exceptions include only their type.
 Normal completion waits for background tasks and delivers their follow-ups. Concurrent runs track
 their tasks separately. If a run pauses for [deferred tools](/ai/tools-toolsets/deferred-tools/) or
 ends through cancellation, a usage limit, or an error, live tasks are cancelled and their results
-are dropped. Async tools get up to one second for cooperative cancellation cleanup.
+are dropped. Run cleanup waits for their async tasks to finish, so async tools must propagate
+cancellation.
 
 !!! warning
-    Cancellation cannot stop a synchronous tool's worker thread. The function may continue with the
-    same dependencies and shared `RunContext` state after the run ends, although its result is
-    discarded. Use a cancellation-cooperative async tool when work must stop with the run.
-    An async tool that suppresses cancellation may also outlive the run.
+    Python cannot stop a synchronous tool's worker thread, so cleanup may wait for the function to
+    return depending on the configured executor's cancellation behavior.
 
     A synchronous background tool runs concurrently with the agent. Make mutable dependencies and
     other shared state it uses thread-safe.

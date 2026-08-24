@@ -2,11 +2,11 @@
 
 from __future__ import annotations
 
-import asyncio
 from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Any
 
 import anyio
+from anyio.abc import Event, TaskGroup
 from pydantic_ai.capabilities import AbstractCapability
 from pydantic_ai.durable_exec._base import BaseDurabilityCapability  # pyright: ignore[reportPrivateUsage]
 from pydantic_ai.exceptions import ApprovalRequired, CallDeferred, ToolFailedError, ToolRetryError, UserError
@@ -36,8 +36,6 @@ acknowledgment. If the run remains active, the text result will be delivered \
 automatically as a follow-up message when the task completes. Continue working on other \
 things in the meantime; do not block waiting for the result.\
 """
-
-_CANCEL_DRAIN_TIMEOUT = 1.0
 
 
 def _format_background_error(error: Exception) -> str:
@@ -86,12 +84,10 @@ class BackgroundTools(AbstractCapability[AgentDepsT]):
     toolset. Or pass a name list / predicate via `tools=...` to ignore metadata entirely.
 
     Warning:
-        Async tools get up to one second for cooperative cancellation cleanup.
-        Cancellation cannot stop a synchronous tool's worker thread. The function may
-        continue with the same dependencies and shared `RunContext` state after the run
-        ends, although its result is discarded. Use a cancellation-cooperative async tool
-        when work must stop with the run. An async tool that suppresses cancellation may
-        also outlive the run.
+        Run cleanup cancels and drains background tasks before it completes. Async tools
+        must propagate cancellation. Python cannot stop a synchronous tool's worker
+        thread, so cleanup may wait for the function to return depending on the configured
+        executor's cancellation behavior.
 
         A synchronous background tool runs concurrently with the agent. Make mutable
         dependencies and other shared state it uses thread-safe.
@@ -115,7 +111,9 @@ class BackgroundTools(AbstractCapability[AgentDepsT]):
     - Callable `(ctx, tool_def) -> bool | Awaitable[bool]`: custom predicate.
     """
 
-    _tasks: set[asyncio.Task[None]] = field(default_factory=set[asyncio.Task[None]], init=False, repr=False)
+    _task_group: TaskGroup | None = field(default=None, init=False, repr=False)
+    _completion_event: Event | None = field(default=None, init=False, repr=False)
+    _pending_tasks: int = field(default=0, init=False, repr=False)
     _completed: list[str] = field(default_factory=list[str], init=False, repr=False)
 
     def get_instructions(self) -> AgentInstructions[AgentDepsT] | None:
@@ -132,8 +130,9 @@ class BackgroundTools(AbstractCapability[AgentDepsT]):
         return self
 
     async def for_run(self, ctx: RunContext[AgentDepsT]) -> BackgroundTools[AgentDepsT]:
-        # The runtime fields are init=False, so concurrent runs do not share state.
-        return replace(self)
+        run_capability = replace(self)
+        run_capability._completion_event = anyio.Event()
+        return run_capability
 
     async def wrap_tool_execute(
         self,
@@ -152,16 +151,23 @@ class BackgroundTools(AbstractCapability[AgentDepsT]):
 
         async def _run() -> None:
             try:
-                result = await handler(args)
-                message = f"Background tool '{tool_name}' (task {task_id}) completed.\nResult: {result}"
-            except Exception as e:
-                error = _format_background_error(e)
-                message = f"Background tool '{tool_name}' (task {task_id}) failed: {error}"
-            self._completed.append(message)
+                try:
+                    result = await handler(args)
+                    message = f"Background tool '{tool_name}' (task {task_id}) completed.\nResult: {result}"
+                except Exception as e:
+                    error = _format_background_error(e)
+                    message = f"Background tool '{tool_name}' (task {task_id}) failed: {error}"
+                self._completed.append(message)
+            finally:
+                self._pending_tasks -= 1
+                completion_event = self._completion_event
+                assert completion_event is not None
+                completion_event.set()
 
-        task = asyncio.create_task(_run())
-        self._tasks.add(task)
-        task.add_done_callback(self._tasks.discard)
+        task_group = self._task_group
+        assert task_group is not None
+        self._pending_tasks += 1
+        task_group.start_soon(_run, name=f'background tool {tool_name} ({task_id})')
         return (
             f"Tool '{tool_name}' is running in background (task {task_id}). "
             f'If this run remains active, you will receive the text result automatically when it completes. '
@@ -183,12 +189,15 @@ class BackgroundTools(AbstractCapability[AgentDepsT]):
 
         # Let the outer drain deliver anything already queued before waiting for
         # another completion.
-        while isinstance(result, End) and self._tasks and not self._completed and not ctx.pending_messages:
-            await asyncio.wait(self._tasks, return_when=asyncio.FIRST_COMPLETED)
+        while isinstance(result, End) and self._pending_tasks and not self._completed and not ctx.pending_messages:
+            completion_event = self._completion_event
+            assert completion_event is not None
+            await completion_event.wait()
 
         for message in self._completed:
             ctx.enqueue(message)
         self._completed.clear()
+        self._completion_event = anyio.Event()
         return result
 
     async def wrap_run(
@@ -197,15 +206,15 @@ class BackgroundTools(AbstractCapability[AgentDepsT]):
         *,
         handler: WrapRunHandler,
     ) -> AgentRunResult[Any]:
+        run_result: AgentRunResult[Any] | None = None
         try:
-            return await handler()
+            async with anyio.create_task_group() as task_group:
+                self._task_group = task_group
+                try:
+                    run_result = await handler()
+                finally:
+                    task_group.cancel_scope.cancel()
         finally:
-            # Give cooperative cleanup a bounded grace period. Python cannot force an
-            # async handler that suppresses cancellation, or a synchronous worker, to stop.
-            with anyio.CancelScope(shield=True):
-                tasks = set(self._tasks)
-                for task in tasks:
-                    task.cancel()
-                if tasks:
-                    done, _ = await asyncio.wait(tasks, timeout=_CANCEL_DRAIN_TIMEOUT)
-                    await asyncio.gather(*done, return_exceptions=True)
+            self._task_group = None
+        assert run_result is not None
+        return run_result

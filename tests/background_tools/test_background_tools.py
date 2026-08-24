@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import asyncio
 import re
+import threading
 from collections.abc import Callable
 
+import anyio
 import pytest
 from pydantic_ai import Agent, CancellationToken, RunCancelled
 from pydantic_ai.exceptions import ApprovalRequired, CallDeferred, ModelRetry, ToolFailed, UserError
@@ -339,6 +341,47 @@ class TestBackgroundTools:
         assert _follow_up_seen(result.all_messages(), 'completed.\nResult: fast value')
         assert _follow_up_seen(result.all_messages(), 'completed.\nResult: slow value')
 
+    async def test_failed_background_tool_does_not_cancel_its_sibling(self) -> None:
+        release_broken = asyncio.Event()
+        release_slow = asyncio.Event()
+        sibling_cancelled = asyncio.Event()
+
+        def model_fn(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+            if _follow_up_seen(messages, 'failed: RuntimeError') and _follow_up_seen(messages, 'slow value'):
+                return ModelResponse(parts=[TextPart(content='done')])
+            if _follow_up_seen(messages, 'failed: RuntimeError'):
+                release_slow.set()
+                return ModelResponse(parts=[TextPart(content='waiting')])
+            if _ack_seen(messages):
+                release_broken.set()
+                return ModelResponse(parts=[TextPart(content='waiting')])
+            return ModelResponse(
+                parts=[ToolCallPart(tool_name='broken', args='{}'), ToolCallPart(tool_name='slow', args='{}')]
+            )
+
+        agent = Agent(FunctionModel(model_fn), capabilities=[BackgroundTools()])
+
+        @agent.tool_plain(metadata={'background': True})
+        async def broken() -> str:  # pyright: ignore[reportUnusedFunction]
+            await release_broken.wait()
+            raise RuntimeError('private detail')
+
+        @agent.tool_plain(metadata={'background': True})
+        async def slow() -> str:  # pyright: ignore[reportUnusedFunction]
+            try:
+                await release_slow.wait()
+            except asyncio.CancelledError:
+                sibling_cancelled.set()
+                raise
+            return 'slow value'
+
+        result = await asyncio.wait_for(agent.run('go'), timeout=5)
+
+        assert result.output == 'done'
+        assert not sibling_cancelled.is_set()
+        assert _follow_up_seen(result.all_messages(), 'failed: RuntimeError')
+        assert _follow_up_seen(result.all_messages(), 'completed.\nResult: slow value')
+
     async def test_run_abort_cancels_live_tasks(self) -> None:
         cancel_seen = asyncio.Event()
         agent = Agent(_model_calling('slow'), capabilities=[BackgroundTools()])
@@ -357,9 +400,9 @@ class TestBackgroundTools:
 
         await asyncio.wait_for(cancel_seen.wait(), timeout=1)
 
-    async def test_run_abort_stops_waiting_for_a_task_that_suppresses_cancellation(self) -> None:
+    async def test_run_abort_waits_for_background_task_cancellation_cleanup(self) -> None:
         started = asyncio.Event()
-        cancellation_suppressed = asyncio.Event()
+        cancellation_seen = asyncio.Event()
         release = asyncio.Event()
         finished = asyncio.Event()
         agent = Agent(_model_calling('stubborn'), capabilities=[BackgroundTools()])
@@ -371,24 +414,53 @@ class TestBackgroundTools:
                 await asyncio.Event().wait()
                 raise AssertionError('unreachable')  # pragma: no cover
             except asyncio.CancelledError:
-                cancellation_suppressed.set()
-                await release.wait()
+                cancellation_seen.set()
+                with anyio.CancelScope(shield=True):
+                    await release.wait()
                 finished.set()
-                return 'late result'
+                raise
 
         run = asyncio.ensure_future(agent.run('go'))
         await asyncio.wait_for(started.wait(), timeout=1)
         run.cancel()
 
         try:
-            with pytest.raises(asyncio.CancelledError):
-                await asyncio.wait_for(asyncio.shield(run), timeout=2)
-            assert cancellation_suppressed.is_set()
+            await asyncio.wait_for(cancellation_seen.wait(), timeout=1)
+            await asyncio.sleep(1.1)
+            assert not run.done()
         finally:
             release.set()
-            await asyncio.wait_for(finished.wait(), timeout=1)
-            with pytest.raises(asyncio.CancelledError):
-                await asyncio.wait_for(run, timeout=1)
+
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(run, timeout=1)
+        assert finished.is_set()
+
+    async def test_run_abort_waits_for_default_sync_worker(self) -> None:
+        started = threading.Event()
+        release = threading.Event()
+        finished = threading.Event()
+        agent = Agent(_model_calling('blocking'), capabilities=[BackgroundTools()])
+
+        @agent.tool_plain(metadata={'background': True})
+        def blocking() -> str:  # pyright: ignore[reportUnusedFunction]
+            started.set()
+            assert release.wait(timeout=5)
+            finished.set()
+            return 'late result'
+
+        run = asyncio.ensure_future(agent.run('go'))
+        assert await asyncio.to_thread(started.wait, 1)
+        run.cancel()
+
+        try:
+            await asyncio.sleep(1.1)
+            assert not run.done()
+        finally:
+            release.set()
+
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(run, timeout=1)
+        assert finished.is_set()
 
     async def test_cancellation_token_cancels_live_tasks(self) -> None:
         cancel_seen = asyncio.Event()
