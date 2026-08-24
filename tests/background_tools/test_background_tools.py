@@ -344,7 +344,6 @@ class TestBackgroundTools:
     async def test_failed_background_tool_does_not_cancel_its_sibling(self) -> None:
         release_broken = asyncio.Event()
         release_slow = asyncio.Event()
-        sibling_cancelled = asyncio.Event()
 
         def model_fn(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
             if _follow_up_seen(messages, 'failed: RuntimeError') and _follow_up_seen(messages, 'slow value'):
@@ -368,17 +367,12 @@ class TestBackgroundTools:
 
         @agent.tool_plain(metadata={'background': True})
         async def slow() -> str:  # pyright: ignore[reportUnusedFunction]
-            try:
-                await release_slow.wait()
-            except asyncio.CancelledError:
-                sibling_cancelled.set()
-                raise
+            await release_slow.wait()
             return 'slow value'
 
         result = await asyncio.wait_for(agent.run('go'), timeout=5)
 
         assert result.output == 'done'
-        assert not sibling_cancelled.is_set()
         assert _follow_up_seen(result.all_messages(), 'failed: RuntimeError')
         assert _follow_up_seen(result.all_messages(), 'completed.\nResult: slow value')
 
