@@ -905,11 +905,31 @@ class TestCompositionWarning:
         await _gate(SpendLimits[None](budgets=[Budget(window='total')]))
 
     async def test_nothing_is_reported_when_the_chain_does_not_list_it(self):
-        """A `SpendLimits` reached through a wrapper is not a member of the chain it would compare against."""
+        """A chain this `SpendLimits` has no position in leaves nothing to compare against."""
         guard = SpendLimits[None](budgets=[Budget(window='total')])
         ctx = _run_ctx(root_capability=CombinedCapability[None]([_InnermostWithAWrapper()]))
 
         await _gate(guard, ctx=ctx)
+
+    async def test_a_wrapped_spend_limits_is_still_located_in_the_chain(self):
+        """The chain holds the wrapper, and the accrual it delegates to runs at that position.
+
+        Comparing chain members by identity alone reads this as "not in the chain" and reports
+        nothing, while the rejector listed after the wrapper still nests inside the accrual:
+        the provider bills the response and the counter never sees it.
+        """
+        guard = SpendLimits[None](budgets=[Budget(window='total')], price=lambda r: Decimal('1'))
+        agent = Agent(
+            _scripted_usage(),
+            deps_type=type(None),
+            capabilities=[_InnermostWrapper(guard), _InnermostRejector()],
+        )
+
+        with pytest.warns(SpendCompositionWarning, match='_InnermostRejector'):
+            with pytest.raises(RuntimeError):
+                await agent.run('hi')
+
+        assert (await guard.status())[0].spent.requests == 0
 
 
 class TestPricing:

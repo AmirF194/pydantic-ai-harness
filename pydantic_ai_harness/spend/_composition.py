@@ -63,16 +63,32 @@ def _inner_wrappers(
 
     A run carries its sorted chain as a `CombinedCapability`, which flattens nested ones, so
     position in that list is the whole answer: everything after `capability` nests inside it.
-    Anything else -- no chain to read, or a `capability` reached through a wrapper rather than
-    listed in the chain -- leaves nothing to compare against and reports nothing.
+    With no chain to read, or no position for `capability` in it, there is nothing to compare
+    against and nothing is reported.
     """
     if not isinstance(root, CombinedCapability):
         return []
     chain: list[AbstractCapability[AgentDepsT]] = list(root.capabilities)
     for position, member in enumerate(chain):
-        if member is capability:
+        if _stands_in_for(member, capability):
             return [type(inner).__name__ for inner in chain[position + 1 :] if _may_reject_a_billed_response(inner)]
     return []
+
+
+def _stands_in_for(member: AbstractCapability[AgentDepsT], capability: AbstractCapability[AgentDepsT]) -> bool:
+    """Whether this chain member is `capability`, or a wrapper chain that reaches it.
+
+    A `WrapperCapability` around `SpendLimits` is what the sorted chain holds, while the
+    accrual it delegates to still runs at that position, so the wrapper occupies the position
+    on its behalf. Comparing chain members to `capability` by identity alone would read that
+    arrangement as "not in the chain" and report nothing, while a capability listed after the
+    wrapper still nests inside the accrual.
+    """
+    while member is not capability:
+        if not isinstance(member, WrapperCapability):
+            return False
+        member = member.wrapped
+    return True
 
 
 def _may_reject_a_billed_response(capability: AbstractCapability[AgentDepsT]) -> bool:
