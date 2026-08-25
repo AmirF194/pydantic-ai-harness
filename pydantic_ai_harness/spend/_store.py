@@ -164,6 +164,37 @@ class _LegacyStoreAdapter:
         }
 
 
+_SINGLE_KEY = frozenset({'get', 'add'})
+_BATCH = frozenset({'get_many', 'add_many'})
+
+
+def warn_unreachable_overrides(store: object, base: type[object]) -> None:
+    """Warn when a subclass overrode the single-key pair that no longer drives anything.
+
+    `SpendLimits` calls `get_many` and `add_many`. A subclass of a concrete store that
+    overrode only `get` and `add` still satisfies `BatchSpendStore` through what it
+    inherited, so `as_batch_store` hands it back unwrapped and the override never runs.
+    Before the batch pair existed that override was the only path, which makes this a
+    change of behavior with nothing to show for it -- an audit or a mirrored write bolted
+    onto `add` simply stops happening.
+
+    Checked against the class dictionaries between `type(store)` and `base` rather than by
+    comparing attributes, so a subclass that redefines the batch pair as well is silent:
+    it has already moved.
+    """
+    mro = type(store).__mro__
+    redefined = {name for klass in mro[: mro.index(base)] for name in klass.__dict__}
+    if redefined & _SINGLE_KEY and not redefined & _BATCH:
+        warnings.warn(
+            f'{type(store).__name__} overrides {sorted(redefined & _SINGLE_KEY)} but not `get_many` or '
+            '`add_many`. `SpendLimits` drives the batch pair, so those overrides are never called and '
+            'whatever they add -- an audit, a mirrored write -- stops happening. Move them onto '
+            '`get_many` and `add_many`.',
+            HarnessDeprecationWarning,
+            stacklevel=4,
+        )
+
+
 def as_batch_store(store: SpendStore | BatchSpendStore) -> BatchSpendStore:
     """The store as a batch store, wrapping a legacy one and saying what that costs.
 
@@ -221,6 +252,10 @@ class InMemorySpendStore:
     )
     _lock: Lock = field(default_factory=Lock, init=False, repr=False)
     _writes_since_sweep: int = field(default=0, init=False, repr=False)
+
+    def __post_init__(self) -> None:
+        """Report a subclass whose single-key overrides the batch pair has left unreachable."""
+        warn_unreachable_overrides(self, InMemorySpendStore)
 
     def __len__(self) -> int:
         """How many windows are still live.

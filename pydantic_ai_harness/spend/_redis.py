@@ -18,7 +18,7 @@ from pydantic_ai.exceptions import UserError
 
 from pydantic_ai_harness.spend._budget import SEPARATOR, delimited
 from pydantic_ai_harness.spend._snapshot import MONEY_PRECISION, Spent, summed
-from pydantic_ai_harness.spend._store import DEFAULT_DEDUP_RETAIN, SpendEntry
+from pydantic_ai_harness.spend._store import DEFAULT_DEDUP_RETAIN, SpendEntry, warn_unreachable_overrides
 
 _SCALE = Decimal(10) ** 9
 
@@ -257,7 +257,7 @@ class RedisSpendStore:
     """
 
     def __post_init__(self) -> None:
-        """Reject a prefix that would break the hash tag it is wrapped in.
+        """Reject a prefix that would break the hash tag it is wrapped in, and report dead overrides.
 
         A brace inside the prefix moves or truncates the tag, so two windows of one
         budget would hash to different slots and a cluster would refuse the script that
@@ -272,6 +272,7 @@ class RedisSpendStore:
                 'the keys hash to, and an empty one leaves `{}`, which Redis Cluster does not read as a tag at '
                 'all -- it would hash each key whole and refuse a script spanning two windows with `CROSSSLOT`.'
             )
+        warn_unreachable_overrides(self, RedisSpendStore)
 
     async def get(self, key: str) -> Spent:
         """What `key` has accumulated. Deprecated in favour of `get_many`, removed in 0.28.0."""

@@ -1651,6 +1651,76 @@ class TestDeprecatedStore:
         assert (await guard.status())[0].spent.requests == 2
 
 
+class TestUnreachableOverrides:
+    """A subclass that overrode the single-key pair is told it is no longer on the path."""
+
+    def test_a_single_key_override_is_reported(self):
+        """`SpendLimits` drives `add_many`, so an audit bolted onto `add` stops running.
+
+        Before the batch pair existed that override *was* the path, so a subclass upgrading
+        into this loses whatever it added and gets nothing back saying so.
+        """
+
+        class Audited(InMemorySpendStore):
+            async def add(
+                self,
+                key: str,
+                *,
+                usd: Decimal,
+                tokens: int,
+                requests: int,
+                unpriced: int,
+                ttl: timedelta | None,
+            ) -> Spent:
+                raise AssertionError('never reached, which is what the warning is about')  # pragma: no cover
+
+        with pytest.warns(HarnessDeprecationWarning, match='never called'):
+            Audited()
+
+    async def test_a_subclass_that_moved_to_the_batch_pair_is_silent(self):
+        """And its batch override really is driven, which is what makes the move the fix."""
+        applied: list[int] = []
+
+        class Moved(InMemorySpendStore):
+            async def add(
+                self,
+                key: str,
+                *,
+                usd: Decimal,
+                tokens: int,
+                requests: int,
+                unpriced: int,
+                ttl: timedelta | None,
+            ) -> Spent:
+                raise AssertionError('never reached, and no longer claimed to be')  # pragma: no cover
+
+            async def add_many(self, entries: Sequence[SpendEntry]) -> Mapping[str, Spent]:
+                applied.append(len(entries))
+                return await super().add_many(entries)
+
+        with warnings.catch_warnings():
+            warnings.simplefilter('error')
+            store = Moved()
+
+        await store.add_many([SpendEntry(key='k', usd=Decimal('1'), requests=1)])
+
+        assert applied == [1]
+
+    def test_the_stores_themselves_are_silent(self):
+        with warnings.catch_warnings():
+            warnings.simplefilter('error')
+            InMemorySpendStore()
+            RedisSpendStore(FakeRedis())
+
+    def test_the_redis_store_reports_it_too(self):
+        class Mirrored(RedisSpendStore):
+            async def get(self, key: str) -> Spent:
+                raise AssertionError('never reached, which is what the warning is about')  # pragma: no cover
+
+        with pytest.warns(HarnessDeprecationWarning, match='never called'):
+            Mirrored(FakeRedis())
+
+
 class TestToolset:
     """The agent-facing tool is off unless asked for."""
 
