@@ -32,7 +32,7 @@ jobs:
       issues: write
       pull-requests: write
     # Pin merged upstream history: GitHub cannot resolve a reusable workflow from a deleted PR-head ref.
-    uses: pydantic/pydantic-ai/.github/workflows/pydantic-ai-owner-routing.yml@2ee6c6658b7c1cd9a4ff09c9ec24f99db5d59946
+    uses: pydantic/pydantic-ai/.github/workflows/pydantic-ai-owner-routing.yml@252922e206ba0064eb8a96ab1e37616ba016b06a
     secrets:
       PYDANTIC_AI_TRIAGE_SLACK_WEBHOOK_URL: ${{ secrets.PYDANTIC_AI_TRIAGE_SLACK_WEBHOOK_URL }}
 
@@ -49,7 +49,7 @@ jobs:
       contents: read
       issues: write
       pull-requests: write
-    uses: pydantic/pydantic-ai/.github/workflows/issue-pr-attention-monitor.yml@2ee6c6658b7c1cd9a4ff09c9ec24f99db5d59946
+    uses: pydantic/pydantic-ai/.github/workflows/issue-pr-attention-monitor.yml@252922e206ba0064eb8a96ab1e37616ba016b06a
     secrets:
       PYDANTIC_AI_TRIAGE_SLACK_WEBHOOK_URL: ${{ secrets.PYDANTIC_AI_TRIAGE_SLACK_WEBHOOK_URL }}
 
@@ -59,6 +59,6 @@ jobs:
       contents: read
       issues: read
       pull-requests: read
-    uses: pydantic/pydantic-ai/.github/workflows/weekly-maintainer-digest.yml@2ee6c6658b7c1cd9a4ff09c9ec24f99db5d59946
+    uses: pydantic/pydantic-ai/.github/workflows/weekly-maintainer-digest.yml@252922e206ba0064eb8a96ab1e37616ba016b06a
     secrets:
       PYDANTIC_AI_TRIAGE_SLACK_WEBHOOK_URL: ${{ secrets.PYDANTIC_AI_TRIAGE_SLACK_WEBHOOK_URL }}
