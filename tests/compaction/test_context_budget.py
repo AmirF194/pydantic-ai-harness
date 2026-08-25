@@ -26,7 +26,7 @@ from pydantic_ai.models import AbstractModel, Model, ModelRequestContext, ModelR
 from pydantic_ai.models.fallback import FallbackModel
 from pydantic_ai.models.test import TestModel
 from pydantic_ai.tools import ToolDefinition
-from pydantic_ai.usage import RequestUsage, RunUsage
+from pydantic_ai.usage import RequestUsage, RunUsage, UsageLimits
 
 from pydantic_ai_harness.compaction import (
     DEFAULT_CONTEXT_WINDOW,
@@ -87,6 +87,7 @@ def _ctx(model: Any = None) -> Any:
     @dataclasses.dataclass
     class _FakeCtx:
         usage: RunUsage = dataclasses.field(default_factory=RunUsage)
+        usage_limits: UsageLimits | None = None
         model: Model = dataclasses.field(default_factory=TestModel)
         deps: None = None
         tracer: Tracer = dataclasses.field(default_factory=NoOpTracer)
@@ -1246,7 +1247,9 @@ class TestPositionalCompatibility:
         assert SlidingWindowCompaction(None, 1_000, 40).keep_messages == 40
 
     def test_summarizing_compaction(self):
-        assert SummarizingCompaction('openai:gpt-4o', None, 1_000, 15).keep_messages == 15
+        strategy = SummarizingCompaction('openai:gpt-4o', None, 1_000, 15, None, '{messages}', len)
+        assert strategy.keep_messages == 15
+        assert strategy.tokenizer is len
 
     def test_clear_tool_results(self):
         assert ClearToolResults(None, 1_000, 5).keep_pairs == 5
@@ -1268,6 +1271,7 @@ class TestPositionalCompatibility:
         cases = [
             (SlidingWindowCompaction, 'max_fraction'),
             (SummarizingCompaction, 'max_fraction'),
+            (SummarizingCompaction, 'instructions'),
             (ClearToolResults, 'max_fraction'),
             (DeduplicateFileReads, 'max_fraction'),
             (TieredCompaction, 'target_fraction'),
