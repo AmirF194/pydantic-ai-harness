@@ -69,10 +69,11 @@ A denied or blocked command surfaces to the model as a `ModelRetry` (the model
 can retry with an allowed command) rather than aborting the run. So does every
 other failure the model can act on: a working directory an earlier command
 deleted or replaced with a file, and a command the operating system refuses to
-spawn because it is too long or holds a NUL byte or a lone surrogate. Failures
+spawn because it is too long, holds a NUL byte, or contains a character the
+operating system cannot encode. Failures
 the model can do nothing about still abort the run: a host that cannot allocate
-a process, and a NUL byte or lone surrogate in an application-supplied `env`,
-which is a configuration error rather than something the model can rewrite.
+a process, and an invalid character in an application-supplied `env`, which is
+a configuration error rather than something the model can rewrite.
 
 > **These checks are best-effort, not a security boundary.** `allowed_commands`
 > is a guardrail against accidents, not a security boundary. Validation checks

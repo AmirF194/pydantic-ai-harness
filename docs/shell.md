@@ -97,10 +97,11 @@ A denied command surfaces to the model as a
 the run continues and the model can pick an allowed command instead. So does
 every other failure the model can act on: a working directory an earlier command
 deleted or replaced with a file, and a command the operating system refuses to
-spawn because it is too long or holds a NUL byte or a lone surrogate. Failures
+spawn because it is too long, holds a NUL byte, or contains a character the
+operating system cannot encode. Failures
 the model can do nothing about still abort the run: a host that cannot allocate
-a process, and a NUL byte or lone surrogate in an application-supplied `env`,
-which is a configuration error rather than something the model can rewrite.
+a process, and an invalid character in an application-supplied `env`, which is
+a configuration error rather than something the model can rewrite.
 
 !!! warning "Best-effort, not a security boundary"
     `allowed_commands` is a guardrail against accidents, not a security boundary.

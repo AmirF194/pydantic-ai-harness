@@ -544,9 +544,10 @@ class TestSpawnFailures:
 
     @pytest.mark.parametrize('env', [{'FOO': 'bar\x00baz'}, {'FO\x00O': 'bar'}, {'FOO': 'bar\ud800'}])
     async def test_unspawnable_env_aborts(self, shell_dir: Path, env: dict[str, str]) -> None:
-        # The spawn reports a NUL or a lone surrogate as the same `ValueError`
-        # wherever it came from. This one came from the application's `env`, so
-        # the model cannot fix it and must not be asked to retry.
+        # The spawn reports a NUL or an unencodable character as the same
+        # `ValueError` wherever it came from. This one came from the
+        # application's `env`, so the model cannot fix it and must not be asked
+        # to retry.
         ts = ShellToolset(
             cwd=shell_dir,
             allowed_commands=[],

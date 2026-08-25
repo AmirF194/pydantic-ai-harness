@@ -252,10 +252,10 @@ class ShellToolset(FunctionToolset[AgentDepsT]):
         (containers, sandboxes) for hard enforcement.
 
         Rejecting a command the OS could not accept belongs here rather than in
-        `_recoverable`: `anyio.open_process` reports a NUL byte or a lone
-        surrogate as the same `ValueError` whether it came from `command`, the
-        working directory, or a configured `env`, and only the first of those is
-        the model's to fix.
+        `_recoverable`: `anyio.open_process` reports a NUL byte or an
+        unencodable character as the same `ValueError` whether it came from
+        `command`, the working directory, or a configured `env`, and only the
+        first of those is the model's to fix.
         """
         if '\x00' in command:
             raise ModelRetry('The command contains a NUL byte, which cannot be passed to a process.')
