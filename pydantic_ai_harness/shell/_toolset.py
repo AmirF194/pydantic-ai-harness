@@ -45,7 +45,6 @@ _P = ParamSpec('_P')
 _RECOVERABLE_ERRNOS: dict[int | None, str] = {
     errno.ENOENT: 'The working directory no longer exists.',
     errno.ENOTDIR: 'The working directory is no longer a directory.',
-    errno.E2BIG: 'The command is too long for the operating system to run. Shorten it or split it up.',
 }
 
 

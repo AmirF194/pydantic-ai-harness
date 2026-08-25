@@ -563,12 +563,14 @@ class TestSpawnFailures:
             await ts.run_command('echo hello')
         assert not isinstance(exc_info.value, ModelRetry)
 
-    async def test_command_too_long(self, toolset: ShellToolset[None], monkeypatch: pytest.MonkeyPatch) -> None:
-        # The real threshold is the platform's argv limit, which differs per OS,
-        # so inject rather than allocating a command large enough to cross
-        # whichever one this host applies.
+    async def test_argument_or_environment_too_long_propagates(
+        self, toolset: ShellToolset[None], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # E2BIG does not identify whether the model's command or the
+        # application's environment crossed the combined platform limit. An
+        # application configuration error must not become an unwinnable retry.
         monkeypatch.setattr(anyio, 'open_process', _raise_oserror(errno.E2BIG, 'Argument list too long'))
-        with pytest.raises(ModelRetry, match='too long for the operating system'):
+        with pytest.raises(OSError, match='Argument list too long'):
             await toolset.run_command('echo hello')
 
     async def test_non_recoverable_errno_propagates(
