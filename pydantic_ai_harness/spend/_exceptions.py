@@ -43,11 +43,12 @@ class SpendCompositionWarning(UserWarning):
     then raise, which sends the run to a fresh request while the rejected response --
     generated, billed, and kept in history -- is never counted.
 
-    Whether that happens depends on the run. An `InputGuardrail(parallel=True)` that
-    finishes before the provider does cancels the request instead, and there is nothing
-    billed to count. So this reports how the capabilities are ordered, not an under-count
-    that has already happened. List `SpendLimits` last among the innermost capabilities
-    to remove it.
+    Whether that happens depends on the run. An `InputGuardrail` reaches a billed
+    response only when `parallel=True` and the guard loses its race with the provider;
+    a sequential guard blocks before the request is made, and a parallel guard that wins
+    its race cancels it. So this reports how the capabilities are ordered, not an
+    under-count that has already happened. List `SpendLimits` last among the innermost
+    capabilities to remove it.
 
     Silence it with::
 

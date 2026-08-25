@@ -552,29 +552,11 @@ class _InnermostWithoutAWrapper(AbstractCapability[None]):
         return CapabilityOrdering(position='innermost')
 
 
-class _EngineDurability(AbstractCapability[None]):
-    """Stands in for a durable-execution capability, carrying both members its base declares."""
-
-    engine_name = 'Stand-in'
-    in_durable_context = False
-
-    def get_ordering(self) -> CapabilityOrdering:
-        return CapabilityOrdering(position='innermost')
-
-    async def wrap_model_request(
-        self,
-        ctx: RunContext[None],
-        *,
-        request_context: ModelRequestContext,
-        handler: WrapModelRequestHandler,
-    ) -> ModelResponse:
-        return await handler(request_context)
-
-
-class _StrayEngineName(AbstractCapability[None]):
-    """Carries one of the two markers by coincidence, and is not a durable-execution capability."""
+class _DurabilityLookalike(AbstractCapability[None]):
+    """Carries the attribute names a durability capability carries, without being one."""
 
     engine_name = 'not a durable engine'
+    in_durable_context = False
 
     def get_ordering(self) -> CapabilityOrdering:
         return CapabilityOrdering(position='innermost')
@@ -771,21 +753,28 @@ class TestCompositionWarning:
         """It routes the request into a durable unit rather than rejecting what comes back.
 
         Core also requires its dispatch to be the innermost wrapper, so listing `SpendLimits`
-        after it is the one correction a reader must not make. `tests/spend/test_temporal.py`
-        composes the real capability the same way. What `SpendLimits` does not support under a
-        durable engine is reported separately, by refusing the workflow clock.
+        after it is the one correction a reader must not make. What `SpendLimits` does not
+        support under a durable engine is reported separately, by refusing the workflow clock.
         """
+        pytest.importorskip('temporalio')
+        from pydantic_ai.durable_exec.temporal import TemporalDurability
+
         guard = SpendLimits[None](budgets=[Budget(window='total')])
-        agent = Agent(_scripted_usage(), deps_type=type(None), capabilities=[guard, _EngineDurability()])
+        agent = Agent(
+            _scripted_usage(),
+            name='durable',
+            deps_type=type(None),
+            capabilities=[guard, TemporalDurability[None]()],
+        )
 
         await agent.run('hi')
 
-    async def test_one_durability_marker_alone_does_not_suppress_the_report(self):
-        """`engine_name` is a plausible name for anything; both public members are required."""
+    async def test_a_capability_that_only_looks_durable_is_still_reported(self):
+        """The exclusion matches the durability base type, not attributes anything could carry."""
         guard = SpendLimits[None](budgets=[Budget(window='total')])
-        agent = Agent(_scripted_usage(), deps_type=type(None), capabilities=[guard, _StrayEngineName()])
+        agent = Agent(_scripted_usage(), deps_type=type(None), capabilities=[guard, _DurabilityLookalike()])
 
-        with pytest.warns(SpendCompositionWarning, match='_StrayEngineName'):
+        with pytest.warns(SpendCompositionWarning, match='_DurabilityLookalike'):
             await agent.run('hi')
 
     async def test_a_hooks_subclass_with_its_own_wrapper_is_reported(self):

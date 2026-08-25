@@ -14,16 +14,17 @@ it has already awaited, which a guard that wins its race against the provider ne
 from __future__ import annotations
 
 import warnings
-from typing import Any
 
 from pydantic_ai.capabilities import AbstractCapability, CombinedCapability, Hooks
+from pydantic_ai.durable_exec._base import BaseDurabilityCapability  # pyright: ignore[reportPrivateUsage]
+from pydantic_ai.tools import AgentDepsT
 
 from pydantic_ai_harness.spend._exceptions import SpendCompositionWarning
 
 
 def warn_about_inner_wrappers(
-    root: AbstractCapability[Any] | None,
-    capability: AbstractCapability[Any],
+    root: AbstractCapability[AgentDepsT] | None,
+    capability: AbstractCapability[AgentDepsT],
     reported: set[str],
 ) -> None:
     """Warn when a capability in `root` wraps inside `capability`'s `wrap_model_request`.
@@ -51,7 +52,10 @@ def warn_about_inner_wrappers(
     )
 
 
-def _inner_wrappers(root: AbstractCapability[Any] | None, capability: AbstractCapability[Any]) -> list[str]:
+def _inner_wrappers(
+    root: AbstractCapability[AgentDepsT] | None,
+    capability: AbstractCapability[AgentDepsT],
+) -> list[str]:
     """Names of the capabilities in `root` whose own `wrap_model_request` runs inside `capability`'s.
 
     A run carries its sorted chain as a `CombinedCapability`, which flattens nested ones, so
@@ -61,14 +65,14 @@ def _inner_wrappers(root: AbstractCapability[Any] | None, capability: AbstractCa
     """
     if not isinstance(root, CombinedCapability):
         return []
-    chain = list(root.capabilities)
+    chain: list[AbstractCapability[AgentDepsT]] = list(root.capabilities)
     for position, member in enumerate(chain):
         if member is capability:
             return [type(inner).__name__ for inner in chain[position + 1 :] if _may_reject_a_billed_response(inner)]
     return []
 
 
-def _may_reject_a_billed_response(capability: AbstractCapability[Any]) -> bool:
+def _may_reject_a_billed_response(capability: AbstractCapability[AgentDepsT]) -> bool:
     """Whether nesting this capability inside the accrual is worth reporting.
 
     The question is whether it brings a `wrap_model_request` that can await a response and
@@ -87,23 +91,20 @@ def _may_reject_a_billed_response(capability: AbstractCapability[Any]) -> bool:
       wrapper, so reordering is the one thing a reader must not do here and there would be
       nothing to act on. That combination has its own, louder report: `SpendLimits` refuses
       the workflow clock and names
-      <https://github.com/pydantic/pydantic-ai-harness/issues/531>. Recognized by both public
-      members `BaseDurabilityCapability` declares, `engine_name` and `in_durable_context`,
-      rather than by `isinstance` against that base: it lives in `pydantic_ai.durable_exec._base`,
-      and importing a private module to decide whether to warn would turn a later rename in
-      core into an `ImportError` on `import pydantic_ai_harness.spend`. Recognizing the engine
-      by name degrades into a warning instead, which is the failure this whole function is
-      built to prefer, and follows what `SpendLimits._now` already does for
-      `RestrictedWorkflowAccessError`. A public way to ask the question is the fourth item on
-      [pydantic-ai#7177](https://github.com/pydantic/pydantic-ai/issues/7177).
+      <https://github.com/pydantic/pydantic-ai-harness/issues/531>.
+
+    `BaseDurabilityCapability` is the shared base of the bundled Temporal/DBOS/Prefect
+    integrations, and Pydantic AI publishes no marker for the durability tier -- the same
+    gap `PlaywrightBrowser.for_agent` works around, matched the same way so both sites move
+    together if core renames the module. A public route is the fourth item on
+    [pydantic-ai#7177](https://github.com/pydantic/pydantic-ai/issues/7177).
 
     A missed report is preferred over one on a correct arrangement, which the reader could
     only silence by changing correct code.
     """
-    capability_type = type(capability)
-    if hasattr(capability_type, 'engine_name') and hasattr(capability_type, 'in_durable_context'):
+    if isinstance(capability, BaseDurabilityCapability):
         return False
-    implementation = capability_type.wrap_model_request
+    implementation = type(capability).wrap_model_request
     return (
         implementation is not AbstractCapability.wrap_model_request and implementation is not Hooks.wrap_model_request
     )
