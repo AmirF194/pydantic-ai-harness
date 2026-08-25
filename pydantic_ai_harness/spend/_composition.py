@@ -113,13 +113,15 @@ def _may_reject_a_billed_response(capability: AbstractCapability[AgentDepsT]) ->
     A durable-execution capability is read as "no" for a different reason: the signal is right,
     and the correction is the problem. Core requires the durable dispatch to be the innermost
     wrapper (`BaseDurabilityCapability.get_ordering`), so listing `SpendLimits` after it is the
-    one thing a reader must not do, and the report would name an unavailable fix. That
-    combination has its own, louder report: `SpendLimits` refuses the workflow clock and names
-    <https://github.com/pydantic/pydantic-ai-harness/issues/531>. Matched by `isinstance`
-    against the base the bundled Temporal, DBOS and Prefect integrations share, the same way
+    one thing a reader must not do, and the report would name an unavailable fix. What that
+    combination costs is covered by the durable-execution caveat rather than here, and how
+    loudly depends on the engine: Temporal refuses the workflow clock and names
+    <https://github.com/pydantic/pydantic-ai-harness/issues/531>, while DBOS recovery and
+    Prefect flow retry replay the accrual reporting nothing. Matched by `isinstance` against
+    the base the bundled Temporal, DBOS and Prefect integrations share, the same way
     `PlaywrightBrowser.for_agent` matches it, so both sites move together if core renames
-    `pydantic_ai.durable_exec._base`. A public route is the fourth item on
-    [pydantic-ai#7177](https://github.com/pydantic/pydantic-ai/issues/7177).
+    `pydantic_ai.durable_exec._base`. A public route is asked for in
+    [pydantic-ai#7771](https://github.com/pydantic/pydantic-ai/issues/7771).
 
     Everything else is reported, including a capability that would not have rejected anything
     on the run in hand. `InputGuardrail` is the case in point: it can reach a billed response
