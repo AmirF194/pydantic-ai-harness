@@ -118,9 +118,9 @@ Set `expose_tools=True` to give the agent a `get_spend` tool. It is off by defau
 
 ## Reacting to a threshold
 
-`on_spend` is awaited inside `wrap_model_request`, so an async callback does hold the run there. It is still the wrong place to ask for approval: it fires after every response the provider returns, including the one carrying the final answer, and `SpendSnapshot` says nothing about whether another turn follows -- so a callback that waits there leaves a run that has already finished waiting for a decision nothing will act on. Use `on_spend` to report.
+`on_spend` is awaited inside `wrap_model_request`, so an async callback does hold the run there. It is still the wrong place to ask for approval: it fires after every response that reaches the accrual, including the one carrying the final answer, and `SpendSnapshot` says nothing about whether another turn follows -- so a callback that waits there leaves a run that has already finished waiting for a decision nothing will act on. Use `on_spend` to report.
 
-The seam that runs only when more spending is about to happen is `before_model_request`. A small capability of your own can read `status(ctx)` there and hold the run until someone decides:
+The seam that runs before a request rather than after a response is `before_model_request`. A small capability of your own can read `status(ctx)` there and hold the run until someone decides:
 
 ```python
 import asyncio
@@ -152,11 +152,11 @@ class ApproveBeforeSpending(AbstractCapability[None]):
 agent = Agent('openai:gpt-5.4', deps_type=type(None), capabilities=[limits, ApproveBeforeSpending()])
 ```
 
-The gate reads numbers `SpendLimits` has already accrued, because the previous response was counted inside `wrap_model_request` before this request was prepared. It gates the first request of a run too, which is what carries a threshold crossed by an earlier run into the next one.
+The gate reads numbers `SpendLimits` has already accrued, because the previous response was counted inside `wrap_model_request` before this request was prepared. It gates the first request of a run too, which is what carries a threshold crossed by an earlier run into the next one. A capability listed after it can still skip the request with `SkipModelRequest`, so an approval taken here is not proof that a request followed.
 
 That pause holds a coroutine, so it lasts as long as the process does and no longer. A *serializable* pause at a model-request boundary is not available: Pydantic AI's deferral path is tool-boundary only. `CallDeferred` and `ApprovalRequired` are honored where a tool call is validated or executed; raised from a model-request hook, nothing catches them and the run ends on the bare exception, which carries no message of its own. [#151](https://github.com/pydantic/pydantic-ai-harness/issues/151) tracks a general interrupt with a serializable continuation.
 
-For a ceiling that expands rather than stops, `budgets` is read fresh on every request, so replacing it after a refusal lets the work continue against the larger ceiling. The counter is keyed on `name`, `window`, and `scope`, so what is already spent carries over.
+For a ceiling that expands rather than stops, `budgets` is read fresh on every request, so replacing it after a refusal lets the work continue against the larger ceiling. The counter is keyed on `name`, `window`, `scope` and the period the window is currently in, never on the ceiling, so what is already spent carries over.
 
 A refusal can land mid-run, after tool calls have already run and been paid for. Re-running the original prompt would repeat that work and any side effects it had, so resume from what the refused run produced instead: `capture_run_messages` holds the partial history, and a run given that history and no new prompt continues from the request that was refused.
 
@@ -250,7 +250,7 @@ What is left is siblings. Pydantic AI orders innermost capabilities against non-
 
 **Durable execution.** `SpendLimits` is not supported inside a durable workflow, on Temporal, DBOS, or Prefect.
 
-The capability hooks run in orchestration code; only the model request itself is the durable unit -- a Temporal activity, a DBOS step, a Prefect task. All three recover by re-executing orchestration code, so they re-execute the accrual with it, and a window counts the same response more than once: one `$1` model request leaves `$2` in the store after one replay. Pydantic AI wraps its own hook dispatch for that reason -- DBOS routes the event-stream handler through a step "so its side effects are checkpointed and don't re-run when the workflow recovers", and Prefect caches the handler task so "a flow retry that re-executes the same run reproduces the same numbers and replays from cache". The accrual has no such wrapper.
+The capability hooks run in orchestration code, while the model request they wrap is a durable unit -- a Temporal activity, a DBOS step, a Prefect task. All three recover by re-executing orchestration code, so they re-execute the accrual with it, and a window counts the same response more than once: one `$1` model request leaves `$2` in the store after one replay. Pydantic AI wraps its own hook dispatch for that reason -- DBOS routes the event-stream handler through a step "so its side effects are checkpointed and don't re-run when the workflow recovers", and Prefect caches the handler task so "a flow retry that re-executes the same run reproduces the same numbers and replays from cache". The accrual has no such wrapper.
 
 What differs between the engines is whether you find out. Temporal raises on the first request: its workflow sandbox restricts the wall clock the day and month buckets come from, `pydantic_ai_harness` is not among the modules `PydanticAIPlugin` passes through the sandbox, and `SpendLimits` translates that error into what it means rather than into the setting that silences it. Passing the package through the sandbox removes the message, not the replay, and under time-skipping the workflow's day and the key's day still drift apart. DBOS recovery and Prefect flow retry report nothing at all: the counter is simply higher than what was spent, so the budget refuses a request earlier than it should.
 
@@ -286,9 +286,11 @@ has no equivalent for: `input_tokens_limit` is cumulative over the run, and
 `per_request_input_tokens_limit` caps one request against the provider-reported
 input tokens of the response that already paid for it. `count_tokens_before_request=True` counts
 the pending request with the model's own `count_tokens` and applies both limits to that count
-before the send, so an oversized context is refused rather than billed. Reach for
-`Budget(tokens=..., window='run')` when the same configuration also has to express a window longer
-than one run, a tenant scope, or a counter shared between processes.
+before the send, so an oversized context is refused rather than billed on the providers that
+implement `count_tokens`; the field names them, and a model without it raises
+`NotImplementedError` instead. Reach for `Budget(tokens=..., window='run')` when the same
+configuration also has to express a window longer than one run, a tenant scope, or a counter
+shared between processes.
 
 ## Tracing
 
