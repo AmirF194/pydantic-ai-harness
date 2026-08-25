@@ -1,7 +1,7 @@
 """Track what an agent spends, and stop it when a budget is gone.
 
-`UsageLimits` in Pydantic AI caps tokens and requests for the duration of one
-run. `SpendLimits` covers what that leaves: money, periods longer than a run,
+`UsageLimits` in Pydantic AI caps tokens, requests and cost for the duration of
+one run. `SpendLimits` covers what that leaves: periods longer than a run,
 partitioning by tenant or user, and a counter that several worker processes
 share. It prices each response with
 [`ModelResponse.cost()`][pydantic_ai.messages.ModelResponse.cost], adds it to
@@ -79,16 +79,18 @@ class SpendLimits(AbstractCapability[AgentDepsT]):
     comes from `Budget(window='run')`, whose key carries the run id.
 
     Durable execution: not supported inside a durable workflow, on Temporal, DBOS,
-    or Prefect. The hooks run in orchestration code while only the model request is
-    the durable unit, so re-execution replays the accrual and a window counts the
-    same response more than once. What differs is whether you find out: Temporal
-    raises, because its workflow sandbox restricts the clock these hooks read and
-    `pydantic_ai_harness` is not one of the modules the Pydantic AI plugin passes
-    through, while DBOS recovery and Prefect flow retry report nothing and leave the
-    counter higher than what was spent. `exhausted()` works without a `RunContext`
-    so a workflow can at least be refused admission on what is already recorded --
-    but it reserves nothing, so it is a gate on the door, not a budget on what
-    happens inside. Tracked in
+    or Prefect. The hooks run in orchestration code, while the model request beside
+    them is a durable unit restored from its checkpoint, so re-execution replays the
+    accrual without replaying the request it counted. What differs is whether you
+    find out: Temporal raises, because its workflow sandbox restricts the clock these
+    hooks read and `pydantic_ai_harness` is not one of the modules the Pydantic AI
+    plugin passes through, while DBOS recovery and Prefect flow retry report nothing
+    and leave the counter wrong in whichever direction the store implies -- too high
+    where recovery still reaches the store that accrued, too low where it landed in a
+    fresh worker holding a fresh `InMemorySpendStore`. `exhausted()` works without a
+    `RunContext` so a workflow can at least be refused admission on what is already
+    recorded -- but it reserves nothing, so it is a gate on the door, not a budget on
+    what happens inside. Tracked in
     <https://github.com/pydantic/pydantic-ai-harness/issues/531>.
     """
 
@@ -235,8 +237,8 @@ class SpendLimits(AbstractCapability[AgentDepsT]):
 
         This orders against non-innermost capabilities only. Innermost members are not
         ordered among themselves, and the one listed later nests further in, so another
-        innermost capability (`TemporalDurability`, `InputGuardrail`) placed after this one
-        still wraps inside it and can reject a billed response before it is counted. List
+        innermost capability placed after this one still wraps inside it. `InputGuardrail` is
+        the one that reaches a billed response before the counter does. List
         `SpendLimits` last among innermost capabilities where that matters; closing it
         outright is <https://github.com/pydantic/pydantic-ai-harness/issues/534>.
         """
@@ -414,13 +416,12 @@ class SpendLimits(AbstractCapability[AgentDepsT]):
         An admission check, and only that. It reads the counters; it reserves nothing and
         records nothing, so work started on the strength of it goes unmeasured unless
         something else accrues it. That makes it the pre-flight option on every durable
-        engine, though what it stands in for differs: under Temporal the run fails before
-        anything accrues, because the sandbox refuses the clock these hooks read, so a
-        workflow admitted here spends against a counter that never moves; under DBOS and
-        Prefect the accrual does run, and recovery or a flow retry replays it, so the next
-        caller is admitted against a reading that has drifted up rather than held still.
-        Either way this is a floor on runaway spend already recorded, not a ceiling on what
-        the workflow goes on to spend.
+        engine, and what the next caller reads differs. Under Temporal nothing accrues
+        inside the workflow at all, because the sandbox refuses the clock these hooks read,
+        so the counter still holds the admission reading. Under DBOS and Prefect the accrual
+        does run and recovery replays it, so the counter moved by the wrong amount rather
+        than not at all. Either way this is a floor on runaway spend already recorded, not a
+        ceiling on what the workflow goes on to spend.
 
         `status()` omits what it cannot resolve, and `any(...)` over the remainder is a brake
         that silently checks nothing when every budget is scoped -- so this raises instead,
