@@ -21,7 +21,7 @@ from pydantic_ai.messages import (
 )
 from pydantic_ai.models.function import AgentInfo, FunctionModel
 
-from pydantic_ai_harness import BackgroundTools
+from pydantic_ai_harness.background_tools import BackgroundTools
 
 database = Path(sys.argv[1])
 markers = Path(sys.argv[2])

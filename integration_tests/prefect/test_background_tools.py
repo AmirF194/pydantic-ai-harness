@@ -31,7 +31,7 @@ from pydantic_ai.messages import (
 )
 from pydantic_ai.models.function import AgentInfo, FunctionModel
 
-from pydantic_ai_harness import BackgroundTools
+from pydantic_ai_harness.background_tools import BackgroundTools
 
 pytestmark = [
     pytest.mark.anyio,
