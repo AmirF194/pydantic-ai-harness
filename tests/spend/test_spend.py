@@ -25,6 +25,7 @@ from pydantic_ai.models.test import TestModel
 from pydantic_ai.tools import RunContext
 from pydantic_ai.usage import RequestUsage, RunUsage
 
+from pydantic_ai_harness import HarnessDeprecationWarning
 from pydantic_ai_harness.spend import (
     Budget,
     InMemorySpendStore,
@@ -1560,7 +1561,14 @@ class TestDeprecatedStore:
     """A store written against the released `SpendStore` keeps working, and says what it costs."""
 
     def test_it_warns_once_naming_what_is_lost(self):
-        with pytest.warns(DeprecationWarning) as warned:
+        """`HarnessDeprecationWarning` rather than `DeprecationWarning`, which is the whole warning.
+
+        Python filters `DeprecationWarning` out by default unless it is triggered from
+        `__main__`, and this one is raised inside the package, so a library caller would
+        see nothing at all. `HarnessDeprecationWarning` derives from `UserWarning`, which
+        is shown by default and which the docs give one recipe for silencing.
+        """
+        with pytest.warns(HarnessDeprecationWarning) as warned:
             SpendLimits[None](budgets=[Budget(window='total')], store=_LegacyStore())
 
         assert len(warned) == 1
@@ -1574,7 +1582,7 @@ class TestDeprecatedStore:
             SpendLimits[None](budgets=[Budget(window='total')], store=InMemorySpendStore())
 
     async def test_it_still_accrues_and_gates(self):
-        with pytest.warns(DeprecationWarning):
+        with pytest.warns(HarnessDeprecationWarning):
             guard = SpendLimits(
                 budgets=[Budget(usd=Decimal('0.02'), window='day')],
                 store=_LegacyStore(),
@@ -1590,7 +1598,7 @@ class TestDeprecatedStore:
     async def test_it_is_driven_one_window_per_call(self):
         """Which is what it is warned about: two windows are two writes, not one."""
         store = _LegacyStore()
-        with pytest.warns(DeprecationWarning):
+        with pytest.warns(HarnessDeprecationWarning):
             guard = SpendLimits(
                 budgets=[Budget(window='day'), Budget(window='month')],
                 store=store,
@@ -1602,7 +1610,7 @@ class TestDeprecatedStore:
 
     async def test_a_replayed_response_counts_twice(self):
         """`SpendEntry.token` has nowhere to go on a store that never sees it."""
-        with pytest.warns(DeprecationWarning):
+        with pytest.warns(HarnessDeprecationWarning):
             guard = SpendLimits(budgets=[Budget(window='total')], store=_LegacyStore(), price=lambda r: Decimal('1'))
         response = _response(provider_response_id='resp-1')
 

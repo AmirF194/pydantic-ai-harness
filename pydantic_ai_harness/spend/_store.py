@@ -20,6 +20,7 @@ from decimal import Decimal
 from threading import Lock
 from typing import Protocol, runtime_checkable
 
+from pydantic_ai_harness._warn import HarnessDeprecationWarning
 from pydantic_ai_harness.spend._snapshot import Spent
 
 _Entries = dict[str, tuple[Spent, 'datetime | None']]
@@ -177,7 +178,7 @@ def as_batch_store(store: SpendStore | BatchSpendStore) -> BatchSpendStore:
         'between them leaves the day counted and the month not. `SpendEntry.token` is dropped too, so a durable '
         'engine that re-executes the accrual (DBOS recovery, a Prefect flow retry) counts the response twice. '
         'Implement `get_many` and `add_many` (`BatchSpendStore`) to get both. `SpendStore` is removed in 0.20.0.',
-        DeprecationWarning,
+        HarnessDeprecationWarning,
         stacklevel=4,
     )
     return _LegacyStoreAdapter(store)
