@@ -121,14 +121,20 @@ These gates catch different failures; none replaces another:
    - **Valid:** fix it, then reply saying what changed, and react 👍.
    - **Invalid:** reply explaining concretely why (with code evidence), and react 👎.
    - Never silently ignore a comment, and never resolve a thread without a reply.
-4. **Escalate real trade-offs, don't guess.** If a comment needs a maintainer decision (a design
+4. **Clear active review requests.** Enumerate every active `REQUEST_CHANGES` review; resolved
+   threads do not clear its formal review state. A human request remains blocking until that human
+   re-reviews or a human maintainer explicitly dismisses it. A bot request requires current-head
+   remediation and a replacement verdict, or a documented workflow-defined safe fallback, before a
+   maintainer dismisses it.
+5. **Escalate real trade-offs, don't guess.** If a comment needs a maintainer decision (a design
    choice, an API trade-off, a behavioral default), leave a comment containing: the background,
    your reasoning, the decision that needs making, the trade-offs (pros/cons of each option), and
    your recommendation. Then **poll every 30 minutes for a reply** and continue when it lands.
-5. Wait for every applicable current-HEAD check to reach an accepted terminal state; classify any
+6. Wait for every applicable current-HEAD check to reach an accepted terminal state; classify any
    documented skip explicitly. Repeat until CI is green, a hosted AI review identifies or attests
-   the current HEAD, no applicable check is pending or failing, and no comment is outstanding.
-6. For a user-facing capability change that affects its paired capability `README.md` and
+   the current HEAD, no applicable check is pending or failing, no active review request remains,
+   and no comment is outstanding.
+7. For a user-facing capability change that affects its paired capability `README.md` and
    `docs/<capability>.md` surfaces, run the `docs-parity-reviewer` required by
    `agent_docs/review-checklist.md`. Treat blocking findings as merge blockers. Substantive changes
    restart the applicable review and verification gates.
@@ -137,15 +143,21 @@ These gates catch different failures; none replaces another:
 
 Run this final metadata check after CI and comments have settled:
 
-1. Dispatch a fresh no-history subagent from the stable policy-base checkout that has not worked on
+1. Capture the exact current title and body before dispatching the reviewer.
+2. Dispatch a fresh no-history subagent from the stable policy-base checkout that has not worked on
    the PR.
-2. Give it the PR URL, linked issue, current `base...HEAD` diff, final test status, title, and body.
-3. Ask it to check only the title and body against this section and the root `AGENTS.md`.
-4. Require either `current` or an exact replacement title and body. The reviewer returns text only;
+3. Give it the PR URL, linked issue, current `base...HEAD` diff, final test status, and captured
+   metadata.
+4. Ask it to check only the title and body against this section and the root `AGENTS.md`.
+5. Require either `current` or an exact replacement title and body. The reviewer returns text only;
    the implementing agent applies only objective rule corrections.
-5. Code changes restart the full lifecycle. Metadata-only changes skip code review and CI but must
-   wait for any applicable metadata-triggered checks and feedback.
-6. After one replacement and its checks, repeat with another fresh subagent. Escalate conflicting,
+6. Before a metadata edit, record the timestamp. Metadata-only changes skip code review and CI but
+   must wait for applicable `edited`-event checks created after that timestamp to reach their
+   accepted terminal outcomes; stale checks on the same HEAD are not evidence. Triage any feedback.
+   Code changes restart the full lifecycle.
+7. After one replacement and its checks, repeat with another fresh subagent. Escalate conflicting,
    repeated, or discretionary rewrites to the maintainer instead of applying another replacement.
-7. Hand the PR back only after the check reports `current` or the maintainer resolves the escalation.
-8. Report the human-only AI-code checkbox separately.
+8. Immediately before handoff, re-read the title and body and compare them with the reviewed
+   snapshot. Any difference restarts this metadata gate.
+9. Hand the PR back only after the check reports `current` or the maintainer resolves the escalation.
+10. Report the human-only AI-code checkbox separately.
