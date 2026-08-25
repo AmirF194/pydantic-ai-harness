@@ -29,7 +29,11 @@ jobs:
       PYDANTIC_AI_TRIAGE_SLACK_WEBHOOK_URL: ${{ secrets.PYDANTIC_AI_TRIAGE_SLACK_WEBHOOK_URL }}
 
   triage:
-    if: github.event_name == 'workflow_dispatch' || github.event.schedule == '10 */6 * * *'
+    needs: owner-routing
+    if: >-
+      always() && !cancelled() &&
+      (github.event_name == 'workflow_dispatch' ||
+      github.event.schedule == '10 */6 * * *')
     permissions:
       actions: read
       checks: read
