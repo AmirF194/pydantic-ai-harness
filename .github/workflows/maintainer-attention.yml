@@ -25,7 +25,7 @@ jobs:
       contents: read
       issues: write
       pull-requests: read
-    uses: pydantic/pydantic-ai/.github/workflows/pydantic-ai-owner-routing.yml@4b8a8771adb35e3eaba982d7468acde446c37948
+    uses: pydantic/pydantic-ai/.github/workflows/pydantic-ai-owner-routing.yml@a64ff816a9d6e5a38afdc896342f64953fd9147d
     secrets:
       PYDANTIC_AI_TRIAGE_SLACK_WEBHOOK_URL: ${{ secrets.PYDANTIC_AI_TRIAGE_SLACK_WEBHOOK_URL }}
 
@@ -42,7 +42,7 @@ jobs:
       contents: read
       issues: write
       pull-requests: write
-    uses: pydantic/pydantic-ai/.github/workflows/issue-pr-attention-monitor.yml@4b8a8771adb35e3eaba982d7468acde446c37948
+    uses: pydantic/pydantic-ai/.github/workflows/issue-pr-attention-monitor.yml@a64ff816a9d6e5a38afdc896342f64953fd9147d
     secrets:
       PYDANTIC_AI_TRIAGE_SLACK_WEBHOOK_URL: ${{ secrets.PYDANTIC_AI_TRIAGE_SLACK_WEBHOOK_URL }}
 
@@ -52,6 +52,6 @@ jobs:
       contents: read
       issues: read
       pull-requests: read
-    uses: pydantic/pydantic-ai/.github/workflows/weekly-maintainer-digest.yml@4b8a8771adb35e3eaba982d7468acde446c37948
+    uses: pydantic/pydantic-ai/.github/workflows/weekly-maintainer-digest.yml@a64ff816a9d6e5a38afdc896342f64953fd9147d
     secrets:
       PYDANTIC_AI_TRIAGE_SLACK_WEBHOOK_URL: ${{ secrets.PYDANTIC_AI_TRIAGE_SLACK_WEBHOOK_URL }}
