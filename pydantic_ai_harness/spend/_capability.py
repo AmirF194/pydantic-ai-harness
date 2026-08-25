@@ -262,13 +262,13 @@ class SpendLimits(AbstractCapability[AgentDepsT]):
     ) -> ModelRequestContext:
         """Refuse the request if any budget with a ceiling is already spent.
 
-        Also the first point at which the sorted capability chain is readable, so the
-        arrangement `get_ordering` cannot rule out is reported here. `for_agent` sees only
-        the capabilities the agent was constructed with, and `RunContext.root_capability`
-        is not yet populated when `for_run` runs, so neither covers a capability added
-        through `agent.run(capabilities=...)`. This still runs before the first billed
-        response, and reads the chain on every request rather than only the first, since
-        a per-run addition can change it between runs.
+        Also where the arrangement `get_ordering` cannot rule out is reported. The sorted
+        chain is readable from `RunContext.root_capability` from `before_run` onward but not
+        before it: `for_agent` sees only the capabilities the agent was constructed with, and
+        `ctx.root_capability` is still `None` in `for_run`, so neither covers a capability
+        added through `agent.run(capabilities=...)`. Reading it here keeps the report on the
+        request path, ahead of any billed response, and re-reads it on every request rather
+        than only the first, since a per-run addition can change the chain between runs.
         """
         warn_about_inner_wrappers(ctx.root_capability, self, self._reported_arrangements)
         read: dict[str, Spent] = {}
