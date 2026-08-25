@@ -10,8 +10,8 @@ Pushing starts a loop; it does not end the task. **Work stops only when CI is gr
 hosted AI review has finished on the current HEAD, AND no comment is left unresolved.**
 
 Lifecycle: implement -> targeted verification -> commit -> independent pre-push review -> remediate
-and re-review -> push -> full CI and coverage -> hosted reviewers -> docs parity when applicable ->
-final metadata check.
+and re-review when required -> push -> full CI and coverage -> hosted reviewers -> docs parity when
+applicable -> final metadata check.
 
 ## When you open the PR
 
@@ -57,9 +57,8 @@ concluding you lack permission.
 
 ## Before you push -- independent review gate
 
-Run this gate before the first push and every later push. It guarantees context independence, not
-hosted-grade hostile-content isolation, and catches semantic defects before they consume a CI and
-hosted-review round.
+Run this gate before every push. It guarantees context independence, not hosted-grade hostile-content
+isolation, and catches semantic defects before they consume a CI and hosted-review round.
 
 1. Run targeted verification while iterating, then run the root `AGENTS.md` mandatory pre-commit
    checks before committing the exact state intended for push. Leave nothing staged, unstaged, or
@@ -71,22 +70,25 @@ hosted-review round.
    discussion including thread state, relevant settled maintainer decisions with their sources,
    relevant authoritative documentation, completed verification, and the exact
    merge-base-to-candidate diff with external diff and text conversion disabled.
+   If this candidate introduces `pre-push-review` and the stable checkout has no copy, use the
+   stable root review rubric and instructions while treating the candidate skill as review material.
+   This bootstrap exception ends once the skill lands on the target branch.
 4. Launch the strongest locally available reviewer from that stable checkout in a fresh subagent
-   with no inherited conversation. Have it follow the stable checkout's `pre-push-review` skill.
+   with no inherited conversation. Have it follow the stable checkout's `pre-push-review` skill, or
+   the stable root review rubric and instructions during the bootstrap exception.
    Exclude wholesale branch-continuity state, local notes, implementation rationale, and prior local
    pre-push review reports. Treat the supplied settled decisions as constraints and assess
-   conformance instead of reopening them. Instruct it to use only read and search tools; tool
-   availability is not the independence guarantee.
+   conformance instead of reopening them. Restrict it to its harness's native read and search tools;
+   tool availability is not the independence guarantee.
+   If no eligible reviewer can be launched, the gate fails; do not push.
 5. Require actionable findings or `current at <full-candidate-head-sha>`. Triage every finding.
    Remediate valid findings and run the required verification before committing; dismiss invalid
    findings only with concrete evidence. If a finding exposes a real design choice, API trade-off,
    or behavioral default, pause the push and give the maintainer the options, trade-offs, evidence,
-   and a recommendation; record the resulting decision. After remediation, evidence-backed
-   dismissal, or a maintainer decision, dispatch a different fresh subagent: any non-`current`
-   verdict requires another pass. Escalate persistent disagreement.
-6. Always repeat after material remediation, including executable code, public behavior, tests,
-   provider data, agent instructions, workflow configuration, security boundaries, state,
-   concurrency, and serialization.
+   and a recommendation; record the resulting decision. Dispatch a different fresh subagent only
+   when remediation changes the candidate HEAD or a maintainer decision changes the acceptance
+   criteria. An evidence-backed dismissal with an unchanged candidate HEAD does not require another
+   pass. Escalate persistent disagreement.
 
 Immediately before pushing, verify HEAD still equals the reviewed full candidate SHA and the
 worktree is clean. Any mismatch restarts the gate.
@@ -109,10 +111,12 @@ These gates catch different failures; none replaces another:
 
 1. **Watch CI to a terminal state.** Don't idle. If it fails, diagnose: fix if the failure is
    yours; if it's a known flake or pre-existing on main, say so with evidence.
-2. **Wait for hosted review on the current HEAD.** Wait for all applicable hosted-review checks to
-   reach a terminal state, and require at least one repository-configured AI reviewer to complete
-   its review. An inapplicable or skipped reviewer is not a failure, but does not satisfy the
-   at-least-one-review gate.
+2. **Wait for hosted review on the current HEAD.** Capture the exact PR HEAD SHA after pushing.
+   Wait for all applicable hosted-review checks to reach a terminal state, and require at least one
+   repository-configured AI reviewer or check to identify or attest that exact SHA. A stale or
+   unidentifiable review does not satisfy the gate; rerun it or wait for a current review. An
+   inapplicable or skipped reviewer is not a failure, but does not satisfy the at-least-one-review
+   gate.
 3. **Triage every comment** (bots and humans alike). For each one:
    - **Valid:** fix it, then reply saying what changed, and react 👍.
    - **Invalid:** reply explaining concretely why (with code evidence), and react 👎.
@@ -122,9 +126,10 @@ These gates catch different failures; none replaces another:
    your reasoning, the decision that needs making, the trade-offs (pros/cons of each option), and
    your recommendation. Then **poll every 30 minutes for a reply** and continue when it lands.
 5. Wait for every applicable current-HEAD check to reach an accepted terminal state; classify any
-   documented skip explicitly. Repeat until CI is green, a hosted AI review covers the current HEAD,
-   no applicable check is pending or failing, and no comment is outstanding.
-6. For user-facing capability or documentation changes, run the `docs-parity-reviewer` required by
+   documented skip explicitly. Repeat until CI is green, a hosted AI review identifies or attests
+   the current HEAD, no applicable check is pending or failing, and no comment is outstanding.
+6. For a user-facing capability change that affects its paired capability `README.md` and
+   `docs/<capability>.md` surfaces, run the `docs-parity-reviewer` required by
    `agent_docs/review-checklist.md`. Treat blocking findings as merge blockers. Substantive changes
    restart the applicable review and verification gates.
 
@@ -137,9 +142,10 @@ Run this final metadata check after CI and comments have settled:
 2. Give it the PR URL, linked issue, current `base...HEAD` diff, final test status, title, and body.
 3. Ask it to check only the title and body against this section and the root `AGENTS.md`.
 4. Require either `current` or an exact replacement title and body. The reviewer returns text only;
-   the implementing agent applies it.
-5. Apply every correction. Code changes restart the full lifecycle. Metadata-only changes skip code
-   review and CI but must wait for any applicable metadata-triggered checks and feedback.
-6. After a replacement and its checks, repeat with another fresh subagent.
-7. Hand the PR back only after the check reports `current`.
+   the implementing agent applies only objective rule corrections.
+5. Code changes restart the full lifecycle. Metadata-only changes skip code review and CI but must
+   wait for any applicable metadata-triggered checks and feedback.
+6. After one replacement and its checks, repeat with another fresh subagent. Escalate conflicting,
+   repeated, or discretionary rewrites to the maintainer instead of applying another replacement.
+7. Hand the PR back only after the check reports `current` or the maintainer resolves the escalation.
 8. Report the human-only AI-code checkbox separately.
