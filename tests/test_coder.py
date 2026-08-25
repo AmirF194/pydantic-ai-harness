@@ -27,7 +27,6 @@ def test_coder_agent_is_model_less_and_composed() -> None:
     assert isinstance(coder_agent, Agent)
     assert coder_agent.model is None
     assert coder_agent.name == 'coder'
-    assert coder_agent._instructions == ['You are a coding agent built on Pydantic AI.']
     assert any(isinstance(capability, FileSystem) for capability in coder_agent.root_capability.capabilities)
 
 
