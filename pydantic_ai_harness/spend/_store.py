@@ -87,7 +87,7 @@ class SpendEntry:
 class SpendStore(Protocol):
     """Reads and accumulates the counter behind one budget window at a time.
 
-    Deprecated, and removed in 0.20.0. Implement
+    Deprecated, and removed in 0.28.0. Implement
     [`BatchSpendStore`][pydantic_ai_harness.spend.BatchSpendStore] instead: it takes
     every window of a response in one call, which is what lets a backend apply them
     together, and it carries the replay token that keeps a re-executed accrual from
@@ -177,7 +177,7 @@ def as_batch_store(store: SpendStore | BatchSpendStore) -> BatchSpendStore:
         'one window at a time: a response counting against a day and a month budget is two writes, and a failure '
         'between them leaves the day counted and the month not. `SpendEntry.token` is dropped too, so a durable '
         'engine that re-executes the accrual (DBOS recovery, a Prefect flow retry) counts the response twice. '
-        'Implement `get_many` and `add_many` (`BatchSpendStore`) to get both. `SpendStore` is removed in 0.20.0.',
+        'Implement `get_many` and `add_many` (`BatchSpendStore`) to get both. `SpendStore` is removed in 0.28.0.',
         HarnessDeprecationWarning,
         stacklevel=4,
     )
@@ -238,7 +238,7 @@ class InMemorySpendStore:
             return sum(1 for _, expires_at in self._entries.values() if expires_at is None or now < expires_at)
 
     async def get(self, key: str) -> Spent:
-        """What `key` has accumulated. Deprecated in favour of `get_many`, removed in 0.20.0."""
+        """What `key` has accumulated. Deprecated in favour of `get_many`, removed in 0.28.0."""
         return (await self.get_many([key]))[key]
 
     async def add(
@@ -251,7 +251,7 @@ class InMemorySpendStore:
         unpriced: int,
         ttl: timedelta | None,
     ) -> Spent:
-        """Add to `key` and return the result. Deprecated in favour of `add_many`, removed in 0.20.0."""
+        """Add to `key` and return the result. Deprecated in favour of `add_many`, removed in 0.28.0."""
         entry = SpendEntry(key=key, usd=usd, tokens=tokens, requests=requests, unpriced=unpriced, ttl=ttl)
         return (await self.add_many([entry]))[key]
 

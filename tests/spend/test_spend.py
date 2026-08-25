@@ -1335,7 +1335,7 @@ class TestRedisStore:
         assert totals == {'k': Spent(usd=Decimal('5'), requests=3)}
 
     async def test_a_write_to_the_old_name_after_the_new_one_exists_still_counts(self):
-        """A rolling deploy leaves pre-0.18 workers writing the old name for a while.
+        """A rolling deploy leaves workers on an earlier release writing the old name for a while.
 
         Moving the old counter once would have read it before that write and never looked
         again, so the spend a still-running old worker recorded would be enforced against
@@ -1574,7 +1574,7 @@ class TestDeprecatedStore:
         assert len(warned) == 1
         message = str(warned[0].message)
         assert 'one window at a time' in message
-        assert 'removed in 0.20.0' in message
+        assert 'removed in 0.28.0' in message
 
     def test_a_batch_store_is_not_warned_about(self):
         with warnings.catch_warnings():

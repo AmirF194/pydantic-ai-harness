@@ -13,8 +13,8 @@ answer decides whether the store is correct:
 - that a repeated `SpendEntry.token` claims nothing and adds nothing;
 - that a zero `ttl` clears an expiry an earlier finite `retain` set, which is
   `PERSIST` doing work `HINCRBY` would not do on its own;
-- that a counter written under the pre-0.18 untagged key is still read and carried
-  forward.
+- that a counter written under the untagged key an earlier release used is still read
+  and carried forward.
 
 This file covers exactly those. It is not a second copy of the unit suite --
 API-shape coverage belongs there, where it runs on every matrix leg.
@@ -252,9 +252,9 @@ class TestLiveScript:
         assert recovered['k'].requests == 1
 
     async def test_a_counter_written_before_the_hash_tag_is_added_to_the_one_after_it(self, store: RedisSpendStore):
-        """Keys gained a hash tag in 0.18, so an upgrade must not strand what was counted.
+        """Keys gained a hash tag, so an upgrade must not strand what an earlier release counted.
 
-        Written here the way a pre-0.18 harness wrote it: the same name without the tag.
+        Written here the way an earlier release wrote it: the same name without the tag.
         The second write models a worker still running the old version during a rolling
         deploy, which is why the old name is read every time rather than moved once.
         """

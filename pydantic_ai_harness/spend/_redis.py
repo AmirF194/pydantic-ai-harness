@@ -271,7 +271,7 @@ class RedisSpendStore:
             )
 
     async def get(self, key: str) -> Spent:
-        """What `key` has accumulated. Deprecated in favour of `get_many`, removed in 0.20.0."""
+        """What `key` has accumulated. Deprecated in favour of `get_many`, removed in 0.28.0."""
         return (await self.get_many([key]))[key]
 
     async def add(
@@ -284,7 +284,7 @@ class RedisSpendStore:
         unpriced: int,
         ttl: timedelta | None,
     ) -> Spent:
-        """Add to `key` and return the result. Deprecated in favour of `add_many`, removed in 0.20.0.
+        """Add to `key` and return the result. Deprecated in favour of `add_many`, removed in 0.28.0.
 
         One window per call, so a response counting against a day and a month budget is
         two calls and a failure between them leaves the day counted and the month not.
@@ -296,8 +296,8 @@ class RedisSpendStore:
     async def get_many(self, keys: Sequence[str]) -> Mapping[str, Spent]:
         """What each key has accumulated. An absent hash reads as zero.
 
-        Two round trips per key while the pre-0.18 fallback is in place: the key's own
-        hash, and the one a pre-0.18 harness would have written; see `_before_hash_tags`.
+        Two round trips per key while the pre-hash-tag fallback is in place: the key's own
+        hash, and the one an earlier release would have written; see `_before_hash_tags`.
         """
         totals: dict[str, Spent] = {}
         for key in keys:
@@ -310,7 +310,7 @@ class RedisSpendStore:
 
         One unit of work: every window of the response lands or none does, and the script
         returns each new total, so the totals need no second read. What does cost a read
-        is the pre-0.18 fallback, one per key, until it goes away; see `_before_hash_tags`.
+        is the pre-hash-tag fallback, one per key, until it goes away; see `_before_hash_tags`.
 
         A failure before the server runs the script -- the client cannot connect, the
         request never lands -- writes nothing. A failure after it does not say which:
@@ -359,12 +359,14 @@ class RedisSpendStore:
             for entry, row in zip(entries, rows)
         }
 
-    # `_before_hash_tags` and `_legacy_name` carry counters written before 0.18, when the
-    # keys had no hash tag. Delete both and their three call sites (`get_many` and the two
-    # in `add_many`) in 0.20.0, by which point every window written under the old name has
-    # passed the longest `Budget.retain` default.
+    # `_before_hash_tags` and `_legacy_name` carry counters written before the keys gained a
+    # hash tag. Delete both and their three call sites (`get_many` and the two in `add_many`)
+    # in 0.28.0. That is not long enough for every counter under the old name to have gone by
+    # itself -- a `month` window's default horizon is 62 days and `total` has none -- so the
+    # residual gap is the one both docs surfaces name: a window an operator still needs is
+    # theirs to move before that release.
     async def _before_hash_tags(self, key: str) -> Spent:
-        """What this budget key accumulated under the name a pre-0.18 harness used.
+        """What this budget key accumulated under the name an earlier release used.
 
         Added to what the tagged key holds rather than moved into it. Moving it would have
         to decide when the move is complete, and nothing here can know that: a worker
@@ -380,7 +382,7 @@ class RedisSpendStore:
         return _spent(await self.client.hgetall(self._legacy_name(key)))
 
     def _legacy_name(self, key: str) -> str:
-        """The Redis key a pre-0.18 harness wrote this budget key under."""
+        """The Redis key an earlier release wrote this budget key under."""
         return f'{self.prefix}:{key}'
 
     def _name(self, key: str) -> str:
