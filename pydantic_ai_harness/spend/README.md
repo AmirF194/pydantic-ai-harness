@@ -250,7 +250,7 @@ What is left is siblings. Pydantic AI orders innermost capabilities against non-
 
 The capability hooks run in orchestration code, while the model request they wrap is a durable unit -- a Temporal activity, a DBOS step, a Prefect task. All three recover by re-executing orchestration code, so they re-execute the accrual with it, and a window counts the same response more than once: one `$1` model request leaves `$2` in the store after one replay. Pydantic AI wraps its own hook dispatch for that reason -- DBOS routes the event-stream handler through a step "so its side effects are checkpointed and don't re-run when the workflow recovers", and Prefect caches the handler task so "a flow retry that re-executes the same run reproduces the same numbers and replays from cache". The accrual has no such wrapper.
 
-What differs between the engines is whether you find out. Temporal raises on the first request: its workflow sandbox restricts the wall clock the day and month buckets come from, `pydantic_ai_harness` is not among the modules `PydanticAIPlugin` passes through the sandbox, and `SpendLimits` translates that error into what it means rather than into the setting that silences it. Passing the package through the sandbox removes the message, not the replay, and under time-skipping the workflow's day and the key's day still drift apart. DBOS recovery and Prefect flow retry report nothing at all: the counter is simply higher than what was spent, so the budget refuses a request earlier than it should.
+What differs between the engines is whether you find out. Temporal raises on the first request: its workflow sandbox restricts the wall clock the day and month buckets come from, `pydantic_ai_harness` is not among the modules `PydanticAIPlugin` passes through the sandbox, and `SpendLimits` translates that error into what it means rather than into the setting that silences it. Passing the package through the sandbox removes the message, not the replay, and under time-skipping the workflow's day and the key's day still drift apart. DBOS recovery and Prefect flow retry report nothing at all, and which way the counter is wrong depends on the store: a shared one carries the replayed accrual and refuses too early, while the default in-process store starts empty in a recovered worker and admits too much.
 
 Refuse the workflow **admission** before starting it instead. That is why `exhausted()` works without a `RunContext`:
 
@@ -279,8 +279,10 @@ in [#531](https://github.com/pydantic/pydantic-ai-harness/issues/531).
 For a ceiling that covers one run and nothing else, Pydantic AI's own
 [`UsageLimits`](https://pydantic.dev/docs/ai/core-concepts/agent/#usage-limits) does the same job
 in-process with no store and no capability: `total_tokens_limit` for tokens and `cost_limit` for
-money, both over a single `run()`. It also carries the two input-token granularities `SpendLimits`
-has no equivalent for: `input_tokens_limit` is cumulative over the run, and
+money, both over a single `run()`. `cost_limit` goes unenforced on a response the registry cannot
+price -- a `CostNotFoundWarning` once the run is over rather than a refusal during it -- where
+`SpendLimits` lets `on_unpriced` decide. It also carries the two input-token granularities
+`SpendLimits` has no equivalent for: `input_tokens_limit` is cumulative over the run, and
 `per_request_input_tokens_limit` caps one request against the provider-reported
 input tokens of the response that already paid for it. `count_tokens_before_request=True` counts
 the pending request with the model's own `count_tokens` and applies both limits to that count
