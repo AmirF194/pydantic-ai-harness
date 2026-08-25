@@ -75,7 +75,7 @@ def _run_ctx(
     deps: Any = None,
     trace_include_content: bool = False,
     tracer: Tracer | None = None,
-    root_capability: AbstractCapability[Any] | None = None,
+    root_capability: AbstractCapability[None] | None = None,
 ) -> RunContext[Any]:
     return RunContext(
         deps=deps,
@@ -585,7 +585,7 @@ class _HooksWithItsOwnWrapper(Hooks[None]):
 
 
 async def _passthrough(
-    ctx: RunContext[Any],
+    ctx: RunContext[None],
     /,
     *,
     request_context: ModelRequestContext,
