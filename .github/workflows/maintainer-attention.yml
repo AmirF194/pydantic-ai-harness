@@ -35,7 +35,7 @@ jobs:
       (github.event_name == 'workflow_dispatch' ||
       github.event.schedule == '10 */6 * * *')
     permissions:
-      actions: read
+      actions: write
       checks: read
       contents: read
       issues: write
