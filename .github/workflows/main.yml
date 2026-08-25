@@ -176,6 +176,26 @@ jobs:
           path: coverage-data/.coverage.*
           include-hidden-files: true
 
+  background-tools-prefect:
+    runs-on: ubuntu-latest
+    name: background tools with Prefect
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - uses: astral-sh/setup-uv@cec208311dfd045dd5311c1add060b2062131d57 # v8.0.0
+        with:
+          python-version: '3.14'
+          enable-cache: true # zizmor: ignore[cache-poisoning] -- Job does not produce release artifacts and has no secrets
+          cache-suffix: background-tools-prefect
+
+      - run: uv sync --locked --group dev
+      - run: uv run --with 'pydantic-ai-slim[prefect]>=2.28.0' pytest integration_tests/prefect/test_background_tools.py
+        env:
+          PREFECT_SERVER_ANALYTICS_ENABLED: 'false'
+
   # Verify the harness still works against the lowest direct-dep versions we claim
   # compatibility with (the `>=` floors in pyproject.toml — including pydantic-ai-slim
   # but also any other direct dep). The default `test` matrix above resolves against
@@ -472,7 +492,7 @@ jobs:
 
   check:
     if: always()
-    needs: [changes, lint, test, test-floor, test-latest, base-import, coverage, localstack-integration, mongodb-integration, redis-integration]
+    needs: [changes, lint, test, background-tools-prefect, test-floor, test-latest, base-import, coverage, localstack-integration, mongodb-integration, redis-integration]
     runs-on: ubuntu-latest
     steps:
       - uses: re-actors/alls-green@05ac9388f0aebcb5727afa17fcccfecd6f8ec5fe # v1.2.2

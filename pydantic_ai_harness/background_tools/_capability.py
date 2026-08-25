@@ -8,8 +8,7 @@ from typing import TYPE_CHECKING, Any
 import anyio
 from anyio.abc import Event, TaskGroup
 from pydantic_ai.capabilities import AbstractCapability
-from pydantic_ai.durable_exec._base import BaseDurabilityCapability  # pyright: ignore[reportPrivateUsage]
-from pydantic_ai.exceptions import ApprovalRequired, CallDeferred, ToolFailedError, ToolRetryError, UserError
+from pydantic_ai.exceptions import ApprovalRequired, CallDeferred, ToolFailedError, ToolRetryError
 from pydantic_ai.messages import ToolCallPart
 from pydantic_ai.tools import (
     AgentDepsT,
@@ -23,7 +22,6 @@ from pydantic_ai.tools import (
 if TYPE_CHECKING:
     from pydantic_ai import _agent_graph
     from pydantic_ai._instructions import AgentInstructions
-    from pydantic_ai.agent import AbstractAgent
     from pydantic_ai.capabilities.abstract import WrapRunHandler, WrapToolExecuteHandler
     from pydantic_ai.result import FinalResult
     from pydantic_ai.run import AgentRunResult
@@ -97,8 +95,11 @@ class BackgroundTools(AbstractCapability[AgentDepsT]):
         do not have this cross-thread race, but delivery still requires the run to
         continue.
 
-    Durable execution is rejected because in-process tasks cannot survive workflow
-    replay or worker restart.
+    `BackgroundTools` composes with Temporal and Prefect durable execution. With DBOS,
+    ordinary function tools are not automatically durable steps, so a background tool
+    must delegate durable work to an explicit DBOS step. A tool handler running inside
+    a durable activity or task must not call `ctx.enqueue()` because replay restores
+    only its return value.
     """
 
     tools: ToolSelector[AgentDepsT] = field(default_factory=lambda: {'background': True})
@@ -118,16 +119,6 @@ class BackgroundTools(AbstractCapability[AgentDepsT]):
 
     def get_instructions(self) -> AgentInstructions[AgentDepsT] | None:
         return _INSTRUCTIONS
-
-    def for_agent(self, agent: AbstractAgent[AgentDepsT, object]) -> AbstractCapability[AgentDepsT]:
-        siblings: list[AbstractCapability[AgentDepsT]] = []
-        agent.root_capability.apply(siblings.append)
-        if any(isinstance(sibling, BaseDurabilityCapability) for sibling in siblings):
-            raise UserError(
-                '`BackgroundTools` does not support durable execution because in-process tasks cannot survive '
-                'workflow replay or worker restart.'
-            )
-        return self
 
     async def for_run(self, ctx: RunContext[AgentDepsT]) -> BackgroundTools[AgentDepsT]:
         run_capability = replace(self)

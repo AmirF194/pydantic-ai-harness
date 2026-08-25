@@ -10,7 +10,7 @@ from collections.abc import Callable
 import anyio
 import pytest
 from pydantic_ai import Agent, CancellationToken, RunCancelled
-from pydantic_ai.exceptions import ApprovalRequired, CallDeferred, ModelRetry, ToolFailed, UserError
+from pydantic_ai.exceptions import ApprovalRequired, CallDeferred, ModelRetry, ToolFailed
 from pydantic_ai.messages import (
     ModelMessage,
     ModelRequest,
@@ -21,7 +21,6 @@ from pydantic_ai.messages import (
     UserPromptPart,
 )
 from pydantic_ai.models.function import AgentInfo, FunctionModel
-from pydantic_ai.models.test import TestModel
 from pydantic_ai.tools import DeferredToolRequests
 
 from pydantic_ai_harness import BackgroundTools
@@ -509,10 +508,3 @@ class TestBackgroundTools:
         result = await agent.run('go')
 
         assert _ack_seen(result.all_messages())
-
-    async def test_rejects_durable_execution(self) -> None:
-        pytest.importorskip('temporalio')
-        from pydantic_ai.durable_exec.temporal import TemporalDurability
-
-        with pytest.raises(UserError, match='does not support durable execution'):
-            Agent(TestModel(), capabilities=[BackgroundTools(), TemporalDurability()])

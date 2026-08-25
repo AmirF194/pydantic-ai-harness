@@ -105,7 +105,17 @@ cancellation.
 
 - **Streaming**: `run_stream()` completes on the model's final response and does not take the extra model turn that delivers late results, so background results are only guaranteed with `agent.run()` or a driven `agent.iter()` loop.
 - **Result hooks**: Background tool results do not pass through [Guardrails](guardrails.md) result guards, `ToolOutputLimits`, or other result hooks. Screen and bound the result inside the tool instead.
-- **Durable execution**: in-process tasks cannot survive workflow replay or worker restart, so this composition is rejected at agent construction.
+
+## Durable execution
+
+`BackgroundTools` works with Temporal and Prefect durable execution. A replay or retry rebuilds the
+run-local background task while the durability integration restores or reruns the tool handler.
+
+With DBOS, ordinary function tools are not automatically durable steps. Delegate the durable work
+inside a background tool to an explicit DBOS step.
+
+A tool handler running inside a durable activity or task must not call `ctx.enqueue()`. Replay
+restores the handler's return value, not messages enqueued while the handler ran.
 
 ## API
 
