@@ -235,9 +235,9 @@ The fields above are what `SpendLimits.from_spec` names in its signature, which 
 ## API
 
 `SpendLimits`, `Budget`, `SpendSnapshot`, `BudgetStatus`, `Spent`, `SpendStore`,
-`InMemorySpendStore`, `RedisSpendStore`, `SpendLimitExceeded`, `UnpricedModelError`, and
-`SpendCompositionWarning` are exported from `pydantic_ai_harness.spend`. Signatures and defaults are rendered from the
-source on the [docs page](https://pydantic.dev/docs/ai/harness/spend/), which is the copy
-that cannot drift.
+`InMemorySpendStore`, `RedisSpendStore`, `SpendLimitExceeded`, `UnpricedModelError`,
+`UnpricedModelWarning`, and `SpendCompositionWarning` are exported from
+`pydantic_ai_harness.spend`. Signatures and defaults are rendered from the source on the
+[docs page](https://pydantic.dev/docs/ai/harness/spend/), which is the copy that cannot drift.
 
 `SpendLimitExceeded` subclasses `UsageLimitExceeded`, so code that already stops on a usage limit stops here too, while code that needs to tell a spent daily budget from an over-long run can catch it specifically. `UnpricedModelError` subclasses `UserError`.

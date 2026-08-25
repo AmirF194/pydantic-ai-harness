@@ -258,4 +258,6 @@ Source: [`pydantic_ai_harness/spend/`](https://github.com/pydantic/pydantic-ai-h
 
 ::: pydantic_ai_harness.spend.UnpricedModelError
 
+::: pydantic_ai_harness.spend.UnpricedModelWarning
+
 ::: pydantic_ai_harness.spend.SpendCompositionWarning
