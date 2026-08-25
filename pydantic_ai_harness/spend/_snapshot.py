@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from collections.abc import Generator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from decimal import Decimal, localcontext
 from typing import TYPE_CHECKING, Any
@@ -22,11 +24,17 @@ Wide enough for the signed 64-bit range of billionths a counter can reach.
 """
 
 
-def summed(*amounts: Decimal) -> Decimal:
-    """The total of `amounts` at `MONEY_PRECISION`, whatever the caller's context is set to."""
+@contextmanager
+def money_precision() -> Generator[None]:
+    """Run `Decimal` arithmetic at `MONEY_PRECISION` rather than at whatever the caller set.
+
+    Wraps the operation rather than replacing it, so one guard covers a sum, a difference
+    and a product instead of one helper per operator. Copies the caller's context and moves
+    only `prec`, so rounding and traps are left as the application chose them.
+    """
     with localcontext() as context:
         context.prec = MONEY_PRECISION
-        return sum(amounts, Decimal(0))
+        yield
 
 
 @dataclass(frozen=True, kw_only=True)

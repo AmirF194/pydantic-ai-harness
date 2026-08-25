@@ -30,7 +30,7 @@ from pydantic_ai.tools import AgentDepsT, RunContext
 
 from pydantic_ai_harness.spend._budget import Budget, BudgetSpec, bucket, delimited, scope_key, store_key
 from pydantic_ai_harness.spend._exceptions import SpendLimitExceeded, UnpricedModelError, UnpricedModelWarning
-from pydantic_ai_harness.spend._snapshot import BudgetStatus, SpendSnapshot, Spent
+from pydantic_ai_harness.spend._snapshot import BudgetStatus, SpendSnapshot, Spent, money_precision
 from pydantic_ai_harness.spend._store import (
     BatchSpendStore,
     InMemorySpendStore,
@@ -85,13 +85,16 @@ class SpendLimits(AbstractCapability[AgentDepsT]):
     budget that reset every run would not be a daily budget. Per-run isolation
     comes from `Budget(window='run')`, whose key carries the run id.
 
-    Durable execution: not supported inside a Temporal workflow. The hooks run in
-    workflow code while only the model request is the activity, so Temporal replays
-    the accrual and a window counts the same response more than once. `exhausted()`
-    works without a `RunContext` so a workflow can at least be refused admission on
-    what is already recorded -- but a workflow admitted that way records nothing of
-    its own, so it is a gate on the door, not a budget on what happens inside.
-    Tracked in <https://github.com/pydantic/pydantic-ai-harness/issues/531>.
+    Durable execution: not supported inside a Temporal workflow. These hooks run in
+    workflow code while only the model request is the activity, and the run stops
+    before any accrual, on the wall clock `before_model_request` reads to pick the
+    window, which the sandbox restricts. `SpendEntry.token` is what makes the accrual
+    itself replay-safe on DBOS and Prefect; it does not reach this, because nothing
+    accrues. `exhausted()` works without a `RunContext` so a workflow can at least be
+    refused admission on what is already recorded -- but a workflow admitted that way
+    records nothing of its own, so it is a gate on the door, not a budget on what
+    happens inside. Tracked in
+    <https://github.com/pydantic/pydantic-ai-harness/issues/531>.
     """
 
     budgets: Sequence[Budget[AgentDepsT]] = ()
@@ -510,9 +513,10 @@ class SpendLimits(AbstractCapability[AgentDepsT]):
                 raise
             raise UserError(
                 'SpendLimits is not safe to run inside a Temporal workflow. Its hooks run in '
-                'workflow code rather than in the model activity, so Temporal replays them and a '
-                'window counts the same response more than once; the clock they read is why the '
-                'sandbox stopped this. Refuse the workflow admission before starting it instead, '
+                'workflow code rather than in the model activity, and the clock they read to pick '
+                'the budget window is what the sandbox stopped here; a workflow day and a key day '
+                'diverge under time-skipping even once it is let through. Refuse the workflow '
+                'admission before starting it instead, '
                 'with `exhausted()` -- which reads the counters and does not move them, so it '
                 'bounds what has already been recorded rather than what the workflow will spend. '
                 'See https://github.com/pydantic/pydantic-ai-harness/issues/531'
@@ -557,8 +561,20 @@ class SpendLimits(AbstractCapability[AgentDepsT]):
         caller-supplied run id can contain anything: joined on a separator,
         `provider_name='a|b'` with id `'c'` and `provider_name='a'` with id `'b|c'` name
         the same response, and the second one's spend is dropped as a replay of the first.
+
+        An empty `provider_response_id` takes the fallback rather than the primary path.
+        The field is a plain `str` on the wire -- `ChatCompletion.id` is required and
+        unnormalised -- so an OpenAI-compatible server answering `"id": ""` would otherwise
+        name every one of its responses the same, and every response after the first would
+        be dropped as a replay of it. Core reads the same field for truth rather than for
+        presence where it matters (`models/_continuation.py`, `models/openai.py`).
+
+        What is left is a server that reports a non-empty id and repeats it. Nothing here
+        can tell that from a genuine replay, so this assumes a reported id identifies the
+        response, which is what the field means. Tracked in
+        <https://github.com/pydantic/pydantic-ai-harness/issues/693>.
         """
-        if response.provider_response_id is not None:
+        if response.provider_response_id:
             return delimited(response.provider_name or '', response.provider_response_id)
         return delimited(ctx.run_id or '', str(ctx.run_step), response.timestamp.isoformat())
 
@@ -624,8 +640,14 @@ class SpendLimits(AbstractCapability[AgentDepsT]):
 
 
 def _status(budget: Budget[Any], key: str, spent: Spent) -> BudgetStatus:
-    """Pair a budget with what its window has accumulated."""
-    remaining_usd = None if budget.usd is None else budget.usd - spent.usd
+    """Pair a budget with what its window has accumulated.
+
+    `remaining_usd` under `money_precision` for the same reason the counter itself is: an
+    application that lowered `Decimal` precision for its own arithmetic would otherwise be
+    told a rounded number by a store that holds an exact one.
+    """
+    with money_precision():
+        remaining_usd = None if budget.usd is None else budget.usd - spent.usd
     remaining_tokens = None if budget.tokens is None else budget.tokens - spent.tokens
     return BudgetStatus(
         budget=budget,
@@ -640,12 +662,17 @@ def _status(budget: Budget[Any], key: str, spent: Spent) -> BudgetStatus:
 
 
 def _warning(budget: Budget[Any], spent: Spent) -> bool:
-    """Whether spend has crossed the budget's warning fraction."""
+    """Whether spend has crossed the budget's warning fraction.
+
+    The USD product is taken under `money_precision`: rounded at the application's, a
+    crossing near the fraction reports the wrong side of it.
+    """
     if budget.warn_at is None:
         return False
     fraction = Decimal(str(budget.warn_at))
-    if budget.usd is not None and spent.usd >= budget.usd * fraction:
-        return True
+    with money_precision():
+        if budget.usd is not None and spent.usd >= budget.usd * fraction:
+            return True
     return budget.tokens is not None and spent.tokens >= budget.tokens * fraction
 
 

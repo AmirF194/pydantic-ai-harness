@@ -11,29 +11,28 @@ from __future__ import annotations
 from collections.abc import Awaitable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import timedelta
-from decimal import ROUND_HALF_UP, Decimal, localcontext
+from decimal import ROUND_HALF_UP, Decimal
 from typing import Protocol, runtime_checkable
 
 from pydantic_ai.exceptions import UserError
 
 from pydantic_ai_harness.spend._budget import SEPARATOR, delimited
-from pydantic_ai_harness.spend._snapshot import MONEY_PRECISION, Spent, summed
+from pydantic_ai_harness.spend._snapshot import Spent, money_precision
 from pydantic_ai_harness.spend._store import DEFAULT_DEDUP_RETAIN, SpendEntry, warn_unreachable_overrides
 
 _SCALE = Decimal(10) ** 9
 
-_MARKER = 'dedup'
-"""First segment of a dedup marker's name, and a prefix a budget key may not carry.
+_MARKER = f'{SEPARATOR}dedup'
+"""First segment of a dedup marker's name.
 
 Markers and counters share one namespace so a script can take both and stay in one Redis
-Cluster slot. That makes them nameable from each other: a budget key of
-`dedup|1:a|1:b` names the marker for `SpendEntry(key='a', token='b')`, and `HINCRBY` on
-the string a marker holds fails the whole script with `WRONGTYPE`. `_name` refuses such a
-key for the reason `__post_init__` refuses a brace in the prefix -- the failure otherwise
-reaches the caller as a Redis type error naming neither key.
+Cluster slot, which means the two must not be able to name each other: a counter under a
+marker's name would meet `HINCRBY` against the string a marker holds, and Redis answers
+`WRONGTYPE` and aborts the whole script.
 
-Nothing `SpendLimits` builds can reach it: `store_key`'s second segment is a `Window`
-literal and a marker's is a length prefix. A caller driving the store itself can.
+The leading `SEPARATOR` is what keeps them apart, and it costs nothing to carry. A budget
+key is `store_key`'s `name|window|scope|bucket` and `Budget.name` is refused empty, so a
+budget key never starts with the separator and no configuration reaches this namespace.
 """
 
 _USD_FIELD = 'usd_nanos'
@@ -156,15 +155,13 @@ def _to_nanos(usd: Decimal) -> int:
     The local context is pinned so an application that lowered `Decimal`
     precision for its own arithmetic cannot silently truncate money here.
     """
-    with localcontext() as context:
-        context.prec = MONEY_PRECISION
+    with money_precision():
         return int((usd * _SCALE).to_integral_value(rounding=ROUND_HALF_UP))
 
 
 def _from_nanos(nanos: int) -> Decimal:
     """Whole billionths back to US dollars."""
-    with localcontext() as context:
-        context.prec = MONEY_PRECISION
+    with money_precision():
         return Decimal(nanos) / _SCALE
 
 
@@ -210,15 +207,16 @@ def _spent(fields: Mapping[str | bytes, str | bytes]) -> Spent:
 def _merged(current: Spent, previous: Spent) -> Spent:
     """One window's counters across the two key names it may be spread over.
 
-    `summed` rather than `+`: both totals reach here exact, and plain addition would take the
-    application's `Decimal` precision rather than the one the counters are held at.
+    Under `money_precision` because both totals reach here exact, and plain addition would
+    take the application's `Decimal` precision rather than the one the counters are held at.
     """
-    return Spent(
-        usd=summed(current.usd, previous.usd),
-        tokens=current.tokens + previous.tokens,
-        requests=current.requests + previous.requests,
-        unpriced_requests=current.unpriced_requests + previous.unpriced_requests,
-    )
+    with money_precision():
+        return Spent(
+            usd=current.usd + previous.usd,
+            tokens=current.tokens + previous.tokens,
+            requests=current.requests + previous.requests,
+            unpriced_requests=current.unpriced_requests + previous.unpriced_requests,
+        )
 
 
 @dataclass
@@ -379,10 +377,11 @@ class RedisSpendStore:
 
     # `_before_hash_tags` and `_legacy_name` carry counters written before the keys gained a
     # hash tag. Delete both and their three call sites (`get_many` and the two in `add_many`)
-    # in 0.28.0. That is not long enough for every counter under the old name to have gone by
-    # itself -- a `month` window's default horizon is 62 days and `total` has none -- so the
-    # residual gap is the one both docs surfaces name: a window an operator still needs is
-    # theirs to move before that release.
+    # in 0.28.0 -- but not as a bare deletion: a `total` window never expires and a
+    # `retain='forever'` one does not either, so whatever is still under the old name is
+    # subtracted from the enforced total the moment the fallback goes. What that release owes
+    # an operator is settled in
+    # <https://github.com/pydantic/pydantic-ai-harness/issues/694>.
     async def _before_hash_tags(self, key: str) -> Spent:
         """What this budget key accumulated under the name an earlier release used.
 
@@ -404,16 +403,7 @@ class RedisSpendStore:
         return f'{self.prefix}:{key}'
 
     def _name(self, key: str) -> str:
-        """The Redis key for a budget key, hash-tagged so one script may take several.
-
-        Refuses a key that would name a dedup marker instead of a counter; see `_MARKER`.
-        """
-        if key.startswith(f'{_MARKER}{SEPARATOR}'):
-            raise UserError(
-                f'A spend key must not start with {_MARKER + SEPARATOR!r}; got {key!r}. That prefix names this '
-                "store's dedup markers, which hold a string rather than a hash, so the counter would fail with "
-                '`WRONGTYPE` on the next write instead of accumulating.'
-            )
+        """The Redis key for a budget key, hash-tagged so one script may take several."""
         return self._tagged(key)
 
     def _tagged(self, name: str) -> str:

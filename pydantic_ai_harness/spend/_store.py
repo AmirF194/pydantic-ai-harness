@@ -21,7 +21,7 @@ from threading import Lock
 from typing import Protocol, runtime_checkable
 
 from pydantic_ai_harness._warn import HarnessDeprecationWarning
-from pydantic_ai_harness.spend._snapshot import Spent, summed
+from pydantic_ai_harness.spend._snapshot import Spent, money_precision
 
 _Entries = dict[str, tuple[Spent, 'datetime | None']]
 """Each key's counter and the moment it stops counting, if it ever does."""
@@ -336,12 +336,13 @@ class InMemorySpendStore:
                 if self._already_applied(entry, now, claimed):
                     totals[entry.key] = current
                     continue
-                updated = Spent(
-                    usd=summed(current.usd, entry.usd),
-                    tokens=current.tokens + entry.tokens,
-                    requests=current.requests + entry.requests,
-                    unpriced_requests=current.unpriced_requests + entry.unpriced,
-                )
+                with money_precision():
+                    updated = Spent(
+                        usd=current.usd + entry.usd,
+                        tokens=current.tokens + entry.tokens,
+                        requests=current.requests + entry.requests,
+                        unpriced_requests=current.unpriced_requests + entry.unpriced,
+                    )
                 pending[entry.key] = (updated, None if entry.ttl is None else now + entry.ttl)
                 if entry.token is not None and self.dedup_retain is not None:
                     claimed[(entry.key, entry.token)] = now + self._remembered_for(entry)

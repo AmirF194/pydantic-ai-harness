@@ -1200,7 +1200,7 @@ class TestRedisStore:
         )
 
         assert set(client.hashes) == {'{acme}:b|day|*|2026-08-04', '{acme}:b|month|*|2026-08'}
-        assert all(marker.startswith('{acme}:dedup|') for marker in client.markers)
+        assert all(marker.startswith('{acme}:|dedup|') for marker in client.markers)
 
     @pytest.mark.parametrize('prefix', ['{acme}', ''])
     def test_a_prefix_that_would_break_the_hash_tag_is_refused(self, prefix: str):
@@ -1446,29 +1446,36 @@ class TestRedisStore:
         with pytest.raises(SpendLimitExceeded):
             await agent.run('hi')
 
-    @pytest.mark.parametrize('key', ['dedup|1:a|1:b', 'dedup|'])
-    async def test_a_key_that_would_name_a_marker_is_refused(self, key: str):
-        """Markers and counters share a namespace, so a crafted key could name the wrong one.
+    async def test_a_budget_named_for_the_marker_sentinel_still_counts(self):
+        """A marker's name starts with the separator, which no budget key can.
 
-        `SpendEntry(key='a', token='b')` marks `dedup|1:a|1:b`, which Redis holds as a string;
-        a counter under that name would fail the whole script with `WRONGTYPE`. Nothing
-        `SpendLimits` builds reaches it -- `store_key`'s second segment is a `Window` literal --
-        but a caller driving the store can.
+        `store_key` is `name|window|scope|bucket` and `Budget.name` is refused empty, so a
+        budget key never begins with one. That is what keeps counters and markers from naming
+        each other in the namespace they share, and it means no configuration is off limits.
         """
-        store = RedisSpendStore(FakeRedis())
+        guard = SpendLimits(
+            budgets=[Budget(usd=Decimal('10'), window='day', name='dedup')],
+            store=RedisSpendStore(FakeRedis()),
+            price=lambda r: Decimal('1'),
+        )
 
-        with pytest.raises(UserError, match='must not start with'):
-            await store.get_many([key])
-        with pytest.raises(UserError, match='must not start with'):
-            await store.add_many([SpendEntry(key=key, usd=Decimal('1'), requests=1)])
+        await _record(guard)
 
-    async def test_a_key_merely_starting_with_the_word_is_kept(self):
-        """The sentinel is `dedup` plus the separator, so an ordinary budget named for it works."""
-        store = RedisSpendStore(FakeRedis())
+        spent = (await guard.status())[0].spent
+        assert (spent.usd, spent.requests) == (Decimal('1'), 1)
 
-        assert await store.add_many([SpendEntry(key='dedup', usd=Decimal('1'), requests=1)]) == {
-            'dedup': Spent(usd=Decimal('1'), requests=1)
-        }
+    async def test_a_marker_cannot_be_named_by_a_budget_key(self):
+        """The separator prefix, asserted on the names themselves rather than on a symptom."""
+        client = FakeRedis()
+        store = RedisSpendStore(client)
+
+        await store.add_many([SpendEntry(key='dedup|1:a|1:b', usd=Decimal('1'), requests=1, token='t')])
+
+        counters = [name for name in client.hashes]
+        markers = list(client.markers)
+        assert counters == ['{pydantic-ai-harness:spend}:dedup|1:a|1:b']
+        assert markers == ['{pydantic-ai-harness:spend}:|dedup|13:dedup|1:a|1:b|1:t']
+        assert not set(counters) & set(markers)
 
     async def test_an_application_s_own_decimal_precision_does_not_round_the_total(self):
         """The counter comes back exact, and merging the pre-hash-tag one must keep it that way."""
@@ -1579,6 +1586,21 @@ class TestIdempotentAccrual:
         await _record(guard, ctx=_run_ctx(run_id='other'), response=response)
 
         assert (await guard.status())[0].spent == Spent(usd=Decimal('2'), tokens=2200, requests=2)
+
+    async def test_an_empty_provider_response_id_is_not_an_identity(self):
+        """`ChatCompletion.id` is a plain required `str`, so a server can answer `""`.
+
+        Read for presence rather than truth, every response from that provider names the
+        same token and everything after the first is dropped as a replay of it -- the brake
+        releasing late, which is the direction this capability exists to avoid. Core reads
+        the same field for truth (`models/_continuation.py`, `models/openai.py`).
+        """
+        guard = SpendLimits(budgets=[Budget(window='total')], price=lambda r: Decimal('1'))
+
+        for _ in range(3):
+            await _record(guard, response=_response(provider_response_id=''))
+
+        assert (await guard.status())[0].spent.requests == 3
 
     async def test_two_responses_of_one_run_both_count(self):
         """The marker identifies a response, so it must not swallow the next one."""
@@ -1743,6 +1765,29 @@ class TestUnreachableOverrides:
 
         with pytest.warns(HarnessDeprecationWarning, match='never called'):
             Mirrored(FakeRedis())
+
+
+class TestReportedPrecision:
+    """What a caller is told stays exact whatever precision the application set."""
+
+    async def test_a_lowered_precision_does_not_round_what_status_reports(self):
+        """`Spent.usd` and the two numbers derived from it are pinned together.
+
+        Rounded, a `warn_at` crossing reports the wrong side of itself and `remaining_usd`
+        contradicts the `spent` on the same dataclass. Enforcement is unaffected -- `_check`
+        compares directly and rounding cannot cross zero -- but the reading ships wrong.
+        """
+        store = InMemorySpendStore()
+        guard = SpendLimits[None](budgets=[Budget(usd=Decimal('1234.56789'), window='total', warn_at=0.8)], store=store)
+        await store.add_many([SpendEntry(key=(await guard.status())[0].key, usd=Decimal('987.654321'), requests=1)])
+
+        with localcontext() as context:
+            context.prec = 4
+            status = (await guard.status())[0]
+
+        assert status.spent.usd == Decimal('987.654321')
+        assert status.remaining_usd == Decimal('246.913569')
+        assert status.warning is True
 
 
 class TestToolset:
