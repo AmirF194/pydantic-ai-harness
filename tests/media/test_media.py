@@ -563,20 +563,93 @@ class TestExternalizeRestoreWalker:
         assert externalized['__harness_external_text__'] is True
         assert await restore_media(externalized, media_store=store) == node
 
-    async def test_invalid_escaped_marker_fields_raise(self, tmp_path: Path) -> None:
-        """A versioned marker with a malformed escaped-key mapping fails loudly."""
+    @pytest.mark.parametrize(
+        'escaped_keys',
+        [
+            pytest.param(['not', 'a', 'mapping'], id='not-a-mapping'),
+            pytest.param({}, id='empty-mapping'),
+            pytest.param({'caller': 'value'}, id='keys-we-never-write'),
+        ],
+    )
+    async def test_marker_metadata_keys_the_writer_never_produced_are_caller_data(
+        self, tmp_path: Path, escaped_keys: object
+    ) -> None:
+        """A marker whose escape keys do not have the writer's shape keeps them as the payload's own.
+
+        Both keys are collidable, so a marker written before the escaping format
+        existed can carry them as caller data. Reading them as an escape stash
+        would drop them; rejecting the marker would make a snapshot that reads
+        today unreadable. It degrades to leaving them alone instead.
+        """
+        import base64
+
+        store = DiskMediaStore(tmp_path)
+        payload = b'\x03' * 16
+        uri = await store.put(payload)
+        marker: dict[str, object] = {
+            '__harness_external_media__': True,
+            '__harness_external_uri__': uri,
+            '__harness_external_marker_format__': 'escaped-keys-v1',
+            '__harness_external_escaped_keys__': escaped_keys,
+            'kind': 'binary',
+        }
+
+        restored = await restore_media(marker, media_store=store)
+
+        assert restored == {
+            'kind': 'binary',
+            'data': base64.b64encode(payload).decode('ascii'),
+            '__harness_external_marker_format__': 'escaped-keys-v1',
+            '__harness_external_escaped_keys__': escaped_keys,
+        }
+
+    async def test_unsupported_escaped_keys_format_raises(self, tmp_path: Path) -> None:
+        """A stash with the writer's shape but a version this reader does not know fails loudly.
+
+        The shape says the harness wrote it, so silently ignoring the stash would
+        strip the caller's values. This reader is the only one that can reject a
+        later format, so it has to.
+        """
         store = DiskMediaStore(tmp_path)
         uri = await store.put(b'payload')
         marker = {
             '__harness_external_media__': True,
             '__harness_external_uri__': uri,
-            '__harness_external_marker_format__': 'escaped-keys-v1',
-            '__harness_external_escaped_keys__': ['not', 'a', 'mapping'],
+            '__harness_external_marker_format__': 'escaped-keys-v2',
+            '__harness_external_escaped_keys__': {'__harness_external_uri__': 'caller-uri'},
             'kind': 'binary',
         }
 
-        with pytest.raises(ValueError, match='invalid escaped keys'):
+        with pytest.raises(ValueError, match='unsupported escaped-keys format'):
             await restore_media(marker, media_store=store)
+
+    async def test_escaped_marker_restores_on_a_pre_escaping_reader(self, tmp_path: Path) -> None:
+        """A reader that predates the escaping format still re-inlines an escaped marker.
+
+        Compatibility in this direction is upgrade-only, and this pins what the
+        older reader gets: the externalized field intact, the caller's escaped
+        value still sitting in the stash rather than back under its own key.
+        """
+        import base64
+
+        store = DiskMediaStore(tmp_path)
+        b64_payload = base64.b64encode(b'\x04' * 70_000).decode('ascii')
+        node: dict[str, object] = {
+            'kind': 'binary',
+            'data': b64_payload,
+            '__harness_external_uri__': 'caller-uri',
+        }
+
+        marker = await externalize_media(node, media_store=store, threshold_bytes=64 * 1024)
+        assert _is_marker_dict(marker)
+
+        rolled_back = await _restore_as_pre_pr_reader(marker, store)
+        assert rolled_back['data'] == b64_payload
+        assert rolled_back['__harness_external_escaped_keys__'] == {'__harness_external_uri__': 'caller-uri'}
+        assert rolled_back['__harness_external_marker_format__'] == 'escaped-keys-v1'
+
+        # The current reader puts the caller's value back where it belongs.
+        assert await restore_media(marker, media_store=store) == node
 
     async def test_legacy_uri_marker_restores(self, tmp_path: Path) -> None:
         """A marker in the pre-`_URI_KEY` format (blob ref under plain `uri`) restores.

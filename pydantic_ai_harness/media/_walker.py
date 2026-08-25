@@ -223,6 +223,17 @@ def _escape_marker_metadata(marker: dict[str, object]) -> None:
         marker[_ESCAPED_KEYS] = escaped
 
 
+def _is_escape_stash(value: object) -> TypeGuard[dict[str, object]]:
+    """Does `value` have the shape `_escape_marker_metadata` writes?
+
+    `_ESCAPED_KEYS` and `_MARKER_FORMAT` are themselves keys a caller can own, so
+    a marker carrying them is not evidence that this format wrote them. Matching
+    on the stash's shape rather than on `_MARKER_FORMAT`'s value is what keeps a
+    marker written before this format existed from being read as one.
+    """
+    return _is_json_dict(value) and bool(value) and not (value.keys() - _MARKER_METADATA_KEYS)
+
+
 async def _preserve_fields(
     node: dict[str, object],
     externalized_key: str,
@@ -263,10 +274,18 @@ async def restore_media(node: object, *, media_store: MediaStore) -> object:
 async def _restore_external(node: dict[str, object], media_store: MediaStore) -> dict[str, object]:
     dropped = {_EXTERNAL_MARKER, _TEXT_MARKER}
     escaped: dict[str, object] | None = None
-    if node.get(_MARKER_FORMAT) == _ESCAPED_KEYS_FORMAT:
-        escaped_value = node.get(_ESCAPED_KEYS)
-        if not _is_json_dict(escaped_value):
-            raise ValueError(f'externalized media marker has invalid escaped keys: {node!r}')
+    escaped_value = node.get(_ESCAPED_KEYS)
+    # An ambiguous match degrades to "this is caller data" instead of raising: a
+    # marker written before this format existed can carry both keys as the
+    # payload's own, and rejecting it would turn a snapshot that reads today into
+    # one that cannot be read at all, with no recovery path. Once the stash does
+    # have our shape the version is ours to read, so an unrecognized one is a
+    # marker this reader cannot restore and has to say so rather than drop the
+    # stash on the floor.
+    if _is_escape_stash(escaped_value):
+        marker_format = node.get(_MARKER_FORMAT)
+        if marker_format != _ESCAPED_KEYS_FORMAT:
+            raise ValueError(f'externalized media marker has an unsupported escaped-keys format: {marker_format!r}')
         escaped = escaped_value
         dropped.update({_MARKER_FORMAT, _ESCAPED_KEYS})
     if _URI_KEY in node:

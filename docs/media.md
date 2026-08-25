@@ -78,7 +78,7 @@ full = await restore_media(lean, media_store=store)
 
 The current reader restores binary markers written before text externalization. That compatibility is upgrade-only: a release that predates text externalization treats every marker as binary, so it cannot validate a snapshot containing an externalized text marker. Keep a current reader for persisted snapshots that contain those markers.
 
-If a payload uses the same namespaced keys as the marker format, the writer moves those values into a versioned reserved mapping and the current reader restores them. Readers remain compatible with markers written before this escaping format was added.
+If a payload uses the same namespaced keys as the marker format, the writer moves those values into a versioned reserved mapping and the current reader restores them. A marker written before this escaping format was added still restores: the reader matches on the reserved mapping's shape, not on the version key's value, so a payload that happened to carry those keys itself is left alone. Compatibility the other way is upgrade-only. A reader that predates the escaping format re-inlines the externalized field correctly, but it leaves the caller's values in the reserved mapping instead of restoring them to their own keys, and leaves the two reserved keys in the payload. Keep a current reader for persisted snapshots that contain escaped markers.
 
 ## Public URLs
 
