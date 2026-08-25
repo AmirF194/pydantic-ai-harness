@@ -116,7 +116,7 @@ Set `expose_tools=True` to give the agent a `get_spend` tool. It is off by defau
 
 ## Reacting to a threshold
 
-`on_spend` is awaited inside `wrap_model_request`, so an async callback does hold the run there. It is still the wrong place to ask for approval: it fires after every priced response, including the one carrying the final answer, and `SpendSnapshot` says nothing about whether another turn follows -- so a callback that waits there leaves a run that has already finished waiting for a decision nothing will act on. Use `on_spend` to report.
+`on_spend` is awaited inside `wrap_model_request`, so an async callback does hold the run there. It is still the wrong place to ask for approval: it fires after every response the provider returns, including the one carrying the final answer, and `SpendSnapshot` says nothing about whether another turn follows -- so a callback that waits there leaves a run that has already finished waiting for a decision nothing will act on. Use `on_spend` to report.
 
 The seam that runs only when more spending is about to happen is `before_model_request`. A small capability of your own can read `status(ctx)` there and hold the run until someone decides:
 
@@ -130,7 +130,8 @@ from pydantic_ai.capabilities import AbstractCapability
 from pydantic_ai.models import ModelRequestContext
 from pydantic_ai.tools import RunContext
 
-from pydantic_ai_harness.spend import Budget, SpendLimits
+from pydantic_ai_harness import SpendLimits
+from pydantic_ai_harness.spend import Budget
 
 limits = SpendLimits[None](budgets=[Budget(usd=Decimal('100'), warn_at=0.8)])
 approvals: asyncio.Queue[bool] = asyncio.Queue()
@@ -146,12 +147,12 @@ class ApproveBeforeSpending(AbstractCapability[None]):
         return request_context
 
 
-agent = Agent('openai:gpt-5.4', capabilities=[limits, ApproveBeforeSpending()])
+agent = Agent('openai:gpt-5.4', deps_type=type(None), capabilities=[limits, ApproveBeforeSpending()])
 ```
 
 The gate reads numbers `SpendLimits` has already accrued, because the previous response was counted inside `wrap_model_request` before this request was prepared. It gates the first request of a run too, which is what carries a threshold crossed by an earlier run into the next one.
 
-That pause holds a coroutine, so it lasts as long as the process does and no longer. A *serializable* pause at a model-request boundary is not available: Pydantic AI's deferral path is tool-boundary only, and a hook raising `CallDeferred` or `ApprovalRequired` anywhere else is refused with an error naming the positions that are legal. [#151](https://github.com/pydantic/pydantic-ai-harness/issues/151) tracks a general interrupt with a serializable continuation.
+That pause holds a coroutine, so it lasts as long as the process does and no longer. A *serializable* pause at a model-request boundary is not available: Pydantic AI's deferral path is tool-boundary only. `CallDeferred` and `ApprovalRequired` are honored where a tool call is validated or executed; raised from a model-request hook, nothing catches them and the run ends on the bare exception, which carries no message of its own. [#151](https://github.com/pydantic/pydantic-ai-harness/issues/151) tracks a general interrupt with a serializable continuation.
 
 For a ceiling that expands rather than stops, `budgets` is read fresh on every request, so replacing it after a refusal lets the work continue against the larger ceiling. The counter is keyed on `name`, `window`, and `scope`, so what is already spent carries over.
 
@@ -163,10 +164,11 @@ from decimal import Decimal
 
 from pydantic_ai import Agent, capture_run_messages
 
-from pydantic_ai_harness.spend import Budget, SpendLimitExceeded, SpendLimits
+from pydantic_ai_harness import SpendLimits
+from pydantic_ai_harness.spend import Budget, SpendLimitExceeded
 
 limits = SpendLimits[None](budgets=[Budget(usd=Decimal('1'), name='session')])
-agent = Agent('openai:gpt-5.4', capabilities=[limits])
+agent = Agent('openai:gpt-5.4', deps_type=type(None), capabilities=[limits])
 
 
 async def ask(prompt: str, ceiling: Decimal) -> str:
@@ -274,11 +276,12 @@ For a per-run token ceiling and nothing else, Pydantic AI's own
 [`UsageLimits(total_tokens_limit=...)`](https://pydantic.dev/docs/ai/core-concepts/agent/#usage-limits)
 does the same job in-process with no store and no capability. `UsageLimits` also carries the two
 input-token granularities `SpendLimits` has no equivalent for: `input_tokens_limit` is cumulative
-over the run, and `per_request_input_tokens_limit` caps one request -- measured against the model's
-own `count_tokens` before the request is sent when `count_tokens_before_request=True`, so an
-oversized context is refused rather than billed. Reach for `Budget(tokens=..., window='run')` when
-the same configuration also has to express money, a longer window, a tenant scope, or a counter
-shared between processes.
+over the run, and `per_request_input_tokens_limit` caps one request against the provider-reported
+input tokens of the response that already paid for it. `count_tokens_before_request=True` counts
+the pending request with the model's own `count_tokens` and applies both limits to that count
+before the send, so an oversized context is refused rather than billed. Reach for
+`Budget(tokens=..., window='run')` when the same configuration also has to express money, a longer
+window, a tenant scope, or a counter shared between processes.
 
 ## Tracing
 
