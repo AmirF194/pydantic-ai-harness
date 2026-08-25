@@ -33,6 +33,7 @@ jobs:
     if: github.event_name == 'pull_request' || github.ref_type == 'branch'
     runs-on: ubuntu-latest
     outputs:
+      background_tools_prefect: ${{ steps.detect_background_tools_prefect.outputs.background_tools_prefect }}
       localstack: ${{ steps.detect.outputs.localstack }}
       mongodb: ${{ steps.detect-mongodb.outputs.mongodb }}
       redis: ${{ steps.detect-redis.outputs.redis }}
@@ -119,6 +120,29 @@ jobs:
             echo 'redis=true' >> "$GITHUB_OUTPUT"
           fi
 
+      - id: detect_background_tools_prefect
+        env:
+          BASE_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event.before }}
+          HEAD_SHA: ${{ github.sha }}
+        run: |
+          if git diff --quiet "$BASE_SHA" "$HEAD_SHA" -- \
+            pydantic_ai_harness/background_tools \
+            tests/background_tools \
+            integration_tests/prefect \
+            pyproject.toml \
+            uv.lock \
+            Makefile \
+            .github/workflows/main.yml
+          then
+            echo 'background_tools_prefect=false' >> "$GITHUB_OUTPUT"
+          else
+            status=$?
+            if [ "$status" -ne 1 ]; then
+              exit "$status"
+            fi
+            echo 'background_tools_prefect=true' >> "$GITHUB_OUTPUT"
+          fi
+
   lint:
     runs-on: ubuntu-latest
     steps:
@@ -177,6 +201,10 @@ jobs:
           include-hidden-files: true
 
   background-tools-prefect:
+    needs: [changes]
+    if: >-
+      ${{ always()
+          && (github.ref_type == 'tag' || needs.changes.outputs.background_tools_prefect == 'true') }}
     runs-on: ubuntu-latest
     name: background tools with Prefect
     timeout-minutes: 10
@@ -192,7 +220,7 @@ jobs:
           cache-suffix: background-tools-prefect
 
       - run: uv sync --locked --group dev
-      - run: uv run --with 'pydantic-ai-slim[prefect]>=2.28.0' pytest integration_tests/prefect/test_background_tools.py
+      - run: uv run --with 'pydantic-ai-slim[prefect]==2.33.0' --with 'prefect==3.8.3' pytest integration_tests/prefect/test_background_tools.py
         env:
           PREFECT_SERVER_ANALYTICS_ENABLED: 'false'
 
@@ -502,8 +530,8 @@ jobs:
           # (no secrets there), and `changes` is skipped on tag events.
           # mongodb-integration and redis-integration are skipped only on the path
           # filter -- neither needs a secret, so both run on fork pull requests too.
-          # All four still vote (block the merge) when they actually run and fail.
-          allowed-skips: changes, localstack-integration, mongodb-integration, redis-integration
+          # All five still vote (block the merge) when they actually run and fail.
+          allowed-skips: changes, localstack-integration, mongodb-integration, redis-integration, background-tools-prefect
           jobs: ${{ toJSON(needs) }}
 
   release:

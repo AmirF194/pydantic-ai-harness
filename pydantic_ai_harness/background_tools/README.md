@@ -71,9 +71,14 @@ If the run remains active, a finished background tool produces a follow-up messa
 - On success: `Background tool 'X' (task <id>) completed.\nResult: <return value>`
 - On failure: `Background tool 'X' (task <id>) failed: <error>`
 
-The task ID matches the acknowledgment. The follow-up is a text user message, not another tool
-return. Retries and deferred calls are reported as text failures. Expected tool errors include their
-message; unexpected exceptions include only their type.
+The task ID matches the acknowledgment. The follow-up is user content, not another tool return.
+`ToolReturn.return_value` and `ToolReturn.content` remain model-visible, including multimodal
+content. Application-only `ToolReturn.metadata` and deferred tool names from `ToolReturn.tools` are
+not carried into the follow-up. Retries and deferred calls are reported as text failures. Expected
+tool errors include
+their message. Unexpected exceptions are logged for the application, while the model sees only
+their type. Raised exceptions become failure results; call `ctx.cancel()` when a background tool
+needs to stop the run.
 
 ## Execution behavior
 
@@ -81,7 +86,7 @@ Normal completion waits for background tasks and delivers their follow-ups. Conc
 their tasks separately. If a run pauses for [deferred tools](https://ai.pydantic.dev/deferred-tools/)
 or ends through cancellation, a usage limit, or an error, live tasks are cancelled and their results
 are dropped. Run cleanup waits for their async tasks to finish, so async tools must propagate
-cancellation.
+cancellation. Suppressing cancellation can keep cleanup open.
 
 > [!WARNING]
 > Python cannot stop a synchronous tool's worker thread, so cleanup may wait for the function to
@@ -96,8 +101,12 @@ cancellation.
 
 ## Limitations
 
-- **Streaming**: `run_stream()` completes on the model's final response and does not take the extra model turn that delivers late results, so background results are only guaranteed with `agent.run()` or a driven `agent.iter()` loop.
-- **Result hooks**: Background tool results do not pass through [Guardrails](https://pydantic.dev/docs/ai/harness/guardrails/) result guards, `ToolOutputLimits`, or other result hooks. Screen and bound the result inside the tool instead.
+- **Streaming**: `run_stream()` waits for live background tasks before it returns, then drops their results because it does not take the extra model turn required for delivery. Use `agent.run()` or a driven `agent.iter()` loop when result delivery is required.
+- **Result hooks and tracing**: The follow-up user message does not pass through result hooks. A
+  wrap-based result guard nested inside `BackgroundTools` can inspect the handler result, so guard
+  behavior depends on capability order. Tool instrumentation and `after_tool_execute` observe the
+  immediate acknowledgment. Screen and bound the result inside the tool when enforcement must not
+  depend on ordering.
 
 ## Durable execution
 

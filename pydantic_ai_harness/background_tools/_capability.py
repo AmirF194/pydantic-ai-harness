@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Any
 
@@ -9,7 +10,7 @@ import anyio
 from anyio.abc import Event, TaskGroup
 from pydantic_ai.capabilities import AbstractCapability
 from pydantic_ai.exceptions import ApprovalRequired, CallDeferred, ToolFailedError, ToolRetryError
-from pydantic_ai.messages import ToolCallPart
+from pydantic_ai.messages import ToolCallPart, ToolReturn, ToolReturnPart, UserContent
 from pydantic_ai.tools import (
     AgentDepsT,
     DeferredToolRequests,
@@ -35,6 +36,8 @@ automatically as a follow-up message when the task completes. Continue working o
 things in the meantime; do not block waiting for the result.\
 """
 
+logger = logging.getLogger(__name__)
+
 
 def _format_background_error(error: Exception) -> str:
     """Format a background-tool error without exposing unexpected exception details."""
@@ -49,14 +52,42 @@ def _format_background_error(error: Exception) -> str:
     return type(error).__name__
 
 
+def _format_background_result(tool_name: str, task_id: str, result: Any) -> tuple[UserContent, ...]:
+    """Format a tool result as model-visible user content without application metadata."""
+    if isinstance(result, ToolReturn):
+        return_value: object = result.return_value
+        extra_content = result.content
+    else:
+        return_value = result
+        extra_content = None
+
+    return_part = ToolReturnPart(tool_name=tool_name, tool_call_id=task_id, content=return_value)
+    return_text = return_part.model_response_str()
+    content: list[UserContent] = [return_text, *return_part.files]
+    if isinstance(extra_content, str):
+        content.append(extra_content)
+    elif extra_content is not None:
+        content.extend(extra_content)
+
+    prefix = f"Background tool '{tool_name}' (task {task_id}) completed.\nResult:"
+    if content and isinstance(content[0], str):
+        content[0] = f'{prefix} {content[0]}'
+    else:
+        content.insert(0, prefix)
+
+    if all(isinstance(item, str) for item in content):
+        return ('\n'.join(item for item in content if isinstance(item, str)),)
+    return tuple(content)
+
+
 @dataclass
 class BackgroundTools(AbstractCapability[AgentDepsT]):
     """Run selected tools concurrently with the current agent run.
 
     When the model calls a tool that matches the selector, the capability spawns the
-    tool's handler in an `asyncio.Task` and immediately returns an acknowledgment
+    tool's handler in a run-owned task group and immediately returns an acknowledgment
     string to the agent. When the task completes, its result (or error) is formatted as
-    text and enqueued via
+    user content and enqueued via
     [`RunContext.enqueue`][pydantic_ai.tools.RunContext.enqueue] as an `'asap'` message.
     Pydantic AI's pending message queue delivers it on the next model request, or
     redirects the agent to a fresh request if it would otherwise end, so the model
@@ -83,7 +114,8 @@ class BackgroundTools(AbstractCapability[AgentDepsT]):
 
     Warning:
         Run cleanup cancels and drains background tasks before it completes. Async tools
-        must propagate cancellation. Python cannot stop a synchronous tool's worker
+        must propagate cancellation; suppressing cancellation can keep cleanup open.
+        Python cannot stop a synchronous tool's worker
         thread, so cleanup may wait for the function to return depending on the configured
         executor's cancellation behavior.
 
@@ -94,6 +126,15 @@ class BackgroundTools(AbstractCapability[AgentDepsT]):
         can race the pending-message drain and lose the message. Async background tools
         do not have this cross-thread race, but delivery still requires the run to
         continue.
+
+    `ToolReturn.return_value` and `ToolReturn.content` remain model-visible, including
+    multimodal content. Application-only `ToolReturn.metadata` and deferred tool names from
+    `ToolReturn.tools` are not carried into the follow-up message. Raised exceptions become
+    failure results; call `ctx.cancel()` when a background tool needs to stop the run.
+
+    `run_stream()` waits for live background tasks before it returns, but does not take
+    the extra model turn that delivers their results. Use `agent.run()` or a driven
+    `agent.iter()` loop when result delivery is required.
 
     `BackgroundTools` composes with Temporal and Prefect durable execution. With DBOS,
     ordinary function tools are not automatically durable steps, so a background tool
@@ -115,7 +156,9 @@ class BackgroundTools(AbstractCapability[AgentDepsT]):
     _task_group: TaskGroup | None = field(default=None, init=False, repr=False)
     _completion_event: Event | None = field(default=None, init=False, repr=False)
     _pending_tasks: int = field(default=0, init=False, repr=False)
-    _completed: list[str] = field(default_factory=list[str], init=False, repr=False)
+    _completed: list[tuple[UserContent, ...]] = field(
+        default_factory=list[tuple[UserContent, ...]], init=False, repr=False
+    )
 
     def get_instructions(self) -> AgentInstructions[AgentDepsT] | None:
         return _INSTRUCTIONS
@@ -144,10 +187,12 @@ class BackgroundTools(AbstractCapability[AgentDepsT]):
             try:
                 try:
                     result = await handler(args)
-                    message = f"Background tool '{tool_name}' (task {task_id}) completed.\nResult: {result}"
+                    message = _format_background_result(tool_name, task_id, result)
                 except Exception as e:
+                    if not isinstance(e, (ApprovalRequired, CallDeferred, ToolRetryError, ToolFailedError)):
+                        logger.exception('Background tool %s failed', tool_name)
                     error = _format_background_error(e)
-                    message = f"Background tool '{tool_name}' (task {task_id}) failed: {error}"
+                    message = (f"Background tool '{tool_name}' (task {task_id}) failed: {error}",)
                 self._completed.append(message)
             finally:
                 self._pending_tasks -= 1
@@ -186,7 +231,7 @@ class BackgroundTools(AbstractCapability[AgentDepsT]):
             await completion_event.wait()
 
         for message in self._completed:
-            ctx.enqueue(message)
+            ctx.enqueue(*message)
         self._completed.clear()
         self._completion_event = anyio.Event()
         return result

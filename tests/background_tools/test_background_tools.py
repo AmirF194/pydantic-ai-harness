@@ -5,23 +5,25 @@ from __future__ import annotations
 import asyncio
 import re
 import threading
-from collections.abc import Callable
+from collections.abc import AsyncIterator, Callable
 
 import anyio
 import pytest
 from pydantic_ai import Agent, CancellationToken, RunCancelled
 from pydantic_ai.exceptions import ApprovalRequired, CallDeferred, ModelRetry, ToolFailed
 from pydantic_ai.messages import (
+    BinaryContent,
     ModelMessage,
     ModelRequest,
     ModelResponse,
     TextPart,
     ToolCallPart,
+    ToolReturn,
     ToolReturnPart,
     UserPromptPart,
 )
-from pydantic_ai.models.function import AgentInfo, FunctionModel
-from pydantic_ai.tools import DeferredToolRequests
+from pydantic_ai.models.function import AgentInfo, DeltaToolCall, FunctionModel
+from pydantic_ai.tools import DeferredToolRequests, RunContext
 
 from pydantic_ai_harness import BackgroundTools
 
@@ -46,7 +48,12 @@ def _ack_seen(messages: list[ModelMessage]) -> bool:
 def _follow_up_seen(messages: list[ModelMessage], needle: str) -> bool:
     """True if any drained user prompt in the history contains `needle`."""
     return any(
-        isinstance(part, UserPromptPart) and isinstance(part.content, str) and needle in part.content
+        isinstance(part, UserPromptPart)
+        and any(
+            needle in item
+            for item in ([part.content] if isinstance(part.content, str) else part.content)
+            if isinstance(item, str)
+        )
         for msg in messages
         if isinstance(msg, ModelRequest)
         for part in msg.parts
@@ -146,6 +153,52 @@ class TestBackgroundTools:
         assert not _follow_up_seen(result.all_messages(), 'private_job_id')
         assert not _follow_up_seen(result.all_messages(), 'secret')
 
+    async def test_unexpected_error_is_logged_without_exposing_details_to_model(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        agent = Agent(_model_calling('broken'), capabilities=[BackgroundTools()])
+
+        @agent.tool_plain(metadata={'background': True})
+        async def broken() -> str:  # pyright: ignore[reportUnusedFunction]
+            raise RuntimeError('private backend detail')
+
+        result = await agent.run('go')
+
+        assert _follow_up_seen(result.all_messages(), 'failed: RuntimeError')
+        assert not _follow_up_seen(result.all_messages(), 'private backend detail')
+        assert 'Background tool broken failed' in caplog.text
+        assert 'private backend detail' in caplog.text
+
+    async def test_run_stream_waits_for_live_task_then_drops_its_result(self) -> None:
+        started = asyncio.Event()
+        release = asyncio.Event()
+
+        async def stream_model(
+            messages: list[ModelMessage], info: AgentInfo
+        ) -> AsyncIterator[str | dict[int, DeltaToolCall]]:
+            if _ack_seen(messages):
+                yield 'final answer'
+            else:
+                yield {0: DeltaToolCall(name='slow', json_args='{}')}
+
+        agent = Agent(FunctionModel(stream_function=stream_model), capabilities=[BackgroundTools()])
+
+        @agent.tool_plain(metadata={'background': True})
+        async def slow() -> str:  # pyright: ignore[reportUnusedFunction]
+            started.set()
+            await release.wait()
+            return 'late result'
+
+        async with agent.run_stream('go') as stream_result:
+            output = asyncio.ensure_future(stream_result.get_output())
+            await asyncio.wait_for(started.wait(), timeout=1)
+            await asyncio.sleep(0)
+            assert not output.done()
+            release.set()
+            assert await asyncio.wait_for(output, timeout=1) == 'final answer'
+
+        assert not _follow_up_seen(stream_result.all_messages(), 'late result')
+
     async def test_unmarked_tool_runs_normally(self) -> None:
         def model_fn(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
             returned = any(
@@ -182,6 +235,60 @@ class TestBackgroundTools:
         assert result.output == 'done'
         assert _ack_seen(result.all_messages())
         assert _follow_up_seen(result.all_messages(), 'completed.\nResult: sync result')
+
+    async def test_background_tool_uses_context_cancel_to_stop_the_run(self) -> None:
+        agent = Agent(_model_calling('stop'), capabilities=[BackgroundTools()])
+
+        @agent.tool(metadata={'background': True})
+        async def stop(ctx: RunContext[object]) -> str:  # pyright: ignore[reportUnusedFunction]
+            ctx.cancel()
+            await asyncio.sleep(0)
+            return 'discarded'  # pragma: no cover -- cancellation is delivered at the await
+
+        with pytest.raises(RunCancelled):
+            await agent.run('go')
+
+    async def test_tool_return_preserves_model_content_without_exposing_metadata(self) -> None:
+        image = BinaryContent(data=b'image bytes', media_type='image/png')
+        agent = Agent(_model_calling('structured'), capabilities=[BackgroundTools()])
+
+        @agent.tool_plain(metadata={'background': True})
+        async def structured() -> ToolReturn[str]:  # pyright: ignore[reportUnusedFunction]
+            return ToolReturn(
+                return_value='public answer',
+                content=['supporting image', image],
+                metadata={'api_key': 'secret application metadata'},
+                tools=['deferred_tool'],
+            )
+
+        result = await agent.run('go')
+
+        follow_up = next(
+            part
+            for message in result.all_messages()
+            if isinstance(message, ModelRequest)
+            for part in message.parts
+            if isinstance(part, UserPromptPart) and 'Background tool' in str(part.content)
+        )
+        assert isinstance(follow_up.content, list)
+        assert len(follow_up.content) == 3
+        assert isinstance(follow_up.content[0], str)
+        assert follow_up.content[0].startswith("Background tool 'structured' (task ")
+        assert follow_up.content[0].endswith(') completed.\nResult: public answer')
+        assert follow_up.content[1:] == ['supporting image', image]
+        assert 'secret application metadata' not in str(follow_up.content)
+        assert 'deferred_tool' not in str(follow_up.content)
+
+    async def test_structured_return_value_uses_core_model_serialization(self) -> None:
+        agent = Agent(_model_calling('structured'), capabilities=[BackgroundTools()])
+
+        @agent.tool_plain(metadata={'background': True})
+        async def structured() -> list[int]:  # pyright: ignore[reportUnusedFunction]
+            return [1, 2]
+
+        result = await agent.run('go')
+
+        assert _follow_up_seen(result.all_messages(), 'completed.\nResult: [1,2]')
 
     async def test_instructions_tell_model_not_to_block(self) -> None:
         seen: list[str | None] = []
