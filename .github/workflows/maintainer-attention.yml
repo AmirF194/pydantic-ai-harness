@@ -25,30 +25,14 @@ jobs:
       contents: read
       issues: write
       pull-requests: write
-    uses: pydantic/pydantic-ai/.github/workflows/pydantic-ai-owner-routing.yml@307dac89152efd578a65f47c226b723efcf9fd32
+    uses: pydantic/pydantic-ai/.github/workflows/pydantic-ai-owner-routing.yml@5dc2363e88cad2032dee20248000e15a78badd6a
     secrets:
       PYDANTIC_AI_TRIAGE_SLACK_WEBHOOK_URL: ${{ secrets.PYDANTIC_AI_TRIAGE_SLACK_WEBHOOK_URL }}
 
-  triage:
-    needs: owner-routing
-    if: >-
-      always() && !cancelled() &&
-      (github.event_name == 'workflow_dispatch' ||
-      github.event.schedule == '10 */6 * * *')
-    permissions:
-      actions: write
-      checks: read
-      contents: read
-      issues: write
-      pull-requests: write
-    uses: pydantic/pydantic-ai/.github/workflows/pydantic-ai-attention-triage.lock.yml@307dac89152efd578a65f47c226b723efcf9fd32
-    secrets:
-      MINIMAX_API_KEY: ${{ secrets.MINIMAX_API_KEY }}
-
   operations:
-    needs: triage
-    # Existing attention requests still need reminders when a classifier run
-    # fails, so only cancellation prevents reconciliation.
+    needs: owner-routing
+    # Existing attention requests still need reminders when owner routing is
+    # skipped or fails, so only cancellation prevents reconciliation.
     if: >-
       always() && !cancelled() &&
       (github.event_name == 'workflow_dispatch' ||
@@ -58,7 +42,7 @@ jobs:
       contents: read
       issues: write
       pull-requests: write
-    uses: pydantic/pydantic-ai/.github/workflows/issue-pr-attention-monitor.yml@307dac89152efd578a65f47c226b723efcf9fd32
+    uses: pydantic/pydantic-ai/.github/workflows/issue-pr-attention-monitor.yml@5dc2363e88cad2032dee20248000e15a78badd6a
     secrets:
       PYDANTIC_AI_TRIAGE_SLACK_WEBHOOK_URL: ${{ secrets.PYDANTIC_AI_TRIAGE_SLACK_WEBHOOK_URL }}
 
@@ -68,6 +52,6 @@ jobs:
       contents: read
       issues: read
       pull-requests: read
-    uses: pydantic/pydantic-ai/.github/workflows/weekly-maintainer-digest.yml@307dac89152efd578a65f47c226b723efcf9fd32
+    uses: pydantic/pydantic-ai/.github/workflows/weekly-maintainer-digest.yml@5dc2363e88cad2032dee20248000e15a78badd6a
     secrets:
       PYDANTIC_AI_TRIAGE_SLACK_WEBHOOK_URL: ${{ secrets.PYDANTIC_AI_TRIAGE_SLACK_WEBHOOK_URL }}
