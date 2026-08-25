@@ -279,6 +279,17 @@ class TestBackgroundTools:
         assert 'secret application metadata' not in str(follow_up.content)
         assert 'deferred_tool' not in str(follow_up.content)
 
+    async def test_tool_return_preserves_string_content(self) -> None:
+        agent = Agent(_model_calling('structured'), capabilities=[BackgroundTools()])
+
+        @agent.tool_plain(metadata={'background': True})
+        async def structured() -> ToolReturn[str]:  # pyright: ignore[reportUnusedFunction]
+            return ToolReturn(return_value='public answer', content='supporting detail')
+
+        result = await agent.run('go')
+
+        assert _follow_up_seen(result.all_messages(), 'completed.\nResult: public answer\nsupporting detail')
+
     async def test_structured_return_value_uses_core_model_serialization(self) -> None:
         agent = Agent(_model_calling('structured'), capabilities=[BackgroundTools()])
 

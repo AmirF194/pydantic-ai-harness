@@ -70,10 +70,7 @@ def _format_background_result(tool_name: str, task_id: str, result: Any) -> tupl
         content.extend(extra_content)
 
     prefix = f"Background tool '{tool_name}' (task {task_id}) completed.\nResult:"
-    if content and isinstance(content[0], str):
-        content[0] = f'{prefix} {content[0]}'
-    else:
-        content.insert(0, prefix)
+    content[0] = f'{prefix} {content[0]}'
 
     if all(isinstance(item, str) for item in content):
         return ('\n'.join(item for item in content if isinstance(item, str)),)
