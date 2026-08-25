@@ -9,7 +9,7 @@ Track what an agent costs, and stop it when a budget is gone.
 
 ## The problem
 
-A loop that calls a model until a condition it never reaches will keep calling until something stops it. `UsageLimits` in Pydantic AI is that stop for one run: it caps tokens and requests, in token counts, for the duration of a single `run()`. What it does not cover is money, a period longer than one run, a per-tenant share of a shared allowance, or a counter that several worker processes agree on. A daily ceiling spread across a queue's workers is exactly the case where each worker independently believes it has the whole budget.
+A loop that calls a model until a condition it never reaches will keep calling until something stops it. `UsageLimits` in Pydantic AI is that stop for one run: it caps tokens, requests and cost for the duration of a single `run()`. What it does not cover is a period longer than one run, a per-tenant share of a shared allowance, or a counter that several worker processes agree on. A daily ceiling spread across a queue's workers is exactly the case where each worker independently believes it has the whole budget.
 
 Provider usage APIs do not close that gap. They are billing and observability pipelines: usage is aggregated after the fact and read by polling, so a number there moves only once the requests behind it have already been made. That is enough to reconcile a ledger and not enough to refuse the request a runaway loop is about to make.
 
@@ -167,7 +167,7 @@ from pydantic_ai import Agent, capture_run_messages
 from pydantic_ai_harness import SpendLimits
 from pydantic_ai_harness.spend import Budget, SpendLimitExceeded
 
-limits = SpendLimits[None](budgets=[Budget(usd=Decimal('1'), name='session')])
+limits = SpendLimits[None](budgets=[Budget(usd=Decimal('1'), name='daily')])
 agent = Agent('openai:gpt-5.4', deps_type=type(None), capabilities=[limits])
 
 
@@ -244,7 +244,7 @@ The accrual happens in `wrap_model_request`, immediately around the provider cal
 
 Wrapping also means a request the provider never saw is not charged for. `SkipModelRequest` from an earlier capability's `before_model_request` reaches `after_model_request` with a response the run never paid for, but never reaches the wrapped handler.
 
-What is left is siblings. Pydantic AI orders innermost capabilities against non-innermost ones only, and among themselves the one listed *later* nests further in. `TemporalDurability` and `InputGuardrail` also declare themselves innermost, so either of them listed after `SpendLimits` wraps inside it and can still reject a billed response before it is counted. For `InputGuardrail(parallel=True)` that only under-counts when the guard is slower than the model call: a guard that trips first cancels the request, and no response comes back to price. List `SpendLimits` last among your innermost capabilities where the difference matters. Closing it outright needs a way to order innermost capabilities against each other, tracked in [#534](https://github.com/pydantic/pydantic-ai-harness/issues/534).
+What is left is siblings. Pydantic AI orders innermost capabilities against non-innermost ones only, and among themselves the one listed *later* nests further in. `TemporalDurability` and `InputGuardrail` also declare themselves innermost, so either of them listed after `SpendLimits` wraps inside it and can still reject a billed response before it is counted. With `InputGuardrail(parallel=True)` the response only reaches the counter when the model wins the race: a guard that trips first cancels the call, so nothing comes back to price even though the provider may already have billed the request it received. List `SpendLimits` last among your innermost capabilities where the difference matters. Closing it outright needs a way to order innermost capabilities against each other, tracked in [#534](https://github.com/pydantic/pydantic-ai-harness/issues/534).
 
 **Durable execution.** `SpendLimits` is not supported inside a durable workflow, on Temporal, DBOS, or Prefect.
 
@@ -267,21 +267,26 @@ inspected nothing -- which is exactly what a `SpendLimits` whose budgets are all
 the scope is missing. `exhausted` raises there instead, naming the budgets that need a
 `scope` or a run context. Use `status` for a reading, `exhausted` for a decision.
 
+Admission is all it is: the check reserves nothing, so what the workflow goes on to spend is
+bounded by nothing this gate did. A floor on runaway spend already recorded, not a ceiling on
+what follows.
+
 Making the accrual replay-safe needs the store write to happen inside the engine's own durable
 unit, which the capability cannot arrange without depending on `temporalio`, `dbos` or `prefect`
 and detecting which one is running -- so it belongs in Pydantic AI core rather than here. Tracked
 in [#531](https://github.com/pydantic/pydantic-ai-harness/issues/531).
 
-For a per-run token ceiling and nothing else, Pydantic AI's own
-[`UsageLimits(total_tokens_limit=...)`](https://pydantic.dev/docs/ai/core-concepts/agent/#usage-limits)
-does the same job in-process with no store and no capability. `UsageLimits` also carries the two
-input-token granularities `SpendLimits` has no equivalent for: `input_tokens_limit` is cumulative
-over the run, and `per_request_input_tokens_limit` caps one request against the provider-reported
+For a ceiling that covers one run and nothing else, Pydantic AI's own
+[`UsageLimits`](https://pydantic.dev/docs/ai/core-concepts/agent/#usage-limits) does the same job
+in-process with no store and no capability: `total_tokens_limit` for tokens and `cost_limit` for
+money, both over a single `run()`. It also carries the two input-token granularities `SpendLimits`
+has no equivalent for: `input_tokens_limit` is cumulative over the run, and
+`per_request_input_tokens_limit` caps one request against the provider-reported
 input tokens of the response that already paid for it. `count_tokens_before_request=True` counts
 the pending request with the model's own `count_tokens` and applies both limits to that count
 before the send, so an oversized context is refused rather than billed. Reach for
-`Budget(tokens=..., window='run')` when the same configuration also has to express money, a longer
-window, a tenant scope, or a counter shared between processes.
+`Budget(tokens=..., window='run')` when the same configuration also has to express a window longer
+than one run, a tenant scope, or a counter shared between processes.
 
 ## Tracing
 
