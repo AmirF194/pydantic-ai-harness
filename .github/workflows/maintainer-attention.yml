@@ -9,6 +9,7 @@ on:
   schedule:
     - cron: '10 */6 * * *'
     - cron: '47 6 * * *'
+    - cron: '23 14 * * 1'
   workflow_dispatch: {}
 
 permissions: {}
@@ -24,7 +25,7 @@ jobs:
       contents: read
       issues: write
       pull-requests: write
-    uses: pydantic/pydantic-ai/.github/workflows/pydantic-ai-owner-routing.yml@0851d494d2a259f3b1d330a8cafebca272bb7f91
+    uses: pydantic/pydantic-ai/.github/workflows/pydantic-ai-owner-routing.yml@307dac89152efd578a65f47c226b723efcf9fd32
     secrets:
       PYDANTIC_AI_TRIAGE_SLACK_WEBHOOK_URL: ${{ secrets.PYDANTIC_AI_TRIAGE_SLACK_WEBHOOK_URL }}
 
@@ -40,7 +41,7 @@ jobs:
       contents: read
       issues: write
       pull-requests: write
-    uses: pydantic/pydantic-ai/.github/workflows/pydantic-ai-attention-triage.lock.yml@0851d494d2a259f3b1d330a8cafebca272bb7f91
+    uses: pydantic/pydantic-ai/.github/workflows/pydantic-ai-attention-triage.lock.yml@307dac89152efd578a65f47c226b723efcf9fd32
     secrets:
       MINIMAX_API_KEY: ${{ secrets.MINIMAX_API_KEY }}
 
@@ -57,6 +58,16 @@ jobs:
       contents: read
       issues: write
       pull-requests: write
-    uses: pydantic/pydantic-ai/.github/workflows/issue-pr-attention-monitor.yml@0851d494d2a259f3b1d330a8cafebca272bb7f91
+    uses: pydantic/pydantic-ai/.github/workflows/issue-pr-attention-monitor.yml@307dac89152efd578a65f47c226b723efcf9fd32
+    secrets:
+      PYDANTIC_AI_TRIAGE_SLACK_WEBHOOK_URL: ${{ secrets.PYDANTIC_AI_TRIAGE_SLACK_WEBHOOK_URL }}
+
+  weekly-digest:
+    if: github.event.schedule == '23 14 * * 1'
+    permissions:
+      contents: read
+      issues: read
+      pull-requests: read
+    uses: pydantic/pydantic-ai/.github/workflows/weekly-maintainer-digest.yml@307dac89152efd578a65f47c226b723efcf9fd32
     secrets:
       PYDANTIC_AI_TRIAGE_SLACK_WEBHOOK_URL: ${{ secrets.PYDANTIC_AI_TRIAGE_SLACK_WEBHOOK_URL }}
