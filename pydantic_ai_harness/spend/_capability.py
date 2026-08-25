@@ -266,9 +266,11 @@ class SpendLimits(AbstractCapability[AgentDepsT]):
         chain is readable from `RunContext.root_capability` from `before_run` onward but not
         before it: `for_agent` sees only the capabilities the agent was constructed with, and
         `ctx.root_capability` is still `None` in `for_run`, so neither covers a capability
-        added through `agent.run(capabilities=...)`. Reading it here keeps the report on the
-        request path, ahead of any billed response, and re-reads it on every request rather
-        than only the first, since a per-run addition can change the chain between runs.
+        added through `agent.run(capabilities=...)`. `before_run` would serve as well, since
+        the chain is fixed for a run; the read sits here to stay on the request path, beside
+        the accrual it is about. Re-reading per request costs nothing because
+        `_reported_arrangements` makes it idempotent, and keying on the arrangement rather
+        than on having reported is what covers a chain that differs between runs.
         """
         warn_about_inner_wrappers(ctx.root_capability, self, self._reported_arrangements)
         read: dict[str, Spent] = {}

@@ -35,7 +35,7 @@ class UnpricedModelWarning(UserWarning):
 
 
 class SpendCompositionWarning(UserWarning):
-    """Warned once when another capability is composed so that it wraps inside the accrual.
+    """Warned when another capability is composed so that it wraps inside the accrual.
 
     Pydantic AI orders the `innermost` tier against non-innermost capabilities only.
     Among themselves the one listed later nests further in, so a capability listed
@@ -43,12 +43,15 @@ class SpendCompositionWarning(UserWarning):
     then raise, which sends the run to a fresh request while the rejected response --
     generated, billed, and kept in history -- is never counted.
 
-    Whether that happens depends on the run. An `InputGuardrail` reaches a billed
-    response only when `parallel=True` and the guard loses its race with the provider;
-    a sequential guard blocks before the request is made, and a parallel guard that wins
-    its race cancels it. So this reports how the capabilities are ordered, not an
-    under-count that has already happened. List `SpendLimits` last among the innermost
-    capabilities to remove it.
+    This reports the ordering, not an under-count that has happened. Reaching one
+    needs the nested capability to reject a response it has already awaited, and whether
+    it does is its own business: an `InputGuardrail` gets there only when `parallel=True`,
+    its guard blocks, and the provider answers before the guard does. Sequentially the
+    guard raises before the request is made, and a parallel guard that blocks first
+    cancels the call, so neither leaves anything billed to count. None of those conditions
+    is read here -- `parallel` can be flipped without moving anything in the list, so the
+    ordering is the durable property and the one you control. List `SpendLimits` last
+    among the innermost capabilities to remove it.
 
     Silence it with::
 

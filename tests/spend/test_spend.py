@@ -22,6 +22,7 @@ from pydantic_ai.capabilities import (
     CombinedCapability,
     Hooks,
     WrapModelRequestHandler,
+    WrapperCapability,
 )
 from pydantic_ai.exceptions import ModelRetry, SkipModelRequest, UsageLimitExceeded, UserError
 from pydantic_ai.messages import ModelMessage, ModelResponse, TextPart, ToolCallPart, ToolReturnPart
@@ -31,6 +32,7 @@ from pydantic_ai.models.test import TestModel
 from pydantic_ai.tools import RunContext
 from pydantic_ai.usage import RequestUsage, RunUsage
 
+from pydantic_ai_harness.guardrails import GuardrailResult, InputGuardrail
 from pydantic_ai_harness.spend import (
     Budget,
     InMemorySpendStore,
@@ -571,6 +573,31 @@ class _DurabilityLookalike(AbstractCapability[None]):
         return await handler(request_context)
 
 
+class _InnermostWrapper(WrapperCapability[None]):
+    """A wrapper that reaches the innermost tier and leaves `wrap_model_request` delegating.
+
+    `WrapperCapability.apply` registers a wrapper over a leaf as itself, not as the leaf, so a
+    bare wrapper does not inherit the wrapped capability's `innermost` position. Declaring it
+    is what puts a wrapper after `SpendLimits` at all.
+    """
+
+    def get_ordering(self) -> CapabilityOrdering:
+        return CapabilityOrdering(position='innermost')
+
+
+class _WrapperWithItsOwnWrapper(_InnermostWrapper):
+    """A wrapper subclass that supplies `wrap_model_request` instead of delegating it."""
+
+    async def wrap_model_request(
+        self,
+        ctx: RunContext[None],
+        *,
+        request_context: ModelRequestContext,
+        handler: WrapModelRequestHandler,
+    ) -> ModelResponse:
+        return await handler(request_context)
+
+
 class _HooksWithItsOwnWrapper(Hooks[None]):
     """A `Hooks` subclass that supplies the method instead of dispatching to a registry."""
 
@@ -719,8 +746,9 @@ class TestCompositionWarning:
 
         assert [str(w.message) for w in reported if w.category is SpendCompositionWarning] == [
             'These capabilities are listed after `SpendLimits`, so they wrap inside it: _InnermostWithAWrapper. '
-            'A response one of them rejects after awaiting it is billed by the provider and never counted. '
-            'List `SpendLimits` last among the innermost capabilities to close that.'
+            'If one of them rejects a response it has already awaited, the provider billed that response and '
+            'the accrual never sees it. This reads the ordering, not what those capabilities do with it. '
+            'List `SpendLimits` last among the innermost capabilities to rule it out.'
         ]
 
     async def test_listing_spend_limits_last_reports_nothing(self):
@@ -796,8 +824,8 @@ class TestCompositionWarning:
     async def test_a_run_that_adds_one_later_is_still_reported(self):
         """A safe first run must not mark every chain that follows it as read.
 
-        The report is deduplicated on the arrangement, not on having reported before, because
-        the same `SpendLimits` instance can be surrounded differently on each run.
+        Nothing is reported on the first run, so a flag set by merely having checked would
+        suppress the second. What is remembered is the arrangement, and the first run has none.
         """
         guard = SpendLimits[None](budgets=[Budget(window='total')])
         agent = Agent(_scripted_usage(), deps_type=type(None), capabilities=[guard])
@@ -805,6 +833,72 @@ class TestCompositionWarning:
         await agent.run('hi')
         with pytest.warns(SpendCompositionWarning, match='_InnermostWithAWrapper'):
             await agent.run('hi', capabilities=[_InnermostWithAWrapper()])
+
+    async def test_a_second_arrangement_reports_even_though_the_first_already_warned(self):
+        """Remembering that a warning fired is not the same as remembering which arrangement fired it.
+
+        A flag set when the warning fires passes both tests above, and loses this one: the same
+        `SpendLimits` instance is surrounded by a different capability on the second run, which
+        is a different arrangement and has never been reported.
+        """
+        guard = SpendLimits[None](budgets=[Budget(window='total')])
+        agent = Agent(_scripted_usage(), deps_type=type(None), capabilities=[guard])
+
+        with pytest.warns(SpendCompositionWarning, match='_InnermostWithAWrapper'):
+            await agent.run('hi', capabilities=[_InnermostWithAWrapper()])
+        with pytest.warns(SpendCompositionWarning, match='_InnermostRejector'):
+            with pytest.raises(RuntimeError):
+                await agent.run('hi', capabilities=[_InnermostRejector()])
+
+    async def test_a_wrapper_is_answered_on_what_it_wraps(self):
+        """`WrapperCapability.wrap_model_request` only delegates, so defining it says nothing."""
+        guard = SpendLimits[None](budgets=[Budget(window='total')])
+        agent = Agent(
+            _scripted_usage(),
+            deps_type=type(None),
+            capabilities=[guard, _InnermostWrapper(_InnermostWithoutAWrapper())],
+        )
+
+        await agent.run('hi')
+
+    async def test_a_wrapper_over_a_real_wrapper_is_reported(self):
+        guard = SpendLimits[None](budgets=[Budget(window='total')])
+        agent = Agent(
+            _scripted_usage(),
+            deps_type=type(None),
+            capabilities=[guard, _InnermostWrapper(_InnermostWithAWrapper())],
+        )
+
+        with pytest.warns(SpendCompositionWarning, match='_InnermostWrapper'):
+            await agent.run('hi')
+
+    async def test_a_wrapper_subclass_with_its_own_wrapper_is_reported(self):
+        """Overriding the method supplies one, so the wrapped capability stops being the answer."""
+        guard = SpendLimits[None](budgets=[Budget(window='total')])
+        agent = Agent(
+            _scripted_usage(),
+            deps_type=type(None),
+            capabilities=[guard, _WrapperWithItsOwnWrapper(_InnermostWithoutAWrapper())],
+        )
+
+        with pytest.warns(SpendCompositionWarning, match='_WrapperWithItsOwnWrapper'):
+            await agent.run('hi')
+
+    async def test_a_sequential_input_guardrail_is_reported_although_it_cannot_under_count(self):
+        """The shipped default trips the check, and the docs say so.
+
+        `InputGuardrail(parallel=False)` runs its guard before calling the handler, so it never
+        holds a billed response to reject. The report reads the ordering, not `parallel`.
+        """
+        guard = SpendLimits[None](budgets=[Budget(window='total')])
+        agent = Agent(
+            _scripted_usage(),
+            deps_type=type(None),
+            capabilities=[guard, InputGuardrail[None](guard=lambda ctx, text: GuardrailResult.allow())],
+        )
+
+        with pytest.warns(SpendCompositionWarning, match='InputGuardrail'):
+            await agent.run('hi')
 
     async def test_nothing_is_reported_without_a_capability_chain(self):
         """`RunContext.root_capability` is unset outside a run, leaving nothing to compare against."""

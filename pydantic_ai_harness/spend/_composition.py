@@ -7,15 +7,17 @@ listing capabilities in a particular order rather than by anything going wrong, 
 resulting chain is readable from
 [`RunContext.root_capability`][pydantic_ai.tools.RunContext.root_capability].
 
-Reported rather than refused: the under-count needs the inner wrapper to reject a response
-it has already awaited, which a guard that wins its race against the provider never does.
+What is read here is the ordering. Whether a nested wrapper actually rejects a billed
+response depends on its own configuration and on how a given run races, none of which is
+visible from the chain, so this reports an arrangement rather than an under-count that has
+happened. That is also why it warns rather than refuses.
 """
 
 from __future__ import annotations
 
 import warnings
 
-from pydantic_ai.capabilities import AbstractCapability, CombinedCapability, Hooks
+from pydantic_ai.capabilities import AbstractCapability, CombinedCapability, Hooks, WrapperCapability
 from pydantic_ai.durable_exec._base import BaseDurabilityCapability  # pyright: ignore[reportPrivateUsage]
 from pydantic_ai.tools import AgentDepsT
 
@@ -45,8 +47,9 @@ def warn_about_inner_wrappers(
     name = type(capability).__name__
     warnings.warn(
         f'These capabilities are listed after `{name}`, so they wrap inside it: {listed}. '
-        'A response one of them rejects after awaiting it is billed by the provider and never counted. '
-        f'List `{name}` last among the innermost capabilities to close that.',
+        'If one of them rejects a response it has already awaited, the provider billed that '
+        'response and the accrual never sees it. This reads the ordering, not what those '
+        f'capabilities do with it. List `{name}` last among the innermost capabilities to rule it out.',
         SpendCompositionWarning,
         stacklevel=2,
     )
@@ -75,36 +78,45 @@ def _inner_wrappers(
 def _may_reject_a_billed_response(capability: AbstractCapability[AgentDepsT]) -> bool:
     """Whether nesting this capability inside the accrual is worth reporting.
 
-    The question is whether it brings a `wrap_model_request` that can await a response and
-    then raise. Two cases are read as "no", both because the report would land on an
-    arrangement the reader cannot correct:
+    The question is whether it brings a `wrap_model_request` of its own that could await a
+    response and then raise. Two kinds of capability define the method unconditionally, so
+    defining it says nothing about them:
 
-    - [`Hooks`][pydantic_ai.capabilities.Hooks] defines the method unconditionally and
-      dispatches to whatever hook functions were registered, so the definition says nothing
-      about whether one was, and the registry that would say is private. Core publishes
-      `has_wrap_node_run` and `has_wrap_run_event_stream` but no equivalent for model
-      requests; asked for in
-      [pydantic-ai#7177](https://github.com/pydantic/pydantic-ai/issues/7177). A subclass
-      that overrides the method supplies its own and is still reported.
-    - A durable-execution capability routes the request into an activity/step/task rather
-      than rejecting what comes back, and core requires its dispatch to be the innermost
-      wrapper, so reordering is the one thing a reader must not do here and there would be
-      nothing to act on. That combination has its own, louder report: `SpendLimits` refuses
-      the workflow clock and names
-      <https://github.com/pydantic/pydantic-ai-harness/issues/531>.
+    - [`Hooks`][pydantic_ai.capabilities.Hooks] dispatches to whatever hook functions were
+      registered, and the registry that would say whether one was is private. Core publishes
+      `has_wrap_node_run` and `has_wrap_run_event_stream` but no equivalent for model requests;
+      asked for in [pydantic-ai#7177](https://github.com/pydantic/pydantic-ai/issues/7177).
+      Read as "no" until that lands.
+    - [`WrapperCapability`][pydantic_ai.capabilities.WrapperCapability] delegates straight to
+      `self.wrapped`, which is the capability that actually decides, so the question moves
+      there. A wrapper over a real rejector is still reported, under the wrapper's own name,
+      which is the name the reader put in the list.
 
-    `BaseDurabilityCapability` is the shared base of the bundled Temporal/DBOS/Prefect
-    integrations, and Pydantic AI publishes no marker for the durability tier -- the same
-    gap `PlaywrightBrowser.for_agent` works around, matched the same way so both sites move
-    together if core renames the module. A public route is the fourth item on
+    A subclass of either that overrides the method supplies its own and is answered on that.
+
+    A durable-execution capability is read as "no" for a different reason: the signal is right,
+    and the correction is the problem. Core requires the durable dispatch to be the innermost
+    wrapper (`BaseDurabilityCapability.get_ordering`), so listing `SpendLimits` after it is the
+    one thing a reader must not do, and the report would name an unavailable fix. That
+    combination has its own, louder report: `SpendLimits` refuses the workflow clock and names
+    <https://github.com/pydantic/pydantic-ai-harness/issues/531>. Matched by `isinstance`
+    against the base the bundled Temporal, DBOS and Prefect integrations share, the same way
+    `PlaywrightBrowser.for_agent` matches it, so both sites move together if core renames
+    `pydantic_ai.durable_exec._base`. A public route is the fourth item on
     [pydantic-ai#7177](https://github.com/pydantic/pydantic-ai/issues/7177).
 
-    A missed report is preferred over one on a correct arrangement, which the reader could
-    only silence by changing correct code.
+    Everything else is reported, including a capability that would not have rejected anything
+    on the run in hand. `InputGuardrail` is the case in point: it can reach a billed response
+    only under `parallel=True`, and that field is deliberately not read. `parallel` can be
+    flipped without moving anything in the list, so the ordering is the durable property and
+    the one the reader controls; and a capability that silenced its own report by reading a
+    sibling's field would go quiet the day that field stopped meaning what it means here.
     """
+    implementation = type(capability).wrap_model_request
+    if isinstance(capability, WrapperCapability) and implementation is WrapperCapability.wrap_model_request:
+        return _may_reject_a_billed_response(capability.wrapped)
     if isinstance(capability, BaseDurabilityCapability):
         return False
-    implementation = type(capability).wrap_model_request
     return (
         implementation is not AbstractCapability.wrap_model_request and implementation is not Hooks.wrap_model_request
     )
