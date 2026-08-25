@@ -36,6 +36,12 @@ def warn_about_inner_wrappers(
     the arrangement rather than on the first call is what lets a reused agent be read again:
     `agent.run(capabilities=[...])` can put a different chain around the same capability
     instance on every run, and a flag set by the first, safe chain would hide every later one.
+
+    The arrangement is recorded after `warnings.warn` returns rather than before, so that an
+    application escalating this category to an error with `filterwarnings('error', ...)` keeps
+    getting one on every run of the arrangement. Recording it first would let the raise happen
+    once and then mark the arrangement as reported, which turns a refusal into a first-run-only
+    one -- the opposite of what escalating a warning asks for.
     """
     inner = _inner_wrappers(root, capability)
     if not inner:
@@ -43,7 +49,6 @@ def warn_about_inner_wrappers(
     listed = ', '.join(inner)
     if listed in reported:
         return
-    reported.add(listed)
     name = type(capability).__name__
     warnings.warn(
         f'These capabilities are listed after `{name}`, so they wrap inside it: {listed}. '
@@ -53,6 +58,7 @@ def warn_about_inner_wrappers(
         SpendCompositionWarning,
         stacklevel=2,
     )
+    reported.add(listed)
 
 
 def _inner_wrappers(

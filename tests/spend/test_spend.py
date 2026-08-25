@@ -850,6 +850,22 @@ class TestCompositionWarning:
             with pytest.raises(RuntimeError):
                 await agent.run('hi', capabilities=[_InnermostRejector()])
 
+    async def test_an_arrangement_escalated_to_an_error_is_refused_on_every_run(self):
+        """Escalating the category is a refusal, so it cannot stop refusing after one run.
+
+        `warnings.warn` raises under `filterwarnings('error', ...)`, so an arrangement recorded
+        before the call would be marked reported by the run the raise came from and skipped
+        after it. Recording it after the call returns is what keeps the second run refused.
+        """
+        guard = SpendLimits[None](budgets=[Budget(window='total')])
+        agent = Agent(_scripted_usage(), deps_type=type(None), capabilities=[guard])
+
+        with warnings.catch_warnings():
+            warnings.simplefilter('error', SpendCompositionWarning)
+            for _ in range(2):
+                with pytest.raises(SpendCompositionWarning):
+                    await agent.run('hi', capabilities=[_InnermostWithAWrapper()])
+
     async def test_a_wrapper_is_answered_on_what_it_wraps(self):
         """`WrapperCapability.wrap_model_request` only delegates, so defining it says nothing."""
         guard = SpendLimits[None](budgets=[Budget(window='total')])
