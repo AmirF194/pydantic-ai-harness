@@ -45,7 +45,7 @@ jobs:
     # Existing attention requests still need reminders when a classifier run
     # fails, so only cancellation prevents reconciliation.
     if: >-
-      !cancelled() &&
+      always() && !cancelled() &&
       (github.event_name == 'workflow_dispatch' ||
       github.event.schedule == '10 */6 * * *' ||
       github.event.schedule == '47 6 * * *')
