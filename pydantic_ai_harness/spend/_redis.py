@@ -22,6 +22,20 @@ from pydantic_ai_harness.spend._store import DEFAULT_DEDUP_RETAIN, SpendEntry, w
 
 _SCALE = Decimal(10) ** 9
 
+_MARKER = 'dedup'
+"""First segment of a dedup marker's name, and a prefix a budget key may not carry.
+
+Markers and counters share one namespace so a script can take both and stay in one Redis
+Cluster slot. That makes them nameable from each other: a budget key of
+`dedup|1:a|1:b` names the marker for `SpendEntry(key='a', token='b')`, and `HINCRBY` on
+the string a marker holds fails the whole script with `WRONGTYPE`. `_name` refuses such a
+key for the reason `__post_init__` refuses a brace in the prefix -- the failure otherwise
+reaches the caller as a Redis type error naming neither key.
+
+Nothing `SpendLimits` builds can reach it: `store_key`'s second segment is a `Window`
+literal and a marker's is a length prefix. A caller driving the store itself can.
+"""
+
 _USD_FIELD = 'usd_nanos'
 _TOKENS_FIELD = 'tokens'
 _REQUESTS_FIELD = 'requests'
@@ -390,8 +404,21 @@ class RedisSpendStore:
         return f'{self.prefix}:{key}'
 
     def _name(self, key: str) -> str:
-        """The Redis key for a budget key, hash-tagged so one script may take several."""
-        return f'{{{self.prefix}}}:{key}'
+        """The Redis key for a budget key, hash-tagged so one script may take several.
+
+        Refuses a key that would name a dedup marker instead of a counter; see `_MARKER`.
+        """
+        if key.startswith(f'{_MARKER}{SEPARATOR}'):
+            raise UserError(
+                f'A spend key must not start with {_MARKER + SEPARATOR!r}; got {key!r}. That prefix names this '
+                "store's dedup markers, which hold a string rather than a hash, so the counter would fail with "
+                '`WRONGTYPE` on the next write instead of accumulating.'
+            )
+        return self._tagged(key)
+
+    def _tagged(self, name: str) -> str:
+        """`name` under this store's hash tag, whether it is a counter or a marker."""
+        return f'{{{self.prefix}}}:{name}'
 
     def _marker_name(self, entry: SpendEntry) -> str:
         """The key written to record that this entry's response reached this window.
@@ -405,8 +432,8 @@ class RedisSpendStore:
         per entry: it gets one nothing writes to, since its horizon is zero.
         """
         if entry.token is None:
-            return self._name('dedup')
-        return self._name(f'dedup{SEPARATOR}{delimited(entry.key, entry.token)}')
+            return self._tagged(_MARKER)
+        return self._tagged(f'{_MARKER}{SEPARATOR}{delimited(entry.key, entry.token)}')
 
     def _marker_seconds(self, entry: SpendEntry) -> int:
         """How long this entry's marker is held, or zero to apply the entry unconditionally.

@@ -1446,6 +1446,30 @@ class TestRedisStore:
         with pytest.raises(SpendLimitExceeded):
             await agent.run('hi')
 
+    @pytest.mark.parametrize('key', ['dedup|1:a|1:b', 'dedup|'])
+    async def test_a_key_that_would_name_a_marker_is_refused(self, key: str):
+        """Markers and counters share a namespace, so a crafted key could name the wrong one.
+
+        `SpendEntry(key='a', token='b')` marks `dedup|1:a|1:b`, which Redis holds as a string;
+        a counter under that name would fail the whole script with `WRONGTYPE`. Nothing
+        `SpendLimits` builds reaches it -- `store_key`'s second segment is a `Window` literal --
+        but a caller driving the store can.
+        """
+        store = RedisSpendStore(FakeRedis())
+
+        with pytest.raises(UserError, match='must not start with'):
+            await store.get_many([key])
+        with pytest.raises(UserError, match='must not start with'):
+            await store.add_many([SpendEntry(key=key, usd=Decimal('1'), requests=1)])
+
+    async def test_a_key_merely_starting_with_the_word_is_kept(self):
+        """The sentinel is `dedup` plus the separator, so an ordinary budget named for it works."""
+        store = RedisSpendStore(FakeRedis())
+
+        assert await store.add_many([SpendEntry(key='dedup', usd=Decimal('1'), requests=1)]) == {
+            'dedup': Spent(usd=Decimal('1'), requests=1)
+        }
+
     async def test_an_application_s_own_decimal_precision_does_not_round_the_total(self):
         """The counter comes back exact, and merging the pre-hash-tag one must keep it that way."""
         client = FakeRedis()
