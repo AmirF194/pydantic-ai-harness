@@ -6,7 +6,7 @@ import json
 import warnings
 from collections.abc import Mapping, Sequence
 from datetime import datetime, timedelta, timezone
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal, InvalidOperation, localcontext
 from typing import Any
 
 import pytest
@@ -1059,6 +1059,23 @@ class TestInMemoryStore:
 
         assert await store.add_many([entry, entry]) == {'k': Spent(usd=Decimal('1'), requests=1)}
 
+    async def test_an_application_s_own_decimal_precision_does_not_round_the_counter(self):
+        """A store that took the caller's context would round the counter and then drift from it.
+
+        The rounded total is what the next response is added to, so the error compounds rather
+        than showing up once. `_snapshot.summed` pins the arithmetic for both stores.
+        """
+        store = InMemorySpendStore()
+        entry = SpendEntry(key='k', usd=Decimal('0.000123456'), requests=1)
+
+        with localcontext() as context:
+            context.prec = 3
+            first = await store.add_many([entry])
+            second = await store.add_many([entry])
+
+        assert first['k'].usd == Decimal('0.000123456')
+        assert second['k'].usd == Decimal('0.000246912')
+
     async def test_a_token_past_its_horizon_is_forgotten(self):
         """`dedup_retain` is the window a replay is recognised in, not the counter's lifetime.
 
@@ -1428,6 +1445,20 @@ class TestRedisStore:
         await agent.run('hi')
         with pytest.raises(SpendLimitExceeded):
             await agent.run('hi')
+
+    async def test_an_application_s_own_decimal_precision_does_not_round_the_total(self):
+        """The counter comes back exact, and merging the pre-hash-tag one must keep it that way."""
+        client = FakeRedis()
+        store = RedisSpendStore(client)
+        client.hashes[f'{store.prefix}:k'] = {'usd_nanos': 1, 'requests': 1}
+
+        with localcontext() as context:
+            context.prec = 3
+            added = await store.add_many([SpendEntry(key='k', usd=Decimal('0.000123456'), requests=1)])
+            read = await store.get_many(['k'])
+
+        assert added['k'].usd == Decimal('0.000123457')
+        assert read['k'].usd == Decimal('0.000123457')
 
 
 class _LegacyStore:

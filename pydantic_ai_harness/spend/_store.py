@@ -21,7 +21,7 @@ from threading import Lock
 from typing import Protocol, runtime_checkable
 
 from pydantic_ai_harness._warn import HarnessDeprecationWarning
-from pydantic_ai_harness.spend._snapshot import Spent
+from pydantic_ai_harness.spend._snapshot import Spent, summed
 
 _Entries = dict[str, tuple[Spent, 'datetime | None']]
 """Each key's counter and the moment it stops counting, if it ever does."""
@@ -302,7 +302,7 @@ class InMemorySpendStore:
                     totals[entry.key] = current
                     continue
                 updated = Spent(
-                    usd=current.usd + entry.usd,
+                    usd=summed(current.usd, entry.usd),
                     tokens=current.tokens + entry.tokens,
                     requests=current.requests + entry.requests,
                     unpriced_requests=current.unpriced_requests + entry.unpriced,

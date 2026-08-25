@@ -17,11 +17,10 @@ from typing import Protocol, runtime_checkable
 from pydantic_ai.exceptions import UserError
 
 from pydantic_ai_harness.spend._budget import SEPARATOR, delimited
-from pydantic_ai_harness.spend._snapshot import Spent
+from pydantic_ai_harness.spend._snapshot import MONEY_PRECISION, Spent, summed
 from pydantic_ai_harness.spend._store import DEFAULT_DEDUP_RETAIN, SpendEntry
 
 _SCALE = Decimal(10) ** 9
-_PRECISION = 40
 
 _USD_FIELD = 'usd_nanos'
 _TOKENS_FIELD = 'tokens'
@@ -144,14 +143,14 @@ def _to_nanos(usd: Decimal) -> int:
     precision for its own arithmetic cannot silently truncate money here.
     """
     with localcontext() as context:
-        context.prec = _PRECISION
+        context.prec = MONEY_PRECISION
         return int((usd * _SCALE).to_integral_value(rounding=ROUND_HALF_UP))
 
 
 def _from_nanos(nanos: int) -> Decimal:
     """Whole billionths back to US dollars."""
     with localcontext() as context:
-        context.prec = _PRECISION
+        context.prec = MONEY_PRECISION
         return Decimal(nanos) / _SCALE
 
 
@@ -195,9 +194,13 @@ def _spent(fields: Mapping[str | bytes, str | bytes]) -> Spent:
 
 
 def _merged(current: Spent, previous: Spent) -> Spent:
-    """One window's counters across the two key names it may be spread over."""
+    """One window's counters across the two key names it may be spread over.
+
+    `summed` rather than `+`: both totals reach here exact, and plain addition would take the
+    application's `Decimal` precision rather than the one the counters are held at.
+    """
     return Spent(
-        usd=current.usd + previous.usd,
+        usd=summed(current.usd, previous.usd),
         tokens=current.tokens + previous.tokens,
         requests=current.requests + previous.requests,
         unpriced_requests=current.unpriced_requests + previous.unpriced_requests,
