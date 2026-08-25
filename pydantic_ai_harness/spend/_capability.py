@@ -1,7 +1,7 @@
 """Track what an agent spends, and stop it when a budget is gone.
 
-`UsageLimits` in Pydantic AI caps tokens and requests for the duration of one
-run. `SpendLimits` covers what that leaves: money, periods longer than a run,
+`UsageLimits` in Pydantic AI caps tokens, requests and cost for the duration of
+one run. `SpendLimits` covers what that leaves: periods longer than a run,
 partitioning by tenant or user, and a counter that several worker processes
 share. It prices each response with
 [`ModelResponse.cost()`][pydantic_ai.messages.ModelResponse.cost], adds it to
@@ -79,13 +79,20 @@ class SpendLimits(AbstractCapability[AgentDepsT]):
     budget that reset every run would not be a daily budget. Per-run isolation
     comes from `Budget(window='run')`, whose key carries the run id.
 
-    Durable execution: not supported inside a Temporal workflow. The hooks run in
-    workflow code while only the model request is the activity, so Temporal replays
-    the accrual and a window counts the same response more than once. `exhausted()`
-    works without a `RunContext` so a workflow can at least be refused admission on
-    what is already recorded -- but a workflow admitted that way records nothing of
-    its own, so it is a gate on the door, not a budget on what happens inside.
-    Tracked in <https://github.com/pydantic/pydantic-ai-harness/issues/531>.
+    Durable execution: not supported inside a durable workflow, on Temporal, DBOS,
+    or Prefect. The hooks run in orchestration code, while the model request beside
+    them is a durable unit restored from its checkpoint, so re-execution replays the
+    accrual without replaying the request it counted. What differs is whether you
+    find out: Temporal raises, because its workflow sandbox restricts the clock these
+    hooks read and `pydantic_ai_harness` is not one of the modules the Pydantic AI
+    plugin passes through, while DBOS recovery and Prefect flow retry report nothing
+    and leave the counter wrong in whichever direction the store implies -- too high
+    where recovery still reaches the store that accrued, too low where it landed in a
+    fresh worker holding a fresh `InMemorySpendStore`. `exhausted()` works without a
+    `RunContext` so a workflow can at least be refused admission on what is already
+    recorded -- but it reserves nothing, so it is a gate on the door, not a budget on
+    what happens inside. Tracked in
+    <https://github.com/pydantic/pydantic-ai-harness/issues/531>.
     """
 
     budgets: Sequence[Budget[AgentDepsT]] = ()
@@ -231,17 +238,16 @@ class SpendLimits(AbstractCapability[AgentDepsT]):
         return 'SpendLimits'
 
     def get_ordering(self) -> CapabilityOrdering:
-        """Sit innermost, so the accrual is the first thing to happen to a billed response.
+        """Sit innermost, so the accrual happens as close to the provider call as ordering allows.
 
-        Innermost puts this capability's `wrap_model_request` closest to the provider call,
-        so every other capability's wrapper -- and every capability's
-        `after_model_request` -- runs outside the accrual and cannot reject a response the
-        counter has not already seen.
+        Innermost puts this capability's `wrap_model_request` inside every capability outside
+        that tier, so their wrappers -- and every capability's `after_model_request` -- run
+        outside the accrual and cannot reject a response the counter has not already seen.
 
         This orders against non-innermost capabilities only. Innermost members are not
         ordered among themselves, and the one listed later nests further in, so another
-        innermost capability (`TemporalDurability`, `InputGuardrail`) placed after this one
-        still wraps inside it and can reject a billed response before it is counted. List
+        innermost capability placed after this one still wraps inside it. `InputGuardrail` is
+        the one that reaches a billed response before the counter does. List
         `SpendLimits` last among innermost capabilities where that matters; closing it
         outright is <https://github.com/pydantic/pydantic-ai-harness/issues/534>.
         """
@@ -289,7 +295,7 @@ class SpendLimits(AbstractCapability[AgentDepsT]):
         request_context: ModelRequestContext,
         handler: WrapModelRequestHandler,
     ) -> ModelResponse:
-        """Price what the provider returned and add it to every window, before anything can reject it.
+        """Price what the provider returned and add it to every window, before an outer capability can reject it.
 
         The accrual belongs here rather than in `after_model_request` because
         `after_model_request` runs outside this chain, once the whole chain has returned.
@@ -430,11 +436,13 @@ class SpendLimits(AbstractCapability[AgentDepsT]):
 
         An admission check, and only that. It reads the counters; it reserves nothing and
         records nothing, so work started on the strength of it goes unmeasured unless
-        something else accrues it. Under Temporal that is the whole of what is available --
-        the hooks cannot reach a shared store mid-run -- so a workflow admitted here spends
-        against a counter that never moves, and the next workflow is admitted on the same
-        stale reading. Sound as a floor on runaway spend already recorded, not as a ceiling
-        on what the workflow goes on to spend.
+        something else accrues it. That makes it the pre-flight option on every durable
+        engine, and what the next caller reads differs. Under Temporal nothing accrues
+        inside the workflow at all, because the sandbox refuses the clock these hooks read,
+        so the counter still holds the admission reading. Under DBOS and Prefect the accrual
+        does run and recovery replays it, so the counter moved by the wrong amount rather
+        than not at all. Either way this is a floor on runaway spend already recorded, not a
+        ceiling on what the workflow goes on to spend.
 
         `status()` omits what it cannot resolve, and `any(...)` over the remainder is a brake
         that silently checks nothing when every budget is scoped -- so this raises instead,
@@ -499,7 +507,8 @@ class SpendLimits(AbstractCapability[AgentDepsT]):
         Temporal's workflow sandbox restricts. The sandbox's own error names
         `datetime.datetime.now` and not what it means here, so it is translated. Matched by
         class name rather than by importing `temporalio`, which this package does not depend
-        on, and which `durable_exec/AGENTS.md` rules out detecting.
+        on, and which core's own `pydantic_ai/durable_exec/AGENTS.md` rules out: "Prefer generic
+        capabilities/toolsets/models extension points over engine-specific escape hatches."
 
         The message leads with the unsafety rather than the passthrough that silences it: the
         sandbox is refusing a symptom, and a caller who only removes the symptom gets a
