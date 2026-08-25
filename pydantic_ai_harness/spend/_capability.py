@@ -273,7 +273,7 @@ class SpendLimits(AbstractCapability[AgentDepsT]):
     ) -> ModelRequestContext:
         """Refuse the request if any budget with a ceiling is already spent."""
         enforcing = [(budget, key) for budget, key in self._keyed(ctx) if budget.enforces]
-        read = await self._store.get_many(list(dict.fromkeys(key for _, key in enforcing)))
+        read = await self._read(list(dict.fromkeys(key for _, key in enforcing)))
         for budget, key in enforcing:
             self._check(budget, read[key], ctx)
         return request_context
@@ -320,8 +320,8 @@ class SpendLimits(AbstractCapability[AgentDepsT]):
                     token=token,
                 )
         # Every window in one call, so a failure cannot leave the response counted
-        # against the day and not the month.
-        accrued = await self._store.add_many(list(entries.values()))
+        # against the day and not the month. Nothing to apply is not a call: see `_read`.
+        accrued: Mapping[str, Spent] = await self._store.add_many(list(entries.values())) if entries else {}
         statuses = [_status(budget, key, accrued[key]) for budget, key in keyed]
 
         if self.on_spend is not None:
@@ -418,7 +418,7 @@ class SpendLimits(AbstractCapability[AgentDepsT]):
                 unresolved.append(budget.name)
                 continue
             keyed.append((budget, self._key(budget, ctx, now, scope)))
-        read = await self._store.get_many(list(dict.fromkeys(key for _, key in keyed)))
+        read = await self._read(list(dict.fromkeys(key for _, key in keyed)))
         return tuple(_status(budget, key, read[key]) for budget, key in keyed), tuple(unresolved)
 
     async def exhausted(
@@ -569,14 +569,21 @@ class SpendLimits(AbstractCapability[AgentDepsT]):
         be dropped as a replay of it. Core reads the same field for truth rather than for
         presence where it matters (`models/_continuation.py`, `models/openai.py`).
 
-        What is left is a server that reports a non-empty id and repeats it. Nothing here
-        can tell that from a genuine replay, so this assumes a reported id identifies the
-        response, which is what the field means. Tracked in
+        The timestamp joins the id rather than only standing in for it, so a server that
+        reports the *same* non-empty id for different responses does not have them collapse
+        into one. It costs the primary path nothing: a replayed response is the same object
+        checkpointed and handed back, so its timestamp is the one it was built with, which
+        is the property the fallback below already rests on. `ModelResponse.timestamp` is
+        the client's own `now_utc()` rather than a provider field (`models/openai.py` keeps
+        the provider's coarse `created` in `provider_details`), so it separates responses at
+        microsecond resolution. What is left is two responses sharing an id *and* a
+        microsecond; tracked in
         <https://github.com/pydantic/pydantic-ai-harness/issues/693>.
         """
+        stamp = response.timestamp.isoformat()
         if response.provider_response_id:
-            return delimited(response.provider_name or '', response.provider_response_id)
-        return delimited(ctx.run_id or '', str(ctx.run_step), response.timestamp.isoformat())
+            return delimited(response.provider_name or '', response.provider_response_id, stamp)
+        return delimited(ctx.run_id or '', str(ctx.run_step), stamp)
 
     def _check(self, budget: Budget[AgentDepsT], spent: Spent, ctx: RunContext[AgentDepsT]) -> None:
         """Raise if `spent` has reached either of the budget's ceilings."""
@@ -594,6 +601,16 @@ class SpendLimits(AbstractCapability[AgentDepsT]):
             attributes['spend.scope'] = budget.scope(ctx)
         ctx.tracer.start_span('spend budget exhausted', attributes=attributes).end()
         raise SpendLimitExceeded(f'Budget {budget.name!r} exhausted for this {budget.window}: {detail}')
+
+    async def _read(self, keys: Sequence[str]) -> Mapping[str, Spent]:
+        """What each key holds, without asking the store about none of them.
+
+        A `SpendLimits` configured to report rather than enforce, or one whose budgets this
+        call cannot resolve, has no key to read. Asking anyway spends a round trip on a
+        store that answers it and fails outright on one that treats an empty batch as a
+        caller error, and neither buys anything. `add_many` is guarded the same way.
+        """
+        return await self._store.get_many(keys) if keys else {}
 
     def _keyed(self, ctx: RunContext[AgentDepsT]) -> list[tuple[Budget[AgentDepsT], str]]:
         """Each budget paired with the store key it accumulates under right now.

@@ -468,15 +468,27 @@ class TestEnforcement:
 
         assert (await guard.status())[0].spent.requests == 2
 
-    async def test_no_budgets_means_no_key_is_read(self):
+    async def test_no_budgets_means_the_store_is_not_called_at_all(self):
+        """Not "called with nothing": a store may treat an empty batch as a caller error.
+
+        A `SpendLimits` with no budgets has no key to read and no entry to apply, so the
+        round trip buys nothing on a store that answers it and fails outright on one that
+        does not.
+        """
+
         class Exploding(InMemorySpendStore):
             async def get_many(self, keys: Sequence[str]) -> Mapping[str, Spent]:
-                if keys:  # pragma: no cover - must never be reached
-                    raise AssertionError('the gate read a key with no budgets configured')
-                return {}
+                raise AssertionError('the gate read with no budgets configured')  # pragma: no cover
+
+            async def add_many(self, entries: Sequence[SpendEntry]) -> Mapping[str, Spent]:
+                raise AssertionError('the gate wrote with no budgets configured')  # pragma: no cover
 
         guard = SpendLimits[None](store=Exploding())
+
         await _gate(guard)
+        await _record(guard)
+
+        assert await guard.status() == ()
 
     async def test_budgets_survive_across_runs(self):
         guard = SpendLimits(budgets=[Budget(usd=Decimal('0.01'), window='day')], price=lambda r: Decimal('0.01'))
@@ -1599,6 +1611,21 @@ class TestIdempotentAccrual:
 
         for _ in range(3):
             await _record(guard, response=_response(provider_response_id=''))
+
+        assert (await guard.status())[0].spent.requests == 3
+
+    async def test_a_provider_that_repeats_one_id_does_not_collapse_its_responses(self):
+        """The response timestamp joins the id, so a broken id does not stand alone.
+
+        A server returning a constant `id` would otherwise have everything after the first
+        response dropped as a replay of it, which is spend the ceiling never sees. A genuine
+        replay hands back the response object it checkpointed, so its timestamp is unchanged
+        and `test_a_response_the_provider_identified_survives_a_new_run_id` still holds.
+        """
+        guard = SpendLimits(budgets=[Budget(window='total')], price=lambda r: Decimal('1'))
+
+        for _ in range(3):
+            await _record(guard, response=_response(provider_response_id='resp-const'))
 
         assert (await guard.status())[0].spent.requests == 3
 
