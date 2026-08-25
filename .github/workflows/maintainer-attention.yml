@@ -1,21 +1,44 @@
 name: Maintainer attention
 
 on:
+  issues:
+    types: [opened, reopened]
+  pull_request_target:
+    # zizmor: ignore[dangerous-triggers] -- this caller runs the base repository's pinned reusable workflow and never checks out contributor code
+    types: [opened, reopened, ready_for_review]
   schedule:
     - cron: '10 */6 * * *'
+    - cron: '25 */6 * * *'
+    - cron: '47 6 * * *'
   workflow_dispatch: {}
 
 permissions: {}
 
 jobs:
+  owner-routing:
+    if: >-
+      github.event_name == 'issues' ||
+      github.event_name == 'pull_request_target' ||
+      github.event_name == 'workflow_dispatch' ||
+      github.event.schedule == '25 */6 * * *'
+    permissions:
+      contents: read
+      issues: write
+      pull-requests: write
+    uses: pydantic/pydantic-ai/.github/workflows/pydantic-ai-owner-routing.lock.yml@f6a4ead46af0dcab291bb61ab82b1d24f31e3b1e
+    secrets:
+      MINIMAX_API_KEY: ${{ secrets.MINIMAX_API_KEY }}
+      PYDANTIC_AI_TRIAGE_SLACK_WEBHOOK_URL: ${{ secrets.PYDANTIC_AI_TRIAGE_SLACK_WEBHOOK_URL }}
+
   triage:
+    if: github.event_name == 'workflow_dispatch' || github.event.schedule == '10 */6 * * *'
     permissions:
       actions: read
       checks: read
       contents: read
       issues: write
       pull-requests: write
-    uses: pydantic/pydantic-ai/.github/workflows/pydantic-ai-attention-triage.lock.yml@592d476c350b342d46403c08f4c3769b48aa2fbf
+    uses: pydantic/pydantic-ai/.github/workflows/pydantic-ai-attention-triage.lock.yml@f6a4ead46af0dcab291bb61ab82b1d24f31e3b1e
     secrets:
       MINIMAX_API_KEY: ${{ secrets.MINIMAX_API_KEY }}
 
@@ -23,11 +46,15 @@ jobs:
     needs: triage
     # Existing attention requests still need reminders when a classifier run
     # fails, so only cancellation prevents reconciliation.
-    if: ${{ !cancelled() }}
+    if: >-
+      !cancelled() &&
+      (github.event_name == 'workflow_dispatch' ||
+      github.event.schedule == '10 */6 * * *' ||
+      github.event.schedule == '47 6 * * *')
     permissions:
       contents: read
       issues: write
       pull-requests: write
-    uses: pydantic/pydantic-ai/.github/workflows/issue-pr-attention-monitor.yml@592d476c350b342d46403c08f4c3769b48aa2fbf
+    uses: pydantic/pydantic-ai/.github/workflows/issue-pr-attention-monitor.yml@f6a4ead46af0dcab291bb61ab82b1d24f31e3b1e
     secrets:
       PYDANTIC_AI_TRIAGE_SLACK_WEBHOOK_URL: ${{ secrets.PYDANTIC_AI_TRIAGE_SLACK_WEBHOOK_URL }}
