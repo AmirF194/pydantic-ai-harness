@@ -267,8 +267,6 @@ class SummarizingCompaction(AbstractCapability[AgentDepsT]):
         ```
     """
 
-    id: str | None = field(default='summarizing_compaction', kw_only=True)
-
     model: str | Model | None = None
     """Model used to generate summaries.
 
@@ -371,6 +369,9 @@ class SummarizingCompaction(AbstractCapability[AgentDepsT]):
     Opt-in for now: the receipt text is content, so defaulting it on is deferred to the
     benchmark eval-rig pass.  The mechanism itself is structural.
     """
+
+    # Override the inherited default ID; stable identity is required for @durable_operation worker-side recovery.
+    id: str | None = field(default='summarizing_compaction', kw_only=True)
 
     def __post_init__(self) -> None:
         if self.max_messages is None and self.max_tokens is None and self.max_fraction is None:
