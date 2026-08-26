@@ -536,6 +536,9 @@ jobs:
     # Same skipped-ancestor opt-out as `release` above.
     if: ${{ !cancelled() && needs.release.result == 'success' }}
     runs-on: ubuntu-latest
+    # Every step here reaches the network, and a hung fetch or push would otherwise
+    # hold the runner until the six-hour job default.
+    timeout-minutes: 10
     permissions:
       contents: write
     steps:

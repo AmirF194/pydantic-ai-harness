@@ -17,6 +17,9 @@ jobs:
   advance:
     name: Advance gh-aw-engine to main
     runs-on: ubuntu-latest
+    # Every step here reaches the network, and none of them owns a timeout of its
+    # own beyond the curl bounds below.
+    timeout-minutes: 10
     permissions:
       contents: write
     steps:
@@ -48,11 +51,15 @@ jobs:
       # PyPI directly. A definition naming a version pip cannot install fails every
       # gh-aw workflow that selects this engine, at install time, in someone else's
       # repository.
+      # The timeouts are what stop a connection that is accepted but never answered
+      # from holding the runner until the six-hour job default. curl exits 28 on
+      # either, which fails the step rather than reporting a version as unpublished.
       - name: Check the pinned version is published
         env:
           VERSION: ${{ steps.engine.outputs.version }}
         run: |
-          status="$(curl --silent --show-error --output /dev/null --write-out '%{http_code}' \
+          status="$(curl --silent --show-error --connect-timeout 10 --max-time 30 \
+            --output /dev/null --write-out '%{http_code}' \
             "https://pypi.org/pypi/pydantic-ai-harness/${VERSION}/json")"
           if [ "$status" != '200' ]; then
             echo "pydantic-ai-harness ${VERSION} is not on PyPI (HTTP ${status}), so gh-aw-engine was not advanced." >&2
