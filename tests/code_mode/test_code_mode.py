@@ -25,13 +25,7 @@ from pydantic_ai import (
     Tool,
     ToolDefinition,
 )
-from pydantic_ai.capabilities import (
-    AbstractCapability,
-    Capability,
-    HandleDeferredToolCalls,
-    Instrumentation,
-    ToolSearch,
-)
+from pydantic_ai.capabilities import AbstractCapability, Capability, Instrumentation, ToolSearch
 from pydantic_ai.exceptions import ApprovalRequired as _ApprovalRequired
 from pydantic_ai.exceptions import ModelRetry, UserError
 from pydantic_ai.messages import (
@@ -992,6 +986,8 @@ class TestCodeMode:
             return DeferredToolResults(
                 approvals={call.tool_call_id: ToolDenied(message='nope') for call in requests.approvals}
             )
+
+        from pydantic_ai.capabilities import HandleDeferredToolCalls  # noqa: PLC0415  # optional-version probe
 
         wrapper = CodeMode[object](max_tool_calls=1).get_wrapper_toolset(_build_function_toolset(needs_approval))
         assert isinstance(wrapper, CodeModeToolset)
