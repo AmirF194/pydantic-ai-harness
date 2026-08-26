@@ -52,6 +52,7 @@ except ImportError as _import_error:  # pragma: no cover
         'pydantic-monty is required for CodeMode. Install it with: pip install "pydantic-ai-harness[code-mode]"'
     ) from _import_error
 from pydantic_ai_harness._monty_exec import MontyExecutor, PrintCapture, is_sandbox_panic
+from pydantic_ai_harness.code_mode._speculation import SpeculationState, SpeculativeCall
 
 # A raw OS callback. Return `pydantic_monty.NOT_HANDLED` to defer the call to the
 # sandbox's default, which leaves it unavailable.
@@ -565,6 +566,14 @@ class CodeModeToolset(WrapperToolset[AgentDepsT]):
     so Tool Search discoveries don't bust the tool-definitions cache prefix.
     """
 
+    speculation: SpeculationState | None = field(default=None, kw_only=True)
+    """Per-run speculation store, set by `CodeMode` when `speculate` is enabled.
+
+    The capability's stream watcher launches calls into it; the dispatch path below claims
+    them. Carried by reference through `for_run`/`for_run_step` `replace` copies, so the
+    watcher and the executing toolset always see the same store.
+    """
+
     # Shared by `for_run_step` copies so they use the same REPL session and the original entered
     # instance can close it. `for_run` leaves this unset, giving concurrent runs isolated state.
     _run_state: _MontyRunState | None = field(default=None, init=False, repr=False, compare=False)
@@ -669,6 +678,17 @@ class CodeModeToolset(WrapperToolset[AgentDepsT]):
 
         callable_defs, sanitized_to_original = self._partition_callable_tools(sandboxed_tools)
 
+        if self.speculation is not None:
+            # Hand the stream watcher this step's dispatch ingredients. `wrapped_tools` (not just
+            # the sandboxed subset) mirrors the nested `ToolManager` the cold dispatch builds.
+            self.speculation.stash_step(
+                wrapped=self.wrapped,
+                wrapped_tools=wrapped_tools,
+                sanitized_to_original=sanitized_to_original,
+                callable_defs=callable_defs,
+                serialize=_TOOL_RETURN_CONTENT_TA.dump_python,
+            )
+
         # `dynamic_catalog` keeps the catalog out of `run_code.description` (cache-stable
         # tool-defs block) and surfaces it via `get_instructions` instead. Stash it for the
         # `get_instructions` call later this step; empty string means "nothing to surface".
@@ -720,10 +740,22 @@ class CodeModeToolset(WrapperToolset[AgentDepsT]):
         )
         return result
 
-    async def call_tool(  # noqa: C901
+    async def call_tool(
         self, name: str, tool_args: dict[str, Any], ctx: RunContext[AgentDepsT], tool: ToolsetTool[AgentDepsT]
     ) -> Any:
         """Execute Python code in the sandbox, or pass through to a native tool."""
+        if self.speculation is None or not isinstance(tool, _RunCodeTool):
+            return await self._call_tool_impl(name, tool_args, ctx, tool)
+        try:
+            return await self._call_tool_impl(name, tool_args, ctx, tool)
+        finally:
+            # The snippet is done (or failed into a retry): launches it never claimed are garbage
+            # for this part, and a retry arrives under a fresh tool call id.
+            await self.speculation.evict_part(ctx.tool_call_id or 'pyd_ai_code_mode')
+
+    async def _call_tool_impl(  # noqa: C901
+        self, name: str, tool_args: dict[str, Any], ctx: RunContext[AgentDepsT], tool: ToolsetTool[AgentDepsT]
+    ) -> Any:
         if not isinstance(tool, _RunCodeTool):
             # Native (non-sandboxed) tool -- pass through to the wrapped toolset.
             return await self.wrapped.call_tool(name, tool_args, ctx, tool)
@@ -795,7 +827,42 @@ class CodeModeToolset(WrapperToolset[AgentDepsT]):
             call_counter += 1
             parent_id = ctx.tool_call_id or 'pyd_ai_code_mode'
             original_name = sanitized_to_original.get(sandbox_name, sandbox_name)
+            speculation = self.speculation
+            if speculation is not None:
+                claimed = speculation.claim(parent_id, sandbox_name, kwargs)
+                if claimed is not None:
+                    speculation.stats.adopted += 1
+                    return adopt_speculative_call(claimed, f'{parent_id}__{call_counter}')
             return run_tool_call(original_name, f'{parent_id}__{call_counter}', kwargs)
+
+        async def adopt_speculative_call(claimed: SpeculativeCall, tool_call_id: str) -> Any:
+            """Resolve a dispatch from a call launched while the snippet was still streaming.
+
+            Budget accounting already happened in `dispatch_tool_call`, exactly as for a cold
+            call. The launch ran under a provisional tool call id, so the message-history parts
+            are recorded here instead, under the real nested id. Awaiting the task does not
+            propagate this coroutine's cancellation into it; an abandoned task is cancelled by
+            `evict_part` when the snippet finishes.
+            """
+            call_part = ToolCallPart(tool_name=claimed.original_name, args=claimed.kwargs, tool_call_id=tool_call_id)
+            nested_calls[tool_call_id] = call_part
+            outcome = await claimed.task
+            if outcome.denied_message is not None:
+                nested_returns[tool_call_id] = ToolReturnPart(
+                    tool_name=claimed.original_name,
+                    content=outcome.denied_message,
+                    tool_call_id=tool_call_id,
+                    outcome='denied',
+                )
+            if outcome.error is not None:
+                raise outcome.error
+            nested_returns[tool_call_id] = ToolReturnPart(
+                tool_name=claimed.original_name,
+                content=outcome.content,
+                tool_call_id=tool_call_id,
+                metadata=outcome.metadata,
+            )
+            return outcome.serialized
 
         async def run_tool_call(original_name: str, tool_call_id: str, kwargs: dict[str, Any]) -> Any:
             """Run a single tool call dispatched from inside the sandbox.

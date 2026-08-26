@@ -219,6 +219,30 @@ time-bounded work behind a Temporal activity instead.
 
 State persists between `run_code` calls within the same agent run -- variables, imports, and function definitions carry over. Pass `restart: true` in the tool call to reset state. If a worker crash or host-side execution failure invalidates the session, `run_code` returns a model retry that reports the reset; the next snippet must recreate any required state.
 
+## Speculative execution (experimental)
+
+`speculate` names tools that may start executing while the model is still streaming the
+`run_code` call. The streamed `code` argument is parsed as it arrives; calls to named tools
+whose arguments are all keyword literals launch immediately, and when the completed snippet
+executes, matching dispatches claim the in-flight results instead of starting the tool cold.
+This overlaps tool latency with model generation (speculative programmatic tool calling,
+<https://alexzhang13.github.io/blog/2026/spec-ptc/>).
+
+```python
+agent = Agent(
+    'openai:gpt-5',
+    capabilities=[CodeMode(speculate=['search', 'fetch'])],
+)
+```
+
+Name only tools without observable side effects: a speculated call can run for a branch the
+snippet never takes, so early execution must be harmless to repeat or discard. Launches that
+the snippet never claims are cancelled when it finishes. `sequential` tools are never
+speculated, tool hooks fire at launch time rather than at claim time, and enabling `speculate`
+puts runs in streaming mode. Under Temporal durable execution the option is inactive.
+Aggregate counters are exposed on `CodeMode.speculation_stats` (`launched`, `adopted`,
+`evicted`).
+
 ## Temporal durability
 
 Install both integrations:

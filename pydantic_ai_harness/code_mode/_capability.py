@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import AsyncGenerator, AsyncIterable, Sequence
 from dataclasses import KW_ONLY, dataclass, field, replace
 from typing import TYPE_CHECKING, Any, Literal
 
@@ -10,16 +10,24 @@ from pydantic import TypeAdapter, ValidationError
 from pydantic_ai import AbstractToolset
 from pydantic_ai.capabilities import AbstractCapability, CapabilityOrdering
 from pydantic_ai.capabilities._tool_search import ToolSearch as _ToolSearch
-from pydantic_ai.messages import ModelResponse, NativeToolSearchReturnPart, SystemPromptPart
+from pydantic_ai.messages import AgentStreamEvent, ModelResponse, NativeToolSearchReturnPart, SystemPromptPart
 from pydantic_ai.tools import AgentDepsT, RunContext, ToolDefinition, ToolSelector
 from typing_extensions import TypedDict
 
-from pydantic_ai_harness.code_mode._toolset import CodeModeMount, CodeModeOS, CodeModeResourceLimits, CodeModeToolset
+from pydantic_ai_harness.code_mode._speculation import SpeculationState, SpeculationStats
+from pydantic_ai_harness.code_mode._toolset import (
+    CodeModeMount,
+    CodeModeOS,
+    CodeModeResourceLimits,
+    CodeModeToolset,
+    _in_temporal_workflow,  # pyright: ignore[reportPrivateUsage]
+)
 
 if TYPE_CHECKING:
     from pydantic_ai.capabilities.abstract import ValidatedToolArgs
     from pydantic_ai.messages import ToolCallPart
     from pydantic_ai.models import ModelRequestContext
+    from pydantic_ai.run import AgentRunResult
 
 
 _DISCOVERY_ANNOUNCEMENT_PREFIX = (
@@ -110,6 +118,27 @@ class CodeMode(AbstractCapability[AgentDepsT]):
     both caps.
     """
 
+    speculate: Sequence[str] | None = None
+    """Tool names that may start executing while the model is still streaming `run_code` code.
+
+    Experimental. When set, the streamed `code` argument is parsed as it arrives, and calls to
+    these tools whose arguments are all keyword literals launch immediately; when the completed
+    snippet executes, matching dispatches claim the in-flight results instead of starting cold.
+    This overlaps tool latency with model generation (speculative programmatic tool calling,
+    <https://alexzhang13.github.io/blog/2026/spec-ptc/>).
+
+    Name only tools without observable side effects: a speculated call can run for a branch the
+    snippet never takes, and its early launch is otherwise indistinguishable from the normal
+    call only when re-running or discarding it is harmless. Tool hooks fire at launch time.
+    Unclaimed launches are cancelled when the snippet finishes. Enabling this puts runs in
+    streaming mode, and has no effect under Temporal durable execution.
+    """
+
+    speculation_stats: SpeculationStats = field(default_factory=SpeculationStats, init=False, repr=False)
+    """Aggregate launch/adopt/evict counters across this instance's runs; observability for the POC."""
+
+    _speculation_state: SpeculationState | None = field(default=None, init=False, repr=False)
+
     dynamic_catalog: bool = False
     """Keep the `run_code` tool definition cache-stable as the sandboxed toolset grows.
 
@@ -147,10 +176,19 @@ class CodeMode(AbstractCapability[AgentDepsT]):
         return CapabilityOrdering(position='outermost', wraps=[_ToolSearch])
 
     async def for_run(self, ctx: RunContext[AgentDepsT]) -> CodeMode[AgentDepsT]:
-        """Return a fresh instance so concurrent runs don't share `_announced_tools`."""
-        if not self.dynamic_catalog:
+        """Return a fresh instance so concurrent runs don't share mutable per-run state."""
+        if not self.dynamic_catalog and self.speculate is None:
             return self
-        return replace(self)
+        clone = replace(self)
+        # `replace` re-runs `__init__`, resetting `init=False` fields: `_announced_tools` starts
+        # fresh (intended), and the stats object is rebound so callers holding this instance
+        # observe counters accumulated by its per-run clones.
+        clone.speculation_stats = self.speculation_stats
+        if self.speculate is not None:
+            clone._speculation_state = SpeculationState(
+                allowlist=frozenset(self.speculate), stats=self.speculation_stats
+            )
+        return clone
 
     def get_wrapper_toolset(self, toolset: AbstractToolset[AgentDepsT]) -> AbstractToolset[AgentDepsT] | None:
         """Wrap the agent's assembled toolset, splitting it into native + sandboxed subsets if needed."""
@@ -163,7 +201,53 @@ class CodeMode(AbstractCapability[AgentDepsT]):
             dynamic_catalog=self.dynamic_catalog,
             os_access=self.os_access,
             mount=self.mount,
+            speculation=self._speculation_state,
         )
+
+    @property
+    def has_wrap_run_event_stream(self) -> bool:
+        """Report the stream hook only when speculation is enabled.
+
+        The base class detects a class-level override, which would put every `CodeMode` user in
+        streaming mode; gating on the instance keeps plain `CodeMode` runs non-streaming.
+        """
+        return self.speculate is not None
+
+    async def wrap_run_event_stream(
+        self,
+        ctx: RunContext[AgentDepsT],
+        *,
+        stream: AsyncIterable[AgentStreamEvent],
+    ) -> AsyncIterable[AgentStreamEvent]:
+        """Launch speculatable sandbox calls from streamed `run_code` argument deltas.
+
+        Events pass through unmodified; the launches are a side effect. Inactive under Temporal,
+        where overlapping non-deterministic work with the stream has no place in a replayed
+        workflow.
+        """
+        state = self._speculation_state
+        if state is not None and _in_temporal_workflow(ctx):
+            state = None
+        try:
+            async for event in stream:
+                if state is not None:
+                    state.observe(event, ctx)
+                yield event
+        finally:
+            if isinstance(stream, AsyncGenerator):
+                await stream.aclose()
+
+    async def after_run(self, ctx: RunContext[AgentDepsT], *, result: AgentRunResult[Any]) -> AgentRunResult[Any]:
+        """Cancel speculative launches no snippet claimed before the run returns."""
+        if self._speculation_state is not None:
+            await self._speculation_state.close()
+        return result
+
+    async def on_run_error(self, ctx: RunContext[AgentDepsT], *, error: BaseException) -> AgentRunResult[Any]:
+        """Cancel speculative launches when the run fails, then let the error propagate."""
+        if self._speculation_state is not None:
+            await self._speculation_state.close()
+        raise error
 
     async def after_tool_execute(
         self,
