@@ -123,7 +123,8 @@ def _may_reject_a_billed_response(capability: AbstractCapability[AgentDepsT]) ->
     combination costs is covered by the durable-execution caveat rather than here, and how
     loudly depends on the engine: Temporal refuses the workflow clock and names
     <https://github.com/pydantic/pydantic-ai-harness/issues/531>, while DBOS recovery and
-    Prefect flow retry replay the accrual reporting nothing. Matched by `isinstance` against
+    Prefect flow retry re-execute the accrual and report nothing, leaving what the counter
+    ends up holding to the store. Matched by `isinstance` against
     the base the bundled Temporal, DBOS and Prefect integrations share, the same way
     `PlaywrightBrowser.for_agent` matches it, so both sites move together if core renames
     `pydantic_ai.durable_exec._base`. A public route is asked for in
