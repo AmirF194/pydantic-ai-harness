@@ -49,6 +49,13 @@ class _Engine(BaseModel):
         # dispatch workflow interpolates it into a PyPI URL. Anything that is not a
         # version is a broken install for consumers, and a value carrying `/` or `?`
         # reaches a different PyPI endpoint than the one the check means to ask about.
+        #
+        # Rejected rather than normalized, both here and for the surrounding
+        # whitespace `Version` would otherwise accept: gh-aw reads the same bytes this
+        # file holds, so a guard that checks a cleaned-up copy is checking a string
+        # that never ships.
+        if value != value.strip():
+            raise ValueError('must not be padded with whitespace, which gh-aw would install verbatim')
         try:
             Version(value)
         except InvalidVersion as exc:
