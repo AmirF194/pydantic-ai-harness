@@ -1,6 +1,6 @@
 # /// script
 # requires-python = ">=3.10"
-# dependencies = ["pydantic>=2", "pyyaml>=6.0.2"]
+# dependencies = ["packaging>=24", "pydantic>=2", "pyyaml>=6.0.2"]
 # ///
 """Validate `gh-aw/pydantic.md` and print the `pydantic-ai-harness` version its engine pins.
 
@@ -27,7 +27,8 @@ from pathlib import Path
 from typing import Literal
 
 import yaml
-from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from packaging.version import InvalidVersion, Version
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
 DEFINITION = Path(__file__).resolve().parent.parent / 'gh-aw' / 'pydantic.md'
 RELEASE_REF = 'gh-aw-engine'
@@ -40,6 +41,19 @@ class _Engine(BaseModel):
     # Not `str | float`: an unquoted `0.21.0` is a YAML float and `0.21` loses a
     # component on the way back to text, so the quoting is part of the contract.
     version: str = Field(min_length=1)
+
+    @field_validator('version')
+    @classmethod
+    def _pep_440(cls, value: str) -> str:
+        # gh-aw interpolates this into `pydantic-ai-harness[cli]==<version>`, and the
+        # dispatch workflow interpolates it into a PyPI URL. Anything that is not a
+        # version is a broken install for consumers, and a value carrying `/` or `?`
+        # reaches a different PyPI endpoint than the one the check means to ask about.
+        try:
+            Version(value)
+        except InvalidVersion as exc:
+            raise ValueError(f'is not a PEP 440 version: {exc}') from exc
+        return value
 
 
 class _Frontmatter(BaseModel):
