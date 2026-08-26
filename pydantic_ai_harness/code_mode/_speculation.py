@@ -207,6 +207,10 @@ def _literal_calls(statements: Sequence[ast.stmt], eligible: frozenset[str]) -> 
     """
     out: list[tuple[str, dict[str, Any]]] = []
     for statement in statements:
+        if isinstance(statement, _SKIP_CONTAINERS):
+            # A top-level `def`/`class` statement only defines; its body (and even its
+            # decorators, conservatively) runs later, if ever.
+            continue
         for call in _iter_calls(statement):
             func = call.func
             if not isinstance(func, ast.Name) or func.id not in eligible:

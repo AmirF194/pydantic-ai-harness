@@ -10,15 +10,31 @@ from __future__ import annotations
 
 import asyncio
 import json
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Sequence
 from dataclasses import dataclass, field
 
 import pytest
-from pydantic_ai import Agent
-from pydantic_ai.messages import ModelMessage, ModelResponse, TextPart, ToolCallPart
+from pydantic_ai import Agent, RunContext, Tool
+from pydantic_ai.capabilities import AbstractCapability, HandleDeferredToolCalls
+from pydantic_ai.exceptions import ApprovalRequired
+from pydantic_ai.messages import (
+    AgentStreamEvent,
+    ModelMessage,
+    ModelResponse,
+    PartDeltaEvent,
+    PartStartEvent,
+    TextPart,
+    ToolCallPart,
+    ToolCallPartDelta,
+    ToolReturn,
+)
 from pydantic_ai.models.function import AgentInfo, DeltaToolCall, DeltaToolCalls, FunctionModel
+from pydantic_ai.models.test import TestModel
+from pydantic_ai.tools import DeferredToolRequests, DeferredToolResults, ToolDenied
+from pydantic_ai.toolsets.function import FunctionToolset
+from pydantic_ai.usage import RunUsage
 
-from pydantic_ai_harness.code_mode import CodeMode
+from pydantic_ai_harness.code_mode import CodeMode, CodeModeToolset
 
 pytestmark = pytest.mark.anyio
 
@@ -54,18 +70,28 @@ def padded(code: str) -> str:
     return f'{code}{filler}\n"ok"'
 
 
-def build_agent(log: ToolLog, code: str, capability: CodeMode[None], chunk_size: int = 16) -> Agent[None, str]:
+def build_agent(
+    log: ToolLog,
+    code: str,
+    capability: CodeMode[None],
+    chunk_size: int = 16,
+    extra_capabilities: Sequence[AbstractCapability[None]] = (),
+    raw_args: str | None = None,
+) -> Agent[None, str]:
     """Agent whose model streams one `run_code` call for `code` in `chunk_size` pieces."""
 
     async def stream_code(messages: list[ModelMessage], info: AgentInfo) -> AsyncIterator[DeltaToolCalls | str]:
         if len(messages) > 1:
-            yield 'done'
+            # Two chunks so the text part produces a delta for an index the watcher never registered.
+            yield 'do'
+            yield 'ne'
             return
-        args = json.dumps({'code': code})
+        args = raw_args if raw_args is not None else json.dumps({'code': code})
         log.streaming_done = False
+        # Name-only first delta: the started part carries no arguments yet.
+        yield {1: DeltaToolCall(name='run_code')}
         for offset in range(0, len(args), chunk_size):
-            name = 'run_code' if offset == 0 else None
-            yield {1: DeltaToolCall(name=name, json_args=args[offset : offset + chunk_size])}
+            yield {1: DeltaToolCall(json_args=args[offset : offset + chunk_size])}
             # Yield to the event loop so launched speculation tasks actually make progress
             # mid-stream, the way tool latency overlaps decode against a real provider.
             await asyncio.sleep(0)
@@ -79,7 +105,7 @@ def build_agent(log: ToolLog, code: str, capability: CodeMode[None], chunk_size:
         return ModelResponse(parts=[ToolCallPart(tool_name='run_code', args={'code': code})])
 
     model = FunctionModel(call_code, stream_function=stream_code)
-    agent: Agent[None, str] = Agent(model, deps_type=type(None), capabilities=[capability])
+    agent: Agent[None, str] = Agent(model, deps_type=type(None), capabilities=[capability, *extra_capabilities])
 
     @agent.tool_plain
     async def search(query: str) -> str:
@@ -97,6 +123,23 @@ def build_agent(log: ToolLog, code: str, capability: CodeMode[None], chunk_size:
             log.started_during_stream += 1
         log.calls.append(('side_effect', payload))
         return f'wrote:{payload}'
+
+    @agent.tool_plain
+    async def boom(payload: str) -> str:
+        """A tool that always fails."""
+        log.calls.append(('boom', payload))
+        raise RuntimeError('kaboom')
+
+    @agent.tool_plain
+    async def approval_gate(value: int) -> str:
+        """A tool that requires approval."""
+        raise ApprovalRequired()
+
+    @agent.tool_plain
+    async def with_metadata(query: str) -> ToolReturn[str]:
+        """A tool that returns a `ToolReturn` carrying metadata."""
+        log.calls.append(('with_metadata', query))
+        return ToolReturn(return_value=f'meta:{query}', metadata={'speculated': True})
 
     return agent
 
@@ -199,3 +242,185 @@ class TestSpeculation:
 
         assert result.output == 'done'
         assert capability.speculation_stats.launched == 0
+
+
+def build_run_context(deps: None) -> RunContext[None]:
+    """Build a `RunContext` for invoking the capability's public hooks directly.
+
+    Mirrors the helper in `test_code_mode.py`.
+    """
+    return RunContext[None](
+        deps=deps,
+        model=TestModel(),
+        usage=RunUsage(),
+        prompt=None,
+        messages=[],
+        run_step=0,
+        pending_messages=[],
+    )
+
+
+class _PlainEventStream:
+    """An async iterable of events that is not an async generator, so it has no `aclose`."""
+
+    def __init__(self, events: Sequence[AgentStreamEvent]) -> None:
+        self._events = list(events)
+
+    def __aiter__(self) -> _PlainEventStream:
+        return self
+
+    async def __anext__(self) -> AgentStreamEvent:
+        if not self._events:
+            raise StopAsyncIteration
+        return self._events.pop(0)
+
+
+class TestSpeculationEdgeCases:
+    async def test_inactive_under_temporal_durability(self):
+        """Under Temporal, nothing launches early and dispatches simply miss the store."""
+
+        class TemporalDurability(AbstractCapability[None]):
+            in_durable_context = True
+
+        TemporalDurability.__module__ = 'pydantic_ai.durable_exec.temporal'
+        log = ToolLog()
+        capability = CodeMode[None](speculate=['search'])
+        code = padded('a = await search(query="alpha")\nprint(a)')
+        agent = build_agent(log, code, capability, extra_capabilities=[TemporalDurability()])
+
+        result = await agent.run('go')
+
+        assert result.output == 'done'
+        assert log.calls == [('search', 'alpha')]
+        assert log.started_during_stream == 0
+        assert capability.speculation_stats.launched == 0
+
+    async def test_speculated_tool_error_surfaces_at_claim(self):
+        """A failed launch delivers its error where the cold call would have raised it."""
+        log = ToolLog()
+        capability = CodeMode[None](speculate=['boom'])
+        agent = build_agent(log, padded('a = await boom(payload="x")\nprint(a)'), capability)
+
+        result = await agent.run('go')
+
+        assert result.output == 'done'
+        assert log.calls == [('boom', 'x')]
+        assert capability.speculation_stats.launched == 1
+        assert capability.speculation_stats.adopted == 1
+
+    async def test_denied_speculated_call_records_denial(self):
+        """A handler denial reached through a launch is recorded and raised like a cold denial."""
+
+        async def deny_all(ctx: RunContext[None], requests: DeferredToolRequests) -> DeferredToolResults:
+            return DeferredToolResults(
+                approvals={call.tool_call_id: ToolDenied(message='nope') for call in requests.approvals}
+            )
+
+        log = ToolLog()
+        capability = CodeMode[None](speculate=['approval_gate'])
+        code = padded('a = await approval_gate(value=1)\nprint(a)')
+        agent = build_agent(log, code, capability, extra_capabilities=[HandleDeferredToolCalls(handler=deny_all)])
+
+        result = await agent.run('go')
+
+        assert result.output == 'done'
+        assert capability.speculation_stats.launched == 1
+        assert capability.speculation_stats.adopted == 1
+
+    async def test_unhandled_approval_in_speculated_call_becomes_user_error(self):
+        """With no handler capability, a launch hitting `ApprovalRequired` mirrors the cold error."""
+        log = ToolLog()
+        capability = CodeMode[None](speculate=['approval_gate'])
+        agent = build_agent(log, padded('a = await approval_gate(value=1)\nprint(a)'), capability)
+
+        result = await agent.run('go')
+
+        assert result.output == 'done'
+        assert capability.speculation_stats.launched == 1
+        assert capability.speculation_stats.adopted == 1
+
+    async def test_tool_return_metadata_survives_adoption(self):
+        """A `ToolReturn`-returning tool keeps its metadata on the adopted nested return part."""
+        log = ToolLog()
+        capability = CodeMode[None](speculate=['with_metadata'])
+        agent = build_agent(log, padded('a = await with_metadata(query="m")\nprint(a)'), capability)
+
+        result = await agent.run('go')
+
+        assert result.output == 'done'
+        assert log.calls == [('with_metadata', 'm')]
+        assert capability.speculation_stats.adopted == 1
+
+    async def test_malformed_argument_stream_launches_nothing(self):
+        """Arguments that never decode as JSON produce no launches and no watcher crash."""
+        log = ToolLog()
+        capability = CodeMode[None](speculate=['search'])
+        agent = build_agent(log, '', capability, raw_args='this is not json at all')
+
+        result = await agent.run('go')
+
+        assert result.output == 'done'
+        assert capability.speculation_stats.launched == 0
+
+    async def test_watcher_handles_dict_args_odd_indexes_and_caps_launches(self):
+        """Dict-argument deltas, unknown part indexes, plain (non-generator) streams, and the
+        per-part launch cap, driven through the capability's public hooks."""
+
+        def search(query: str) -> str:
+            """Return a canned result."""
+            return f'result:{query}'
+
+        ctx = build_run_context(None)
+        capability = CodeMode[None](speculate=['search'])
+        run_capability = await capability.for_run(ctx)
+        toolset = run_capability.get_wrapper_toolset(FunctionToolset[None](tools=[Tool(search)]))
+        assert isinstance(toolset, CodeModeToolset)
+
+        # Before any step stashed dispatch ingredients, streamed parts are watched but nothing
+        # can launch. A string-args part start exercises the initial-args accumulation path.
+        pre_events: list[AgentStreamEvent] = [
+            PartStartEvent(
+                index=0, part=ToolCallPart(tool_name='run_code', args='{"code": "y = 1\\n', tool_call_id='c0')
+            ),
+        ]
+        seen = [
+            event async for event in run_capability.wrap_run_event_stream(ctx, stream=_PlainEventStream(pre_events))
+        ]
+        assert seen == pre_events
+        assert run_capability.speculation_stats.launched == 0
+
+        await toolset.get_tools(ctx)
+
+        code = (
+            'def helper():\n    return search(query="inner")\n'
+            'if True:\n    def nested():\n        return search(query="nested")\n'
+            'if False:\n    search("positional")\n'
+            'if False:\n    search(**{"query": "z"})\n'
+            + ''.join(f'x{i} = search(query="q")\n' for i in range(34))
+            + 'done = 1\n'
+        )
+        events: list[AgentStreamEvent] = [
+            PartStartEvent(index=0, part=TextPart(content='hi')),
+            PartStartEvent(index=1, part=ToolCallPart(tool_name='run_code', args={}, tool_call_id='c1')),
+            PartDeltaEvent(index=1, delta=ToolCallPartDelta(args_delta=None, tool_call_id='c1')),
+            PartDeltaEvent(index=1, delta=ToolCallPartDelta(args_delta={'code': code})),
+            PartDeltaEvent(index=9, delta=ToolCallPartDelta(args_delta='{}')),
+        ]
+
+        seen = [event async for event in run_capability.wrap_run_event_stream(ctx, stream=_PlainEventStream(events))]
+
+        assert seen == events
+        # 34 identical literal calls stream past; the def bodies (top-level and nested), the
+        # positional call, and the double-star call are ineligible, and the per-part cap stops
+        # launches at the limit.
+        assert run_capability.speculation_stats.launched == 32
+
+        with pytest.raises(RuntimeError, match='synthetic run failure'):
+            await run_capability.on_run_error(ctx, error=RuntimeError('synthetic run failure'))
+        assert run_capability.speculation_stats.evicted == 32
+
+    async def test_run_error_without_speculation_passes_through(self):
+        """`on_run_error` re-raises untouched when speculation was never enabled."""
+        capability = CodeMode[None]()
+        with pytest.raises(RuntimeError, match='plain failure'):
+            await capability.on_run_error(build_run_context(None), error=RuntimeError('plain failure'))
