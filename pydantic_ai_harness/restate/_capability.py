@@ -24,16 +24,18 @@ except ImportError as _import_error:
 
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
-from typing import Any, ClassVar
+from typing import Any, ClassVar, Literal, Protocol, TypeAlias, runtime_checkable
 
 from pydantic_ai.agent import EventStreamHandler
-from pydantic_ai.durable_exec._base import BaseDurabilityCapability, ToolsetKind
+from pydantic_ai.durable_exec._base import BaseDurabilityCapability
 from pydantic_ai.durable_exec._codec import JSON_CODEC
-from pydantic_ai.durable_exec._runtime_toolsets import RuntimeToolsetKind
-from pydantic_ai.durable_exec._toolset import Lifecycle
+from pydantic_ai.durable_exec._operation_backend import CallableOperationBackend
+from pydantic_ai.durable_exec._operation_names import JournalOperationNamer
 from pydantic_ai.exceptions import UserError
 from pydantic_ai.models import Model
 from pydantic_ai.tools import AgentDepsT
+from pydantic_ai.toolsets import ToolsetTool
+from pydantic_core import PydanticSerializationError
 from restate.context import RunOptions
 from restate.exceptions import TerminalError
 from restate.extensions import current_context
@@ -42,6 +44,15 @@ from restate.serde import JsonSerde
 _ENGINE_NAME = 'Restate'
 _TOOL_CONFIG_KEY = 'restate'
 
+RuntimeToolsetKind: TypeAlias = Literal['function', 'mcp', 'dynamic']
+ToolsetKind: TypeAlias = Literal['function', 'mcp', 'dynamic']
+Lifecycle: TypeAlias = Literal['enter-outside-durable', 'enter-always', 'enter-never']
+
+
+@runtime_checkable
+class _ToolOperationId(Protocol):
+    toolset_kind: ToolsetKind
+
 
 def _current_restate_context() -> restate.Context | None:
     """Return the active Restate context, or `None` outside a Restate invocation."""
@@ -49,6 +60,54 @@ def _current_restate_context() -> restate.Context | None:
         return current_context()
     except LookupError:
         return None
+
+
+class _RestateOperationConfig:
+    def base(self, role: object, operation_id: object) -> Mapping[str, Any]:
+        del role, operation_id
+        return {}
+
+    def for_tool(
+        self,
+        role: object,
+        operation_id: object,
+        tool: object | None,
+        tool_name: str,
+    ) -> Mapping[str, Any] | Literal[False]:
+        del role, tool_name
+        config = (tool.tool_def.metadata or {}).get(_TOOL_CONFIG_KEY) if isinstance(tool, ToolsetTool) else None
+        if config is False:
+            if isinstance(operation_id, _ToolOperationId) and operation_id.toolset_kind == 'mcp':
+                raise UserError('MCP tools cannot run outside a durable step in Restate.')
+            return False
+        if config:
+            raise UserError('Restate run steps take no per-tool options; remove the config.')
+        return {}
+
+
+class _RestateOperationBackend(CallableOperationBackend[Mapping[str, Any]]):
+    def __init__(self, agent_name: str, default_model_id: str | None) -> None:
+        super().__init__(
+            namer=JournalOperationNamer(agent_name, default_model_id=default_model_id or 'default'),
+            config=_RestateOperationConfig(),
+        )
+
+    async def _execute(
+        self,
+        *,
+        name: str,
+        body: Callable[[], Awaitable[object]],
+        cache_key: tuple[object, ...],
+        config: object,
+    ) -> object:
+        del cache_key
+        assert not config
+        context = current_context()
+        assert context is not None
+        try:
+            return await context.run_typed(name, body, RunOptions(serde=JsonSerde()))
+        except (PydanticSerializationError, TypeError) as exc:
+            raise TerminalError(str(exc)) from exc
 
 
 @dataclass(init=False)
@@ -138,21 +197,5 @@ class RestateDurability(BaseDurabilityCapability[AgentDepsT]):
     def in_durable_context(self) -> bool:
         return _current_restate_context() is not None
 
-    async def run_durable_unit(
-        self, name: str, fn: Callable[[], Awaitable[Any]], *, inputs: tuple[Any, ...], config: Any
-    ) -> Any:
-        """Run the base-built operation through a Restate run step."""
-        del inputs
-        assert not config
-        context = current_context()
-        assert context is not None
-        return await context.run_typed(name, fn, RunOptions(serde=JsonSerde()))
-
-    def _normalize_unit_config(self, config: Any) -> Any:
-        if config:
-            raise UserError('Restate run steps take no per-tool options; remove the config.')
-        return config
-
-    def _serialization_failure(self, exc: Exception) -> BaseException:
-        """Fail non-serializable step results without retrying the Restate invocation."""
-        return TerminalError(str(exc))
+    def _build_operation_backend(self) -> _RestateOperationBackend:
+        return _RestateOperationBackend(self.name, self._default_model_id)

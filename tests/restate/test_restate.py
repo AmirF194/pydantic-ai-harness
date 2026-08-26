@@ -18,6 +18,7 @@ import pytest
 pytest.importorskip('restate')
 
 from pydantic_ai import Agent, RunContext
+from pydantic_ai.capabilities import AbstractCapability, durable_operation
 from pydantic_ai.exceptions import ApprovalRequired, CallDeferred, ModelRetry, UserError
 from pydantic_ai.messages import (
     AgentStreamEvent,
@@ -69,6 +70,21 @@ def _tool_then_done_model(tool_name: str, args: dict[str, object]) -> FunctionMo
         return ModelResponse(parts=[TextPart(content='done')])
 
     return FunctionModel(fn, model_name='fn')
+
+
+class _CountingOperation(AbstractCapability[object]):
+    id = 'counter'
+
+    def __init__(self, calls: list[int]) -> None:
+        self.calls = calls
+
+    async def before_run(self, ctx: RunContext[object]) -> None:
+        await self.increment(ctx)
+
+    @durable_operation
+    async def increment(self, ctx: RunContext[object]) -> int:
+        self.calls.append(1)
+        return len(self.calls)
 
 
 class TestTransparency:
@@ -729,6 +745,31 @@ class TestRepeatedStepNames:
 
 
 class TestCheckpointFormat:
+    async def test_capability_operation_name_and_replay_are_pinned(self) -> None:
+        operation_calls: list[int] = []
+        model_calls = {'calls': 0}
+        agent = Agent(
+            _text_model(model_calls),
+            name='compat',
+            capabilities=[_CountingOperation(operation_calls), RestateDurability()],
+        )
+
+        ctx = FakeRestateContext()
+        with restate_context(ctx):
+            await agent.run('hi')
+
+        assert ctx.step_names == ['compat__capability__counter.increment', 'compat__model.request']
+        assert operation_calls == [1]
+
+        replay = ctx.replay()
+        with restate_context(replay):
+            await agent.run('hi')
+
+        assert replay.step_names == ctx.step_names
+        assert replay.invoked == []
+        assert operation_calls == [1]
+        assert model_calls['calls'] == 1
+
     async def test_hand_written_model_request_payload_replays(self) -> None:
         from .conftest import Entry
 
