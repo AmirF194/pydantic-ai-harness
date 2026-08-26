@@ -20,33 +20,29 @@ except ImportError as _import_error:  # pragma: no cover
         '`pip install "pydantic-ai-harness[aws-lambda]"`'
     ) from _import_error
 
-from collections.abc import Awaitable, Callable, Mapping
+from collections.abc import Mapping
 from dataclasses import dataclass, fields
-from typing import Any, ClassVar
+from typing import Any, ClassVar, Literal, TypeAlias
 
 from aws_durable_execution_sdk_python.config import StepConfig
-from aws_durable_execution_sdk_python.exceptions import ExecutionError
 from pydantic_ai.agent import EventStreamHandler
-from pydantic_ai.durable_exec._base import BaseDurabilityCapability, ToolsetKind
+from pydantic_ai.durable_exec._base import BaseDurabilityCapability
 from pydantic_ai.durable_exec._codec import JSON_CODEC
-from pydantic_ai.durable_exec._runtime_toolsets import RuntimeToolsetKind
-from pydantic_ai.durable_exec._toolset import Lifecycle
+from pydantic_ai.durable_exec._operation_backend import DurableOperationBackend
 from pydantic_ai.exceptions import UserError
 from pydantic_ai.models import Model
 from pydantic_ai.tools import AgentDepsT
+from pydantic_ai.toolsets import ToolsetTool
 
 from ._bridge import ENGINE_NAME as _ENGINE_NAME
-from ._bridge import StepBridge, current_bridge, in_durable_context
+from ._bridge import in_durable_context
+from ._operation_backend import AWSLambdaOperationBackend, AWSLambdaOperationConfig
 
 _TOOL_CONFIG_KEY = 'aws_lambda'
+_ToolsetKind: TypeAlias = Literal['function', 'mcp', 'dynamic']
+_Lifecycle: TypeAlias = Literal['enter-outside-durable', 'enter-always', 'enter-never']
 # Derived rather than listed so a new SDK `StepConfig` field is accepted, not rejected as unknown.
 _STEP_CONFIG_FIELDS = frozenset(f.name for f in fields(StepConfig))
-
-
-def _require_bridge() -> StepBridge:
-    bridge = current_bridge()
-    assert bridge is not None  # pragma: no cover - callers gate on `in_durable_context`
-    return bridge
 
 
 def _step_config(config: Mapping[str, Any] | None) -> StepConfig | None:
@@ -61,6 +57,12 @@ def _step_config(config: Mapping[str, Any] | None) -> StepConfig | None:
             f'{", ".join(repr(field) for field in sorted(_STEP_CONFIG_FIELDS))}.'
         )
     return StepConfig(**config)
+
+
+def _toolset_tool(value: object | None) -> ToolsetTool[Any] | None:
+    if isinstance(value, ToolsetTool):
+        return value  # pyright: ignore[reportUnknownVariableType]
+    return None
 
 
 @dataclass(init=False)
@@ -107,11 +109,9 @@ class AWSLambdaDurability(BaseDurabilityCapability[AgentDepsT]):
 
     engine_name = _ENGINE_NAME
     _codec: ClassVar = JSON_CODEC
-    _unsupported_runtime_toolset_kinds: ClassVar[frozenset[RuntimeToolsetKind]] = frozenset(
-        {'function', 'mcp', 'dynamic'}
-    )
-    _wrapped_toolset_kinds: ClassVar[frozenset[ToolsetKind]] = frozenset({'function', 'mcp', 'dynamic'})
-    _toolset_lifecycles: ClassVar[Mapping[ToolsetKind, Lifecycle]] = {
+    _unsupported_runtime_toolset_kinds: ClassVar[frozenset[_ToolsetKind]] = frozenset({'function', 'mcp', 'dynamic'})
+    _wrapped_toolset_kinds: ClassVar[frozenset[_ToolsetKind]] = frozenset({'function', 'mcp', 'dynamic'})
+    _toolset_lifecycles: ClassVar[Mapping[_ToolsetKind, _Lifecycle]] = {
         'function': 'enter-always',
         'mcp': 'enter-always',
         'dynamic': 'enter-never',
@@ -156,34 +156,17 @@ class AWSLambdaDurability(BaseDurabilityCapability[AgentDepsT]):
     def in_durable_context(self) -> bool:
         return in_durable_context()
 
-    async def run_durable_unit(
-        self, name: str, fn: Callable[[], Awaitable[Any]], *, inputs: tuple[Any, ...], config: Any
-    ) -> Any:
-        """Run the base-built operation through Lambda's synchronous step bridge."""
-        del inputs
-        assert config is None or isinstance(config, StepConfig)
+    def _build_operation_backend(  # pyright: ignore[reportIncompatibleMethodOverride]
+        self,
+    ) -> DurableOperationBackend[StepConfig | None]:
+        def tool_config(kind: _ToolsetKind, tool: object | None, tool_name: str) -> StepConfig | Literal[False] | None:
+            config = self._build_resolve_tool_config(self._base_step_config)(_toolset_tool(tool), tool_name)
+            if config is False:
+                return False
+            return _step_config(config)
 
-        async def operation() -> Any:
-            return await fn()
-
-        return await _require_bridge().run_step(name, operation, config)
-
-    def _model_unit_config(self) -> StepConfig | None:
-        return _step_config(self._base_step_config)
-
-    def _event_unit_config(self) -> StepConfig | None:
-        return _step_config(self._base_step_config)
-
-    def _toolset_base_config(self, kind: ToolsetKind) -> Mapping[str, Any] | None:
-        del kind
-        return self._base_step_config
-
-    def _normalize_unit_config(self, config: Any) -> StepConfig | None:
-        return _step_config(config)
-
-    def _serialization_failure(self, exc: Exception) -> BaseException:
-        """Map serialization failures to the SDK's non-retryable execution error.
-
-        This fails invalid checkpoint values without consuming SDK step retries.
-        """
-        return ExecutionError(str(exc))
+        return AWSLambdaOperationBackend(
+            agent_name=self.name,
+            default_model_id=self._default_model_id,
+            config=AWSLambdaOperationConfig(base=self._base_step_config, tool=tool_config),
+        )

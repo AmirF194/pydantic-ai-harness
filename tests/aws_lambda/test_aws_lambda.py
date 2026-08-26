@@ -14,6 +14,7 @@ import pytest
 from aws_durable_execution_sdk_python.exceptions import ExecutionError
 from pydantic_ai import Agent, RunContext
 from pydantic_ai._run_context import get_current_run_context  # pyright: ignore[reportPrivateUsage]
+from pydantic_ai.capabilities import AbstractCapability, durable_operation
 from pydantic_ai.exceptions import ApprovalRequired, CallDeferred, ModelRetry, UserError
 from pydantic_ai.messages import (
     AgentStreamEvent,
@@ -122,6 +123,43 @@ class TestDurableRun:
             run_durable(lambda: agent.run('go'), context=ctx)
 
         assert [op.status for op in ctx.failed] == ['failed']
+
+
+class TestCapabilityOperation:
+    def test_operation_is_journaled_and_replayed_without_rerunning_handler(self) -> None:
+        class Contributor(AbstractCapability[Any]):
+            id = 'contributor'
+
+            def __init__(self) -> None:
+                self.calls = 0
+
+            async def before_run(self, ctx: RunContext[Any]) -> None:
+                await self.record(ctx, 'value')
+
+            @durable_operation
+            async def record(self, ctx: RunContext[Any], value: str) -> str:
+                self.calls += 1
+                return value
+
+        contributor = Contributor()
+        agent = Agent(
+            TestModel(custom_output_text='done'),
+            name='a',
+            capabilities=[contributor, AWSLambdaDurability()],
+        )
+
+        first = FakeDurableContext()
+        run_durable(lambda: agent.run('go'), context=first)
+
+        assert first.step_names[0] == 'a__capability__contributor.record'
+        assert contributor.calls == 1
+
+        resumed = FakeDurableContext(journal=first.operations)
+        result = run_durable(lambda: agent.run('go'), context=resumed)
+
+        assert result.output == 'done'
+        assert resumed.invoked == []
+        assert contributor.calls == 1
 
 
 class TestControlFlowSignals:
