@@ -348,9 +348,8 @@ Both prompt surfaces of the summary request are fields: `summary_prompt` is the 
 The summary call is a real request to the model, so its full usage -- tokens **and** the request itself -- is folded into the run's `ctx.usage`. This is deliberate: it keeps cost honest, keeps the request count consistent (a model request that did not count as one would be the surprise), and lets a `UsageLimits` request limit catch a runaway compaction. The nested run receives the other parent limits unchanged; the finite request limit is reduced by one so it cannot spend the slot already approved for the parent request. A run-request or iteration limiter will therefore see compaction calls among its requests.
 
 With a durable-execution capability attached, the summary call runs as a contributed durable
-operation, so replay uses the recorded summary instead of calling the model again. Temporal
-currently requires an explicit `model=` for this path because generic contributed operations do not
-rebuild `RunContext.model` inside an activity.
+operation, so replay uses the recorded summary instead of calling the model again. When `model` is
+not set, the operation uses the run's model.
 
 ## `WarnNearLimits`: warn instead of rewrite
 

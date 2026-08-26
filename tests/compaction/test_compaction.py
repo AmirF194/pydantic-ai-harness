@@ -101,7 +101,6 @@ def _make_ctx(
         usage_limits: UsageLimits | None = None
         model: Model = dataclasses.field(default_factory=TestModel)
         deps: None = None
-        agent: None = None
         tracer: Tracer = dataclasses.field(default_factory=NoOpTracer)
         # A declared field, like the real `RunContext`: a strategy reached from
         # `before_model_request` sees a context rebuilt for the request's model, and an

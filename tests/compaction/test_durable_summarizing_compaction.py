@@ -57,20 +57,25 @@ def _history() -> list[ModelMessage]:
 async def test_dbos_replays_the_recorded_summary(dbos: DBOS) -> None:
     summary_calls = 0
 
-    async def summarize(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
-        del messages, info
+    async def respond(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        del info
         nonlocal summary_calls
-        summary_calls += 1
-        return ModelResponse(parts=[TextPart(f'summary {summary_calls}')])
+        if any(
+            isinstance(part, UserPromptPart) and isinstance(part.content, str) and '<messages>' in part.content
+            for message in messages
+            for part in message.parts
+        ):
+            summary_calls += 1
+            return ModelResponse(parts=[TextPart(f'summary {summary_calls}')])
+        return ModelResponse(parts=[TextPart('done')])
 
     compaction: SummarizingCompaction[None] = SummarizingCompaction(
-        model=FunctionModel(summarize),
         max_messages=1,
         keep_messages=1,
         preserve_first_user_message=False,
     )
     agent: Agent[None, str] = Agent(
-        TestModel(),
+        FunctionModel(respond),
         name='durable_summary',
         deps_type=type(None),
         capabilities=[compaction, DBOSDurability[None]()],

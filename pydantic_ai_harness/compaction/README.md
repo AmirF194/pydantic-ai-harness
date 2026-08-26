@@ -401,9 +401,8 @@ the finite request limit is reduced by one so it cannot spend the slot already a
 A run-request / iteration limiter will therefore see compaction calls among its requests.
 
 With a durable-execution capability attached, the summary call runs as a contributed durable
-operation, so replay uses the recorded summary instead of calling the model again. Temporal
-currently requires an explicit `model=` for this path because generic contributed operations do not
-rebuild `RunContext.model` inside an activity.
+operation, so replay uses the recorded summary instead of calling the model again. When `model` is
+not set, the operation uses the run's model.
 
 ## `DeduplicateFileReads.file_key`
 

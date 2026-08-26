@@ -90,7 +90,6 @@ def _ctx(model: Any = None) -> Any:
         usage_limits: UsageLimits | None = None
         model: Model = dataclasses.field(default_factory=TestModel)
         deps: None = None
-        agent: None = None
         tracer: Tracer = dataclasses.field(default_factory=NoOpTracer)
 
     return _FakeCtx(model=model) if model is not None else _FakeCtx()
@@ -1457,4 +1456,4 @@ class TestRealtimeModelSkipsTokenTriggers:
         ctx = _ctx(model=_FakeRealtimeModel())
 
         with pytest.raises(UserError, match='needs a request-response model'):
-            await capability._summarize(ctx, _history(2))  # pyright: ignore[reportPrivateUsage]
+            await capability._summarize(_history(2), ctx)  # pyright: ignore[reportPrivateUsage]
