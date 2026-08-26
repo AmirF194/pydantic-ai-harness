@@ -400,6 +400,11 @@ request count consistent (a model request that didn't count as one would be the 
 the finite request limit is reduced by one so it cannot spend the slot already approved for the parent request.
 A run-request / iteration limiter will therefore see compaction calls among its requests.
 
+With a durable-execution capability attached, the summary call runs as a contributed durable
+operation, so replay uses the recorded summary instead of calling the model again. Temporal
+currently requires an explicit `model=` for this path because generic contributed operations do not
+rebuild `RunContext.model` inside an activity.
+
 ## `DeduplicateFileReads.file_key`
 
 There is no default `file_key`: identifying a file read is agent-specific, and a wrong guess would

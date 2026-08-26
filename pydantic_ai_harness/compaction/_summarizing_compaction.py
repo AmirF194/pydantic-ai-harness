@@ -4,10 +4,11 @@ from __future__ import annotations
 
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field, replace
+from decimal import Decimal
 from typing import TYPE_CHECKING, Any, cast
 
 from pydantic_ai._run_context import AgentDepsT
-from pydantic_ai.capabilities import AbstractCapability
+from pydantic_ai.capabilities import AbstractCapability, durable_operation
 from pydantic_ai.exceptions import UserError
 from pydantic_ai.messages import (
     ModelMessage,
@@ -23,6 +24,7 @@ from pydantic_ai.messages import (
 from pydantic_ai.models import Model
 from pydantic_ai.models.fallback import FallbackModel
 from pydantic_ai.tools import RunContext
+from pydantic_ai.usage import RunUsage
 
 from pydantic_ai_harness._usage import reserved_usage_limits
 from pydantic_ai_harness.compaction._context_window import DEFAULT_CONTEXT_WINDOW
@@ -108,6 +110,30 @@ _BRIDGE_PREFIX = 'This summary was produced by a different model than the one co
 
 _KEPT_USER_MESSAGE_METADATA = 'pydantic-ai-harness.compaction.kept-user-message.v1'
 """Model-request metadata marking a user turn retained by `keep_user_messages`."""
+
+
+@dataclass
+class _SummaryResult:
+    summary: str
+    usage: RunUsage
+
+
+def _usage_delta(before: RunUsage, after: RunUsage) -> RunUsage:
+    """Return the usage added to `after` since `before`."""
+    delta = RunUsage(requests=after.requests - before.requests, tool_calls=after.tool_calls - before.tool_calls)
+    excluded = {'requests', 'tool_calls', 'details', 'cost'}
+    for name in (before.__dict__.keys() | after.__dict__.keys()) - excluded:
+        before_value = getattr(before, name, 0)
+        after_value = getattr(after, name, 0)
+        if isinstance(before_value, (int, float)) and isinstance(after_value, (int, float)):
+            setattr(delta, name, after_value - before_value)
+    delta.details = {
+        name: after.details.get(name, 0) - before.details.get(name, 0)
+        for name in before.details.keys() | after.details.keys()
+    }
+    if after.cost is not None:
+        delta.cost = after.cost - (before.cost or Decimal())
+    return delta
 
 
 def _model_name(model: str | AbstractModel | None) -> str | None:
@@ -267,6 +293,8 @@ class SummarizingCompaction(AbstractCapability[AgentDepsT]):
         ```
     """
 
+    id: str | None = field(default='summarizing_compaction', kw_only=True)
+
     model: str | Model | None = None
     """Model used to generate summaries.
 
@@ -412,7 +440,10 @@ class SummarizingCompaction(AbstractCapability[AgentDepsT]):
         preserved = messages[cutoff:]
 
         previous_summary = _extract_previous_summary(messages) if self.incremental else None
-        summary = await self._summarize(to_summarize, ctx, previous_summary=previous_summary)
+        summary_result = await self._summarize(ctx, to_summarize, previous_summary=previous_summary)
+        if summary_result.usage is not ctx.usage:
+            ctx.usage.incr(_usage_delta(ctx.usage, summary_result.usage))
+        summary = summary_result.summary
         summary = self._maybe_bridge_prefix(summary, messages, ctx)
 
         summary_part = SystemPromptPart(content=f'{_SUMMARY_PREFIX}{summary}')
@@ -603,13 +634,14 @@ class SummarizingCompaction(AbstractCapability[AgentDepsT]):
         request_context.messages = compacted
         return request_context
 
+    @durable_operation
     async def _summarize(
         self,
-        messages: list[ModelMessage],
         ctx: RunContext[AgentDepsT],
+        messages: list[ModelMessage],
         *,
         previous_summary: str | None = None,
-    ) -> str:
+    ) -> _SummaryResult:
         """Generate a summary for the given messages using the configured model."""
         from pydantic_ai import Agent
 
@@ -639,4 +671,4 @@ class SummarizingCompaction(AbstractCapability[AgentDepsT]):
             instructions=self.instructions,
         )
         result = await agent.run(prompt, usage=ctx.usage, usage_limits=reserved_usage_limits(ctx.usage_limits))
-        return result.output.strip()
+        return _SummaryResult(result.output.strip(), ctx.usage)
