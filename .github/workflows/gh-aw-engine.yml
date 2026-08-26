@@ -1,0 +1,66 @@
+name: gh-aw engine ref
+
+# GitHub Agentic Workflows resolves its `pydantic-ai` engine from
+# `gh-aw/pydantic.md` on this repository's `gh-aw-engine` branch. The release job
+# in `main.yml` advances that branch whenever a tag ships the version the
+# definition pins, which covers changes that ride along with a release. This
+# workflow covers the rest: a correction to the definition itself has no package
+# release to ride, and until someone runs this the fix sits on main while gh-aw
+# keeps serving the previous commit. It is also how the branch is created.
+on:
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  advance:
+    name: Advance gh-aw-engine to main
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          # Pinned to main rather than the dispatched ref: the ref picker selects
+          # which copy of this workflow runs, and an engine definition that has not
+          # landed on main must not become the one gh-aw serves.
+          ref: main
+          # Full history, for the same reason as the release job in `main.yml`: a
+          # push from a shallow clone depends on the receiving end accepting
+          # updates at the shallow boundary.
+          fetch-depth: 0
+          # zizmor: ignore[artipacked] -- the checkout credentials are what performs the push below
+          persist-credentials: true
+
+      - uses: astral-sh/setup-uv@cec208311dfd045dd5311c1add060b2062131d57 # v8.0.0
+        with:
+          python-version: '3.14'
+          enable-cache: false
+
+      - id: engine
+        run: |
+          version="$(uv run --script scripts/gh_aw_engine_version.py)"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      # The release path gets this for free: it runs seconds after the publish whose
+      # version it matched. Nothing is published here, so the pin is checked against
+      # PyPI directly. A definition naming a version pip cannot install fails every
+      # gh-aw workflow that selects this engine, at install time, in someone else's
+      # repository.
+      - name: Check the pinned version is published
+        env:
+          VERSION: ${{ steps.engine.outputs.version }}
+        run: |
+          status="$(curl --silent --show-error --output /dev/null --write-out '%{http_code}' \
+            "https://pypi.org/pypi/pydantic-ai-harness/${VERSION}/json")"
+          if [ "$status" != '200' ]; then
+            echo "pydantic-ai-harness ${VERSION} is not on PyPI (HTTP ${status}), so gh-aw-engine was not advanced." >&2
+            exit 1
+          fi
+
+      # A plain push, never `--force`: gh-aw's engine catalog names this branch
+      # rather than a commit and resolves it at compile time, so a non-fast-forward
+      # changes the definition under every consumer that recompiles. A push that
+      # cannot fast-forward is meant to fail. The first push creates the branch.
+      - run: git push origin HEAD:refs/heads/gh-aw-engine
