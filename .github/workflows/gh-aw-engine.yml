@@ -77,13 +77,19 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     # The write token is granted to a deployment of this environment, and an
-    # environment's deployment branch policy is enforced by GitHub rather than by
-    # the workflow file. That matters here because `workflow_dispatch` runs the
-    # workflow definition carried by the ref the dispatcher picked, so the `ref:
-    # main` checkout above pins what gets validated but cannot pin the code that
-    # holds the token. The policy can. Until an administrator configures the
-    # environment with a `main` branch policy and a `v*` tag policy, this line is
-    # inert and the gate is the repository's write-access list.
+    # environment's protection rules are enforced by GitHub rather than by the
+    # workflow file. That matters here because `workflow_dispatch` runs the workflow
+    # definition carried by the ref the dispatcher picked, so the `ref: main`
+    # checkout above pins what gets validated but cannot pin the code that holds the
+    # token. Protection rules can.
+    #
+    # A deployment ref policy is not the whole answer, because it matches the ref's
+    # name rather than its provenance: the `v*` half of it (which the release job in
+    # `main.yml` relies on) is worth exactly as much as the restrictions on creating
+    # `v*` tags, and this repository has none. Required reviewers are what close
+    # that, which is what the `release` environment already uses for the publish.
+    # Until an administrator configures this environment, the line is inert and the
+    # gate is the write-access list.
     environment: gh-aw-engine
     permissions:
       contents: write

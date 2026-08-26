@@ -571,13 +571,17 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     # The write token is granted to a deployment of this environment, and an
-    # environment's deployment branch policy is enforced by GitHub rather than by
-    # the workflow file. That distinction is the point: `workflow_dispatch` and tag
-    # pushes both run the workflow definition carried by the selected ref, so no
-    # condition written here can stop a ref from running its own version of this
-    # job. The policy can. Until an administrator configures the environment with a
-    # `main` branch policy and a `v*` tag policy, this line is inert and the gate is
-    # the repository's write-access list.
+    # environment's protection rules are enforced by GitHub rather than by the
+    # workflow file. That distinction is the point: tag pushes run the workflow
+    # definition carried by the tag, so no condition written here can stop a ref
+    # from running its own version of this job. Protection rules can.
+    #
+    # A deployment ref policy is not the whole answer, because it matches the ref's
+    # name rather than its provenance: a `v*` policy is worth exactly as much as the
+    # restrictions on creating `v*` tags, and this repository has none. Required
+    # reviewers are what close that, which is what the `release` environment already
+    # uses for the publish one job up. Until an administrator configures this
+    # environment, the line is inert and the gate is the write-access list.
     environment: gh-aw-engine
     permissions:
       contents: write
