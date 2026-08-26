@@ -14,27 +14,31 @@ permissions:
   contents: read
 
 jobs:
-  advance:
-    name: Advance gh-aw-engine to main
+  verify:
+    name: Verify main's engine pin
     runs-on: ubuntu-latest
-    # Every step here reaches the network, and none of them owns a timeout of its
-    # own beyond the curl bounds below.
+    # Every step here reaches the network and none of them owns a timeout beyond
+    # the curl bounds below.
     timeout-minutes: 10
     permissions:
-      contents: write
+      contents: read
+    outputs:
+      # Advancing to the commit this job checked out, rather than re-resolving main
+      # one job later, keeps the commit that was validated and the commit that ships
+      # the same one even if main moves in between.
+      sha: ${{ steps.commit.outputs.sha }}
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
-          # Pinned to main rather than the dispatched ref: the ref picker selects
-          # which copy of this workflow runs, and an engine definition that has not
-          # landed on main must not become the one gh-aw serves.
+          # main rather than the dispatched ref: the ref picker chooses which copy of
+          # this workflow runs, so it cannot be trusted to choose what gets published.
+          # An engine definition that has not landed on main must not become the one
+          # gh-aw serves.
           ref: main
-          # Full history, for the same reason as the release job in `main.yml`: a
-          # push from a shallow clone depends on the receiving end accepting
-          # updates at the shallow boundary.
-          fetch-depth: 0
-          # zizmor: ignore[artipacked] -- the checkout credentials are what performs the push below
-          persist-credentials: true
+          persist-credentials: false
+
+      - id: commit
+        run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
 
       - uses: astral-sh/setup-uv@cec208311dfd045dd5311c1add060b2062131d57 # v8.0.0
         with:
@@ -51,6 +55,7 @@ jobs:
       # PyPI directly. A definition naming a version pip cannot install fails every
       # gh-aw workflow that selects this engine, at install time, in someone else's
       # repository.
+      #
       # The timeouts are what stop a connection that is accepted but never answered
       # from holding the runner until the six-hour job default. curl exits 28 on
       # either, which fails the step rather than reporting a version as unpublished.
@@ -66,8 +71,52 @@ jobs:
             exit 1
           fi
 
-      # A plain push, never `--force`: gh-aw's engine catalog names this branch
-      # rather than a commit and resolves it at compile time, so a non-fast-forward
-      # changes the definition under every consumer that recompiles. A push that
-      # cannot fast-forward is meant to fail. The first push creates the branch.
-      - run: git push origin HEAD:refs/heads/gh-aw-engine
+  advance:
+    name: Advance gh-aw-engine to main
+    needs: [verify]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    # The write token is granted to a deployment of this environment, and an
+    # environment's deployment branch policy is enforced by GitHub rather than by
+    # the workflow file. That matters here because `workflow_dispatch` runs the
+    # workflow definition carried by the ref the dispatcher picked, so the `ref:
+    # main` checkout above pins what gets validated but cannot pin the code that
+    # holds the token. The policy can. Until an administrator configures the
+    # environment with a `main` branch policy and a `v*` tag policy, this line is
+    # inert and the gate is the repository's write-access list.
+    environment: gh-aw-engine
+    permissions:
+      contents: write
+    steps:
+      # No checkout and no actions. This is the only job that holds a write token,
+      # and nothing it runs comes from the repository tree, from PyPI, or from a
+      # third-party action. The two API calls below are the entire job.
+      - name: Fast-forward the engine ref
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SHA: ${{ needs.verify.outputs.sha }}
+          ENGINE_REF: gh-aw-engine
+        run: |
+          # `force: false` has GitHub refuse a non-fast-forward server-side, so the
+          # guarantee holds even if this script is wrong. gh-aw's engine catalog
+          # names the branch rather than a commit and resolves it at compile time,
+          # so a non-fast-forward would change the definition under every consumer
+          # that recompiles.
+          if response="$(gh api -X PATCH \
+            "repos/${GITHUB_REPOSITORY}/git/refs/heads/${ENGINE_REF}" \
+            -f sha="${SHA}" -F force=false 2>&1)"; then
+            echo "${ENGINE_REF} now points at ${SHA}"
+            exit 0
+          fi
+
+          # A refused fast-forward and a branch that does not exist yet both answer
+          # 422, and only the message separates them. Anything else fails closed.
+          if ! printf '%s' "${response}" | grep -q 'Reference does not exist'; then
+            printf '%s\n' "${response}" >&2
+            echo "${ENGINE_REF} was not advanced to ${SHA}." >&2
+            exit 1
+          fi
+
+          gh api -X POST "repos/${GITHUB_REPOSITORY}/git/refs" \
+            -f ref="refs/heads/${ENGINE_REF}" -f sha="${SHA}" --silent
+          echo "${ENGINE_REF} created at ${SHA}"
