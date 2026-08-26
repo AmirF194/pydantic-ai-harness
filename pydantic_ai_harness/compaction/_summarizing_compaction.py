@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass, field, replace
+from dataclasses import KW_ONLY, dataclass, field, replace
 from typing import TYPE_CHECKING, Any, cast
 
 from pydantic_ai._run_context import AgentDepsT
@@ -371,7 +371,8 @@ class SummarizingCompaction(AbstractCapability[AgentDepsT]):
     """
 
     # Override the inherited default ID; stable identity is required for @durable_operation worker-side recovery.
-    id: str | None = field(default='summarizing_compaction', kw_only=True)
+    _: KW_ONLY
+    id: str | None = 'summarizing_compaction'
 
     def __post_init__(self) -> None:
         if self.max_messages is None and self.max_tokens is None and self.max_fraction is None:
