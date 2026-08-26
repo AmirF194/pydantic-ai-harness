@@ -20,6 +20,7 @@ pytest.importorskip('absurd_sdk')
 from absurd_sdk import JsonValue
 from pydantic_ai import Agent
 from pydantic_ai.agent import ParallelExecutionMode
+from pydantic_ai.capabilities import AbstractCapability, durable_operation
 from pydantic_ai.exceptions import ModelRetry, UserError
 from pydantic_ai.messages import (
     AgentStreamEvent,
@@ -77,6 +78,39 @@ class TestTransparency:
         result = await agent.run('hi')
         assert result.output == 'ok'
         assert counter['calls'] == 1
+
+
+class TestCapabilityOperation:
+    async def test_operation_is_checkpointed_and_replayed(self) -> None:
+        calls: list[str] = []
+
+        class Recorder(AbstractCapability[object]):
+            id = 'recorder'
+
+            async def before_run(self, ctx: RunContext[object]) -> None:
+                await self.record(ctx, 'started')
+
+            @durable_operation
+            async def record(self, ctx: RunContext[object], value: str) -> None:
+                del ctx
+                calls.append(value)
+
+        agent = Agent(_text_model(), name='cap', capabilities=[Recorder(), AbsurdDurability()])
+
+        ctx = FakeAsyncTaskContext()
+        with absurd_task_context(ctx):
+            await agent.run('hi')
+
+        operation_name = 'cap__capability__recorder.record'
+        assert operation_name in ctx.stored
+        assert calls == ['started']
+
+        replay = ctx.replay()
+        with absurd_task_context(replay):
+            await agent.run('hi')
+
+        assert calls == ['started']
+        assert replay.invoked == []
 
 
 class TestModelRequestCheckpoint:
