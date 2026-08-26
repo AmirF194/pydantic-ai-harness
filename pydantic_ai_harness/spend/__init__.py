@@ -10,9 +10,10 @@ from pydantic_ai_harness.spend._exceptions import (
 )
 from pydantic_ai_harness.spend._redis import RedisClient, RedisSpendStore
 from pydantic_ai_harness.spend._snapshot import BudgetStatus, SpendSnapshot, Spent
-from pydantic_ai_harness.spend._store import InMemorySpendStore, SpendStore
+from pydantic_ai_harness.spend._store import BatchSpendStore, InMemorySpendStore, SpendEntry, SpendStore
 
 __all__ = [
+    'BatchSpendStore',
     'Budget',
     'BudgetSpec',
     'BudgetStatus',
@@ -22,6 +23,7 @@ __all__ = [
     'RedisSpendStore',
     'SpendCallback',
     'SpendCompositionWarning',
+    'SpendEntry',
     'SpendLimits',
     'SpendLimitExceeded',
     'SpendSnapshot',
