@@ -370,6 +370,10 @@ class TestSpeculationEdgeCases:
             """Return a canned result."""
             return f'result:{query}'
 
+        # Launched tasks may be cancelled before any reaches the tool body (that's the eviction
+        # contract), so the body's coverage cannot depend on task scheduling; cover it directly.
+        assert search(query='direct') == 'result:direct'
+
         ctx = build_run_context(None)
         capability = CodeMode[None](speculate=['search'])
         run_capability = await capability.for_run(ctx)
