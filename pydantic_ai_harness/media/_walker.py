@@ -47,7 +47,11 @@ _URI_KEY = '__harness_external_uri__'
 # the metadata, and the reader puts them back after rehydrating the payload.
 _ESCAPED_KEYS = '__harness_external_escaped_keys__'
 _MARKER_FORMAT = '__harness_external_marker_format__'
-_ESCAPED_KEYS_FORMAT = 'escaped-keys-v1'
+# Version stamps this format issues. The prefix is what tells a stamp we wrote
+# apart from a caller-owned `_MARKER_FORMAT` value, so only a stamp inside the
+# namespace makes the version check apply at all.
+_ESCAPED_KEYS_FORMAT_PREFIX = 'escaped-keys-v'
+_ESCAPED_KEYS_FORMAT = f'{_ESCAPED_KEYS_FORMAT_PREFIX}1'
 _MARKER_METADATA_KEYS = (
     _EXTERNAL_MARKER,
     _TEXT_MARKER,
@@ -227,11 +231,20 @@ def _is_escape_stash(value: object) -> TypeGuard[dict[str, object]]:
     """Does `value` have the shape `_escape_marker_metadata` writes?
 
     `_ESCAPED_KEYS` and `_MARKER_FORMAT` are themselves keys a caller can own, so
-    a marker carrying them is not evidence that this format wrote them. Matching
-    on the stash's shape rather than on `_MARKER_FORMAT`'s value is what keeps a
-    marker written before this format existed from being read as one.
+    a marker carrying them is not evidence that this format wrote them. The stash
+    is only ever a non-empty mapping keyed by metadata names.
     """
     return _is_json_dict(value) and bool(value) and not (value.keys() - _MARKER_METADATA_KEYS)
+
+
+def _is_escaped_keys_format(value: object) -> bool:
+    """Is `value` a version stamp from this format's own namespace?
+
+    Paired with `_is_escape_stash`: both have to hold before the marker is read
+    as escaped. A caller-owned `_MARKER_FORMAT` carrying anything else leaves the
+    marker in the pre-escaping reading, where both keys are the payload's data.
+    """
+    return isinstance(value, str) and value.startswith(_ESCAPED_KEYS_FORMAT_PREFIX)
 
 
 async def _preserve_fields(
@@ -275,15 +288,17 @@ async def _restore_external(node: dict[str, object], media_store: MediaStore) ->
     dropped = {_EXTERNAL_MARKER, _TEXT_MARKER}
     escaped: dict[str, object] | None = None
     escaped_value = node.get(_ESCAPED_KEYS)
+    marker_format = node.get(_MARKER_FORMAT)
     # An ambiguous match degrades to "this is caller data" instead of raising: a
     # marker written before this format existed can carry both keys as the
     # payload's own, and rejecting it would turn a snapshot that reads today into
-    # one that cannot be read at all, with no recovery path. Once the stash does
-    # have our shape the version is ours to read, so an unrecognized one is a
-    # marker this reader cannot restore and has to say so rather than drop the
-    # stash on the floor.
-    if _is_escape_stash(escaped_value):
-        marker_format = node.get(_MARKER_FORMAT)
+    # one that cannot be read at all, with no recovery path. So both halves have
+    # to look like ours -- the stash's shape and a version stamp from this
+    # format's namespace -- before the marker is read as escaped. Once they do,
+    # an unrecognized version is a marker this reader genuinely cannot restore,
+    # and it says so rather than drop the stash on the floor: this reader is the
+    # only one that can refuse a later format.
+    if _is_escape_stash(escaped_value) and _is_escaped_keys_format(marker_format):
         if marker_format != _ESCAPED_KEYS_FORMAT:
             raise ValueError(f'externalized media marker has an unsupported escaped-keys format: {marker_format!r}')
         escaped = escaped_value

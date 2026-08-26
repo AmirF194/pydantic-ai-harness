@@ -564,22 +564,53 @@ class TestExternalizeRestoreWalker:
         assert await restore_media(externalized, media_store=store) == node
 
     @pytest.mark.parametrize(
-        'escaped_keys',
+        'marker_metadata',
         [
-            pytest.param(['not', 'a', 'mapping'], id='not-a-mapping'),
-            pytest.param({}, id='empty-mapping'),
-            pytest.param({'caller': 'value'}, id='keys-we-never-write'),
+            pytest.param(
+                {
+                    '__harness_external_marker_format__': 'escaped-keys-v1',
+                    '__harness_external_escaped_keys__': ['not', 'a', 'mapping'],
+                },
+                id='stamped-but-stash-is-not-a-mapping',
+            ),
+            pytest.param(
+                {
+                    '__harness_external_marker_format__': 'escaped-keys-v1',
+                    '__harness_external_escaped_keys__': {},
+                },
+                id='stamped-but-stash-is-empty',
+            ),
+            pytest.param(
+                {
+                    '__harness_external_marker_format__': 'escaped-keys-v1',
+                    '__harness_external_escaped_keys__': {'caller': 'value'},
+                },
+                id='stamped-but-stash-has-keys-we-never-write',
+            ),
+            pytest.param(
+                {'__harness_external_escaped_keys__': {'__harness_external_uri__': 'caller-uri'}},
+                id='stash-shaped-like-ours-but-unstamped',
+            ),
+            pytest.param(
+                {
+                    '__harness_external_marker_format__': 'caller-format',
+                    '__harness_external_escaped_keys__': {'__harness_external_uri__': 'caller-uri'},
+                },
+                id='stash-shaped-like-ours-but-stamped-by-the-caller',
+            ),
         ],
     )
-    async def test_marker_metadata_keys_the_writer_never_produced_are_caller_data(
-        self, tmp_path: Path, escaped_keys: object
+    async def test_marker_metadata_the_writer_never_produced_is_caller_data(
+        self, tmp_path: Path, marker_metadata: dict[str, object]
     ) -> None:
-        """A marker whose escape keys do not have the writer's shape keeps them as the payload's own.
+        """A marker that does not carry both halves of the escape format keeps them as the payload's own.
 
         Both keys are collidable, so a marker written before the escaping format
-        existed can carry them as caller data. Reading them as an escape stash
-        would drop them; rejecting the marker would make a snapshot that reads
-        today unreadable. It degrades to leaving them alone instead.
+        existed can carry either or both as caller data. Reading them as an
+        escape stash would drop them, and rejecting the marker would make a
+        snapshot that reads today unreadable with no recovery path. It takes the
+        stash's shape and a version stamp from the format's own namespace
+        together; short of both, it leaves them alone.
         """
         import base64
 
@@ -589,9 +620,8 @@ class TestExternalizeRestoreWalker:
         marker: dict[str, object] = {
             '__harness_external_media__': True,
             '__harness_external_uri__': uri,
-            '__harness_external_marker_format__': 'escaped-keys-v1',
-            '__harness_external_escaped_keys__': escaped_keys,
             'kind': 'binary',
+            **marker_metadata,
         }
 
         restored = await restore_media(marker, media_store=store)
@@ -599,8 +629,7 @@ class TestExternalizeRestoreWalker:
         assert restored == {
             'kind': 'binary',
             'data': base64.b64encode(payload).decode('ascii'),
-            '__harness_external_marker_format__': 'escaped-keys-v1',
-            '__harness_external_escaped_keys__': escaped_keys,
+            **marker_metadata,
         }
 
     async def test_unsupported_escaped_keys_format_raises(self, tmp_path: Path) -> None:
