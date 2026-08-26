@@ -107,6 +107,9 @@ SpendLimits(budgets=[Budget(usd=Decimal('100'))], on_spend=show)
 `status()` reads the same numbers without a run, which is what a cost display in a UI wants:
 
 ```python
+from pydantic_ai_harness.spend import SpendLimits
+
+
 async def report(limits: SpendLimits[None]) -> None:
     for status in await limits.status(scope='acme'):
         print(status.budget.name, status.spent.usd, status.exhausted)
@@ -277,10 +280,17 @@ What bounds that is settled under "Sharing a counter across processes" above: ho
 Refuse the workflow **admission** before starting it instead. That is why `exhausted()` works without a `RunContext`:
 
 ```python
-async def start_if_funded(limits: SpendLimits[None], tenant_id: str) -> None:
+from collections.abc import Awaitable, Callable
+
+from pydantic_ai_harness.spend import SpendLimits
+
+
+async def start_if_funded(
+    limits: SpendLimits[None], tenant_id: str, start_workflow: Callable[[], Awaitable[None]]
+) -> None:
     if await limits.exhausted(scope=tenant_id):
         raise RuntimeError('daily budget exhausted')
-    await workflow_handle.execute(...)
+    await start_workflow()
 ```
 
 `exhausted` rather than `any(s.exhausted for s in await limits.status(...))`: `status` omits
