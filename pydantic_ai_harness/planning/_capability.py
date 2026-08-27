@@ -3,10 +3,10 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass, field, replace
+from dataclasses import KW_ONLY, dataclass, field, replace
 from typing import TYPE_CHECKING, Literal
 
-from pydantic_ai.capabilities import AbstractCapability
+from pydantic_ai.capabilities import AbstractCapability, durable_operation
 from pydantic_ai.messages import CachePoint, ModelRequest, ModelResponse, UserPromptPart
 from pydantic_ai.tools import AgentDepsT, RunContext
 from pydantic_ai.toolsets import AgentToolset
@@ -18,6 +18,7 @@ from pydantic_ai_harness.planning._toolset import (
     available_tool_names,
     render_plan,
 )
+from pydantic_ai_harness.planning._types import PlanItem
 
 if TYPE_CHECKING:
     from pydantic_ai._instructions import AgentInstructions
@@ -67,6 +68,9 @@ class Planning(AbstractCapability[AgentDepsT]):
     agent = Agent('anthropic:claude-sonnet-4-6', capabilities=[Planning()])
     ```
     """
+
+    _: KW_ONLY
+    id: str | None = 'planning'
 
     guidance: str | None = None
     """Static planning guidance for the system prompt. Cache-stable.
@@ -120,6 +124,7 @@ class Planning(AbstractCapability[AgentDepsT]):
     async def for_run(self, ctx: RunContext[AgentDepsT]) -> Planning[AgentDepsT]:
         """Return a clone with this run's store resolved and cached (per-run isolation)."""
         clone = replace(self)
+        clone._set_durable_operation_bindings(self._get_durable_operation_bindings())
         clone._resolved_store = clone._resolve_store(ctx)
         return clone
 
@@ -171,7 +176,7 @@ class Planning(AbstractCapability[AgentDepsT]):
         """Append the current plan as an ephemeral tail reminder with a cache breakpoint."""
         if not self.inject:
             return await handler(request_context)
-        items = await self.resolve_store(ctx).get_items()
+        items = await self._read_plan(ctx)
         if not items:
             return await handler(request_context)
         messages = request_context.messages
@@ -182,6 +187,10 @@ class Planning(AbstractCapability[AgentDepsT]):
             )
             messages[-1] = replace(last, parts=[*last.parts, reminder])
         return await handler(request_context)
+
+    @durable_operation
+    async def _read_plan(self, ctx: RunContext[AgentDepsT]) -> list[PlanItem]:
+        return await self.resolve_store(ctx).get_items()
 
     @classmethod
     def from_spec(
