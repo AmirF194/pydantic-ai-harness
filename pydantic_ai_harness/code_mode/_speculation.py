@@ -154,6 +154,13 @@ class _PartWatch:
     args_text: str = ''
     args_dict: dict[str, Any] | None = None
     consumed_statements: int = 0
+    scanned_newlines: int = -1
+    """Newline count of the code at the last full scan.
+
+    Statements only close on line boundaries, so the AST work (parse loop plus call
+    extraction) is skipped for the many deltas that arrive within a line -- they still
+    produce a code-update event, just without reparsing.
+    """
     launched: int = 0
     calls: dict[str, deque[SpeculativeCall]] = field(default_factory=dict[str, deque[SpeculativeCall]])
     """FIFO per canonical key: the k-th identical dispatch claims the k-th launch, so results
@@ -401,6 +408,19 @@ class SpeculationState:
             if maybe_code is None:
                 return
             code = maybe_code
+        newlines = code.count('\n')
+        if not final and newlines == watch.scanned_newlines:
+            # No line boundary since the last scan: nothing can have closed. Report the
+            # grown code for live rendering and skip the parse work.
+            produced.append(
+                SpeculativeCodeUpdateEvent(
+                    tool_call_id=watch.tool_call_id,
+                    code=code,
+                    closed_statements=watch.consumed_statements,
+                )
+            )
+            return
+        watch.scanned_newlines = newlines
         if final:
             try:
                 body = ast.parse(code).body
