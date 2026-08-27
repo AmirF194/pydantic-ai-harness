@@ -5,12 +5,14 @@ from __future__ import annotations
 import asyncio
 import re
 import threading
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncGenerator, AsyncIterator, Callable, Sequence
+from contextlib import asynccontextmanager
+from typing import Any
 
 import anyio
 import pytest
-from pydantic_ai import Agent, CancellationToken, RunCancelled
-from pydantic_ai.exceptions import ApprovalRequired, CallDeferred, ModelRetry, ToolFailed
+from pydantic_ai import Agent, CancellationToken, RunCancelled, UsageLimits
+from pydantic_ai.exceptions import ApprovalRequired, CallDeferred, ModelRetry, ToolFailed, UsageLimitExceeded
 from pydantic_ai.messages import (
     BinaryContent,
     ModelMessage,
@@ -22,8 +24,21 @@ from pydantic_ai.messages import (
     ToolReturnPart,
     UserPromptPart,
 )
+from pydantic_ai.models import ModelRequestParameters
 from pydantic_ai.models.function import AgentInfo, DeltaToolCall, FunctionModel
-from pydantic_ai.tools import DeferredToolRequests, RunContext
+from pydantic_ai.models.test import TestModel
+from pydantic_ai.realtime import RealtimeModel, RealtimeModelProfile, RealtimeModelSettings
+from pydantic_ai.realtime.codec import (
+    RealtimeCodecEvent,
+    RealtimeConnection,
+    RealtimeInput,
+    ResponseDone,
+    ToolCall,
+    ToolResult,
+)
+from pydantic_ai.run import AgentRunResult
+from pydantic_ai.tools import DeferredToolRequests, RunContext, ToolDefinition
+from pydantic_ai.usage import RunUsage
 
 from pydantic_ai_harness import BackgroundTools
 
@@ -75,6 +90,50 @@ def _model_calling(tool_name: str, args: str = '{}', ack_callback: Callable[[], 
     return FunctionModel(model_fn)
 
 
+class _BackgroundRealtimeConnection(RealtimeConnection):
+    def __init__(self) -> None:
+        self.sent: list[RealtimeInput] = []
+        self.sent_event = asyncio.Event()
+
+    async def send(self, content: RealtimeInput) -> None:
+        self.sent.append(content)
+        self.sent_event.set()
+
+    async def __aiter__(self) -> AsyncIterator[RealtimeCodecEvent]:
+        yield ToolCall(tool_call_id='tc1', tool_name='structured', args='{}')
+        yield ResponseDone()
+        await asyncio.Event().wait()
+
+
+class _BackgroundRealtimeModel(RealtimeModel):
+    def __init__(self, connection: _BackgroundRealtimeConnection) -> None:
+        self.connection = connection
+        self.messages: Sequence[ModelMessage] | None = None
+
+    @property
+    def model_name(self) -> str:
+        return 'fake-realtime'
+
+    @property
+    def system(self) -> str:
+        return 'fake'
+
+    @property
+    def profile(self) -> RealtimeModelProfile:
+        return RealtimeModelProfile(supports_text_output=True, supports_image_input=True)
+
+    @asynccontextmanager
+    async def connect(
+        self,
+        *,
+        messages: Sequence[ModelMessage],
+        model_settings: RealtimeModelSettings | None,
+        model_request_parameters: ModelRequestParameters,
+    ) -> AsyncGenerator[RealtimeConnection]:
+        self.messages = messages
+        yield self.connection
+
+
 class TestBackgroundTools:
     """The metadata-default selector path: spawn, ack, deliver, error, cancel."""
 
@@ -121,6 +180,38 @@ class TestBackgroundTools:
             f"Background tool 'slow_research' (task {match['task_id']}) completed.\nResult: researched topic"
         )
 
+    async def test_realtime_uses_native_rich_tool_result_path(self) -> None:
+        image = BinaryContent(data=b'image bytes', media_type='image/png')
+        connection = _BackgroundRealtimeConnection()
+        model = _BackgroundRealtimeModel(connection)
+        agent = Agent(capabilities=[BackgroundTools()])
+
+        @agent.tool_plain(metadata={'background': True})
+        async def structured() -> ToolReturn[str]:  # pyright: ignore[reportUnusedFunction]
+            return ToolReturn(return_value='public answer', content=['supporting detail', image])
+
+        async with agent.realtime(model).session() as session:
+
+            async def consume() -> None:
+                async for _ in session:  # pragma: no branch
+                    pass
+
+            async with anyio.create_task_group() as task_group:
+                task_group.start_soon(consume)
+                await asyncio.wait_for(connection.sent_event.wait(), timeout=5)
+
+                assert connection.sent == [
+                    ToolResult(
+                        tool_call_id='tc1',
+                        output='public answer',
+                        content=['supporting detail', image],
+                    )
+                ]
+                assert model.messages is not None
+                initial = next(message for message in model.messages if isinstance(message, ModelRequest))
+                assert 'do not block waiting for the result' not in (initial.instructions or '')
+                task_group.cancel_scope.cancel()
+
     @pytest.mark.parametrize(
         ('error_factory', 'expected'),
         [
@@ -152,6 +243,72 @@ class TestBackgroundTools:
         assert _follow_up_seen(result.all_messages(), expected)
         assert not _follow_up_seen(result.all_messages(), 'private_job_id')
         assert not _follow_up_seen(result.all_messages(), 'secret')
+        assert result.usage.tool_calls == 0
+
+    async def test_pending_background_call_counts_toward_tool_call_limit(self) -> None:
+        started = 0
+
+        def model_fn(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+            if _ack_seen(messages):
+                return ModelResponse(parts=[ToolCallPart(tool_name='slow', args='{}')])
+            return ModelResponse(parts=[ToolCallPart(tool_name='slow', args='{}')])
+
+        agent = Agent(FunctionModel(model_fn), capabilities=[BackgroundTools()])
+
+        @agent.tool_plain(metadata={'background': True})
+        async def slow() -> str:  # pyright: ignore[reportUnusedFunction]
+            nonlocal started
+            started += 1
+            await asyncio.Event().wait()
+            return 'unreachable'  # pragma: no cover -- the run cancels the pending call
+
+        with pytest.raises(UsageLimitExceeded):
+            await agent.run('go', usage_limits=UsageLimits(tool_calls_limit=1))
+
+        assert started == 1
+
+    async def test_sequential_tool_stays_on_normal_execution_path(self) -> None:
+        sequential_active = False
+        overlapped = False
+
+        def model_fn(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+            if _follow_up_seen(messages, "Background tool 'later'"):
+                return ModelResponse(parts=[TextPart(content='done')])
+            return ModelResponse(
+                parts=[
+                    ToolCallPart(tool_name='barrier', args='{}'),
+                    ToolCallPart(tool_name='later', args='{}'),
+                ]
+            )
+
+        agent = Agent(FunctionModel(model_fn), capabilities=[BackgroundTools()])
+
+        @agent.tool_plain(metadata={'background': True}, sequential=True)
+        async def barrier() -> str:  # pyright: ignore[reportUnusedFunction]
+            nonlocal sequential_active
+            sequential_active = True
+            await asyncio.sleep(0)
+            sequential_active = False
+            return 'barrier result'
+
+        @agent.tool_plain(metadata={'background': True})
+        async def later() -> str:  # pyright: ignore[reportUnusedFunction]
+            nonlocal overlapped
+            overlapped = sequential_active
+            return 'later result'
+
+        result = await agent.run('go')
+
+        assert result.output == 'done'
+        assert not overlapped
+        barrier_return = next(
+            part
+            for message in result.all_messages()
+            if isinstance(message, ModelRequest)
+            for part in message.parts
+            if isinstance(part, ToolReturnPart) and part.tool_name == 'barrier'
+        )
+        assert barrier_return.content == 'barrier result'
 
     async def test_unexpected_error_is_logged_without_exposing_details_to_model(
         self, caplog: pytest.LogCaptureFixture
@@ -237,16 +394,55 @@ class TestBackgroundTools:
         assert _follow_up_seen(result.all_messages(), 'completed.\nResult: sync result')
 
     async def test_background_tool_uses_context_cancel_to_stop_the_run(self) -> None:
-        agent = Agent(_model_calling('stop'), capabilities=[BackgroundTools()])
+        first_started = asyncio.Event()
+        second_started = asyncio.Event()
+        first_cancelled = asyncio.Event()
+        second_cancelled = asyncio.Event()
+
+        def model_fn(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+            return ModelResponse(
+                parts=[
+                    ToolCallPart(tool_name='stop', args='{}'),
+                    ToolCallPart(tool_name='first', args='{}'),
+                    ToolCallPart(tool_name='second', args='{}'),
+                ]
+            )
+
+        agent = Agent(FunctionModel(model_fn), capabilities=[BackgroundTools()])
 
         @agent.tool(metadata={'background': True})
         async def stop(ctx: RunContext[object]) -> str:  # pyright: ignore[reportUnusedFunction]
+            await first_started.wait()
+            await second_started.wait()
             ctx.cancel()
             await asyncio.sleep(0)
             return 'discarded'  # pragma: no cover -- cancellation is delivered at the await
 
+        @agent.tool_plain(metadata={'background': True})
+        async def first() -> str:  # pyright: ignore[reportUnusedFunction]
+            first_started.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                first_cancelled.set()
+                raise
+            return 'unreachable'  # pragma: no cover
+
+        @agent.tool_plain(metadata={'background': True})
+        async def second() -> str:  # pyright: ignore[reportUnusedFunction]
+            second_started.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                second_cancelled.set()
+                raise
+            return 'unreachable'  # pragma: no cover
+
         with pytest.raises(RunCancelled):
             await agent.run('go')
+
+        assert first_cancelled.is_set()
+        assert second_cancelled.is_set()
 
     async def test_tool_return_preserves_model_content_without_exposing_metadata(self) -> None:
         image = BinaryContent(data=b'image bytes', media_type='image/png')
@@ -493,6 +689,83 @@ class TestBackgroundTools:
         assert _follow_up_seen(result.all_messages(), 'failed: RuntimeError')
         assert _follow_up_seen(result.all_messages(), 'completed.\nResult: slow value')
 
+    async def test_cancelled_background_tool_does_not_cancel_its_sibling(self) -> None:
+        release = asyncio.Event()
+        sibling_cancelled = False
+
+        def model_fn(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+            if _follow_up_seen(messages, 'slow value'):
+                return ModelResponse(parts=[TextPart(content='done')])
+            if _ack_seen(messages):
+                release.set()
+                return ModelResponse(parts=[TextPart(content='waiting')])
+            return ModelResponse(
+                parts=[ToolCallPart(tool_name='cancelled', args='{}'), ToolCallPart(tool_name='slow', args='{}')]
+            )
+
+        agent = Agent(FunctionModel(model_fn), capabilities=[BackgroundTools()])
+
+        @agent.tool_plain(metadata={'background': True})
+        async def cancelled() -> str:  # pyright: ignore[reportUnusedFunction]
+            await release.wait()
+            raise asyncio.CancelledError
+
+        @agent.tool_plain(metadata={'background': True})
+        async def slow() -> str:  # pyright: ignore[reportUnusedFunction]
+            nonlocal sibling_cancelled
+            await release.wait()
+            try:
+                await asyncio.sleep(0.05)
+            except asyncio.CancelledError:
+                sibling_cancelled = True
+                raise
+            return 'slow value'
+
+        result = await asyncio.wait_for(agent.run('go'), timeout=5)
+
+        assert result.output == 'done'
+        assert not sibling_cancelled
+        assert _follow_up_seen(result.all_messages(), 'completed.\nResult: slow value')
+
+    async def test_background_base_exception_stops_the_run(self) -> None:
+        class FatalBackgroundError(BaseException):
+            pass
+
+        agent = Agent(_model_calling('fatal'), capabilities=[BackgroundTools()])
+
+        @agent.tool_plain(metadata={'background': True})
+        async def fatal() -> str:  # pyright: ignore[reportUnusedFunction]
+            raise FatalBackgroundError
+
+        with pytest.raises(FatalBackgroundError):
+            await agent.run('go')
+
+    async def test_pre_start_cancellation_releases_reserved_tool_usage(self) -> None:
+        ctx = RunContext(deps=None, model=TestModel(), usage=RunUsage(), pending_messages=[])
+        capability = await BackgroundTools().for_run(ctx)
+        handler_started = False
+
+        async def tool_handler(args: dict[str, Any]) -> str:
+            nonlocal handler_started
+            handler_started = True
+            return 'unreachable'
+
+        async def run_handler() -> AgentRunResult[str]:
+            await capability.wrap_tool_execute(
+                ctx,
+                call=ToolCallPart(tool_name='slow', args='{}'),
+                tool_def=ToolDefinition(name='slow', metadata={'background': True}),
+                args={},
+                handler=tool_handler,
+            )
+            return AgentRunResult('done')
+
+        result = await capability.wrap_run(ctx, handler=run_handler)
+
+        assert result.output == 'done'
+        assert not handler_started
+        assert ctx.usage.tool_calls == 0
+
     async def test_run_abort_cancels_live_tasks(self) -> None:
         cancel_seen = asyncio.Event()
         agent = Agent(_model_calling('slow'), capabilities=[BackgroundTools()])
@@ -546,7 +819,7 @@ class TestBackgroundTools:
             await asyncio.wait_for(run, timeout=1)
         assert finished.is_set()
 
-    async def test_run_abort_waits_for_default_sync_worker(self) -> None:
+    async def test_run_abort_does_not_wait_for_default_sync_worker(self) -> None:
         started = threading.Event()
         release = threading.Event()
         finished = threading.Event()
@@ -564,14 +837,13 @@ class TestBackgroundTools:
         run.cancel()
 
         try:
-            await asyncio.sleep(1.1)
-            assert not run.done()
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(run, timeout=1)
+            assert not finished.is_set()
         finally:
             release.set()
 
-        with pytest.raises(asyncio.CancelledError):
-            await asyncio.wait_for(run, timeout=1)
-        assert finished.is_set()
+        assert await asyncio.to_thread(finished.wait, 1)
 
     async def test_cancellation_token_cancels_live_tasks(self) -> None:
         cancel_seen = asyncio.Event()

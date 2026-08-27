@@ -2,12 +2,11 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Any
 
-import anyio
-from anyio.abc import Event, TaskGroup
 from pydantic_ai.capabilities import AbstractCapability
 from pydantic_ai.exceptions import ApprovalRequired, CallDeferred, ToolFailedError, ToolRetryError
 from pydantic_ai.messages import ToolCallPart, ToolReturn, ToolReturnPart, UserContent
@@ -82,7 +81,7 @@ class BackgroundTools(AbstractCapability[AgentDepsT]):
     """Run selected tools concurrently with the current agent run.
 
     When the model calls a tool that matches the selector, the capability spawns the
-    tool's handler in a run-owned task group and immediately returns an acknowledgment
+    tool's handler in a run-owned task and immediately returns an acknowledgment
     string to the agent. When the task completes, its result (or error) is formatted as
     user content and enqueued via
     [`RunContext.enqueue`][pydantic_ai.tools.RunContext.enqueue] as an `'asap'` message.
@@ -112,9 +111,8 @@ class BackgroundTools(AbstractCapability[AgentDepsT]):
     Warning:
         Run cleanup cancels and drains background tasks before it completes. Async tools
         must propagate cancellation; suppressing cancellation can keep cleanup open.
-        Python cannot stop a synchronous tool's worker
-        thread, so cleanup may wait for the function to return depending on the configured
-        executor's cancellation behavior.
+        Python cannot stop a synchronous tool's worker thread, so it may continue after
+        the cancelled run returns.
 
         A synchronous background tool runs concurrently with the agent. Make mutable
         dependencies and other shared state it uses thread-safe.
@@ -127,17 +125,22 @@ class BackgroundTools(AbstractCapability[AgentDepsT]):
     `ToolReturn.return_value` and `ToolReturn.content` remain model-visible, including
     multimodal content. Application-only `ToolReturn.metadata` and deferred tool names from
     `ToolReturn.tools` are not carried into the follow-up message. Raised exceptions become
-    failure results; call `ctx.cancel()` when a background tool needs to stop the run.
+    failure results. Cancelling one background tool does not cancel its siblings; call
+    `ctx.cancel()` when a background tool needs to stop the run and all live background tasks.
 
     `run_stream()` waits for live background tasks before it returns, but does not take
     the extra model turn that delivers their results. Use `agent.run()` or a driven
     `agent.iter()` loop when result delivery is required.
 
-    `BackgroundTools` composes with Temporal and Prefect durable execution. With DBOS,
-    ordinary function tools are not automatically durable steps, so a background tool
-    must delegate durable work to an explicit DBOS step. A tool handler running inside
-    a durable activity or task must not call `ctx.enqueue()` because replay restores
-    only its return value.
+    Realtime sessions already execute tools concurrently. `BackgroundTools` leaves
+    them on the realtime session's native tool-result path instead of replacing their
+    result with an acknowledgment and follow-up message.
+
+    `BackgroundTools` composes with Temporal durable execution. With DBOS, ordinary
+    function tools are not automatically durable steps, so a background tool must
+    delegate durable work to an explicit DBOS step. A tool handler running inside a
+    durable activity or task must not call `ctx.enqueue()` because replay restores only
+    its return value.
     """
 
     tools: ToolSelector[AgentDepsT] = field(default_factory=lambda: {'background': True})
@@ -150,19 +153,19 @@ class BackgroundTools(AbstractCapability[AgentDepsT]):
     - Callable `(ctx, tool_def) -> bool | Awaitable[bool]`: custom predicate.
     """
 
-    _task_group: TaskGroup | None = field(default=None, init=False, repr=False)
-    _completion_event: Event | None = field(default=None, init=False, repr=False)
-    _pending_tasks: int = field(default=0, init=False, repr=False)
+    _tasks: set[asyncio.Task[None]] = field(default_factory=set[asyncio.Task[None]], init=False, repr=False)
+    _realtime: bool = field(default=False, init=False, repr=False)
     _completed: list[tuple[UserContent, ...]] = field(
         default_factory=list[tuple[UserContent, ...]], init=False, repr=False
     )
+    _task_errors: list[BaseException] = field(default_factory=list[BaseException], init=False, repr=False)
 
     def get_instructions(self) -> AgentInstructions[AgentDepsT] | None:
-        return _INSTRUCTIONS
+        return None if self._realtime else _INSTRUCTIONS
 
     async def for_run(self, ctx: RunContext[AgentDepsT]) -> BackgroundTools[AgentDepsT]:
         run_capability = replace(self)
-        run_capability._completion_event = anyio.Event()
+        run_capability._realtime = ctx.realtime
         return run_capability
 
     async def wrap_tool_execute(
@@ -174,7 +177,7 @@ class BackgroundTools(AbstractCapability[AgentDepsT]):
         args: dict[str, Any],
         handler: WrapToolExecuteHandler,
     ) -> Any:
-        if not await matches_tool_selector(self.tools, ctx, tool_def):
+        if self._realtime or tool_def.sequential or not await matches_tool_selector(self.tools, ctx, tool_def):
             return await handler(args)
 
         task_id = call.tool_call_id
@@ -182,25 +185,30 @@ class BackgroundTools(AbstractCapability[AgentDepsT]):
 
         async def _run() -> None:
             try:
-                try:
-                    result = await handler(args)
-                    message = _format_background_result(tool_name, task_id, result)
-                except Exception as e:
-                    if not isinstance(e, (ApprovalRequired, CallDeferred, ToolRetryError, ToolFailedError)):
-                        logger.exception('Background tool %s failed', tool_name)
-                    error = _format_background_error(e)
-                    message = (f"Background tool '{tool_name}' (task {task_id}) failed: {error}",)
-                self._completed.append(message)
-            finally:
-                self._pending_tasks -= 1
-                completion_event = self._completion_event
-                assert completion_event is not None
-                completion_event.set()
+                result = await handler(args)
+                message = _format_background_result(tool_name, task_id, result)
+            except Exception as e:
+                if not isinstance(e, (ApprovalRequired, CallDeferred, ToolRetryError, ToolFailedError)):
+                    logger.exception('Background tool %s failed', tool_name)
+                error = _format_background_error(e)
+                message = (f"Background tool '{tool_name}' (task {task_id}) failed: {error}",)
+            except asyncio.CancelledError:
+                raise
+            except BaseException as e:
+                self._task_errors.append(e)
+                raise
+            self._completed.append(message)
 
-        task_group = self._task_group
-        assert task_group is not None
-        self._pending_tasks += 1
-        task_group.start_soon(_run, name=f'background tool {tool_name} ({task_id})')
+        def task_done(task: asyncio.Task[None]) -> None:
+            self._tasks.discard(task)
+            ctx.usage.tool_calls -= 1
+            if not task.cancelled():
+                task.exception()
+
+        ctx.usage.tool_calls += 1
+        task = asyncio.create_task(_run(), name=f'background tool {tool_name} ({task_id})')
+        self._tasks.add(task)
+        task.add_done_callback(task_done)
         return (
             f"Tool '{tool_name}' is running in background (task {task_id}). "
             f'If this run remains active, you will receive the text result automatically when it completes. '
@@ -222,15 +230,15 @@ class BackgroundTools(AbstractCapability[AgentDepsT]):
 
         # Let the outer drain deliver anything already queued before waiting for
         # another completion.
-        while isinstance(result, End) and self._pending_tasks and not self._completed and not ctx.pending_messages:
-            completion_event = self._completion_event
-            assert completion_event is not None
-            await completion_event.wait()
+        while isinstance(result, End) and self._tasks and not self._completed and not ctx.pending_messages:
+            done, _ = await asyncio.wait(tuple(self._tasks), return_when=asyncio.FIRST_COMPLETED)
+            self._tasks.difference_update(done)
 
+        if self._task_errors:
+            raise self._task_errors.pop(0)
         for message in self._completed:
             ctx.enqueue(*message)
         self._completed.clear()
-        self._completion_event = anyio.Event()
         return result
 
     async def wrap_run(
@@ -239,15 +247,17 @@ class BackgroundTools(AbstractCapability[AgentDepsT]):
         *,
         handler: WrapRunHandler,
     ) -> AgentRunResult[Any]:
-        run_result: AgentRunResult[Any] | None = None
+        if self._realtime:
+            return await handler()
+
         try:
-            async with anyio.create_task_group() as task_group:
-                self._task_group = task_group
-                try:
-                    run_result = await handler()
-                finally:
-                    task_group.cancel_scope.cancel()
+            result = await handler()
         finally:
-            self._task_group = None
-        assert run_result is not None
-        return run_result
+            tasks = tuple(self._tasks)
+            for task in tasks:
+                task.cancel()
+            if tasks:
+                await asyncio.gather(*tasks, return_exceptions=True)
+        if self._task_errors:
+            raise self._task_errors.pop(0)
+        return result

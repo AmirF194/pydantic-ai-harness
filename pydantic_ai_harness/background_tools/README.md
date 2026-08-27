@@ -1,8 +1,14 @@
 # Background Tools
 
-Run selected tools concurrently with the current agent run. The model receives an immediate acknowledgment, keeps working, and, if the run remains active, receives the result as a follow-up message.
+`BackgroundTools` lets selected tools run in the background while the agent continues without waiting. Use it when the model can work on something else until the result is ready.
 
 [Source](https://github.com/pydantic/pydantic-ai-harness/tree/main/pydantic_ai_harness/background_tools/)
+
+Install the OpenAI provider before running this example:
+
+```bash
+pip install "pydantic-ai-slim[openai]"
+```
 
 ```python
 import asyncio
@@ -77,8 +83,9 @@ content. Application-only `ToolReturn.metadata` and deferred tool names from `To
 not carried into the follow-up. Retries and deferred calls are reported as text failures. Expected
 tool errors include
 their message. Unexpected exceptions are logged for the application, while the model sees only
-their type. Raised exceptions become failure results; call `ctx.cancel()` when a background tool
-needs to stop the run.
+their type. Raised exceptions become failure results. Cancelling one background tool does not
+cancel its siblings; call `ctx.cancel()` when a background tool needs to stop the run and all live
+background tasks.
 
 ## Execution behavior
 
@@ -89,8 +96,8 @@ are dropped. Run cleanup waits for their async tasks to finish, so async tools m
 cancellation. Suppressing cancellation can keep cleanup open.
 
 > [!WARNING]
-> Python cannot stop a synchronous tool's worker thread, so cleanup may wait for the function to
-> return depending on the configured executor's cancellation behavior.
+> Python cannot stop a synchronous tool's worker thread, so it may continue after the cancelled
+> run returns.
 >
 > A synchronous background tool runs concurrently with the agent. Make mutable dependencies and
 > other shared state it uses thread-safe.
@@ -102,6 +109,9 @@ cancellation. Suppressing cancellation can keep cleanup open.
 ## Limitations
 
 - **Streaming**: `run_stream()` waits for live background tasks before it returns, then drops their results because it does not take the extra model turn required for delivery. Use `agent.run()` or a driven `agent.iter()` loop when result delivery is required.
+- **Realtime**: Realtime sessions already execute tools concurrently. Selected tools stay on the
+  realtime session's native tool-result path, so their original result content is preserved and
+  they do not return the background acknowledgment.
 - **Result hooks and tracing**: The follow-up user message does not pass through result hooks. A
   wrap-based result guard nested inside `BackgroundTools` can inspect the handler result, so guard
   behavior depends on capability order. Tool instrumentation and `after_tool_execute` observe the
@@ -110,8 +120,8 @@ cancellation. Suppressing cancellation can keep cleanup open.
 
 ## Durable execution
 
-`BackgroundTools` works with Temporal and Prefect durable execution. A replay or retry rebuilds the
-run-local background task while the durability integration restores or reruns the tool handler.
+`BackgroundTools` works with Temporal durable execution. A replay rebuilds the run-local background
+task while Temporal restores the tool handler from workflow history.
 
 With DBOS, ordinary function tools are not automatically durable steps. Delegate the durable work
 inside a background tool to an explicit DBOS step.
@@ -128,6 +138,12 @@ BackgroundTools(
 ```
 
 ## Agent spec (YAML/JSON)
+
+Install Agent spec support before using this example:
+
+```bash
+pip install "pydantic-ai-slim[spec]"
+```
 
 ```yaml
 # agent.yaml
