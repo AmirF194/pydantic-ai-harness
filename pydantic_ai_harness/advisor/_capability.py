@@ -216,9 +216,8 @@ class Advisor(NativeOrLocalTool[AgentDepsT]):
         )
         if self.caching is not None:
             if hasattr(tool, 'provider_settings'):
-                # Compatibility with Pydantic AI versions before provider-specific native-tool settings.
                 setattr(tool, 'provider_settings', {'anthropic': {'caching': self.caching}})
-            else:
+            else:  # pragma: no cover - exercised only with older Pydantic AI versions
                 tool.caching = self.caching
         return tool
 
