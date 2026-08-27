@@ -716,7 +716,7 @@ class TestBackgroundTools:
             await release.wait()
             try:
                 await asyncio.sleep(0.05)
-            except asyncio.CancelledError:
+            except asyncio.CancelledError:  # pragma: no cover -- the assertion below verifies this path is not taken
                 sibling_cancelled = True
                 raise
             return 'slow value'
@@ -746,9 +746,9 @@ class TestBackgroundTools:
         handler_started = False
 
         async def tool_handler(args: dict[str, Any]) -> str:
-            nonlocal handler_started
-            handler_started = True
-            return 'unreachable'
+            nonlocal handler_started  # pragma: no cover -- the task is cancelled before its first step
+            handler_started = True  # pragma: no cover
+            return 'unreachable'  # pragma: no cover
 
         async def run_handler() -> AgentRunResult[str]:
             await capability.wrap_tool_execute(
