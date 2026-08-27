@@ -99,7 +99,14 @@ jobs:
       # third-party action. The two API calls below are the entire job.
       - name: Fast-forward the engine ref
         env:
-          GH_TOKEN: ${{ github.token }}
+          # The secret lives in the `gh-aw-engine` environment, so only a job that
+          # cleared that environment's protection rules can read it. That is what
+          # makes it worth more than `github.token`: the environment gate binds our
+          # jobs, but every account with write access can move a branch on its own,
+          # so the ruleset on `refs/heads/gh-aw-engine` has to name this credential
+          # as its only bypass. Until an administrator creates both, the fallback
+          # keeps the workflow working and the branch stays open to any writer.
+          GH_TOKEN: ${{ secrets.GH_AW_ENGINE_ADVANCE_TOKEN || github.token }}
           SHA: ${{ needs.verify.outputs.sha }}
           ENGINE_REF: gh-aw-engine
         run: |

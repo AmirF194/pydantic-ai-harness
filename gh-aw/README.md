@@ -2,8 +2,12 @@
 
 `pydantic.md` in this directory is the engine definition that
 [GitHub Agentic Workflows](https://github.com/github/gh-aw) (gh-aw) uses for its
-`pydantic-ai` engine. gh-aw resolves it from the `gh-aw-engine` branch of this
-repository, so this directory is the source and that branch is what ships.
+`pydantic-ai` engine. This directory is the source; the `gh-aw-engine` branch of
+this repository is what ships, and workflows import the file from that branch.
+
+A workflow has to write the `imports:` line itself. gh-aw's engine catalog maps
+the `pydantic-ai` id to this path, but only to suggest it: naming the engine
+without the import fails to compile with a tip carrying the line to add.
 
 The engine runs the [Pydantic AI](https://ai.pydantic.dev) CLI (`pai`) over an agent
 composed from this package's `Coder` capability: filesystem, shell, planning,
@@ -20,7 +24,7 @@ on:
 permissions:
   contents: read
 imports:
-  - shared/pydantic.md
+  - pydantic/pydantic-ai-harness/gh-aw/pydantic.md@gh-aw-engine
 engine:
   id: pydantic-ai
   model: copilot/claude-sonnet-4-5

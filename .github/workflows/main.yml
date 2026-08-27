@@ -591,7 +591,13 @@ jobs:
       # third-party action. The two API calls below are the entire job.
       - name: Fast-forward the engine ref
         env:
-          GH_TOKEN: ${{ github.token }}
+          # Same reasoning as the dispatch workflow: the secret is held by the
+          # `gh-aw-engine` environment, so only a job that cleared its protection
+          # rules can read it, and the ruleset on `refs/heads/gh-aw-engine` names
+          # that credential as its only bypass. The environment gate alone binds
+          # our jobs and not the other accounts with write access. The fallback
+          # keeps this working before an administrator configures either.
+          GH_TOKEN: ${{ secrets.GH_AW_ENGINE_ADVANCE_TOKEN || github.token }}
           SHA: ${{ needs.verify-gh-aw-engine.outputs.sha }}
           ENGINE_REF: gh-aw-engine
         run: |
