@@ -40,6 +40,7 @@ from pydantic_ai.messages import (
     AgentStreamEvent,
     CapabilityEvent,
     PartDeltaEvent,
+    PartEndEvent,
     PartStartEvent,
     ToolCallPart,
     ToolCallPartDelta,
@@ -374,10 +375,20 @@ class SpeculationState:
             elif isinstance(delta.args_delta, dict):
                 watch.args_dict = {**(watch.args_dict or {}), **delta.args_delta}
             await self._scan(watch, ctx, produced)
+        elif isinstance(event, PartEndEvent):
+            part_id = self._index_to_part.get(event.index)
+            if part_id is not None:
+                # The arguments are complete: every statement is closed now, including the
+                # trailing ones the line-conservative scanner held back (streamed code rarely
+                # ends with a newline, so without this a snippet's last statements never
+                # launch and their dispatches go cold).
+                await self._scan(self._parts[part_id], ctx, produced, final=True)
         self._collect_settles(produced)
         return produced
 
-    async def _scan(self, watch: _PartWatch, ctx: RunContext[Any], produced: list[CapabilityEvent]) -> None:
+    async def _scan(
+        self, watch: _PartWatch, ctx: RunContext[Any], produced: list[CapabilityEvent], *, final: bool = False
+    ) -> None:
         step = self._step
         if step is None or not step.eligible:
             return
@@ -390,7 +401,14 @@ class SpeculationState:
             if maybe_code is None:
                 return
             code = maybe_code
-        fresh, watch.consumed_statements = _closed_statements(code, watch.consumed_statements)
+        if final:
+            try:
+                body = ast.parse(code).body
+            except SyntaxError:
+                return
+            fresh, watch.consumed_statements = body[watch.consumed_statements :], len(body)
+        else:
+            fresh, watch.consumed_statements = _closed_statements(code, watch.consumed_statements)
         produced.append(
             SpeculativeCodeUpdateEvent(
                 tool_call_id=watch.tool_call_id,
@@ -476,14 +494,23 @@ class SpeculationState:
         return self._step is not None and sandbox_name in self._step.eligible
 
     def claim(self, parent_tool_call_id: str, sandbox_name: str, kwargs: dict[str, Any]) -> SpeculativeCall | None:
-        """Pop the oldest in-flight launch matching this dispatch, if any."""
-        watch = self._parts.get(parent_tool_call_id)
-        if watch is None:
-            return None
-        queue = watch.calls.get(_canonical_key(sandbox_name, kwargs))
-        if not queue:
-            return None
-        return queue.popleft()
+        """Pop the oldest in-flight launch matching this dispatch, if any.
+
+        Prefers the watch recorded under this part's id, then falls back to any other watch
+        holding an exact `(function, arguments)` match: some providers re-key a tool call
+        between the streamed part and its executed form, which would otherwise turn every
+        launch into a miss, and the allowlist's purity promise makes an identical launch from
+        another part interchangeable.
+        """
+        key = _canonical_key(sandbox_name, kwargs)
+        primary = self._parts.get(parent_tool_call_id)
+        watches = [primary] if primary is not None else []
+        watches.extend(watch for part_id, watch in self._parts.items() if part_id != parent_tool_call_id)
+        for watch in watches:
+            queue = watch.calls.get(key)
+            if queue:
+                return queue.popleft()
+        return None
 
     async def flush_events(self, ctx: RunContext[Any]) -> None:
         """Emit buffered execution-side events; called from `CodeMode`'s hook dispatches."""

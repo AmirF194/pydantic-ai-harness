@@ -9,6 +9,7 @@ record when and how often they ran.
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import json
 from collections.abc import AsyncIterable, AsyncIterator, Sequence
 from dataclasses import dataclass, field
@@ -372,6 +373,87 @@ class TestSpeculationEdgeCases:
 
         assert result.output == 'done'
         assert capability.speculation_stats.launched == 0
+
+    async def test_rekeyed_part_id_still_claims_by_exact_arguments(self):
+        """A launch recorded under the streamed part id is claimable under a different execution id.
+
+        Some providers re-key a tool call between its streamed part and its executed form;
+        strict per-part lookup would turn every launch into a silent miss. The purity promise
+        makes an exact `(function, arguments)` match from another watch interchangeable.
+        """
+
+        def search(query: str) -> str:
+            """Return a canned result."""
+            return f'result:{query}'
+
+        ctx = build_run_context(None)
+        capability = CodeMode[None](speculate=['search'])
+        run_capability = await capability.for_run(ctx)
+        toolset = run_capability.get_wrapper_toolset(FunctionToolset[None](tools=[Tool(search)]))
+        assert isinstance(toolset, CodeModeToolset)
+        tools = await toolset.get_tools(ctx)
+
+        code = 'a = await search(query="alpha")\nprint(a)\na'
+        events: list[AgentStreamEvent] = [
+            PartStartEvent(index=0, part=ToolCallPart(tool_name='run_code', args={}, tool_call_id='streamed-id')),
+            PartDeltaEvent(index=0, delta=ToolCallPartDelta(args_delta={'code': code})),
+        ]
+        async for _ in run_capability.wrap_run_event_stream(ctx, stream=_PlainEventStream(events)):
+            pass
+        assert run_capability.speculation_stats.launched == 1
+
+        from pydantic_ai.tool_manager import ToolManager
+
+        exec_ctx = dataclasses.replace(ctx, tool_call_id='rekeyed-id', tool_name='run_code')
+        exec_ctx.tool_manager = await ToolManager(toolset=toolset).for_run_step(exec_ctx)
+        async with toolset:
+            result = await toolset.call_tool('run_code', {'code': code}, exec_ctx, tools['run_code'])
+
+        assert isinstance(result, ToolReturn)
+        return_value: dict[str, Any] = result.return_value
+        assert return_value['result'] == 'result:alpha'
+        assert run_capability.speculation_stats.adopted == 1
+
+    async def test_part_end_launches_the_statements_streaming_held_back(self):
+        """A snippet's trailing statements launch when the arguments finish streaming.
+
+        Streamed code rarely ends with a newline, and the line-conservative scanner only
+        closes a statement once a complete later line exists -- so without the final scan, a
+        short snippet's calls never launch and their dispatches go cold. This is the exact
+        shape observed dogfooding: one read call plus a print, no trailing newline.
+        """
+
+        def search(query: str) -> str:
+            """Return a canned result."""
+            return f'result:{query}'
+
+        ctx = build_run_context(None)
+        capability = CodeMode[None](speculate=['search'])
+        run_capability = await capability.for_run(ctx)
+        toolset = run_capability.get_wrapper_toolset(FunctionToolset[None](tools=[Tool(search)]))
+        assert isinstance(toolset, CodeModeToolset)
+        await toolset.get_tools(ctx)
+
+        code = 'a = await search(query="alpha")\nprint(a)'
+        part = ToolCallPart(tool_name='run_code', args={}, tool_call_id='c1')
+        events: list[AgentStreamEvent] = [
+            PartStartEvent(index=0, part=part),
+            PartDeltaEvent(index=0, delta=ToolCallPartDelta(args_delta={'code': code})),
+        ]
+        async for _ in run_capability.wrap_run_event_stream(ctx, stream=_PlainEventStream(events)):
+            pass
+        assert run_capability.speculation_stats.launched == 0
+
+        end_events: list[AgentStreamEvent] = [PartEndEvent(index=0, part=part)]
+        seen = [
+            event async for event in run_capability.wrap_run_event_stream(ctx, stream=_PlainEventStream(end_events))
+        ]
+
+        assert run_capability.speculation_stats.launched == 1
+        launches = [e for e in seen if isinstance(e, SpeculativeCallLaunchedEvent)]
+        assert [e.wrapped_tool_name for e in launches] == ['search']
+        updates = [e for e in seen if isinstance(e, SpeculativeCodeUpdateEvent)]
+        assert updates[-1].closed_statements == 2
 
     async def test_watcher_handles_dict_args_odd_indexes_and_caps_launches(self):
         """Dict-argument deltas, unknown part indexes, plain (non-generator) streams, and the
