@@ -766,6 +766,30 @@ class TestBackgroundTools:
         assert not handler_started
         assert ctx.usage.tool_calls == 0
 
+    async def test_fatal_error_during_run_teardown_is_propagated(self) -> None:
+        class FatalBackgroundError(BaseException):
+            pass
+
+        ctx = RunContext(deps=None, model=TestModel(), usage=RunUsage(), pending_messages=[])
+        capability = await BackgroundTools().for_run(ctx)
+
+        async def tool_handler(args: dict[str, Any]) -> str:
+            raise FatalBackgroundError
+
+        async def run_handler() -> AgentRunResult[str]:
+            await capability.wrap_tool_execute(
+                ctx,
+                call=ToolCallPart(tool_name='fatal', args='{}'),
+                tool_def=ToolDefinition(name='fatal', metadata={'background': True}),
+                args={},
+                handler=tool_handler,
+            )
+            await asyncio.sleep(0)
+            return AgentRunResult('done')
+
+        with pytest.raises(FatalBackgroundError):
+            await capability.wrap_run(ctx, handler=run_handler)
+
     async def test_run_abort_cancels_live_tasks(self) -> None:
         cancel_seen = asyncio.Event()
         agent = Agent(_model_calling('slow'), capabilities=[BackgroundTools()])
