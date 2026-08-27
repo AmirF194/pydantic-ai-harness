@@ -34,6 +34,7 @@ from pydantic_ai_harness.system_reminders import (
     Reminder,
     SystemReminders,
 )
+from tests._recording_durability import RecordingDurability  # pyright: ignore[reportMissingTypeStubs]
 
 pytestmark = pytest.mark.anyio
 
@@ -587,6 +588,21 @@ def _capture_model(store: dict[str, str], output: str = 'generated') -> Function
 
 
 class TestLLMReminder:
+    async def test_generation_dispatches_as_durable_operation(self) -> None:
+        durability = RecordingDurability()
+        capability = SystemReminders(
+            dynamic_reminders=[
+                LLMReminder(model=FunctionModel(lambda _messages, _info: ModelResponse(parts=[TextPart('refocus')])))
+            ]
+        )
+        agent = Agent(TestModel(call_tools=[]), name='system_reminders', capabilities=[capability, durability])
+
+        await agent.run('stay focused')
+
+        bound = RecordingDurability.from_agent(agent)
+        assert bound is not None
+        assert any('__capability__' in name and 'generate_reminder' in name for name, _ in bound.calls), bound.calls
+
     async def test_generates_from_transcript(self) -> None:
         store: dict[str, str] = {}
         messages: list[ModelMessage] = [
