@@ -117,36 +117,59 @@ engine:
         delete env.COPILOT_GITHUB_TOKEN;
 
         const provider = process.env.GH_AW_LLM_PROVIDER;
-        if (!provider) throw new Error("GH_AW_LLM_PROVIDER is required");
-        let baseUrl = process.env.OPENAI_BASE_URL;
-        if (process.env.AWF_REFLECT_ENABLED === "1") {
-          const result = await fetchAWFReflect({ logger: log });
-          if (!result.ok || !result.reflectData) {
-            throw new Error(`Unable to discover the Pydantic AI LLM endpoint from /reflect: ${result.reason || "empty response"}`);
-          }
-          const endpoint = resolveProviderEndpointFromReflect({
-            provider,
-            reflectData: result.reflectData,
-            logger: log,
-          });
-          if (!endpoint?.baseUrl) {
-            throw new Error(`No configured /reflect endpoint found for provider ${provider}`);
-          }
-          baseUrl = endpoint.baseUrl;
-          const reflectedEndpoint = result.reflectData.endpoints?.find(
-            entry => entry?.configured === true && entry.provider === endpoint.endpointProvider
-          );
-          if (typeof reflectedEndpoint?.models_url === "string") {
-            // `endpoint.baseUrl` is the models-listing origin, while the
-            // OpenAI-compatible client posts to `<base>/chat/completions`, so the
-            // path prefix carried by models_url (`/v1` on some providers) has to
-            // come along — and this helper applies the same api-proxy ->
-            // host.docker.internal rewrite.
-            baseUrl = deriveBaseUrlFromModelsURL(reflectedEndpoint.models_url);
+        // `PAI_BASE_URL` points the engine at an OpenAI-compatible endpoint of the
+        // workflow's choosing instead of the AWF api-proxy. Two constraints shape
+        // it.
+        //
+        // It has to be a variable of this definition's own, because AWF sets
+        // OPENAI_BASE_URL on this step itself (to the api-proxy on
+        // host.docker.internal): that variable is always present, so it can never
+        // say what the workflow asked for, and reading it as intent is what made
+        // the pre-#52843 definition pick the wrong endpoint.
+        //
+        // There is deliberately no matching key knob. gh-aw excludes any
+        // `engine.env` value holding a secret from the agent sandbox
+        // (`awf --exclude-env`), so a credential cannot be delivered here at all
+        // and OPENAI_API_KEY below stays the placeholder. The endpoint therefore
+        // has to accept that placeholder, or be fronted by something upstream of
+        // the agent that adds the real credential.
+        const configuredBaseUrl = process.env.PAI_BASE_URL;
+        let baseUrl = configuredBaseUrl || process.env.OPENAI_BASE_URL;
+        if (!configuredBaseUrl) {
+          // Only /reflect discovery needs the provider: it selects which of the
+          // api-proxy's configured endpoints to use. A caller-supplied base URL
+          // names the endpoint outright, so demanding a provider alongside it
+          // would reject a complete configuration.
+          if (!provider) throw new Error("GH_AW_LLM_PROVIDER is required");
+          if (process.env.AWF_REFLECT_ENABLED === "1") {
+            const result = await fetchAWFReflect({ logger: log });
+            if (!result.ok || !result.reflectData) {
+              throw new Error(`Unable to discover the Pydantic AI LLM endpoint from /reflect: ${result.reason || "empty response"}`);
+            }
+            const endpoint = resolveProviderEndpointFromReflect({
+              provider,
+              reflectData: result.reflectData,
+              logger: log,
+            });
+            if (!endpoint?.baseUrl) {
+              throw new Error(`No configured /reflect endpoint found for provider ${provider}`);
+            }
+            baseUrl = endpoint.baseUrl;
+            const reflectedEndpoint = result.reflectData.endpoints?.find(
+              entry => entry?.configured === true && entry.provider === endpoint.endpointProvider
+            );
+            if (typeof reflectedEndpoint?.models_url === "string") {
+              // `endpoint.baseUrl` is the models-listing origin, while the
+              // OpenAI-compatible client posts to `<base>/chat/completions`, so the
+              // path prefix carried by models_url (`/v1` on some providers) has to
+              // come along — and this helper applies the same api-proxy ->
+              // host.docker.internal rewrite.
+              baseUrl = deriveBaseUrlFromModelsURL(reflectedEndpoint.models_url);
+            }
           }
         }
         if (!baseUrl) {
-          throw new Error("Pydantic AI requires AWF endpoint discovery or OPENAI_BASE_URL");
+          throw new Error("Pydantic AI requires AWF endpoint discovery, PAI_BASE_URL or OPENAI_BASE_URL");
         }
         env.OPENAI_BASE_URL = baseUrl;
         // The AWF api-proxy injects the real upstream credentials and ignores the
@@ -183,7 +206,7 @@ engine:
         // billing a model the workflow never asked for. The fallback here is the
         // same model, made explicit.
         const args = [...commandArgs, "-a", "gh_aw_agent:agent", "-m", `openai-chat:${model}`, readFileSync(promptFile, "utf8")];
-        log(`provider=${provider} model=${model} baseUrl=${baseUrl}`);
+        log(`provider=${configuredBaseUrl ? "(PAI_BASE_URL)" : provider} model=${model} baseUrl=${baseUrl}`);
         const result = spawnSync(command, args, { cwd: workspace, env, stdio: "inherit" });
         if (result.error) throw result.error;
         if (result.status !== 0) {
@@ -357,16 +380,27 @@ their server name, so safe outputs are reachable as `safeoutputs_create_issue`
 and the like. Only HTTP servers are carried over; CLI-mounted servers stay
 available to the agent's shell as executables on `PATH`.
 
-`model` must use `provider/model` format. Supported providers are `copilot`,
-`anthropic`, and `openai`. Requests are routed through the AWF api-proxy, whose
-endpoint is discovered from `/reflect` at run time, so the provider segment is
-dropped and the bare model ID is passed with `-m openai-chat:<model>`
+`model` must use `provider/model` format. The provider segment selects which of
+the AWF api-proxy's backends handles the request; `copilot`, `anthropic`,
+`openai` and `codex` are the values gh-aw accepts. Requests are routed through
+that proxy, whose endpoint is discovered from `/reflect` at run time, so the
+provider segment is dropped and the bare model ID is passed with
+`-m openai-chat:<model>`
 (`openai-chat:` selects the Pydantic AI OpenAI-compatible client and is not part
 of the model name sent upstream). Copilot Claude aliases such as
 `claude-sonnet-4-5` are normalized to the dotted model IDs exposed by the proxy,
 such as `claude-sonnet-4.5`. `-m` is always passed, because a workflow that
 declares no model would otherwise inherit the CLI's own `openai:gpt-5` default
 silently.
+
+Setting `PAI_BASE_URL` in `engine.env` sends requests to that URL instead of the
+proxy, for any endpoint speaking the OpenAI Chat Completions API. `/reflect`
+discovery is skipped and the provider segment of `model` becomes a formality, so
+write `openai/<model-id>` and the bare ID reaches the endpoint. There is no
+matching key setting: gh-aw keeps `engine.env` values holding secrets out of the
+agent sandbox, so the endpoint has to accept the placeholder bearer token or sit
+behind something that adds the real credential. See `README.md` next to this file
+for the whole picture.
 
 Responses are streamed. The proxy's aggregated non-streaming body omits
 `object` and `choices[].index`, which Pydantic AI rejects during response
