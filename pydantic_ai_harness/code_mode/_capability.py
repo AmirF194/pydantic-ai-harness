@@ -221,18 +221,25 @@ class CodeMode(AbstractCapability[AgentDepsT]):
     ) -> AsyncIterable[AgentStreamEvent]:
         """Launch speculatable sandbox calls from streamed `run_code` argument deltas.
 
-        Events pass through unmodified; the launches are a side effect. Inactive under Temporal,
-        where overlapping non-deterministic work with the stream has no place in a replayed
-        workflow.
+        Wrapped events pass through unmodified; the speculation events each one produces are
+        yielded directly into the stream right behind it. Yielding (rather than `ctx.emit_event`)
+        is what makes them live: the run's event buffer only drains mid-stream during tool
+        execution, so emitted events would sit until the model request finished. The trade-off is
+        that these events bypass `@on_event` listener dispatch, which happens upstream of
+        capability wrappers; they are for stream consumers (`event_stream_handler`, UI adapters).
+        Inactive under Temporal, where overlapping non-deterministic work with the stream has no
+        place in a replayed workflow.
         """
         state = self._speculation_state
         if state is not None and _in_temporal_workflow(ctx):
             state = None
+        run_id = next((rid for rid, cap in ctx.capabilities.items() if cap is self), None)
         try:
             async for event in stream:
-                if state is not None:
-                    await state.observe(event, ctx)
                 yield event
+                if state is not None:
+                    for spec_event in await state.observe(event, ctx):
+                        yield replace(spec_event, capability_id=run_id) if run_id is not None else spec_event
         finally:
             if isinstance(stream, AsyncGenerator):
                 await stream.aclose()

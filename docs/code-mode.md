@@ -251,9 +251,14 @@ namespace, so UIs and other capabilities can observe the lifecycle live from the
 stream: `SpeculativeCodeUpdateEvent` (the decoded snippet so far, with its closed-statement
 boundary), `SpeculativeCallLaunchedEvent` (with the launching statement's line span),
 `SpeculativeCallSettledEvent`, and -- once the snippet executes -- `SpeculativeCallClaimedEvent`,
-`SpeculativeCallMissedEvent`, and `SpeculativeCallEvictedEvent`. Events are best-effort
-observability: contexts without a live event stream drop them rather than failing the work
-they describe. Requires a pydantic-ai release carrying capability events.
+`SpeculativeCallMissedEvent`, and `SpeculativeCallEvictedEvent`. Delivery differs by phase:
+stream-phase events (updates, launches, settles) are yielded directly into the wrapped event
+stream, interleaved live with the argument deltas that produced them -- so they reach stream
+consumers (`event_stream_handler`, UI adapters) but bypass `@on_event` listener dispatch.
+Execution-phase events (claims, misses, evictions) are emitted as capability events when the
+snippet finishes, and reach listeners as well. Emission is best-effort: contexts without a
+live event stream drop events rather than failing the work they describe. Requires a
+pydantic-ai release carrying capability events.
 
 ## Temporal durability
 

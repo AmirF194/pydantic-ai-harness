@@ -339,8 +339,16 @@ class SpeculationState:
 
     # -- streaming side ---------------------------------------------------------------------
 
-    async def observe(self, event: AgentStreamEvent, ctx: RunContext[Any]) -> None:
-        """Feed one stream event; launches tasks for any newly speculatable calls."""
+    async def observe(self, event: AgentStreamEvent, ctx: RunContext[Any]) -> list[CapabilityEvent]:
+        """Feed one stream event; launches tasks for any newly speculatable calls.
+
+        Returns the speculation events this stream event produced, for the caller to yield
+        directly into the wrapped event stream. Stream-phase events are yielded rather than
+        emitted through `ctx.emit_event` because the run's event buffer only drains live during
+        tool execution; during a model request it flushes at node end, which would delay every
+        update until the snippet finished streaming.
+        """
+        produced: list[CapabilityEvent] = []
         if isinstance(event, PartStartEvent):
             part = event.part
             if isinstance(part, ToolCallPart) and part.tool_name == _RUN_CODE_TOOL_NAME:
@@ -351,24 +359,25 @@ class SpeculationState:
                     watch.args_dict = dict(part.args)
                 self._parts[part.tool_call_id] = watch
                 self._index_to_part[event.index] = part.tool_call_id
-                await self._scan(watch, ctx)
+                await self._scan(watch, ctx, produced)
             else:
                 self._index_to_part.pop(event.index, None)
         elif isinstance(event, PartDeltaEvent):
             part_id = self._index_to_part.get(event.index)
             delta = event.delta
             if part_id is None or not isinstance(delta, ToolCallPartDelta):
-                await self._emit_settles(ctx)
-                return
+                self._collect_settles(produced)
+                return produced
             watch = self._parts[part_id]
             if isinstance(delta.args_delta, str):
                 watch.args_text += delta.args_delta
             elif isinstance(delta.args_delta, dict):
                 watch.args_dict = {**(watch.args_dict or {}), **delta.args_delta}
-            await self._scan(watch, ctx)
-        await self._emit_settles(ctx)
+            await self._scan(watch, ctx, produced)
+        self._collect_settles(produced)
+        return produced
 
-    async def _scan(self, watch: _PartWatch, ctx: RunContext[Any]) -> None:
+    async def _scan(self, watch: _PartWatch, ctx: RunContext[Any], produced: list[CapabilityEvent]) -> None:
         step = self._step
         if step is None or not step.eligible:
             return
@@ -382,25 +391,25 @@ class SpeculationState:
                 return
             code = maybe_code
         fresh, watch.consumed_statements = _closed_statements(code, watch.consumed_statements)
-        await emit_best_effort(
-            ctx,
+        produced.append(
             SpeculativeCodeUpdateEvent(
                 tool_call_id=watch.tool_call_id,
                 code=code,
                 closed_statements=watch.consumed_statements,
-            ),
+            )
         )
         for extracted in _literal_calls(fresh, step.eligible):
             if watch.launched >= _MAX_SPECULATIONS_PER_PART:
                 return
-            await self._launch(watch, step, extracted, ctx)
+            self._launch(watch, step, extracted, ctx, produced)
 
-    async def _launch(
+    def _launch(
         self,
         watch: _PartWatch,
         step: _StepIngredients,
         extracted: _ExtractedCall,
         ctx: RunContext[Any],
+        produced: list[CapabilityEvent],
     ) -> None:
         sandbox_name = extracted.sandbox_name
         original_name = step.sanitized_to_original.get(sandbox_name, sandbox_name)
@@ -427,8 +436,7 @@ class SpeculationState:
         )
         task.add_done_callback(lambda _task, _call=call: setattr(_call, 'settled_at', time.perf_counter()))
         self.calls_for(watch, sandbox_name, extracted.kwargs).append(call)
-        await emit_best_effort(
-            ctx,
+        produced.append(
             SpeculativeCallLaunchedEvent(
                 tool_call_id=watch.tool_call_id,
                 launch_id=launch_id,
@@ -437,10 +445,10 @@ class SpeculationState:
                 arguments=extracted.kwargs,
                 line_start=extracted.line_start,
                 line_end=extracted.line_end,
-            ),
+            )
         )
 
-    async def _emit_settles(self, ctx: RunContext[Any]) -> None:
+    def _collect_settles(self, produced: list[CapabilityEvent]) -> None:
         """Report launches that finished since the watcher last saw stream traffic."""
         for watch in self._parts.values():
             for queue in watch.calls.values():
@@ -449,14 +457,13 @@ class SpeculationState:
                         continue
                     call.settle_emitted = True
                     state = call.settled_state()
-                    await emit_best_effort(
-                        ctx,
+                    produced.append(
                         SpeculativeCallSettledEvent(
                             tool_call_id=watch.tool_call_id,
                             launch_id=call.launch_id,
                             outcome='failed' if state == 'failed' else 'ready',
                             elapsed_ms=call.elapsed_ms(),
-                        ),
+                        )
                     )
 
     def calls_for(self, watch: _PartWatch, sandbox_name: str, kwargs: dict[str, Any]) -> deque[SpeculativeCall]:

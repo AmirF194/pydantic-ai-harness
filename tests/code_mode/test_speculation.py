@@ -23,6 +23,7 @@ from pydantic_ai.messages import (
     ModelMessage,
     ModelResponse,
     PartDeltaEvent,
+    PartEndEvent,
     PartStartEvent,
     TextPart,
     ToolCallPart,
@@ -423,7 +424,9 @@ class TestSpeculationEdgeCases:
 
         seen = [event async for event in run_capability.wrap_run_event_stream(ctx, stream=_PlainEventStream(events))]
 
-        assert seen == events
+        # Wrapped events pass through in order; the wrapper interleaves its own
+        # speculation events (yield-based delivery) between them.
+        assert [e for e in seen if not isinstance(e, CapabilityEvent)] == events
         # 34 identical literal calls stream past; the def bodies (top-level and nested), the
         # positional call, and the double-star call are ineligible, and the per-part cap stops
         # launches at the limit.
@@ -447,6 +450,16 @@ def event_collector(events: list[CapabilityEvent]):
         async for event in stream:
             if isinstance(event, CapabilityEvent):
                 events.append(event)
+
+    return collect
+
+
+def full_stream_collector(events: list[AgentStreamEvent]):
+    """An `event_stream_handler` that keeps every stream event, for interleaving assertions."""
+
+    async def collect(ctx: RunContext[None], stream: AsyncIterable[AgentStreamEvent]) -> None:
+        async for event in stream:
+            events.append(event)
 
     return collect
 
@@ -485,6 +498,32 @@ class TestSpeculationEvents:
         assert claim.ready_at_claim is True
         assert claim.elapsed_ms >= 0
         assert not [e for e in events if isinstance(e, (SpeculativeCallMissedEvent, SpeculativeCallEvictedEvent))]
+
+    async def test_stream_events_interleave_with_argument_deltas(self):
+        """Updates and launches arrive while the `run_code` part is still streaming.
+
+        Pins the yield-based delivery: emitting through `ctx.emit_event` buffers stream-phase
+        events until the model request's node stream ends, which showed up in the CLI as the
+        whole snippet appearing only after its arguments finished streaming.
+        """
+        log = ToolLog()
+        events: list[AgentStreamEvent] = []
+        capability = CodeMode[None](speculate=['search'])
+        code = padded('a = await search(query="alpha")\nprint(a)')
+        agent = build_agent(log, code, capability)
+
+        result = await agent.run('go', event_stream_handler=full_stream_collector(events))
+
+        assert result.output == 'done'
+        part_end_at = next(
+            i
+            for i, e in enumerate(events)
+            if isinstance(e, PartEndEvent) and isinstance(e.part, ToolCallPart) and e.part.tool_name == 'run_code'
+        )
+        first_update_at = next(i for i, e in enumerate(events) if isinstance(e, SpeculativeCodeUpdateEvent))
+        first_launch_at = next(i for i, e in enumerate(events) if isinstance(e, SpeculativeCallLaunchedEvent))
+        assert first_update_at < part_end_at
+        assert first_launch_at < part_end_at
 
     async def test_eligible_cold_dispatch_emits_miss(self):
         """A variable-argument dispatch of an eligible tool reports a miss, and no launch."""
