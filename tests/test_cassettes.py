@@ -24,8 +24,26 @@ from vcr.serializers import yamlserializer  # pyright: ignore[reportMissingTypeS
 
 _ROOT = Path(__file__).parent.parent
 
-# What httpx decodes from the standard library alone; everything else needs a package.
+# `httpx._decoders.SUPPORTED_DECODERS` minus the two entries it pops when their
+# optional package is absent: `br` needs `brotli`/`brotlicffi`, `zstd` needs
+# `zstandard`. An encoding it cannot look up falls through to `IdentityDecoder`,
+# which is what leaves a compressed body sitting in `Response.content`.
 _STDLIB_ENCODINGS = frozenset({'gzip', 'deflate', 'identity'})
+
+
+def _optional_encodings(header_value: str) -> list[str]:
+    """The encodings in one `Content-Encoding` value that httpx cannot decode from the stdlib.
+
+    Normalizes the way httpx does -- it reads the header with `split_commas=True`
+    and then `.strip().lower()` -- so `gzip, deflate` is two stdlib decoders rather
+    than one unrecognized encoding.
+    """
+    optional: list[str] = []
+    for part in header_value.split(','):
+        encoding = part.strip().lower()
+        if encoding and encoding not in _STDLIB_ENCODINGS:
+            optional.append(encoding)
+    return optional
 
 
 class _Request(BaseModel):
@@ -64,11 +82,19 @@ def test_cassette_replays_without_an_optional_decompressor(path: Path) -> None:
     needs = [
         f'{interaction.request.uri} responds `Content-Encoding: {encoding}`'
         for interaction in cassette.interactions
-        for encoding in interaction.response.headers.get('content-encoding', [])
-        if encoding.lower() not in _STDLIB_ENCODINGS
+        for value in interaction.response.headers.get('content-encoding', [])
+        for encoding in _optional_encodings(value)
     ]
     assert not needs, (
         '\n'.join(needs) + f'\nDecode the body in {path.name} and drop the header, or re-record it '
         'without that encoding. Relying on an optional decompressor makes the cassette depend on '
         'whichever extra a transitive dependency happens to pull in.'
     )
+
+
+def test_optional_encodings_normalizes_like_httpx() -> None:
+    assert _optional_encodings('gzip') == []
+    assert _optional_encodings(' GZIP , deflate ') == []  # a list value, and httpx lowercases
+    assert _optional_encodings('') == []  # no encoding declared is not an unknown one
+    assert _optional_encodings('br') == ['br']
+    assert _optional_encodings('gzip, zstd') == ['zstd']
