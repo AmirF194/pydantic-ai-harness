@@ -161,6 +161,15 @@ class _PartWatch:
     extraction) is skipped for the many deltas that arrive within a line -- they still
     produce a code-update event, just without reparsing.
     """
+
+    demanded: dict[str, int] = field(default_factory=dict[str, int])
+    """Occurrences of each `(function, arguments)` key this part's closed statements hold.
+
+    Launches are deduplicated against calls already in flight (typically a failed
+    attempt's surviving launches), so a retry claims instead of relaunching. Multiplicity
+    within the part stays exact: the Nth occurrence launches once N exceeds the in-flight
+    count.
+    """
     launched: int = 0
     calls: dict[str, deque[SpeculativeCall]] = field(default_factory=dict[str, deque[SpeculativeCall]])
     """FIFO per canonical key: the k-th identical dispatch claims the k-th launch, so results
@@ -439,6 +448,14 @@ class SpeculationState:
         for extracted in _literal_calls(fresh, step.eligible):
             if watch.launched >= _MAX_SPECULATIONS_PER_PART:
                 return
+            key = _canonical_key(extracted.sandbox_name, extracted.kwargs)
+            watch.demanded[key] = watch.demanded.get(key, 0) + 1
+            in_flight = sum(len(w.calls.get(key, ())) for w in self._parts.values())
+            if watch.demanded[key] <= in_flight:
+                # Already covered, usually by a failed attempt's surviving launch; the
+                # snippet claims it at execution. If another part claims it first, the
+                # execution prefetch launches the deficit.
+                continue
             self._launch(watch, step, extracted, ctx, produced)
 
     def _launch(
@@ -578,9 +595,10 @@ class SpeculationState:
     async def evict_part(self, parent_tool_call_id: str) -> None:
         """Drop unclaimed launches for one executed `run_code` part.
 
-        Called when the snippet finishes (successfully or not): whatever was not claimed --
-        wrong-branch conditionals, rewritten lines -- is garbage for this part, and a retry
-        arrives under a fresh tool call id.
+        Called when the snippet finishes successfully: whatever was not claimed --
+        wrong-branch conditionals, rewritten lines -- is garbage for this part. Failed
+        snippets keep their launches: syntax and type errors fail before any dispatch, and
+        the retry claims the surviving launches under its fresh tool call id.
         """
         watch = self._parts.pop(parent_tool_call_id, None)
         if watch is not None:

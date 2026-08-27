@@ -750,18 +750,21 @@ class CodeModeToolset(WrapperToolset[AgentDepsT]):
         """Execute Python code in the sandbox, or pass through to a native tool."""
         if self.speculation is None or not isinstance(tool, _RunCodeTool):
             return await self._call_tool_impl(name, tool_args, ctx, tool)
-        try:
-            code = tool_args.get('code')
-            if isinstance(code, str) and not _in_temporal_workflow(ctx):
-                # Execution prefetch: the code is complete here, so every literal eligible
-                # call not already in flight launches now. Sequential awaits then collect
-                # from concurrently-running tasks instead of blocking one another.
-                self.speculation.prelaunch_for_execution(ctx.tool_call_id or 'pyd_ai_code_mode', code, ctx)
-            return await self._call_tool_impl(name, tool_args, ctx, tool)
-        finally:
-            # The snippet is done (or failed into a retry): launches it never claimed are garbage
-            # for this part, and a retry arrives under a fresh tool call id.
-            await self.speculation.evict_part(ctx.tool_call_id or 'pyd_ai_code_mode')
+        code = tool_args.get('code')
+        if isinstance(code, str) and not _in_temporal_workflow(ctx):
+            # Execution prefetch: the code is complete here, so every literal eligible
+            # call not already in flight launches now. Sequential awaits then collect
+            # from concurrently-running tasks instead of blocking one another.
+            self.speculation.prelaunch_for_execution(ctx.tool_call_id or 'pyd_ai_code_mode', code, ctx)
+        result = await self._call_tool_impl(name, tool_args, ctx, tool)
+        # Eviction only on success: launches the executed snippet never claimed were
+        # wrong-branch or rewritten-line garbage. A snippet that failed into a retry keeps
+        # its launches instead -- syntax and type errors fail before any dispatch, the
+        # retry usually re-issues the same literal calls, and the cross-watch claim
+        # fallback lets it adopt them under its fresh tool call id. Run-end `close`
+        # bounds whatever a run abandons.
+        await self.speculation.evict_part(ctx.tool_call_id or 'pyd_ai_code_mode')
+        return result
 
     async def _call_tool_impl(  # noqa: C901
         self, name: str, tool_args: dict[str, Any], ctx: RunContext[AgentDepsT], tool: ToolsetTool[AgentDepsT]

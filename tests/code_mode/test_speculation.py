@@ -413,6 +413,61 @@ class TestSpeculationEdgeCases:
         assert "'result': 'result:alpha'" in repr(result.return_value)
         assert run_capability.speculation_stats.adopted == 1
 
+    async def test_failed_snippet_keeps_launches_for_the_retry(self):
+        """A snippet that dies before dispatching keeps its launches; the retry claims them.
+
+        Syntax and type errors fail the feed before any call dispatches. Evicting there
+        turned every launch of a failed attempt into waste, and retries relaunched work
+        that was already running. The retry's fresh part id adopts the surviving launches
+        through the cross-watch claim, and the streaming dedupe keeps the retry from
+        double-launching them.
+        """
+        log = ToolLog()
+        attempts: list[int] = []
+        capability = CodeMode[None](speculate=['search'])
+        good = padded('a = await search(query="alpha")\nprint(a)')
+
+        async def stream_attempts(messages: list[ModelMessage], info: AgentInfo) -> AsyncIterator[DeltaToolCalls | str]:
+            prior_calls = sum(
+                1 for m in messages if isinstance(m, ModelResponse) for p in m.parts if isinstance(p, ToolCallPart)
+            )
+            if prior_calls >= 2:
+                yield 'done'
+                return
+            attempts.append(prior_calls)
+            if prior_calls == 0:
+                # Same literal call, then a name Monty's type check rejects.
+                code = 'a = await search(query="alpha")\nundefined_name'
+            else:
+                code = good
+            args = json.dumps({'code': code})
+            yield {1: DeltaToolCall(name='run_code')}
+            for offset in range(0, len(args), 16):
+                yield {1: DeltaToolCall(json_args=args[offset : offset + 16])}
+                await asyncio.sleep(0)
+
+        def search(query: str) -> str:
+            """Return a canned result."""
+            log.calls.append(('search', query))
+            return f'result:{query}'
+
+        agent: Agent[None, str] = Agent(
+            FunctionModel(stream_function=stream_attempts),
+            deps_type=type(None),
+            capabilities=[capability],
+            tools=[Tool(search)],
+        )
+
+        result = await agent.run('go')
+
+        assert result.output == 'done'
+        assert len(attempts) == 2
+        # One launch total: the failed attempt's launch survived, the retry deduped
+        # against it and claimed it. The tool body ran once.
+        assert capability.speculation_stats.launched == 1
+        assert capability.speculation_stats.adopted == 1
+        assert log.calls == [('search', 'alpha')]
+
     async def test_execution_prefetch_runs_sequential_awaits_concurrently(self):
         """Literal calls the stream never saw all launch before Monty starts executing.
 
