@@ -84,7 +84,7 @@ class TestAdvisor:
         assert isinstance(tool, AdvisorTool)
         assert tool.model == 'claude-opus-4-8'
         assert tool.max_tokens == 2048
-        if hasattr(tool, 'provider_settings'):
+        if hasattr(tool, 'provider_settings'):  # pragma: no cover - exercised with unreleased Pydantic AI
             assert getattr(tool, 'provider_settings') == {'anthropic': {'caching': '5m'}}
             assert tool.caching is None
         else:
