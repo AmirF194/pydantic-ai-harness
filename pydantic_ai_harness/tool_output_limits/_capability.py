@@ -4,11 +4,11 @@ from __future__ import annotations
 
 import warnings
 from collections.abc import Awaitable, Callable, Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import KW_ONLY, dataclass, field
 from typing import Any, TypeGuard, cast
 
 from pydantic_ai import FunctionToolset
-from pydantic_ai.capabilities import AbstractCapability
+from pydantic_ai.capabilities import AbstractCapability, durable_operation
 from pydantic_ai.exceptions import ModelRetry, UserError
 from pydantic_ai.messages import ToolCallPart, ToolReturn, ToolReturnContent, UserContent
 from pydantic_ai.models import AbstractModel, Model
@@ -121,6 +121,9 @@ class ToolOutputLimits(AbstractCapability[AgentDepsT]):
         )
         ```
     """
+
+    _: KW_ONLY
+    id: str | None = 'tool_output_limits'
 
     bands: Sequence[Band] = field(default_factory=_default_bands)
     """Ordered size bands. The first band whose `over` threshold is met wins."""
@@ -416,7 +419,11 @@ class ToolOutputLimits(AbstractCapability[AgentDepsT]):
             return await self._fallback(ctx, call, action.then, unit)
         assert unit.text is not None
         try:
-            summary = await self._summarize(ctx, call, action, unit.text)
+            if action.summarize is not None:
+                outcome = action.summarize(call.tool_name, unit.text)
+                summary = await outcome if isinstance(outcome, Awaitable) else outcome
+            else:
+                summary = await self._summarize(ctx, call.tool_name, unit.text, self._summarize_path(action))
         except UserError:
             # A misconfiguration -- e.g. a realtime run with no summarizer `model=` (#585) -- is
             # the user's to fix, not something to mask by silently truncating instead.
@@ -425,22 +432,18 @@ class ToolOutputLimits(AbstractCapability[AgentDepsT]):
             return await self._fallback(ctx, call, action.then, unit)
         return summary, None
 
+    @durable_operation
     async def _summarize(
         self,
         ctx: RunContext[AgentDepsT],
-        call: ToolCallPart,
-        action: Summarize,
+        tool_name: str,
         text: str,
+        action_path: str,
     ) -> str:
-        """Generate the summary via a custom callable or the inherited-model agent."""
-        if action.summarize is not None:
-            outcome = action.summarize(call.tool_name, text)
-            if isinstance(outcome, Awaitable):
-                return await outcome
-            return outcome
-
+        """Generate a summary with configuration recovered from this capability."""
         from pydantic_ai import Agent
 
+        action = self._resolve_summarize(action_path)
         model = action.model if action.model is not None else ctx.model
         # `ctx.model` is an `AbstractModel`; summarizing needs a request-response model. A
         # realtime run reaches here only when no summarizer `model=` was configured on the
@@ -452,7 +455,7 @@ class ToolOutputLimits(AbstractCapability[AgentDepsT]):
                 f'uses {type(model).__name__}, which is not one. Set a `model=` on the '
                 '`Summarize` action to use for summarization.'
             )
-        prompt = self.summary_prompt.format(tool_name=call.tool_name, output=text)
+        prompt = self.summary_prompt.format(tool_name=tool_name, output=text)
         # `isinstance` narrows the generic `Model` to `Model[Unknown]`; `cast` recovers
         # `Model[Any]`, mirroring core's own `reinject_system_prompt` idiom.
         agent: Agent[None, str] = Agent(
@@ -460,6 +463,39 @@ class ToolOutputLimits(AbstractCapability[AgentDepsT]):
         )
         run = await agent.run(prompt, usage=ctx.usage, usage_limits=reserved_usage_limits(ctx.usage_limits))
         return run.output.strip()
+
+    def _summarize_path(self, target: Summarize) -> str:
+        for prefix, bands in [
+            ('bands', self.bands),
+            *((f'per_tool:{name}', value) for name, value in self.per_tool.items()),
+        ]:
+            for index, band in enumerate(bands):
+                action = band.action
+                depth = 0
+                while action is not None:
+                    if action is target:
+                        return f'{prefix}:{index}:{depth}'
+                    action = _next_action(action)
+                    depth += 1
+        raise RuntimeError('Summarize action is not part of this capability configuration.')
+
+    def _resolve_summarize(self, path: str) -> Summarize:
+        prefix, index_text, depth_text = path.rsplit(':', 2)
+        bands = self.bands if prefix == 'bands' else self.per_tool[prefix.removeprefix('per_tool:')]
+        action: Action | None = bands[int(index_text)].action
+        for _ in range(int(depth_text)):
+            if action is None:  # pragma: no cover - durable inputs originate from `_summarize_path`
+                break
+            action = _next_action(action)
+        if not isinstance(action, Summarize):  # pragma: no cover - durable inputs originate from `_summarize_path`
+            raise RuntimeError(f'Durable summarize path no longer identifies a Summarize action: {path!r}.')
+        return action
+
+
+def _next_action(action: Action) -> Action | None:
+    if isinstance(action, (Truncate, Spill, Summarize)):
+        return action.then
+    return None
 
 
 def _ensure_text(rendered: object) -> str:

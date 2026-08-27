@@ -11,7 +11,7 @@ from typing import Any
 from unittest.mock import AsyncMock, patch
 
 import pytest
-from pydantic_ai import Agent
+from pydantic_ai import Agent, FunctionToolset
 from pydantic_ai.exceptions import ModelRetry, UserError
 from pydantic_ai.messages import (
     BinaryContent,
@@ -61,6 +61,7 @@ from pydantic_ai_harness.tool_output_limits._payload import (
     truncate_text,
 )
 from pydantic_ai_harness.tool_output_limits._store import _safe_segment
+from tests._recording_durability import RecordingDurability  # pyright: ignore[reportMissingTypeStubs]
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -629,6 +630,50 @@ class TestContentReduction:
 
 
 class TestSummarize:
+    async def test_model_summarizer_dispatches_as_durable_operation(self):
+        def large_output() -> str:
+            return 'x' * 100
+
+        durability = RecordingDurability()
+        cap: ToolOutputLimits[Any] = ToolOutputLimits(
+            bands=[Band(over=5, action=Summarize(model=_fixed_model('THE SUMMARY')))]
+        )
+
+        agent = Agent(
+            TestModel(call_tools='all'),
+            name='tool_output_limits',
+            capabilities=[cap, durability],
+            toolsets=[FunctionToolset(tools=[large_output], id='large-output')],
+        )
+        await agent.run('call the tool')
+
+        bound = RecordingDurability.from_agent(agent)
+        assert bound is not None
+        assert any('__capability__tool_output_limits' in name and 'summarize' in name for name, _ in bound.calls), (
+            bound.calls
+        )
+
+    async def test_custom_summarizer_bypasses_durable_operation(self):
+        def large_output() -> str:
+            return 'x' * 100
+
+        durability = RecordingDurability()
+        cap: ToolOutputLimits[Any] = ToolOutputLimits(
+            bands=[Band(over=5, action=Summarize(summarize=lambda _name, _text: 'summary'))]
+        )
+
+        agent = Agent(
+            TestModel(call_tools='all'),
+            name='custom_tool_output_limits',
+            capabilities=[cap, durability],
+            toolsets=[FunctionToolset(tools=[large_output], id='custom-large-output')],
+        )
+        await agent.run('call the tool')
+
+        bound = RecordingDurability.from_agent(agent)
+        assert bound is not None
+        assert not any('__capability__tool_output_limits._summarize' in name for name, _ in bound.calls)
+
     async def test_custom_sync_summarizer(self):
         cap: ToolOutputLimits[object] = ToolOutputLimits(
             bands=[Band(over=5, action=Summarize(summarize=lambda name, text: f'{name}:{len(text)}'))]
