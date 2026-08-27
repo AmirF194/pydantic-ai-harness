@@ -79,7 +79,16 @@ class TestAdvisor:
         await agent.run('Review this plan.')
 
         assert seen[0].function_tools == []
-        assert seen[0].native_tools == [AdvisorTool(model='claude-opus-4-8', max_tokens=2048, caching='5m')]
+        assert len(seen[0].native_tools) == 1
+        tool = seen[0].native_tools[0]
+        assert isinstance(tool, AdvisorTool)
+        assert tool.model == 'claude-opus-4-8'
+        assert tool.max_tokens == 2048
+        if hasattr(tool, 'provider_settings'):
+            assert getattr(tool, 'provider_settings') == {'anthropic': {'caching': '5m'}}
+            assert tool.caching is None
+        else:
+            assert tool.caching == '5m'
 
     async def test_model_instance_uses_local_advisor_and_preserves_identity(self) -> None:
         advisor_prompts: list[str] = []

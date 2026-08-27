@@ -209,12 +209,18 @@ class Advisor(NativeOrLocalTool[AgentDepsT]):
         return self._advisor_tool(native_model_name)
 
     def _advisor_tool(self, model_name: str) -> AdvisorTool:
-        return AdvisorTool(
+        tool = AdvisorTool(
             model=model_name,
             max_uses=self.max_uses,
             max_tokens=self.max_tokens,
-            caching=self.caching,
         )
+        if self.caching is not None:
+            if hasattr(tool, 'provider_settings'):
+                # Compatibility with Pydantic AI versions before provider-specific native-tool settings.
+                setattr(tool, 'provider_settings', {'anthropic': {'caching': self.caching}})
+            else:
+                tool.caching = self.caching
+        return tool
 
     @staticmethod
     def _parse_native_model(
