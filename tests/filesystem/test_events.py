@@ -75,6 +75,17 @@ class TestFileSystemEvents:
             )
         ]
 
+    async def test_binary_read_emits_raw_content_hash(self, tmp_path: Path) -> None:
+        content = b'hello\x00world'
+        (tmp_path / 'binary.bin').write_bytes(content)
+
+        events = await _run_and_collect(tmp_path, 'read_file', '{"path":"binary.bin"}')
+
+        read_events = [event for event in events if isinstance(event, FileReadEvent)]
+        assert len(read_events) == 1
+        assert read_events[0].path == 'binary.bin'
+        assert read_events[0].content_hash == hashlib.sha256(content).hexdigest()[:12]
+
     async def test_list_emits_normalized_path_and_entry_count(self, tmp_path: Path) -> None:
         sub = tmp_path / 'sub'
         sub.mkdir()

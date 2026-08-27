@@ -357,6 +357,10 @@ class FileSystemToolset(FunctionToolset[AgentDepsT]):
         raw = resolved.read_bytes()
         if _is_binary(raw):
             size = len(raw)
+            if ctx is not None:
+                safe_path = _model_safe_filename(os.fspath(resolved), self._real_root)
+                content_hash = hashlib.sha256(raw).hexdigest()[:12]
+                await ctx.emit_event(FileReadEvent(path=safe_path, content_hash=content_hash))
             return f'[Binary file: {size} bytes. Use a binary-aware tool to inspect.]'
 
         text = raw.decode('utf-8', errors='replace')
@@ -576,6 +580,7 @@ class FileSystemToolset(FunctionToolset[AgentDepsT]):
             raise NotADirectoryError(f'Not a directory: {path}')
 
         entries: list[str] = []
+        entry_count = 0
         for entry in sorted(resolved.iterdir()):
             try:
                 rel_path = entry.relative_to(self._real_root)
@@ -605,9 +610,10 @@ class FileSystemToolset(FunctionToolset[AgentDepsT]):
                 entries.append(f'[... truncated at {self._max_list_results} entries]')
                 break
             entries.append(line)
+            entry_count += 1
         safe_path = _model_safe_filename(os.fspath(resolved), self._real_root)
         if ctx is not None:
-            await ctx.emit_event(DirectoryListedEvent(path=safe_path, entry_count=len(entries)))
+            await ctx.emit_event(DirectoryListedEvent(path=safe_path, entry_count=entry_count))
         return '\n'.join(entries) if entries else '(empty directory)'
 
     @_recoverable
