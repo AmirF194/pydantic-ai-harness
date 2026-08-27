@@ -230,6 +230,68 @@ class TestSpeculation:
         assert capability.speculation_stats.adopted == 1
         assert capability.speculation_stats.evicted == 1
 
+    async def test_both_arms_of_a_conditional_launch(self):
+        """Literal calls in both arms launch; the taken arm claims, the untaken arm is evicted."""
+        log = ToolLog()
+        capability = CodeMode[None](speculate=['search'])
+        code = padded(
+            'if False:\n    a = await search(query="alpha")\nelse:\n    a = await search(query="beta")\nprint(a)'
+        )
+        agent = build_agent(log, code, capability)
+
+        result = await agent.run('go')
+
+        assert result.output == 'done'
+        # The taken arm's dispatch adopted its launch: the tool body ran once for beta.
+        assert log.calls.count(('search', 'beta')) == 1
+        assert capability.speculation_stats.launched == 2
+        assert capability.speculation_stats.adopted == 1
+        assert capability.speculation_stats.evicted == 1
+
+    async def test_identical_call_in_both_arms_launches_per_occurrence(self):
+        """Occurrence-exact multiplicity is syntactic: exclusive arms still launch twice.
+
+        The dedupe in the streaming scan counts demand per occurrence and compares against
+        launches already in flight from other parts; it does not reason about branch
+        exclusivity within a part. Whichever arm runs claims one launch, the other launch
+        is evicted at commit.
+        """
+        log = ToolLog()
+        capability = CodeMode[None](speculate=['search'])
+        code = padded(
+            'if False:\n    a = await search(query="same")\nelse:\n    a = await search(query="same")\nprint(a)'
+        )
+        agent = build_agent(log, code, capability)
+
+        result = await agent.run('go')
+
+        assert result.output == 'done'
+        assert capability.speculation_stats.launched == 2
+        assert capability.speculation_stats.adopted == 1
+        assert capability.speculation_stats.evicted == 1
+
+    async def test_loop_body_literal_call_launches_once(self):
+        """A literal call in a loop launches per occurrence, not per iteration.
+
+        Iteration one claims the single launch; iteration two finds the queue empty and
+        runs cold as a miss. Reachability is predicted, trip counts are not.
+        """
+        log = ToolLog()
+        capability = CodeMode[None](speculate=['search'])
+        code = padded(
+            'results = []\nfor i in [1, 2]:\n    r = await search(query="fixed")\n    results.append(r)\nprint(results)'
+        )
+        agent = build_agent(log, code, capability)
+
+        result = await agent.run('go')
+
+        assert result.output == 'done'
+        # Tool body ran twice: once inside the adopted launch, once cold for iteration two.
+        assert log.calls.count(('search', 'fixed')) == 2
+        assert capability.speculation_stats.launched == 1
+        assert capability.speculation_stats.adopted == 1
+        assert capability.speculation_stats.evicted == 0
+
     async def test_repeated_identical_calls_launch_and_adopt_per_occurrence(self):
         """N identical dispatches claim N launches; nondeterministic results never collapse."""
         log = ToolLog()
