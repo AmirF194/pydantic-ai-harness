@@ -92,6 +92,11 @@ def _ctx(model: Any = None) -> Any:
         deps: None = None
         tracer: Tracer = dataclasses.field(default_factory=NoOpTracer)
 
+        async def emit_event(self, event: Any) -> Any:
+            # Like the real `RunContext.emit_event` with no listeners: inline dispatch
+            # returns the (unmutated) event for the emitter to inspect.
+            return event
+
     return _FakeCtx(model=model) if model is not None else _FakeCtx()
 
 

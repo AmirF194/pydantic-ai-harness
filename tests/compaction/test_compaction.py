@@ -109,6 +109,11 @@ def _make_ctx(
             default_factory=dict[str, AbstractCapability[None]]
         )
 
+        async def emit_event(self, event: Any) -> Any:
+            # Like the real `RunContext.emit_event` with no listeners: inline dispatch
+            # returns the (unmutated) event for the emitter to inspect.
+            return event
+
     return _FakeCtx(usage=usage, usage_limits=usage_limits)
 
 
@@ -2865,6 +2870,8 @@ class TestCompactWithSpan:
     @pytest.mark.anyio
     async def test_non_recording_tracer_skips_attributes(self):
         # A no-op tracer returns a non-recording span, so attribute computation is skipped.
+        # Events are disabled here because an emitted `CompactionStartEvent` legitimately
+        # invokes the tokenizer for its `estimated_tokens`.
         before: list[ModelMessage] = [_user('a'), _user('b')]
         after: list[ModelMessage] = [_user('a')]
         called = False
@@ -2878,7 +2885,7 @@ class TestCompactWithSpan:
             return after
 
         result = await compact_with_span(
-            _make_ctx(), strategy='Strat', messages=before, compact=_compact, tokenizer=_tokenizer
+            _make_ctx(), strategy='Strat', messages=before, compact=_compact, tokenizer=_tokenizer, emit_events=False
         )
         assert result is after
         assert called is False

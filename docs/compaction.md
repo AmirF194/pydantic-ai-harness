@@ -391,7 +391,7 @@ The span name is the static `compact_messages`; the strategy is an attribute, no
 
 ## Events
 
-Every strategy attempt emits `BeforeCompactionEvent` after its trigger fires and before it rewrites history. The event reports the strategy, message count, and estimated tokens. It uses inline dispatch, so capability and application listeners can call `cancel()` before the strategy continues. Cancellation applies to this attempt only; a later trigger tries again. A cancelled fallback candidate is a deliberate skip and does not advance the fallback chain.
+Every strategy attempt emits `CompactionStartEvent` (from the compaction event family Pydantic AI core defines and its provider-native compaction capabilities share) after its trigger fires and before it rewrites history. The event reports the strategy, message count, and estimated tokens. It uses inline dispatch, so capability and application listeners can call `cancel()` before the strategy continues. Cancellation applies to this attempt only; a later trigger tries again. A cancelled fallback candidate is a deliberate skip and does not advance the fallback chain.
 
 `CompactionEndEvent` follows only when the strategy actually changes history. It reports the before/after message and token counts. The event is a live coordination signal; [compaction receipts](#compaction-receipts) remain an in-history note for the model.
 
@@ -403,24 +403,24 @@ from typing import Any
 
 from pydantic_ai.capabilities import AbstractCapability, on_event
 from pydantic_ai.tools import RunContext
-from pydantic_ai_harness.compaction import BeforeCompactionEvent
+from pydantic_ai.capabilities import CompactionStartEvent
 
 
 @dataclass
 class HoldCompaction(AbstractCapability[Any]):
     activity_in_progress: bool = False
 
-    @on_event(BeforeCompactionEvent)
-    async def hold(self, ctx: RunContext[Any], event: BeforeCompactionEvent) -> None:
+    @on_event(CompactionStartEvent)
+    async def hold(self, ctx: RunContext[Any], event: CompactionStartEvent) -> None:
         if self.activity_in_progress:
             event.cancel('activity state has not been saved')
 ```
 
-Application code can register the same listener with `@hooks.on.event(BeforeCompactionEvent)`. Because the decision is inline, listeners must finish synchronously with the attempt rather than deferring an answer to background work.
+Application code can register the same listener with `@hooks.on.event(CompactionStartEvent)`. Because the decision is inline, listeners must finish synchronously with the attempt rather than deferring an answer to background work.
 
 ## Compaction receipts
 
-Compaction is a memory wipe the model cannot veto and often cannot detect. Capabilities and application hooks can now veto an individual attempt with `BeforeCompactionEvent`; the model still cannot. Without a receipt, completed compaction invites *resumption drift* -- the model confabulates continuity with history it no longer has. A receipt makes the wipe legible: after a boundary-crossing strategy rewrites history it appends a short, deterministic note recording how much was compacted, warning that what survives is secondhand, and -- when a handle provider is attached -- an identifier for persisted run history.
+Compaction is a memory wipe the model cannot veto and often cannot detect. Capabilities and application hooks can veto an individual attempt with `CompactionStartEvent`; the model still cannot. Without a receipt, completed compaction invites *resumption drift* -- the model confabulates continuity with history it no longer has. A receipt makes the wipe legible: after a boundary-crossing strategy rewrites history it appends a short, deterministic note recording how much was compacted, warning that what survives is secondhand, and -- when a handle provider is attached -- an identifier for persisted run history.
 
 ```python
 from pydantic_ai_harness import SlidingWindowCompaction, SummarizingCompaction

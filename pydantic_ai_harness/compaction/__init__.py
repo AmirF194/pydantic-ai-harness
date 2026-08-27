@@ -12,7 +12,6 @@ from pydantic_ai_harness.compaction._context_window import (
     resolve_context_window,
 )
 from pydantic_ai_harness.compaction._deduplicate_file_reads import DeduplicateFileReads
-from pydantic_ai_harness.compaction._events import BeforeCompactionEvent, CompactionEndEvent
 from pydantic_ai_harness.compaction._fallback_compaction import FallbackCompaction
 from pydantic_ai_harness.compaction._manual import compact_now
 from pydantic_ai_harness.compaction._pinning import is_pinned, pin, reinject_pinned
@@ -32,10 +31,8 @@ from pydantic_ai_harness.compaction._warn_near_limits import WarningKind, WarnNe
 __all__ = [
     'DEFAULT_CONTEXT_WINDOW',
     'ClampOversizedMessages',
-    'BeforeCompactionEvent',
     'ClearToolResults',
     'CompactionStrategy',
-    'CompactionEndEvent',
     'ContextUsage',
     'ReportContextUsage',
     'DeduplicateFileReads',

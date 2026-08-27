@@ -9,14 +9,12 @@ import pydantic
 import pytest
 from inline_snapshot import snapshot
 from pydantic_ai import Agent
-from pydantic_ai.capabilities import AbstractCapability, Hooks, on_event
+from pydantic_ai.capabilities import AbstractCapability, CompactionEndEvent, CompactionStartEvent, Hooks, on_event
 from pydantic_ai.messages import AgentStreamEvent, ModelMessage, ModelRequest, UserPromptPart
 from pydantic_ai.models.test import TestModel
 from pydantic_ai.tools import RunContext
 
 from pydantic_ai_harness.compaction import (
-    BeforeCompactionEvent,
-    CompactionEndEvent,
     FallbackCompaction,
     SlidingWindowCompaction,
     TieredCompaction,
@@ -37,11 +35,11 @@ def _history(*values: str) -> list[ModelMessage]:
 
 @dataclass
 class _CancelFirst(AbstractCapability[Any]):
-    events: list[BeforeCompactionEvent | CompactionEndEvent]
+    events: list[CompactionStartEvent | CompactionEndEvent]
     cancelled: bool = False
 
-    @on_event(BeforeCompactionEvent)
-    async def cancel_first(self, ctx: RunContext[Any], event: BeforeCompactionEvent) -> None:
+    @on_event(CompactionStartEvent)
+    async def cancel_first(self, ctx: RunContext[Any], event: CompactionStartEvent) -> None:
         self.events.append(event)
         if not self.cancelled:
             event.cancel('activity in progress')
@@ -53,7 +51,7 @@ class _CancelFirst(AbstractCapability[Any]):
 
 
 async def test_cancelled_attempt_retries_and_then_emits_end() -> None:
-    events: list[BeforeCompactionEvent | CompactionEndEvent] = []
+    events: list[CompactionStartEvent | CompactionEndEvent] = []
     listener = _CancelFirst(events)
     compaction = SlidingWindowCompaction(
         max_messages=1,
@@ -66,7 +64,7 @@ async def test_cancelled_attempt_retries_and_then_emits_end() -> None:
     first = await agent.run('first trigger', message_history=_history('old one', 'old two'))
     assert len(events) == 1
     before = events[0]
-    assert isinstance(before, BeforeCompactionEvent)
+    assert isinstance(before, CompactionStartEvent)
     assert before.strategy == 'SlidingWindowCompaction'
     assert before.message_count == 2
     assert before.estimated_tokens is not None
@@ -74,11 +72,11 @@ async def test_cancelled_attempt_retries_and_then_emits_end() -> None:
     assert 'History before this point' not in first.all_messages_json().decode()
 
     second = await agent.run('second trigger', message_history=first.all_messages())
-    assert [type(event) for event in events] == [BeforeCompactionEvent, BeforeCompactionEvent, CompactionEndEvent]
+    assert [type(event) for event in events] == [CompactionStartEvent, CompactionStartEvent, CompactionEndEvent]
     end = events[-1]
     retry_before = events[-2]
     assert isinstance(end, CompactionEndEvent)
-    assert isinstance(retry_before, BeforeCompactionEvent)
+    assert isinstance(retry_before, CompactionStartEvent)
     assert end.messages_before == retry_before.message_count
     assert end.messages_after < end.messages_before
     assert end.tokens_before == retry_before.estimated_tokens
@@ -89,8 +87,8 @@ async def test_cancelled_attempt_retries_and_then_emits_end() -> None:
 async def test_app_hook_can_cancel_compaction() -> None:
     hooks = Hooks[Any]()
 
-    @hooks.on.event(BeforeCompactionEvent)
-    async def hold(ctx: RunContext[Any], event: BeforeCompactionEvent) -> None:
+    @hooks.on.event(CompactionStartEvent)
+    async def hold(ctx: RunContext[Any], event: CompactionStartEvent) -> None:
         event.cancel('application is mid-activity')
 
     history = _history('old one', 'old two')
@@ -132,8 +130,8 @@ async def test_fallback_cancellation_does_not_advance_but_failure_does() -> None
 
     @dataclass
     class Listener(AbstractCapability[Any]):
-        @on_event(BeforeCompactionEvent)
-        async def cancel_failure(self, ctx: RunContext[Any], event: BeforeCompactionEvent) -> None:
+        @on_event(CompactionStartEvent)
+        async def cancel_failure(self, ctx: RunContext[Any], event: CompactionStartEvent) -> None:
             nonlocal cancelled
             if event.strategy == '_FailingStrategy' and not cancelled:
                 event.cancel()
@@ -151,7 +149,7 @@ async def test_fallback_cancellation_does_not_advance_but_failure_does() -> None
 def test_events_serialize() -> None:
     adapter = pydantic.TypeAdapter[AgentStreamEvent](AgentStreamEvent)
     events: list[AgentStreamEvent] = [
-        BeforeCompactionEvent(strategy='sliding', message_count=8, estimated_tokens=120),
+        CompactionStartEvent(strategy='sliding', message_count=8, estimated_tokens=120),
         CompactionEndEvent(
             strategy='sliding',
             messages_before=8,
@@ -169,7 +167,7 @@ def test_events_serialize() -> None:
                 'estimated_tokens': 120,
                 'cancelled': False,
                 'event_kind': 'capability',
-                'kind': 'compaction.before_compaction',
+                'kind': 'compaction.start',
             },
             {
                 'strategy': 'sliding',
@@ -178,7 +176,7 @@ def test_events_serialize() -> None:
                 'tokens_before': 120,
                 'tokens_after': 40,
                 'event_kind': 'capability',
-                'kind': 'compaction.compaction_end',
+                'kind': 'compaction.end',
             },
         ]
     )
