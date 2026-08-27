@@ -84,6 +84,10 @@ class SpeculativeCallLaunchedEvent(CapabilityEvent, namespace=CODE_MODE_EVENTS):
     line_end: int
     """1-based last line of the launching statement within the snippet."""
 
+    phase: Literal['streaming', 'execution'] = 'streaming'
+    """When the launch happened: `streaming` overlaps the model's own generation;
+    `execution` is the pre-Monty prefetch that parallelizes the snippet's sequential awaits."""
+
 
 @dataclass(kw_only=True)
 class SpeculativeCallSettledEvent(CapabilityEvent, namespace=CODE_MODE_EVENTS):

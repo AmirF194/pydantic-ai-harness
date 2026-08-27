@@ -751,6 +751,12 @@ class CodeModeToolset(WrapperToolset[AgentDepsT]):
         if self.speculation is None or not isinstance(tool, _RunCodeTool):
             return await self._call_tool_impl(name, tool_args, ctx, tool)
         try:
+            code = tool_args.get('code')
+            if isinstance(code, str) and not _in_temporal_workflow(ctx):
+                # Execution prefetch: the code is complete here, so every literal eligible
+                # call not already in flight launches now. Sequential awaits then collect
+                # from concurrently-running tasks instead of blocking one another.
+                self.speculation.prelaunch_for_execution(ctx.tool_call_id or 'pyd_ai_code_mode', code, ctx)
             return await self._call_tool_impl(name, tool_args, ctx, tool)
         finally:
             # The snippet is done (or failed into a retry): launches it never claimed are garbage

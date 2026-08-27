@@ -270,7 +270,12 @@ namespace, so UIs and other capabilities can observe the lifecycle live from the
 stream: `SpeculativeCodeUpdateEvent` (the decoded snippet so far, with its closed-statement
 boundary), `SpeculativeCallLaunchedEvent` (with the launching statement's line span),
 `SpeculativeCallSettledEvent`, and -- once the snippet executes -- `SpeculativeCallClaimedEvent`,
-`SpeculativeCallMissedEvent`, and `SpeculativeCallEvictedEvent`. Delivery differs by phase:
+`SpeculativeCallMissedEvent`, and `SpeculativeCallEvictedEvent`. Launches carry a `phase`
+field: `streaming` launches overlap the model's own generation, while `execution` launches
+are the prefetch that runs when the snippet starts executing -- the complete code is parsed
+and every literal eligible call not already in flight starts at once, so the snippet's
+sequential awaits collect from concurrently-running tasks instead of blocking one another.
+Delivery differs by phase:
 stream-phase events (updates, launches, settles) are yielded directly into the wrapped event
 stream, interleaved live with the argument deltas that produced them -- so they reach stream
 consumers (`event_stream_handler`, UI adapters) but bypass `@on_event` listener dispatch.

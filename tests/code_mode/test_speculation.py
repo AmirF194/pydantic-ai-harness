@@ -413,6 +413,109 @@ class TestSpeculationEdgeCases:
         assert "'result': 'result:alpha'" in repr(result.return_value)
         assert run_capability.speculation_stats.adopted == 1
 
+    async def test_execution_prefetch_runs_sequential_awaits_concurrently(self):
+        """Literal calls the stream never saw all launch before Monty starts executing.
+
+        The tools deadlock unless both are started before either finishes, so the test
+        passes only when the prefetch actually runs them concurrently.
+        """
+        ping_started = asyncio.Event()
+        pong_started = asyncio.Event()
+
+        async def ping() -> str:
+            """Wait for pong to start, then return."""
+            ping_started.set()
+            await asyncio.wait_for(pong_started.wait(), timeout=5)
+            return 'ping'
+
+        async def pong() -> str:
+            """Wait for ping to start, then return."""
+            pong_started.set()
+            await asyncio.wait_for(ping_started.wait(), timeout=5)
+            return 'pong'
+
+        ctx = build_run_context(None)
+        capability = CodeMode[None](speculate=['ping', 'pong'])
+        run_capability = await capability.for_run(ctx)
+        toolset = run_capability.get_wrapper_toolset(FunctionToolset[None](tools=[Tool(ping), Tool(pong)]))
+        assert isinstance(toolset, CodeModeToolset)
+        tools = await toolset.get_tools(ctx)
+
+        from pydantic_ai.tool_manager import ToolManager
+
+        code = 'a = await ping()\nb = await pong()\na + b'
+        exec_ctx = dataclasses.replace(ctx, tool_call_id='exec-1', tool_name='run_code')
+        exec_ctx.tool_manager = await ToolManager(toolset=toolset).for_run_step(exec_ctx)
+        async with toolset:
+            result = await toolset.call_tool('run_code', {'code': code}, exec_ctx, tools['run_code'])
+
+        assert isinstance(result, ToolReturn)
+        assert repr(result.return_value) == "'pingpong'"
+        assert run_capability.speculation_stats.launched == 2
+        assert run_capability.speculation_stats.adopted == 2
+        assert toolset.speculation is not None
+        launch_events = [e for e in toolset.speculation.pending_events if isinstance(e, SpeculativeCallLaunchedEvent)]
+        assert [e.phase for e in launch_events] == ['execution', 'execution']
+
+    async def test_execution_prefetch_guards_no_step_and_the_launch_cap(self):
+        """Prefetch is inert before a step stashes ingredients, and the per-part cap holds."""
+
+        def search(query: str) -> str:
+            """Return a canned result."""
+            return f'result:{query}'
+
+        ctx = build_run_context(None)
+        capability = CodeMode[None](speculate=['search'])
+        run_capability = await capability.for_run(ctx)
+        toolset = run_capability.get_wrapper_toolset(FunctionToolset[None](tools=[Tool(search)]))
+        assert isinstance(toolset, CodeModeToolset)
+        assert toolset.speculation is not None
+
+        toolset.speculation.prelaunch_for_execution('p0', 'a = await search(query="x")\nprint(a)', ctx)
+        assert run_capability.speculation_stats.launched == 0
+
+        await toolset.get_tools(ctx)
+        big = '\n'.join(f'x{i} = await search(query="q{i}")' for i in range(33)) + '\nprint(1)'
+        toolset.speculation.prelaunch_for_execution('p1', big, ctx)
+        assert run_capability.speculation_stats.launched == 32
+
+        await toolset.speculation.evict_part('p1')
+
+    async def test_execution_prefetch_launches_only_the_deficit(self):
+        """Streamed launches count against the prefetch, so FIFO multiplicity stays exact."""
+
+        def search(query: str) -> str:
+            """Return a canned result."""
+            return f'result:{query}'
+
+        ctx = build_run_context(None)
+        capability = CodeMode[None](speculate=['search'])
+        run_capability = await capability.for_run(ctx)
+        toolset = run_capability.get_wrapper_toolset(FunctionToolset[None](tools=[Tool(search)]))
+        assert isinstance(toolset, CodeModeToolset)
+        tools = await toolset.get_tools(ctx)
+
+        streamed = 'a = await search(query="alpha")\nprint(a)\n'
+        events: list[AgentStreamEvent] = [
+            PartStartEvent(index=0, part=ToolCallPart(tool_name='run_code', args={}, tool_call_id='c1')),
+            PartDeltaEvent(index=0, delta=ToolCallPartDelta(args_delta={'code': streamed})),
+        ]
+        async for _ in run_capability.wrap_run_event_stream(ctx, stream=_PlainEventStream(events)):
+            pass
+        assert run_capability.speculation_stats.launched == 1
+
+        from pydantic_ai.tool_manager import ToolManager
+
+        code = 'a = await search(query="alpha")\nb = await search(query="alpha")\nb'
+        exec_ctx = dataclasses.replace(ctx, tool_call_id='c1', tool_name='run_code')
+        exec_ctx.tool_manager = await ToolManager(toolset=toolset).for_run_step(exec_ctx)
+        async with toolset:
+            await toolset.call_tool('run_code', {'code': code}, exec_ctx, tools['run_code'])
+
+        # Two identical dispatches, one streamed launch: the prefetch adds exactly one more.
+        assert run_capability.speculation_stats.launched == 2
+        assert run_capability.speculation_stats.adopted == 2
+
     async def test_part_end_launches_the_statements_streaming_held_back(self):
         """A snippet's trailing statements launch when the arguments finish streaming.
 

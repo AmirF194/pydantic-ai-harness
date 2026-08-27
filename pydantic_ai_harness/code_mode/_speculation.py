@@ -428,6 +428,7 @@ class SpeculationState:
         extracted: _ExtractedCall,
         ctx: RunContext[Any],
         produced: list[CapabilityEvent],
+        phase: Literal['streaming', 'execution'] = 'streaming',
     ) -> None:
         sandbox_name = extracted.sandbox_name
         original_name = step.sanitized_to_original.get(sandbox_name, sandbox_name)
@@ -463,6 +464,7 @@ class SpeculationState:
                 arguments=extracted.kwargs,
                 line_start=extracted.line_start,
                 line_end=extracted.line_end,
+                phase=phase,
             )
         )
 
@@ -488,6 +490,41 @@ class SpeculationState:
         return watch.calls.setdefault(_canonical_key(sandbox_name, kwargs), deque())
 
     # -- execution side ---------------------------------------------------------------------
+
+    def prelaunch_for_execution(self, parent_tool_call_id: str, code: str, ctx: RunContext[Any]) -> None:
+        """Launch every literal eligible call the snippet holds, before Monty takes a step.
+
+        Sequential `await`s execute one statement at a time, so a cold eligible call blocks
+        every statement after it. At execution start the code is complete: launching the calls
+        the stream watcher never saw (single-chunk argument deltas, provider quirks) means the
+        snippet's awaits collect from tasks that are all already running, and wall time
+        approaches the longest call instead of the sum. Only the deficit against launches
+        already in flight is started, so FIFO multiplicity stays exact.
+        """
+        step = self._step
+        if step is None or not step.eligible:
+            return
+        try:
+            body = ast.parse(code).body
+        except SyntaxError:
+            return
+        extracted_calls = list(_literal_calls(body, step.eligible))
+        if not extracted_calls:
+            return
+        watch = self._parts.get(parent_tool_call_id)
+        if watch is None:
+            watch = _PartWatch(tool_call_id=parent_tool_call_id)
+            self._parts[parent_tool_call_id] = watch
+        demanded: dict[str, int] = {}
+        for extracted in extracted_calls:
+            key = _canonical_key(extracted.sandbox_name, extracted.kwargs)
+            demanded[key] = demanded.get(key, 0) + 1
+            in_flight = sum(len(w.calls.get(key, ())) for w in self._parts.values())
+            if demanded[key] <= in_flight:
+                continue
+            if watch.launched >= _MAX_SPECULATIONS_PER_PART:
+                return
+            self._launch(watch, step, extracted, ctx, self.pending_events, phase='execution')
 
     def eligible(self, sandbox_name: str) -> bool:
         """Whether this sandbox function may speculate this step; drives miss reporting."""
