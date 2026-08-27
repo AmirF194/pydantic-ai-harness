@@ -137,7 +137,11 @@ class RepoContext(AbstractCapability[AgentDepsT]):
 
     async def for_run(self, ctx: RunContext[AgentDepsT]) -> RepoContext[AgentDepsT]:
         """Return a fresh per-run instance with isolated traversal/cache state."""
-        return replace(self)
+        if not self._sniff_traversal_tools:
+            return replace(self)
+        with warnings.catch_warnings():
+            warnings.simplefilter('ignore', HarnessDeprecationWarning)
+            return replace(self)
 
     def _files(self) -> list[ContextFile]:
         if self._context_files is None:
