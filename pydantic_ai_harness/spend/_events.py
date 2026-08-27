@@ -29,7 +29,7 @@ class SpendBudgetStatus:
 
 
 @dataclass(kw_only=True)
-class SpendRecordedEvent(CapabilityEvent, namespace=SPEND_EVENTS):
+class SpendRecordedEvent(CapabilityEvent, namespace=SPEND_EVENTS, name='recorded'):
     """A model response was recorded against the configured spend windows."""
 
     model: str | None

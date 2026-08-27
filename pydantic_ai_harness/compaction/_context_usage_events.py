@@ -8,7 +8,7 @@ CONTEXT_USAGE_EVENTS = 'context_usage'
 
 
 @dataclass(kw_only=True)
-class ContextUsageEvent(CapabilityEvent, namespace=CONTEXT_USAGE_EVENTS):
+class ContextUsageEvent(CapabilityEvent, namespace=CONTEXT_USAGE_EVENTS, name='measured'):
     """A context usage reading was recorded before a model request."""
 
     used_tokens: int

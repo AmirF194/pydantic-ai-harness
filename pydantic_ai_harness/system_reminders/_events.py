@@ -8,7 +8,7 @@ SYSTEM_REMINDER_EVENTS = 'system_reminders'
 
 
 @dataclass(kw_only=True)
-class ReminderFiredEvent(CapabilityEvent, namespace=SYSTEM_REMINDER_EVENTS):
+class ReminderFiredEvent(CapabilityEvent, namespace=SYSTEM_REMINDER_EVENTS, name='fired'):
     """A rendered reminder was appended to a model request."""
 
     text: str
