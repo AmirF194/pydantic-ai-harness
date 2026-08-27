@@ -46,6 +46,7 @@ from pydantic_ai_harness.memory import (
     MemoryToolset,
     SqliteMemoryStore,
 )
+from tests._recording_durability import RecordingDurability  # pyright: ignore[reportMissingTypeStubs]
 
 pytestmark = pytest.mark.anyio
 
@@ -128,6 +129,19 @@ async def _seed(store: MemoryStore, path: str, content: str) -> MemoryMutation:
         content,
         expected_version=None if current is None else current.version,
     )
+
+
+async def test_snapshot_load_dispatches_as_durable_operation() -> None:
+    store = InMemoryStore()
+    await _seed(store, 'main/MEMORY.md', '- durable fact')
+    durability = RecordingDurability()
+    agent = Agent(TestModel(call_tools=[]), name='memory', capabilities=[Memory(store=store), durability])
+
+    await agent.run('continue')
+
+    bound = RecordingDurability.from_agent(agent)
+    assert bound is not None
+    assert any('__capability__' in name and 'load_snapshot' in name for name, _ in bound.calls), bound.calls
 
 
 @dataclass
@@ -724,8 +738,10 @@ class TestInjection:
         await Agent(
             FunctionModel(model),
             capabilities=[
-                Memory(store=store, agent_name='you', guidance='', heading='Your notes'),
-                Memory(store=store, agent_name='team', guidance='', heading='Team notes').prefix_tools('team'),
+                Memory(store=store, agent_name='you', guidance='', heading='Your notes', id='memory-you'),
+                Memory(
+                    store=store, agent_name='team', guidance='', heading='Team notes', id='memory-team'
+                ).prefix_tools('team'),
             ],
         ).run('go')
         blocks = captured[0]
@@ -1127,8 +1143,8 @@ class TestInjection:
         agent = Agent(
             FunctionModel(capture),
             capabilities=[
-                Memory(store=store),
-                Memory(store=store, agent_name='org').prefix_tools('org'),
+                Memory(store=store, id='memory-main'),
+                Memory(store=store, agent_name='org', id='memory-org').prefix_tools('org'),
             ],
         )
         first = await agent.run('first')
