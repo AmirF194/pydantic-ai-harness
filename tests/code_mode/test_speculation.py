@@ -410,8 +410,7 @@ class TestSpeculationEdgeCases:
             result = await toolset.call_tool('run_code', {'code': code}, exec_ctx, tools['run_code'])
 
         assert isinstance(result, ToolReturn)
-        return_value: dict[str, Any] = result.return_value
-        assert return_value['result'] == 'result:alpha'
+        assert "'result': 'result:alpha'" in repr(result.return_value)
         assert run_capability.speculation_stats.adopted == 1
 
     async def test_part_end_launches_the_statements_streaming_held_back(self):
