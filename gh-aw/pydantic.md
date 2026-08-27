@@ -365,11 +365,11 @@ Shared engine definition for the [Pydantic AI](https://ai.pydantic.dev) CLI
 this file and set `engine: id: pydantic-ai` to use it:
 
 ```yaml
+imports:
+  - pydantic/pydantic-ai-harness/gh-aw/pydantic.md@gh-aw-engine
 engine:
   id: pydantic-ai
-model: copilot/claude-sonnet-4-5
-imports:
-  - shared/pydantic.md
+  model: copilot/claude-sonnet-4-5
 ```
 
 The agent is a `pydantic_ai.Agent` composed from the harness `Coder`

@@ -593,10 +593,12 @@ jobs:
         env:
           # Same reasoning as the dispatch workflow: the secret is held by the
           # `gh-aw-engine` environment, so only a job that cleared its protection
-          # rules can read it, and the ruleset on `refs/heads/gh-aw-engine` names
-          # that credential as its only bypass. The environment gate alone binds
-          # our jobs and not the other accounts with write access. The fallback
-          # keeps this working before an administrator configures either.
+          # rules can read it, and a ruleset on `refs/heads/gh-aw-engine` restricts
+          # updates to that credential alone -- granted through a dedicated team
+          # holding only its machine account, since ruleset bypasses name roles,
+          # teams and GitHub Apps rather than people. The environment gate by
+          # itself binds our jobs and not the other accounts with write access. The
+          # fallback keeps this working before an administrator configures either.
           GH_TOKEN: ${{ secrets.GH_AW_ENGINE_ADVANCE_TOKEN || github.token }}
           SHA: ${{ needs.verify-gh-aw-engine.outputs.sha }}
           ENGINE_REF: gh-aw-engine

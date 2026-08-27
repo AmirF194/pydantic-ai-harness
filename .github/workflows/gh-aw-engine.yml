@@ -103,9 +103,13 @@ jobs:
           # cleared that environment's protection rules can read it. That is what
           # makes it worth more than `github.token`: the environment gate binds our
           # jobs, but every account with write access can move a branch on its own,
-          # so the ruleset on `refs/heads/gh-aw-engine` has to name this credential
-          # as its only bypass. Until an administrator creates both, the fallback
-          # keeps the workflow working and the branch stays open to any writer.
+          # so a ruleset on `refs/heads/gh-aw-engine` has to restrict updates to
+          # this credential alone. A ruleset grants bypass to roles, teams and
+          # GitHub Apps rather than to a named person, so the credential belongs to
+          # a machine account in a dedicated team holding nothing else, and that
+          # team is the only bypass. Until an administrator creates both, the
+          # fallback keeps the workflow working and the branch stays open to any
+          # writer.
           GH_TOKEN: ${{ secrets.GH_AW_ENGINE_ADVANCE_TOKEN || github.token }}
           SHA: ${{ needs.verify.outputs.sha }}
           ENGINE_REF: gh-aw-engine
