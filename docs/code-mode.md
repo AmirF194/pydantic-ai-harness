@@ -243,6 +243,18 @@ puts runs in streaming mode. Under Temporal durable execution the option is inac
 Aggregate counters are exposed on `CodeMode.speculation_stats` (`launched`, `adopted`,
 `evicted`).
 
+### Speculation events
+
+Each speculation transition is emitted as a typed
+[capability event](https://pydantic.dev/docs/ai/core-concepts/hooks/) in the `code_mode`
+namespace, so UIs and other capabilities can observe the lifecycle live from the run's event
+stream: `SpeculativeCodeUpdateEvent` (the decoded snippet so far, with its closed-statement
+boundary), `SpeculativeCallLaunchedEvent` (with the launching statement's line span),
+`SpeculativeCallSettledEvent`, and -- once the snippet executes -- `SpeculativeCallClaimedEvent`,
+`SpeculativeCallMissedEvent`, and `SpeculativeCallEvictedEvent`. Events are best-effort
+observability: contexts without a live event stream drop them rather than failing the work
+they describe. Requires a pydantic-ai release carrying capability events.
+
 ## Temporal durability
 
 Install both integrations:

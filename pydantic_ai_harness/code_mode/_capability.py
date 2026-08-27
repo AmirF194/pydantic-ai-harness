@@ -231,7 +231,7 @@ class CodeMode(AbstractCapability[AgentDepsT]):
         try:
             async for event in stream:
                 if state is not None:
-                    state.observe(event, ctx)
+                    await state.observe(event, ctx)
                 yield event
         finally:
             if isinstance(stream, AsyncGenerator):
@@ -240,13 +240,13 @@ class CodeMode(AbstractCapability[AgentDepsT]):
     async def after_run(self, ctx: RunContext[AgentDepsT], *, result: AgentRunResult[Any]) -> AgentRunResult[Any]:
         """Cancel speculative launches no snippet claimed before the run returns."""
         if self._speculation_state is not None:
-            await self._speculation_state.close()
+            await self._speculation_state.close(ctx)
         return result
 
     async def on_run_error(self, ctx: RunContext[AgentDepsT], *, error: BaseException) -> AgentRunResult[Any]:
         """Cancel speculative launches when the run fails, then let the error propagate."""
         if self._speculation_state is not None:
-            await self._speculation_state.close()
+            await self._speculation_state.close(ctx)
         raise error
 
     async def after_tool_execute(
@@ -258,16 +258,35 @@ class CodeMode(AbstractCapability[AgentDepsT]):
         args: ValidatedToolArgs,
         result: Any,
     ) -> Any:
-        """Announce newly-discovered tools from a local `search_tools` return.
+        """Flush buffered speculation events, and announce newly-discovered tools.
 
-        Only active with `dynamic_catalog=True`. The native-search path is handled by
+        Speculation claim/miss/eviction events buffer during `run_code` execution because
+        capability-event attribution requires a capability hook context; this dispatch is the
+        first one after the snippet finishes. The discovery announcement is only active with
+        `dynamic_catalog=True`; the native-search path is handled by
         [`after_model_request`][pydantic_ai_harness.CodeMode.after_model_request] instead
         (server-side search emits a `NativeToolSearchReturnPart` rather than a regular tool
         execute result).
         """
+        if self._speculation_state is not None:
+            await self._speculation_state.flush_events(ctx)
         if self.dynamic_catalog and tool_def.tool_kind == 'tool-search':
             self._announce_newly_discovered(ctx, _extract_discovered_names(result))
         return result
+
+    async def before_model_request(
+        self, ctx: RunContext[AgentDepsT], request_context: ModelRequestContext
+    ) -> ModelRequestContext:
+        """Flush speculation events buffered by a snippet whose failure skipped `after_tool_execute`.
+
+        A snippet that fails into a `ModelRetry` produces no `after_tool_execute` dispatch, so
+        its buffered claim/miss/eviction events would otherwise wait for run end, after the
+        stream has closed. The retry's next model request is the first hook context with a live
+        stream; flushing here puts the events on it.
+        """
+        if self._speculation_state is not None:
+            await self._speculation_state.flush_events(ctx)
+        return request_context
 
     async def after_model_request(
         self,

@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import json
-from collections.abc import AsyncIterator, Sequence
+from collections.abc import AsyncIterable, AsyncIterator, Sequence
 from dataclasses import dataclass, field
 
 import pytest
@@ -19,6 +19,7 @@ from pydantic_ai.capabilities import AbstractCapability, HandleDeferredToolCalls
 from pydantic_ai.exceptions import ApprovalRequired
 from pydantic_ai.messages import (
     AgentStreamEvent,
+    CapabilityEvent,
     ModelMessage,
     ModelResponse,
     PartDeltaEvent,
@@ -34,7 +35,16 @@ from pydantic_ai.tools import DeferredToolRequests, DeferredToolResults, ToolDen
 from pydantic_ai.toolsets.function import FunctionToolset
 from pydantic_ai.usage import RunUsage
 
-from pydantic_ai_harness.code_mode import CodeMode, CodeModeToolset
+from pydantic_ai_harness.code_mode import (
+    CodeMode,
+    CodeModeToolset,
+    SpeculativeCallClaimedEvent,
+    SpeculativeCallEvictedEvent,
+    SpeculativeCallLaunchedEvent,
+    SpeculativeCallMissedEvent,
+    SpeculativeCallSettledEvent,
+    SpeculativeCodeUpdateEvent,
+)
 
 pytestmark = pytest.mark.anyio
 
@@ -428,3 +438,98 @@ class TestSpeculationEdgeCases:
         capability = CodeMode[None]()
         with pytest.raises(RuntimeError, match='plain failure'):
             await capability.on_run_error(build_run_context(None), error=RuntimeError('plain failure'))
+
+
+def event_collector(events: list[CapabilityEvent]):
+    """An `event_stream_handler` that keeps the capability events, for `agent.run(...)`."""
+
+    async def collect(ctx: RunContext[None], stream: AsyncIterable[AgentStreamEvent]) -> None:
+        async for event in stream:
+            if isinstance(event, CapabilityEvent):
+                events.append(event)
+
+    return collect
+
+
+class TestSpeculationEvents:
+    async def test_happy_path_emits_updates_launch_settle_and_claim(self):
+        """The full lifecycle reaches the run's event stream with correlated ids and line spans."""
+        log = ToolLog()
+        events: list[CapabilityEvent] = []
+        capability = CodeMode[None](speculate=['search'])
+        code = padded('a = await search(query="alpha")\nprint(a)')
+        agent = build_agent(log, code, capability)
+
+        result = await agent.run('go', event_stream_handler=event_collector(events))
+
+        assert result.output == 'done'
+        updates = [e for e in events if isinstance(e, SpeculativeCodeUpdateEvent)]
+        launches = [e for e in events if isinstance(e, SpeculativeCallLaunchedEvent)]
+        settles = [e for e in events if isinstance(e, SpeculativeCallSettledEvent)]
+        claims = [e for e in events if isinstance(e, SpeculativeCallClaimedEvent)]
+        assert len(updates) > 1
+        assert updates[-1].code.startswith('a = await search')
+        closed_counts = [e.closed_statements for e in updates]
+        assert closed_counts == sorted(closed_counts)
+        assert [e.kind for e in launches] == ['code_mode.speculative_call_launched']
+        launch = launches[0]
+        assert launch.sandbox_function == 'search'
+        assert launch.wrapped_tool_name == 'search'
+        assert launch.arguments == {'query': 'alpha'}
+        assert (launch.line_start, launch.line_end) == (1, 1)
+        assert launch.tool_call_id is not None
+        assert [e.outcome for e in settles] == ['ready']
+        assert settles[0].launch_id == launch.launch_id
+        (claim,) = claims
+        assert claim.launch_id == launch.launch_id
+        assert claim.ready_at_claim is True
+        assert claim.elapsed_ms >= 0
+        assert not [e for e in events if isinstance(e, (SpeculativeCallMissedEvent, SpeculativeCallEvictedEvent))]
+
+    async def test_eligible_cold_dispatch_emits_miss(self):
+        """A variable-argument dispatch of an eligible tool reports a miss, and no launch."""
+        log = ToolLog()
+        events: list[CapabilityEvent] = []
+        capability = CodeMode[None](speculate=['search'])
+        code = padded('q = "alpha"\na = await search(query=q)\nprint(a)')
+        agent = build_agent(log, code, capability)
+
+        result = await agent.run('go', event_stream_handler=event_collector(events))
+
+        assert result.output == 'done'
+        misses = [e for e in events if isinstance(e, SpeculativeCallMissedEvent)]
+        assert [e.wrapped_tool_name for e in misses] == ['search']
+        assert misses[0].nested_tool_call_id
+        assert not [e for e in events if isinstance(e, SpeculativeCallLaunchedEvent)]
+
+    async def test_unclaimed_branch_launch_emits_eviction(self):
+        """The wrong-branch launch reports an eviction alongside the taken branch's claim."""
+        log = ToolLog()
+        events: list[CapabilityEvent] = []
+        capability = CodeMode[None](speculate=['search'])
+        code = padded('if False:\n    a = await search(query="never")\nb = await search(query="alpha")\nprint(b)')
+        agent = build_agent(log, code, capability)
+
+        result = await agent.run('go', event_stream_handler=event_collector(events))
+
+        assert result.output == 'done'
+        evictions = [e for e in events if isinstance(e, SpeculativeCallEvictedEvent)]
+        claims = [e for e in events if isinstance(e, SpeculativeCallClaimedEvent)]
+        assert len(claims) == 1
+        assert [e.state in ('pending', 'ready') for e in evictions] == [True]
+        assert evictions[0].launch_id != claims[0].launch_id
+
+    async def test_failed_launch_settles_failed_and_still_claims(self):
+        """A failing tool's launch settles as `failed`; adoption still reports the claim."""
+        log = ToolLog()
+        events: list[CapabilityEvent] = []
+        capability = CodeMode[None](speculate=['boom'])
+        agent = build_agent(log, padded('a = await boom(payload="x")\nprint(a)'), capability)
+
+        result = await agent.run('go', event_stream_handler=event_collector(events))
+
+        assert result.output == 'done'
+        settles = [e for e in events if isinstance(e, SpeculativeCallSettledEvent)]
+        claims = [e for e in events if isinstance(e, SpeculativeCallClaimedEvent)]
+        assert [e.outcome for e in settles] == ['failed']
+        assert len(claims) == 1

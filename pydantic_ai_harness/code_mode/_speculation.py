@@ -29,14 +29,16 @@ from __future__ import annotations
 import ast
 import asyncio
 import json
+import time
 from collections import deque
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import TypeAdapter, ValidationError
 from pydantic_ai.messages import (
     AgentStreamEvent,
+    CapabilityEvent,
     PartDeltaEvent,
     PartStartEvent,
     ToolCallPart,
@@ -47,6 +49,14 @@ from pydantic_ai.tools import RunContext, ToolDefinition
 from pydantic_ai.toolsets.abstract import AbstractToolset, ToolsetTool
 from pydantic_core import from_json
 from typing_extensions import NotRequired, TypedDict
+
+from pydantic_ai_harness.code_mode._events import (
+    SpeculativeCallEvictedEvent,
+    SpeculativeCallLaunchedEvent,
+    SpeculativeCallSettledEvent,
+    SpeculativeCodeUpdateEvent,
+    emit_best_effort,
+)
 
 _RUN_CODE_TOOL_NAME = 'run_code'
 
@@ -98,6 +108,27 @@ class SpeculativeCall:
     original_name: str
     kwargs: dict[str, Any]
     task: asyncio.Task[_SpecOutcome]
+    launch_id: str
+    started_at: float
+    settled_at: float | None = None
+    settle_emitted: bool = False
+
+    def settled_state(self) -> Literal['pending', 'ready', 'failed']:
+        """Where this launch currently stands, for settle and eviction events."""
+        if not self.task.done() or self.task.cancelled():
+            return 'pending'
+        if self.task.exception() is not None:  # pragma: no cover - the runner settles, never raises
+            return 'failed'
+        return 'failed' if self.task.result().error is not None else 'ready'
+
+    def elapsed_ms(self) -> float:
+        """Wall-clock from launch until settled, or until now while still running.
+
+        The done callback recording `settled_at` was added before any awaiter, so readers that
+        await the task first always see it set; the fallback covers in-flight queries only.
+        """
+        end = self.settled_at if self.settled_at is not None else time.perf_counter()  # pragma: no branch
+        return (end - self.started_at) * 1000
 
 
 @dataclass
@@ -199,13 +230,23 @@ def _iter_calls(node: ast.AST) -> list[ast.Call]:
     return found
 
 
-def _literal_calls(statements: Sequence[ast.stmt], eligible: frozenset[str]) -> list[tuple[str, dict[str, Any]]]:
+@dataclass
+class _ExtractedCall:
+    """One speculatable call read off the AST, with the launching statement's line span."""
+
+    sandbox_name: str
+    kwargs: dict[str, Any]
+    line_start: int
+    line_end: int
+
+
+def _literal_calls(statements: Sequence[ast.stmt], eligible: frozenset[str]) -> list[_ExtractedCall]:
     """Extract eligible sandbox calls whose arguments are entirely keyword literals.
 
     Positional arguments are never speculated: the sandbox rejects them at execution time, so an
     early launch would run a call the real snippet cannot claim.
     """
-    out: list[tuple[str, dict[str, Any]]] = []
+    out: list[_ExtractedCall] = []
     for statement in statements:
         if isinstance(statement, _SKIP_CONTAINERS):
             # A top-level `def`/`class` statement only defines; its body (and even its
@@ -229,7 +270,14 @@ def _literal_calls(statements: Sequence[ast.stmt], eligible: frozenset[str]) -> 
                     literal = False
                     break
             if literal:
-                out.append((func.id, kwargs))
+                out.append(
+                    _ExtractedCall(
+                        sandbox_name=func.id,
+                        kwargs=kwargs,
+                        line_start=statement.lineno,
+                        line_end=statement.end_lineno or statement.lineno,
+                    )
+                )
     return out
 
 
@@ -247,6 +295,16 @@ class SpeculationState:
     """Original tool names the user declared side-effect free."""
 
     stats: SpeculationStats
+
+    pending_events: list[CapabilityEvent] = field(default_factory=list[CapabilityEvent], init=False)
+    """Execution-side events awaiting a capability hook context.
+
+    Capability events may only be emitted from a capability hook or a capability-contributed
+    toolset the framework can attribute; the dispatch path inside `run_code` is neither, so
+    claim/miss/eviction events buffer here and `CodeMode` flushes them from its
+    `after_tool_execute` / `on_tool_execute_error` hooks -- which also matches the UX: outcomes
+    reveal when the snippet finishes executing.
+    """
 
     _step: _StepIngredients | None = field(default=None, init=False)
     _parts: dict[str, _PartWatch] = field(default_factory=dict[str, _PartWatch], init=False)
@@ -281,7 +339,7 @@ class SpeculationState:
 
     # -- streaming side ---------------------------------------------------------------------
 
-    def observe(self, event: AgentStreamEvent, ctx: RunContext[Any]) -> None:
+    async def observe(self, event: AgentStreamEvent, ctx: RunContext[Any]) -> None:
         """Feed one stream event; launches tasks for any newly speculatable calls."""
         if isinstance(event, PartStartEvent):
             part = event.part
@@ -293,22 +351,24 @@ class SpeculationState:
                     watch.args_dict = dict(part.args)
                 self._parts[part.tool_call_id] = watch
                 self._index_to_part[event.index] = part.tool_call_id
-                self._scan(watch, ctx)
+                await self._scan(watch, ctx)
             else:
                 self._index_to_part.pop(event.index, None)
         elif isinstance(event, PartDeltaEvent):
             part_id = self._index_to_part.get(event.index)
             delta = event.delta
             if part_id is None or not isinstance(delta, ToolCallPartDelta):
+                await self._emit_settles(ctx)
                 return
             watch = self._parts[part_id]
             if isinstance(delta.args_delta, str):
                 watch.args_text += delta.args_delta
             elif isinstance(delta.args_delta, dict):
                 watch.args_dict = {**(watch.args_dict or {}), **delta.args_delta}
-            self._scan(watch, ctx)
+            await self._scan(watch, ctx)
+        await self._emit_settles(ctx)
 
-    def _scan(self, watch: _PartWatch, ctx: RunContext[Any]) -> None:
+    async def _scan(self, watch: _PartWatch, ctx: RunContext[Any]) -> None:
         step = self._step
         if step is None or not step.eligible:
             return
@@ -322,21 +382,27 @@ class SpeculationState:
                 return
             code = maybe_code
         fresh, watch.consumed_statements = _closed_statements(code, watch.consumed_statements)
-        if not fresh:
-            return
-        for sandbox_name, kwargs in _literal_calls(fresh, step.eligible):
+        await emit_best_effort(
+            ctx,
+            SpeculativeCodeUpdateEvent(
+                tool_call_id=watch.tool_call_id,
+                code=code,
+                closed_statements=watch.consumed_statements,
+            ),
+        )
+        for extracted in _literal_calls(fresh, step.eligible):
             if watch.launched >= _MAX_SPECULATIONS_PER_PART:
                 return
-            self._launch(watch, step, sandbox_name, kwargs, ctx)
+            await self._launch(watch, step, extracted, ctx)
 
-    def _launch(
+    async def _launch(
         self,
         watch: _PartWatch,
         step: _StepIngredients,
-        sandbox_name: str,
-        kwargs: dict[str, Any],
+        extracted: _ExtractedCall,
         ctx: RunContext[Any],
     ) -> None:
+        sandbox_name = extracted.sandbox_name
         original_name = step.sanitized_to_original.get(sandbox_name, sandbox_name)
         parent_manager = ctx.tool_manager
         tool_manager = ToolManager(
@@ -347,17 +413,60 @@ class SpeculationState:
         )
         watch.launched += 1
         self.stats.launched += 1
-        provisional_id = f'{watch.tool_call_id}__spec_{watch.launched}'
+        launch_id = f'{watch.tool_call_id}__spec_{watch.launched}'
         task = asyncio.ensure_future(
-            _run_speculative(tool_manager, original_name, provisional_id, kwargs, step.serialize)
+            _run_speculative(tool_manager, original_name, launch_id, extracted.kwargs, step.serialize)
         )
-        call = SpeculativeCall(sandbox_name=sandbox_name, original_name=original_name, kwargs=kwargs, task=task)
-        self.calls_for(watch, sandbox_name, kwargs).append(call)
+        call = SpeculativeCall(
+            sandbox_name=sandbox_name,
+            original_name=original_name,
+            kwargs=extracted.kwargs,
+            task=task,
+            launch_id=launch_id,
+            started_at=time.perf_counter(),
+        )
+        task.add_done_callback(lambda _task, _call=call: setattr(_call, 'settled_at', time.perf_counter()))
+        self.calls_for(watch, sandbox_name, extracted.kwargs).append(call)
+        await emit_best_effort(
+            ctx,
+            SpeculativeCallLaunchedEvent(
+                tool_call_id=watch.tool_call_id,
+                launch_id=launch_id,
+                sandbox_function=sandbox_name,
+                wrapped_tool_name=original_name,
+                arguments=extracted.kwargs,
+                line_start=extracted.line_start,
+                line_end=extracted.line_end,
+            ),
+        )
+
+    async def _emit_settles(self, ctx: RunContext[Any]) -> None:
+        """Report launches that finished since the watcher last saw stream traffic."""
+        for watch in self._parts.values():
+            for queue in watch.calls.values():
+                for call in queue:
+                    if call.settle_emitted or not call.task.done():
+                        continue
+                    call.settle_emitted = True
+                    state = call.settled_state()
+                    await emit_best_effort(
+                        ctx,
+                        SpeculativeCallSettledEvent(
+                            tool_call_id=watch.tool_call_id,
+                            launch_id=call.launch_id,
+                            outcome='failed' if state == 'failed' else 'ready',
+                            elapsed_ms=call.elapsed_ms(),
+                        ),
+                    )
 
     def calls_for(self, watch: _PartWatch, sandbox_name: str, kwargs: dict[str, Any]) -> deque[SpeculativeCall]:
         return watch.calls.setdefault(_canonical_key(sandbox_name, kwargs), deque())
 
     # -- execution side ---------------------------------------------------------------------
+
+    def eligible(self, sandbox_name: str) -> bool:
+        """Whether this sandbox function may speculate this step; drives miss reporting."""
+        return self._step is not None and sandbox_name in self._step.eligible
 
     def claim(self, parent_tool_call_id: str, sandbox_name: str, kwargs: dict[str, Any]) -> SpeculativeCall | None:
         """Pop the oldest in-flight launch matching this dispatch, if any."""
@@ -369,6 +478,12 @@ class SpeculationState:
             return None
         return queue.popleft()
 
+    async def flush_events(self, ctx: RunContext[Any]) -> None:
+        """Emit buffered execution-side events; called from `CodeMode`'s hook dispatches."""
+        events, self.pending_events = self.pending_events, []
+        for event in events:
+            await emit_best_effort(ctx, event)
+
     async def evict_part(self, parent_tool_call_id: str) -> None:
         """Drop unclaimed launches for one executed `run_code` part.
 
@@ -378,27 +493,39 @@ class SpeculationState:
         """
         watch = self._parts.pop(parent_tool_call_id, None)
         if watch is not None:
-            await _cancel_watch(watch, self.stats)
+            await self._cancel_watch(watch)
 
-    async def close(self) -> None:
-        """Run-end cleanup: cancel every launch no snippet ever claimed."""
+    async def close(self, ctx: RunContext[Any]) -> None:
+        """Run-end cleanup: cancel every launch no snippet ever claimed, then report it."""
         parts, self._parts = self._parts, {}
         self._index_to_part.clear()
         for watch in parts.values():
-            await _cancel_watch(watch, self.stats)
+            await self._cancel_watch(watch)
+        await self.flush_events(ctx)
 
-
-async def _cancel_watch(watch: _PartWatch, stats: SpeculationStats) -> None:
-    tasks: list[asyncio.Task[_SpecOutcome]] = []
-    for queue in watch.calls.values():
-        for call in queue:
-            call.task.cancel()
-            tasks.append(call.task)
-            stats.evicted += 1
-    if tasks:
-        # Await the cancellations so dispatched work has fully unwound before the run moves on,
-        # mirroring `MontyExecutor.run`'s cleanup. Outcomes are deliberately discarded.
-        await asyncio.gather(*tasks, return_exceptions=True)
+    async def _cancel_watch(self, watch: _PartWatch) -> None:
+        evicted: list[tuple[SpeculativeCall, Literal['pending', 'ready', 'failed']]] = []
+        tasks: list[asyncio.Task[_SpecOutcome]] = []
+        for queue in watch.calls.values():
+            for call in queue:
+                # Capture where the launch stood before cancellation rewrites it.
+                evicted.append((call, call.settled_state()))
+                call.task.cancel()
+                tasks.append(call.task)
+                self.stats.evicted += 1
+        if tasks:
+            # Await the cancellations so dispatched work has fully unwound before the run moves
+            # on, mirroring `MontyExecutor.run`'s cleanup. Outcomes are deliberately discarded.
+            await asyncio.gather(*tasks, return_exceptions=True)
+        for call, state in evicted:
+            self.pending_events.append(
+                SpeculativeCallEvictedEvent(
+                    tool_call_id=watch.tool_call_id,
+                    launch_id=call.launch_id,
+                    wrapped_tool_name=call.original_name,
+                    state=state,
+                )
+            )
 
 
 async def _run_speculative(

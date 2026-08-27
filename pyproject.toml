@@ -152,6 +152,13 @@ vcs = 'git'
 style = 'pep440'
 bump = true
 
+# POC branch only: capability events (pydantic/pydantic-ai#7794) are merged but
+# unreleased, so the branch rides the merge commit until the next pydantic-ai
+# release. Remove when a released version carries `CapabilityEvent`.
+[tool.uv.sources]
+pydantic-ai-slim = { git = "https://github.com/pydantic/pydantic-ai", subdirectory = "pydantic_ai_slim", rev = "13051f947c915482c1ffa0da8539a7a70ecede50" }
+pydantic-graph = { git = "https://github.com/pydantic/pydantic-ai", subdirectory = "pydantic_graph", rev = "13051f947c915482c1ffa0da8539a7a70ecede50" }
+
 [tool.uv]
 # `browser-use` pins provider SDKs to exact versions far below the floors `pydantic-ai-slim`
 # declares (`anthropic==0.76.0`, `openai==2.16.0`), so they only resolve together under an

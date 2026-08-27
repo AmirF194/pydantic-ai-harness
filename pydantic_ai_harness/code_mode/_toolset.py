@@ -52,6 +52,10 @@ except ImportError as _import_error:  # pragma: no cover
         'pydantic-monty is required for CodeMode. Install it with: pip install "pydantic-ai-harness[code-mode]"'
     ) from _import_error
 from pydantic_ai_harness._monty_exec import MontyExecutor, PrintCapture, is_sandbox_panic
+from pydantic_ai_harness.code_mode._events import (
+    SpeculativeCallClaimedEvent,
+    SpeculativeCallMissedEvent,
+)
 from pydantic_ai_harness.code_mode._speculation import SpeculationState, SpeculativeCall
 
 # A raw OS callback. Return `pydantic_monty.NOT_HANDLED` to defer the call to the
@@ -833,7 +837,28 @@ class CodeModeToolset(WrapperToolset[AgentDepsT]):
                 if claimed is not None:
                     speculation.stats.adopted += 1
                     return adopt_speculative_call(claimed, f'{parent_id}__{call_counter}')
+                if speculation.eligible(sandbox_name):
+                    return miss_then_run(sandbox_name, original_name, f'{parent_id}__{call_counter}', kwargs)
             return run_tool_call(original_name, f'{parent_id}__{call_counter}', kwargs)
+
+        async def miss_then_run(
+            sandbox_name: str, original_name: str, tool_call_id: str, kwargs: dict[str, Any]
+        ) -> Any:
+            """Record a speculation-eligible dispatch that found no launch, then run it cold.
+
+            Buffered rather than emitted: capability-event attribution requires a capability
+            hook context, so `CodeMode` flushes after the snippet finishes.
+            """
+            assert self.speculation is not None
+            self.speculation.pending_events.append(
+                SpeculativeCallMissedEvent(
+                    tool_call_id=ctx.tool_call_id,
+                    sandbox_function=sandbox_name,
+                    wrapped_tool_name=original_name,
+                    nested_tool_call_id=tool_call_id,
+                )
+            )
+            return await run_tool_call(original_name, tool_call_id, kwargs)
 
         async def adopt_speculative_call(claimed: SpeculativeCall, tool_call_id: str) -> Any:
             """Resolve a dispatch from a call launched while the snippet was still streaming.
@@ -846,7 +871,19 @@ class CodeModeToolset(WrapperToolset[AgentDepsT]):
             """
             call_part = ToolCallPart(tool_name=claimed.original_name, args=claimed.kwargs, tool_call_id=tool_call_id)
             nested_calls[tool_call_id] = call_part
+            ready_at_claim = claimed.task.done()
             outcome = await claimed.task
+            assert self.speculation is not None
+            self.speculation.pending_events.append(
+                SpeculativeCallClaimedEvent(
+                    tool_call_id=ctx.tool_call_id,
+                    launch_id=claimed.launch_id,
+                    nested_tool_call_id=tool_call_id,
+                    wrapped_tool_name=claimed.original_name,
+                    ready_at_claim=ready_at_claim,
+                    elapsed_ms=claimed.elapsed_ms(),
+                )
+            )
             if outcome.denied_message is not None:
                 nested_returns[tool_call_id] = ToolReturnPart(
                     tool_name=claimed.original_name,
