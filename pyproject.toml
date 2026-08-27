@@ -136,6 +136,13 @@ dev = [
     "pydantic-ai-slim[spec]>=2.18.0",
     "pytest-examples>=0.0.18",
     "pytest-recording>=0.13.4",
+    # Cassette replay only, which is why nothing imports it. httpx advertises `br` in
+    # `Accept-Encoding` only when the decoder is installed, so a live run without it simply
+    # never receives brotli. A recorded response declares `content-encoding: br` whatever the
+    # replaying client advertises, and 25 of them do, so without this the bodies reach
+    # `json.loads` still compressed. It arrived transitively via `ddgs` until 9.16.0 dropped
+    # its `httpx[brotli]` requirement, which is what turned `test-floor` red.
+    "httpx[brotli]>=0.28.1",
     "mongomock-motor>=0.0.36",
     "redis>=6.0.0",
 ]
