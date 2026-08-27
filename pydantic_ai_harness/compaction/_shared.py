@@ -39,6 +39,7 @@ from pydantic_ai.tools import RunContext
 from typing_extensions import Self, assert_never
 
 from pydantic_ai_harness.compaction._context_window import DEFAULT_CONTEXT_WINDOW, resolve_context_window
+from pydantic_ai_harness.compaction._events import BeforeCompactionEvent, CompactionEndEvent
 from pydantic_ai_harness.compaction._pinning import is_pinned
 from pydantic_ai_harness.compaction._receipts import (
     RECEIPT_EVENT_NAME,
@@ -63,6 +64,9 @@ _COMPACTION_RECLAIM: ContextVar[tuple[ReferenceType[object], int] | None] = Cont
     'pydantic_ai_harness.compaction.reclaim', default=None
 )
 """Heuristic reclaim from compaction that ran earlier in this request's hook chain."""
+
+_COMPACTION_EVENTS_ENABLED: ContextVar[bool] = ContextVar('pydantic_ai_harness.compaction.events_enabled', default=True)
+"""Whether nested composing strategies should emit lifecycle events."""
 
 
 def _collect_message_text(messages: Sequence[ModelMessage]) -> list[str]:
@@ -477,8 +481,9 @@ async def compact_with_span(
     messages: list[ModelMessage],
     compact: Callable[[], Awaitable[list[ModelMessage]]],
     tokenizer: Callable[[str], int] | None = None,
+    emit_events: bool = True,
 ) -> list[ModelMessage]:
-    """Run *compact* and emit a `compact_messages` span when it changes the history.
+    """Run *compact* and emit lifecycle signals when it changes the history.
 
     *compact* runs before the span so a no-op compaction (a trigger fired but the history is
     returned unchanged) emits nothing. The span is started on `ctx.tracer`, which is a no-op
@@ -492,17 +497,31 @@ async def compact_with_span(
         compact: Zero-argument async callable returning the compacted message list.
         tokenizer: Optional tokenizer for the `compaction.tokens_*` estimates. When `None`,
             uses the same ~4 characters-per-token heuristic as `estimate_token_count`.
+        emit_events: Whether to emit lifecycle events. Disable this outside an agent run.
     """
     token = open_receipt_scope()
     try:
-        compacted = await compact()
+        compacted = await compact_with_events(
+            ctx,
+            strategy=strategy,
+            messages=messages,
+            compact=compact,
+            tokenizer=tokenizer,
+            emit_events=emit_events,
+        )
         receipts = drain_receipts()
     finally:
         reset_receipt_scope(token)
     if not _history_changed(messages, compacted):
         return messages
+    tokens_before: int | None = None
+    tokens_after: int | None = None
     with ctx.tracer.start_as_current_span(_SPAN_NAME) as span:
         if span.is_recording():
+            if tokens_before is None:
+                tokens_before = estimate_token_count(messages, tokenizer)
+            if tokens_after is None:
+                tokens_after = estimate_token_count(compacted, tokenizer)
             span.set_attributes(
                 {
                     # GenAI semconv flag; the convention says set `true` only, never `false`.
@@ -510,8 +529,8 @@ async def compact_with_span(
                     'compaction.strategy': strategy,
                     'compaction.messages_before': len(messages),
                     'compaction.messages_after': len(compacted),
-                    'compaction.tokens_before': estimate_token_count(messages, tokenizer),
-                    'compaction.tokens_after': estimate_token_count(compacted, tokenizer),
+                    'compaction.tokens_before': tokens_before,
+                    'compaction.tokens_after': tokens_after,
                 }
             )
             for receipt in receipts:
@@ -525,6 +544,51 @@ async def compact_with_span(
                     attributes['compaction.receipt.handle'] = receipt.handle
                 span.add_event(RECEIPT_EVENT_NAME, attributes)
     return compacted
+
+
+async def compact_with_events(
+    ctx: RunContext[AgentDepsT],
+    *,
+    strategy: str,
+    messages: list[ModelMessage],
+    compact: Callable[[], Awaitable[list[ModelMessage]]],
+    tokenizer: Callable[[str], int] | None = None,
+    emit_events: bool | None = None,
+) -> list[ModelMessage]:
+    """Run one strategy attempt with cancellable before and changed-only end events."""
+    enabled = _COMPACTION_EVENTS_ENABLED.get() if emit_events is None else emit_events
+    token = _COMPACTION_EVENTS_ENABLED.set(enabled)
+    try:
+        emit_event = getattr(ctx, 'emit_event', None) if enabled else None
+        if emit_event is None:
+            return await compact()
+
+        tokens_before = estimate_token_count(messages, tokenizer)
+        before_event = await emit_event(
+            BeforeCompactionEvent(
+                strategy=strategy,
+                message_count=len(messages),
+                estimated_tokens=tokens_before,
+            )
+        )
+        if before_event.cancelled:
+            return messages
+
+        compacted = await compact()
+        if not _history_changed(messages, compacted):
+            return messages
+        await emit_event(
+            CompactionEndEvent(
+                strategy=strategy,
+                messages_before=len(messages),
+                messages_after=len(compacted),
+                tokens_before=tokens_before,
+                tokens_after=estimate_token_count(compacted, tokenizer),
+            )
+        )
+        return compacted
+    finally:
+        _COMPACTION_EVENTS_ENABLED.reset(token)
 
 
 # ---------------------------------------------------------------------------
