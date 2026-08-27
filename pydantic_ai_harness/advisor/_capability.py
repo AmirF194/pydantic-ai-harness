@@ -6,6 +6,7 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import Literal
 
+import pydantic_ai.native_tools as native_tools
 from pydantic_ai import Agent
 from pydantic_ai.capabilities import ModelSelection, NativeOrLocalTool
 from pydantic_ai.exceptions import ModelRetry, UnexpectedModelBehavior, UserError
@@ -215,7 +216,7 @@ class Advisor(NativeOrLocalTool[AgentDepsT]):
             max_tokens=self.max_tokens,
         )
         if self.caching is not None:
-            if hasattr(tool, 'provider_settings'):  # pragma: no cover - exercised with unreleased Pydantic AI
+            if hasattr(native_tools, 'AnthropicAdvisorToolSettings'):  # pragma: no cover - unreleased Pydantic AI
                 setattr(tool, 'provider_settings', {'anthropic': {'caching': self.caching}})
             else:
                 tool.caching = self.caching

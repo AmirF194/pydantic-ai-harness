@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Sequence
 
+import pydantic_ai.native_tools as native_tools
 import pytest
 from inline_snapshot import snapshot
 from pydantic_ai import AdvisorTool, Agent
@@ -84,7 +85,7 @@ class TestAdvisor:
         assert isinstance(tool, AdvisorTool)
         assert tool.model == 'claude-opus-4-8'
         assert tool.max_tokens == 2048
-        if hasattr(tool, 'provider_settings'):  # pragma: no cover - exercised with unreleased Pydantic AI
+        if hasattr(native_tools, 'AnthropicAdvisorToolSettings'):  # pragma: no cover - unreleased Pydantic AI
             assert getattr(tool, 'provider_settings') == {'anthropic': {'caching': '5m'}}
             assert tool.caching is None
         else:
