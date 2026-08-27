@@ -33,6 +33,7 @@ from pydantic_ai.messages import (
 )
 from pydantic_ai.models.function import AgentInfo, DeltaToolCall, DeltaToolCalls, FunctionModel
 from pydantic_ai.models.test import TestModel
+from pydantic_ai.tool_manager import ToolManager
 from pydantic_ai.tools import DeferredToolRequests, DeferredToolResults, ToolDenied
 from pydantic_ai.toolsets.function import FunctionToolset
 from pydantic_ai.usage import RunUsage
@@ -464,8 +465,6 @@ class TestSpeculationEdgeCases:
             pass
         assert run_capability.speculation_stats.launched == 1
 
-        from pydantic_ai.tool_manager import ToolManager
-
         exec_ctx = dataclasses.replace(ctx, tool_call_id='rekeyed-id', tool_name='run_code')
         exec_ctx.tool_manager = await ToolManager(toolset=toolset).for_run_step(exec_ctx)
         async with toolset:
@@ -558,8 +557,6 @@ class TestSpeculationEdgeCases:
         assert isinstance(toolset, CodeModeToolset)
         tools = await toolset.get_tools(ctx)
 
-        from pydantic_ai.tool_manager import ToolManager
-
         code = 'a = await ping()\nb = await pong()\na + b'
         exec_ctx = dataclasses.replace(ctx, tool_call_id='exec-1', tool_name='run_code')
         exec_ctx.tool_manager = await ToolManager(toolset=toolset).for_run_step(exec_ctx)
@@ -579,7 +576,7 @@ class TestSpeculationEdgeCases:
 
         def search(query: str) -> str:
             """Return a canned result."""
-            return f'result:{query}'
+            return f'result:{query}'  # pragma: no cover - launches are cancelled before the body runs
 
         ctx = build_run_context(None)
         capability = CodeMode[None](speculate=['search'])
@@ -621,8 +618,6 @@ class TestSpeculationEdgeCases:
             pass
         assert run_capability.speculation_stats.launched == 1
 
-        from pydantic_ai.tool_manager import ToolManager
-
         code = 'a = await search(query="alpha")\nb = await search(query="alpha")\nb'
         exec_ctx = dataclasses.replace(ctx, tool_call_id='c1', tool_name='run_code')
         exec_ctx.tool_manager = await ToolManager(toolset=toolset).for_run_step(exec_ctx)
@@ -644,7 +639,7 @@ class TestSpeculationEdgeCases:
 
         def search(query: str) -> str:
             """Return a canned result."""
-            return f'result:{query}'
+            return f'result:{query}'  # pragma: no cover - launches are cancelled before the body runs
 
         ctx = build_run_context(None)
         capability = CodeMode[None](speculate=['search'])
