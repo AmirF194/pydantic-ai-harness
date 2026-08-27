@@ -18,12 +18,12 @@ from __future__ import annotations
 import inspect
 import warnings
 from collections.abc import Awaitable, Callable, Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import KW_ONLY, dataclass, field
 from datetime import datetime
 from decimal import Decimal
 from typing import TYPE_CHECKING, Any, Literal, TypeGuard
 
-from pydantic_ai.capabilities import AbstractCapability, CapabilityOrdering
+from pydantic_ai.capabilities import AbstractCapability, CapabilityOrdering, durable_operation
 from pydantic_ai.exceptions import UserError
 from pydantic_ai.messages import ModelResponse
 from pydantic_ai.tools import AgentDepsT, RunContext
@@ -86,22 +86,11 @@ class SpendLimits(AbstractCapability[AgentDepsT]):
     budget that reset every run would not be a daily budget. Per-run isolation
     comes from `Budget(window='run')`, whose key carries the run id.
 
-    Durable execution: not supported inside a durable workflow, on Temporal, DBOS,
-    or Prefect. The hooks run in orchestration code, while the model request beside
-    them is a durable unit restored from its checkpoint, so re-execution replays the
-    accrual without replaying the request it counted. `SpendEntry.token` identifies
-    the response, so a store implementing `BatchSpendStore` applies a replayed accrual
-    once rather than twice -- within `dedup_retain`, and not at all through the adapter
-    that drives a deprecated `SpendStore`, which has nowhere to put the token. What is
-    left is the other direction: recovery that lands in a fresh worker holding a fresh
-    `InMemorySpendStore` finds neither the counter nor the marker that guards it, and
-    admits more than the budget allows. Temporal stops earlier than any of that, on
-    the wall clock `before_model_request` reads to pick the window, which the sandbox
-    restricts and `PydanticAIPlugin` does not pass `pydantic_ai_harness` through.
-    `exhausted()` works without a `RunContext` so a workflow can at least be refused
-    admission on what is already recorded -- but it reserves nothing, so it is a gate
-    on the door, not a budget on what happens inside. Tracked in
-    <https://github.com/pydantic/pydantic-ai-harness/issues/531>.
+    Under a durability engine, counter reads, clock reads, and accruals are durable
+    operations. An accrual must execute exactly once: its operation includes the complete
+    `add_many` call and journals the returned totals, so replay does not enter the store
+    again. The store still needs to be shared across workers for budgets to survive worker
+    replacement. The default `InMemorySpendStore` only survives replays in the same process.
     """
 
     budgets: Sequence[Budget[AgentDepsT]] = ()
@@ -152,6 +141,9 @@ class SpendLimits(AbstractCapability[AgentDepsT]):
     expiry. Both remain absolute instants, so a custom clock buckets on one and expires on
     the other; pass the same callable to the store when that matters.
     """
+
+    _: KW_ONLY
+    id: str | None = 'spend_limits'
 
     _warned_unpriced: set[str] = field(default_factory=set[str], init=False, repr=False, compare=False)
     """Model names already reported by `UnpricedModelWarning`, so each reports once.
@@ -298,7 +290,7 @@ class SpendLimits(AbstractCapability[AgentDepsT]):
         than on having reported is what covers a chain that differs between runs.
         """
         warn_about_inner_wrappers(ctx.root_capability, self, self._reported_arrangements)
-        enforcing = [(budget, key) for budget, key in self._keyed(ctx) if budget.enforces]
+        enforcing = [(budget, key) for budget, key in await self._keyed(ctx) if budget.enforces]
         read = await self._read(list(dict.fromkeys(key for _, key in enforcing)))
         for budget, key in enforcing:
             self._check(budget, read[key], ctx)
@@ -328,7 +320,7 @@ class SpendLimits(AbstractCapability[AgentDepsT]):
         """
         response = await handler(request_context)
         usd, priced, price_error = self._price_of(response)
-        keyed = self._keyed(ctx)
+        keyed = await self._keyed(ctx)
         token = self._dedup_token(ctx, response)
         entries: dict[str, SpendEntry] = {}
         for budget, key in keyed:
@@ -347,7 +339,7 @@ class SpendLimits(AbstractCapability[AgentDepsT]):
                 )
         # Every window in one call, so a failure cannot leave the response counted
         # against the day and not the month. Nothing to apply is not a call: see `_read`.
-        accrued: Mapping[str, Spent] = await self._store.add_many(list(entries.values())) if entries else {}
+        accrued = await self._accrue(list(entries.values()))
         statuses = [_status(budget, key, accrued[key]) for budget, key in keyed]
 
         if self.on_spend is not None:
@@ -436,7 +428,7 @@ class SpendLimits(AbstractCapability[AgentDepsT]):
                 'so a second answer here would be reporting one scope under the name of another. '
                 'Drop `scope=` to read the run, or drop `ctx` to read another partition.'
             )
-        now = self._now()
+        now = await self._now()
         keyed: list[tuple[Budget[AgentDepsT], str]] = []
         unresolved: list[str] = []
         for budget in self.budgets:
@@ -522,35 +514,10 @@ class SpendLimits(AbstractCapability[AgentDepsT]):
             defer_loading=defer_loading,
         )
 
-    def _now(self) -> datetime:
-        """The current time, naming the real problem when Temporal's sandbox refuses the clock.
-
-        These hooks run in workflow code, and the default clock calls `datetime.now`, which
-        Temporal's workflow sandbox restricts. The sandbox's own error names
-        `datetime.datetime.now` and not what it means here, so it is translated. Matched by
-        class name rather than by importing `temporalio`, which this package does not depend
-        on, and which core's own `pydantic_ai/durable_exec/AGENTS.md` rules out: "Prefer generic
-        capabilities/toolsets/models extension points over engine-specific escape hatches."
-
-        The message leads with the unsafety rather than the passthrough that silences it: the
-        sandbox is refusing a symptom, and a caller who only removes the symptom gets a
-        counter that Temporal replays.
-        """
-        try:
-            return self.clock()
-        except Exception as error:
-            if type(error).__name__ != 'RestrictedWorkflowAccessError':
-                raise
-            raise UserError(
-                'SpendLimits is not safe to run inside a Temporal workflow. Its hooks run in '
-                'workflow code rather than in the model activity, and the clock they read to pick '
-                'the budget window is what the sandbox stopped here; a workflow day and a key day '
-                'diverge under time-skipping even once it is let through. Refuse the workflow '
-                'admission before starting it instead, '
-                'with `exhausted()` -- which reads the counters and does not move them, so it '
-                'bounds what has already been recorded rather than what the workflow will spend. '
-                'See https://github.com/pydantic/pydantic-ai-harness/issues/531'
-            ) from error
+    @durable_operation
+    async def _now(self) -> datetime:
+        """Read the configured clock in a journaled operation."""
+        return self.clock()
 
     def _key(
         self,
@@ -632,6 +599,7 @@ class SpendLimits(AbstractCapability[AgentDepsT]):
         ctx.tracer.start_span('spend budget exhausted', attributes=attributes).end()
         raise SpendLimitExceeded(f'Budget {budget.name!r} exhausted for this {budget.window}: {detail}')
 
+    @durable_operation
     async def _read(self, keys: Sequence[str]) -> Mapping[str, Spent]:
         """What each key holds, without asking the store about none of them.
 
@@ -642,7 +610,12 @@ class SpendLimits(AbstractCapability[AgentDepsT]):
         """
         return await self._store.get_many(keys) if keys else {}
 
-    def _keyed(self, ctx: RunContext[AgentDepsT]) -> list[tuple[Budget[AgentDepsT], str]]:
+    @durable_operation
+    async def _accrue(self, entries: list[SpendEntry]) -> Mapping[str, Spent]:
+        """Apply one response exactly once when the durability engine replays the run."""
+        return await self._store.add_many(entries) if entries else {}
+
+    async def _keyed(self, ctx: RunContext[AgentDepsT]) -> list[tuple[Budget[AgentDepsT], str]]:
         """Each budget paired with the store key it accumulates under right now.
 
         No collision check here. Every part of a key is fixed at construction -- `name`,
@@ -650,7 +623,7 @@ class SpendLimits(AbstractCapability[AgentDepsT]):
         that would collide, so two budgets share a key only where sharing one is the
         point. Checking again would repeat that work on every model request.
         """
-        now = self._now()
+        now = await self._now()
         return [(budget, self._key(budget, ctx, now, None)) for budget in self.budgets]
 
     def _price_of(self, response: ModelResponse) -> tuple[Decimal, bool, str | None]:
