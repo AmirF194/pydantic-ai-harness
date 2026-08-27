@@ -5,9 +5,13 @@ runtimes:
 pre-agent-steps:
   - name: Preinstall Pydantic AI coder agent
     run: |
-      python3 -m pip install --quiet --user --disable-pip-version-check "pydantic-ai-harness[cli]==$GH_AW_ENGINE_VERSION" "pydantic-ai-slim[openai,mcp]"
+      # This step runs on the host runner with the checkout as its working
+      # directory, before the AWF sandbox exists. -P keeps that directory off
+      # sys.path, so a repo-local pip.py or pydantic_ai_harness/ cannot be
+      # imported in place of the installed packages.
+      python3 -P -m pip install --quiet --user --disable-pip-version-check "pydantic-ai-harness[cli]==$GH_AW_ENGINE_VERSION" "pydantic-ai-slim[openai,mcp]"
       "$HOME/.local/bin/pai" --version
-      python3 -c "from pydantic_ai_harness import Coder"
+      python3 -P -c "from pydantic_ai_harness import Coder"
 engine:
   id: pydantic-ai
   version: "0.21.0"
