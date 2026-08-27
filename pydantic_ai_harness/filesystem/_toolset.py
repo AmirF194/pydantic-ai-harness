@@ -370,7 +370,7 @@ class FileSystemToolset(FunctionToolset[AgentDepsT]):
         if ctx is not None:
             await ctx.emit_event(FileReadEvent(path=safe_path, content_hash=content_hash))
 
-        header = f'[{safe_path} | {len(lines)} lines | hash:{content_hash}]\n'
+        header = f'[{path} | {len(lines)} lines | hash:{content_hash}]\n'
         return header + _format_lines(lines, offset, limit)
 
     async def write_file(self, path: str, content: str, *, expected_hash: str | None = None) -> str:
@@ -481,7 +481,7 @@ class FileSystemToolset(FunctionToolset[AgentDepsT]):
         safe_path = _model_safe_filename(os.fspath(resolved), self._real_root)
         if ctx is not None:
             await ctx.emit_event(FileWrittenEvent(path=safe_path, content_hash=new_hash))
-        return f'Wrote {len(content)} chars ({lines} lines) to {safe_path}. [hash:{new_hash}]'
+        return f'Wrote {len(content)} chars ({lines} lines) to {path}. [hash:{new_hash}]'
 
     async def edit_file(self, path: str, old_text: str, new_text: str, *, expected_hash: str | None = None) -> str:
         """Edit a text file directly, outside an agent run."""
@@ -552,7 +552,7 @@ class FileSystemToolset(FunctionToolset[AgentDepsT]):
         safe_path = _model_safe_filename(os.fspath(resolved), self._real_root)
         if ctx is not None:
             await ctx.emit_event(FileWrittenEvent(path=safe_path, content_hash=new_hash))
-        return f'Edited {safe_path}. [hash:{new_hash}]'
+        return f'Edited {path}. [hash:{new_hash}]'
 
     async def list_directory(self, path: str = '.') -> str:
         """List a directory directly, outside an agent run."""
