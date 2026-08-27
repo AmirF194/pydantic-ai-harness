@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from typing import cast
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from pydantic_ai import Agent
@@ -47,7 +47,10 @@ from pydantic_ai_harness.planning._toolset import (
     validate_hierarchy,
 )
 
-pytestmark = pytest.mark.anyio
+pytestmark = [
+    pytest.mark.anyio,
+    pytest.mark.filterwarnings('ignore::pydantic_ai_harness.HarnessDeprecationWarning'),
+]
 
 
 @pytest.fixture
@@ -56,7 +59,13 @@ def anyio_backend() -> str:
 
 
 def _ctx() -> RunContext[None]:
-    return cast(RunContext[None], MagicMock())
+    ctx = MagicMock()
+
+    async def emit_event(event: object) -> object:
+        return event
+
+    ctx.emit_event = AsyncMock(side_effect=emit_event)
+    return cast(RunContext[None], ctx)
 
 
 def _toolset(*, subtasks: bool = False, store: InMemoryPlanStore | None = None) -> PlanningToolset[None]:

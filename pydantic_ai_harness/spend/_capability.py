@@ -28,8 +28,10 @@ from pydantic_ai.exceptions import UserError
 from pydantic_ai.messages import ModelResponse
 from pydantic_ai.tools import AgentDepsT, RunContext
 
+from pydantic_ai_harness._warn import HarnessDeprecationWarning
 from pydantic_ai_harness.spend._budget import Budget, BudgetSpec, bucket, delimited, scope_key, store_key
 from pydantic_ai_harness.spend._composition import warn_about_inner_wrappers
+from pydantic_ai_harness.spend._events import SpendBudgetStatus, SpendRecordedEvent
 from pydantic_ai_harness.spend._exceptions import SpendLimitExceeded, UnpricedModelError, UnpricedModelWarning
 from pydantic_ai_harness.spend._snapshot import BudgetStatus, SpendSnapshot, Spent, money_precision
 from pydantic_ai_harness.spend._store import (
@@ -73,7 +75,7 @@ class SpendLimits(AbstractCapability[AgentDepsT]):
     )
     ```
 
-    With no budgets the capability only reports, through `on_spend`. Add a
+    With no budgets the capability only reports through `SpendRecordedEvent`. Add a
     `Budget` with no ceiling to keep a running total that never blocks.
 
     What the gate guarantees: no request **starts** after a budget is
@@ -127,7 +129,7 @@ class SpendLimits(AbstractCapability[AgentDepsT]):
     """
 
     on_spend: SpendCallback | None = None
-    """Called with a `SpendSnapshot` after each response. May be sync or async."""
+    """Deprecated callback after each response. Subscribe to `SpendRecordedEvent` instead."""
 
     on_unpriced: Literal['zero', 'raise'] = 'zero'
     """What to do when a response cannot be priced.
@@ -177,6 +179,13 @@ class SpendLimits(AbstractCapability[AgentDepsT]):
         Anything other than `'raise'` behaves as `'zero'`, so a typo in a spec
         would quietly turn unpriced responses free instead of failing the run.
         """
+        if self.on_spend is not None:
+            warnings.warn(
+                '`SpendLimits.on_spend` is deprecated; subscribe to `SpendRecordedEvent` with `@on_event` instead.',
+                HarnessDeprecationWarning,
+                stacklevel=2,
+            )
+
         # Budgets sharing a name, window and scope share a counter deliberately, which is how
         # one window carries a USD and a token ceiling. Two ceilings of the SAME kind on one
         # counter is not that: it reads as two independent limits and behaves as the smaller
@@ -350,14 +359,40 @@ class SpendLimits(AbstractCapability[AgentDepsT]):
         accrued: Mapping[str, Spent] = await self._store.add_many(list(entries.values())) if entries else {}
         statuses = [_status(budget, key, accrued[key]) for budget, key in keyed]
 
-        if self.on_spend is not None:
-            snapshot = SpendSnapshot(
-                model=response.model_name,
-                usage=response.usage,
-                usd=usd,
-                priced=priced,
-                budgets=tuple(statuses),
+        snapshot = SpendSnapshot(
+            model=response.model_name,
+            usage=response.usage,
+            usd=usd,
+            priced=priced,
+            budgets=tuple(statuses),
+        )
+        await ctx.emit_event(
+            SpendRecordedEvent(
+                model=snapshot.model,
+                usage=snapshot.usage,
+                usd=snapshot.usd,
+                priced=snapshot.priced,
+                budgets=tuple(
+                    SpendBudgetStatus(
+                        name=status.budget.name,
+                        window=status.budget.window,
+                        usd_limit=status.budget.usd,
+                        token_limit=status.budget.tokens,
+                        key=status.key,
+                        spent_usd=status.spent.usd,
+                        spent_tokens=status.spent.tokens,
+                        requests=status.spent.requests,
+                        unpriced_requests=status.spent.unpriced_requests,
+                        remaining_usd=status.remaining_usd,
+                        remaining_tokens=status.remaining_tokens,
+                        warning=status.warning,
+                        exhausted=status.exhausted,
+                    )
+                    for status in snapshot.budgets
+                ),
             )
+        )
+        if self.on_spend is not None:
             result = self.on_spend(snapshot)
             if inspect.isawaitable(result):
                 await result

@@ -1,19 +1,63 @@
-"""Event system for plan mutations.
+"""Typed plan events and the deprecated callback event system.
 
-Stores can be given a `PlanEventEmitter` so an application reacts to plan
-changes -- surface progress in a UI, mirror steps to an external tracker, notify
-a channel on completion. Callbacks may be sync or async.
+`Planning` emits `CapabilityEvent` subclasses for mutations made through its tools. Direct store
+mutations have no run context and emit no run events. The callback-based `PlanEventEmitter` remains
+for compatibility with stores configured to use it.
 """
 
-from __future__ import annotations
-
 import inspect
+import warnings
 from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
 from enum import Enum
 
 from pydantic import BaseModel
+from pydantic_ai import CapabilityEvent
 
+from pydantic_ai_harness._warn import HarnessDeprecationWarning
 from pydantic_ai_harness.planning._types import PlanItem
+
+PLAN_EVENTS = 'plan'
+
+
+@dataclass(kw_only=True)
+class PlanCreatedEvent(CapabilityEvent, namespace=PLAN_EVENTS, name='created'):
+    """A plan step was created through a planning tool."""
+
+    item: PlanItem
+    previous_state: PlanItem | None = None
+
+
+@dataclass(kw_only=True)
+class PlanUpdatedEvent(CapabilityEvent, namespace=PLAN_EVENTS, name='updated'):
+    """A plan step was updated through a planning tool."""
+
+    item: PlanItem
+    previous_state: PlanItem | None = None
+
+
+@dataclass(kw_only=True)
+class PlanStatusChangedEvent(CapabilityEvent, namespace=PLAN_EVENTS, name='status_changed'):
+    """A plan step changed status through a planning tool."""
+
+    item: PlanItem
+    previous_state: PlanItem | None = None
+
+
+@dataclass(kw_only=True)
+class PlanCompletedEvent(CapabilityEvent, namespace=PLAN_EVENTS, name='completed'):
+    """A plan step transitioned to `completed` through a planning tool."""
+
+    item: PlanItem
+    previous_state: PlanItem | None = None
+
+
+@dataclass(kw_only=True)
+class PlanDeletedEvent(CapabilityEvent, namespace=PLAN_EVENTS, name='deleted'):
+    """A plan step was deleted through a planning tool."""
+
+    item: PlanItem
+    previous_state: PlanItem | None = None
 
 
 class PlanEventType(str, Enum):
@@ -49,11 +93,11 @@ class PlanEvent(BaseModel):
 
 
 EventCallback = Callable[[PlanEvent], None | Awaitable[None]]
-"""A sync or async listener invoked with each emitted `PlanEvent`."""
+"""Deprecated callback type for `PlanEventEmitter`. Subscribe to typed plan events instead."""
 
 
 class PlanEventEmitter:
-    """Register listeners and dispatch `PlanEvent`s to them.
+    """Deprecated callback dispatcher. Subscribe to typed plan events instead.
 
     ```python
     from pydantic_ai_harness.planning import PlanEventEmitter
@@ -67,6 +111,11 @@ class PlanEventEmitter:
     """
 
     def __init__(self) -> None:
+        warnings.warn(
+            '`PlanEventEmitter` is deprecated; subscribe to typed plan events with `@on_event` instead.',
+            HarnessDeprecationWarning,
+            stacklevel=2,
+        )
         self._listeners: dict[PlanEventType, list[EventCallback]] = {kind: [] for kind in PlanEventType}
 
     def on(self, event_type: PlanEventType, callback: EventCallback) -> EventCallback:

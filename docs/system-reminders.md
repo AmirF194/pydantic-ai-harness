@@ -114,6 +114,22 @@ SystemReminders(dynamic_reminders=[every_tenth])
 
 ## Configuration
 
+Subscribe to `ReminderFiredEvent` to observe reminders after they are appended:
+
+```python
+from pydantic_ai.capabilities import Capability
+from pydantic_ai_harness.system_reminders import ReminderFiredEvent
+
+reporting = Capability()
+
+@reporting.on_event(ReminderFiredEvent)
+async def record(ctx, event):
+    print(event.text)
+```
+
+Add `reporting` beside `SystemReminders` in the agent's capabilities. Migration: `on_fire`
+remains supported but is deprecated. Move its callback body to this subscription.
+
 ```python
 from pydantic_ai_harness import SystemReminders
 from pydantic_ai_harness.system_reminders import Reminder
@@ -122,7 +138,6 @@ SystemReminders(
     reminders=[Reminder('...', interval=5)],
     dynamic_reminders=[],       # callables evaluated every request
     cache_ttl='5m',             # TTL for the cache breakpoint before the reminder ('5m' | '1h')
-    on_fire=None,               # optional callback invoked with each rendered reminder
 )
 ```
 

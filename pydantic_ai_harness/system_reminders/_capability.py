@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import warnings
 from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Generic, Literal
@@ -24,6 +25,8 @@ from pydantic_ai.models import KnownModelName, Model
 from pydantic_ai.tools import AgentDepsT, RunContext
 
 from pydantic_ai_harness._usage import reserved_usage_limits
+from pydantic_ai_harness._warn import HarnessDeprecationWarning
+from pydantic_ai_harness.system_reminders._events import ReminderFiredEvent
 
 if TYPE_CHECKING:
     from pydantic_ai.capabilities.abstract import WrapModelRequestHandler
@@ -118,7 +121,7 @@ class SystemReminders(AbstractCapability[AgentDepsT]):
     """TTL for the cache breakpoint placed before the tail reminder."""
 
     on_fire: Callable[[str], None] | None = None
-    """Optional observability callback invoked with each rendered reminder as it fires."""
+    """Deprecated callback invoked with each rendered reminder. Subscribe to `ReminderFiredEvent` instead."""
 
     _request_count: int = field(default=0, init=False, repr=False, compare=False)
     # Keyed by `id(reminder)`, not list index: a user callback that inserts or removes a
@@ -128,6 +131,12 @@ class SystemReminders(AbstractCapability[AgentDepsT]):
     def __post_init__(self) -> None:
         if not self.reminders and not self.dynamic_reminders:
             raise ValueError('At least one static or dynamic reminder must be provided.')
+        if self.on_fire is not None:
+            warnings.warn(
+                '`SystemReminders.on_fire` is deprecated; subscribe to `ReminderFiredEvent` with `@on_event` instead.',
+                HarnessDeprecationWarning,
+                stacklevel=2,
+            )
 
     async def for_run(self, ctx: RunContext[AgentDepsT]) -> SystemReminders[AgentDepsT]:
         """Return a fresh per-run instance with reset counters (config preserved).
@@ -136,7 +145,9 @@ class SystemReminders(AbstractCapability[AgentDepsT]):
         `init=False` fields -- `_request_count` back to `0` and `_fire_counts` to an empty
         dict -- so concurrent runs on the same agent never share fire state.
         """
-        return replace(self)
+        with warnings.catch_warnings():
+            warnings.simplefilter('ignore', HarnessDeprecationWarning)
+            return replace(self)
 
     async def wrap_model_request(
         self,
@@ -177,6 +188,8 @@ class SystemReminders(AbstractCapability[AgentDepsT]):
                 messages[-1] = replace(last, parts=[*last.parts, UserPromptPart(content=content)])
                 for key, _text in fired:
                     self._fire_counts[key] = self._fire_counts.get(key, 0) + 1
+                for text in texts:
+                    await ctx.emit_event(ReminderFiredEvent(text=text))
                 if self.on_fire is not None:
                     for text in texts:
                         self.on_fire(text)
