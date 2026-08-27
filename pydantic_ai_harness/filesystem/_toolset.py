@@ -14,8 +14,10 @@ from pathlib import Path
 from typing import Concatenate, ParamSpec
 
 from pydantic_ai.exceptions import ModelRetry
-from pydantic_ai.tools import AgentDepsT
+from pydantic_ai.tools import AgentDepsT, RunContext
 from pydantic_ai.toolsets import FunctionToolset
+
+from pydantic_ai_harness.filesystem._events import DirectoryListedEvent, FileReadEvent, FileWrittenEvent
 
 _P = ParamSpec('_P')
 
@@ -320,10 +322,13 @@ class FileSystemToolset(FunctionToolset[AgentDepsT]):
         return resolved
 
     @_recoverable
-    async def read_file(self, path: str, *, offset: int = 0, limit: int | None = None) -> str:
+    async def read_file(
+        self, ctx: RunContext[AgentDepsT], path: str, *, offset: int = 0, limit: int | None = None
+    ) -> str:
         """Read a text file with line numbers.
 
         Args:
+            ctx: The current agent run context.
             path: File path relative to the root directory.
             offset: Zero-based line offset to start reading from.
             limit: Maximum number of lines to return (default: 2000).
@@ -347,15 +352,25 @@ class FileSystemToolset(FunctionToolset[AgentDepsT]):
         text = raw.decode('utf-8', errors='replace')
         lines = text.splitlines(keepends=True)
         content_hash = _content_hash(text)
+        safe_path = _model_safe_filename(os.fspath(resolved), self._real_root)
+        await ctx.emit_event(FileReadEvent(path=safe_path, content_hash=content_hash))
 
-        header = f'[{path} | {len(lines)} lines | hash:{content_hash}]\n'
+        header = f'[{safe_path} | {len(lines)} lines | hash:{content_hash}]\n'
         return header + _format_lines(lines, offset, limit)
 
     @_recoverable
-    async def write_file(self, path: str, content: str, *, expected_hash: str | None = None) -> str:
+    async def write_file(
+        self,
+        ctx: RunContext[AgentDepsT],
+        path: str,
+        content: str,
+        *,
+        expected_hash: str | None = None,
+    ) -> str:
         """Create or overwrite a file with conflict detection.
 
         Args:
+            ctx: The current agent run context.
             path: File path relative to the root directory.
             content: The text content to write.
             expected_hash: If provided, the write is rejected when the file exists
@@ -434,16 +449,27 @@ class FileSystemToolset(FunctionToolset[AgentDepsT]):
 
         new_hash = _content_hash(content)
         lines = len(content.splitlines())
-        return f'Wrote {len(content)} chars ({lines} lines) to {path}. [hash:{new_hash}]'
+        safe_path = _model_safe_filename(os.fspath(resolved), self._real_root)
+        await ctx.emit_event(FileWrittenEvent(path=safe_path, content_hash=new_hash))
+        return f'Wrote {len(content)} chars ({lines} lines) to {safe_path}. [hash:{new_hash}]'
 
     @_recoverable
-    async def edit_file(self, path: str, old_text: str, new_text: str, *, expected_hash: str | None = None) -> str:
+    async def edit_file(
+        self,
+        ctx: RunContext[AgentDepsT],
+        path: str,
+        old_text: str,
+        new_text: str,
+        *,
+        expected_hash: str | None = None,
+    ) -> str:
         """Edit a file by exact string replacement with conflict detection.
 
         The old_text must appear exactly once in the file. Include surrounding
         context lines to ensure uniqueness.
 
         Args:
+            ctx: The current agent run context.
             path: File path relative to the root directory.
             old_text: The exact text to find (must appear exactly once).
             new_text: The replacement text.
@@ -478,13 +504,16 @@ class FileSystemToolset(FunctionToolset[AgentDepsT]):
         new_content = text.replace(old_text, new_text, 1)
         resolved.write_text(new_content, encoding='utf-8')
         new_hash = _content_hash(new_content)
-        return f'Edited {path}. [hash:{new_hash}]'
+        safe_path = _model_safe_filename(os.fspath(resolved), self._real_root)
+        await ctx.emit_event(FileWrittenEvent(path=safe_path, content_hash=new_hash))
+        return f'Edited {safe_path}. [hash:{new_hash}]'
 
     @_recoverable
-    async def list_directory(self, path: str = '.') -> str:
+    async def list_directory(self, ctx: RunContext[AgentDepsT], path: str = '.') -> str:
         """List the contents of a directory.
 
         Args:
+            ctx: The current agent run context.
             path: Directory path relative to the root directory.
 
         Returns:
@@ -527,6 +556,8 @@ class FileSystemToolset(FunctionToolset[AgentDepsT]):
                 entries.append(f'[... truncated at {self._max_list_results} entries]')
                 break
             entries.append(line)
+        safe_path = _model_safe_filename(os.fspath(resolved), self._real_root)
+        await ctx.emit_event(DirectoryListedEvent(path=safe_path, entry_count=len(entries)))
         return '\n'.join(entries) if entries else '(empty directory)'
 
     @_recoverable
