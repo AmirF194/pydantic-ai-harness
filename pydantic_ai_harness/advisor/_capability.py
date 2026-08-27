@@ -216,9 +216,9 @@ class Advisor(NativeOrLocalTool[AgentDepsT]):
             max_tokens=self.max_tokens,
         )
         if self.caching is not None:
-            if hasattr(native_tools, 'AnthropicAdvisorToolSettings'):  # pragma: no cover - unreleased Pydantic AI
+            if hasattr(native_tools, 'AnthropicAdvisorToolSettings'):  # pragma: no cover - new-version path
                 setattr(tool, 'provider_settings', {'anthropic': {'caching': self.caching}})
-            else:
+            else:  # pragma: no cover - old-version path
                 tool.caching = self.caching
         return tool
 

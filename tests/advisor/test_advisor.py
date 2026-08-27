@@ -85,10 +85,10 @@ class TestAdvisor:
         assert isinstance(tool, AdvisorTool)
         assert tool.model == 'claude-opus-4-8'
         assert tool.max_tokens == 2048
-        if hasattr(native_tools, 'AnthropicAdvisorToolSettings'):  # pragma: no cover - unreleased Pydantic AI
+        if hasattr(native_tools, 'AnthropicAdvisorToolSettings'):  # pragma: no cover - new-version path
             assert getattr(tool, 'provider_settings') == {'anthropic': {'caching': '5m'}}
             assert tool.caching is None
-        else:
+        else:  # pragma: no cover - old-version path
             assert tool.caching == '5m'
 
     async def test_model_instance_uses_local_advisor_and_preserves_identity(self) -> None:
