@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Any, cast
 
 import pytest
-from pydantic_ai import Agent, CallToolsNode, ModelRequestNode, ModelRetry, RunContext
+from pydantic_ai import Agent, CallToolsNode, FunctionToolset, ModelRequestNode, ModelRetry, RunContext
 from pydantic_ai._agent_graph import GraphAgentState  # pyright: ignore[reportPrivateUsage]
 from pydantic_ai.capabilities import AbstractCapability
 from pydantic_ai.messages import (
@@ -49,6 +49,7 @@ from pydantic_ai_harness.step_persistence import (
     is_provider_valid,
 )
 from pydantic_ai_harness.step_persistence._store import _validate_id  # pyright: ignore[reportPrivateUsage]
+from tests._recording_durability import RecordingDurability  # pyright: ignore[reportMissingTypeStubs]
 
 pytestmark = pytest.mark.anyio
 
@@ -114,6 +115,27 @@ async def first_run_id(store: StepStore) -> str:
     runs = await store.list_runs()
     assert len(runs) >= 1
     return runs[0].run_id
+
+
+async def test_store_writes_dispatch_as_durable_operations() -> None:
+    def add(a: int, b: int) -> int:
+        return a + b
+
+    durability = RecordingDurability()
+    agent: Agent[None, str] = Agent(
+        TestModel(call_tools='all'),
+        name='step_persistence',
+        capabilities=[StepPersistence(agent_name='worker'), durability],
+        toolsets=[FunctionToolset(tools=[add], id='tools')],
+    )
+
+    await agent.run('add')
+
+    bound = RecordingDurability.from_agent(agent)
+    assert bound is not None
+    operation_names = {name for name, _ in bound.calls if '__capability__step_persistence' in name}
+    for operation in ('register_run', 'append_event', 'save_snapshot', 'record_tool_effect', 'finish_tool_effect'):
+        assert any(operation in name for name in operation_names), operation_names
 
 
 # ---------------------------------------------------------------------------
