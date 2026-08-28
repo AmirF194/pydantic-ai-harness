@@ -22,20 +22,19 @@ except ImportError as _import_error:  # pragma: no cover
 
 from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import Any, ClassVar, Literal, cast
+from typing import Any, ClassVar, Literal
 
-from pydantic_ai import ToolsetTool
-from pydantic_ai.agent import EventStreamHandler, ParallelExecutionMode
+from pydantic_ai.agent import AbstractAgent, EventStreamHandler, ParallelExecutionMode
 from pydantic_ai.capabilities import WrapRunHandler
-from pydantic_ai.durable_exec._base import BaseDurabilityCapability
-from pydantic_ai.durable_exec._codec import JSON_CODEC
+from pydantic_ai.durable_exec import JSON_CODEC, BaseDurabilityCapability, DurabilityEngineSpec
 from pydantic_ai.exceptions import UserError
 from pydantic_ai.models import Model
 from pydantic_ai.run import AgentRunResult
 from pydantic_ai.tools import AgentDepsT, RunContext
+from typing_extensions import Self
 
 from ._context import current_async_task_context
-from ._operation_backend import AbsurdOperationBackend, AbsurdOperationConfig, DurableConfig
+from ._operation_backend import AbsurdOperationBackend, AbsurdOperationConfig
 
 AbsurdParallelExecutionMode = Literal['sequential', 'parallel_ordered_events']
 """Tool-call execution modes usable with Absurd. A subset of `ParallelExecutionMode`.
@@ -54,8 +53,6 @@ in the model's tool-call order once the whole batch completes, so every repeated
 calls and event-handler steps alike -- lines up on replay."""
 
 _ENGINE_NAME = 'Absurd'
-_TOOL_CONFIG_KEY = 'absurd'
-ToolsetKind = Literal['function', 'mcp', 'dynamic']
 
 
 def _reject_model_id_hash(model_id: str) -> None:
@@ -106,23 +103,23 @@ class AbsurdDurability(BaseDurabilityCapability[AgentDepsT]):
         ```
     """
 
-    engine_name = _ENGINE_NAME
-    _codec: ClassVar = JSON_CODEC
+    engine_spec: ClassVar = DurabilityEngineSpec(
+        engine_name=_ENGINE_NAME,
+        durable_unit_noun='step',
+        durable_container_noun='task',
+        codec=JSON_CODEC,
+        toolset_lifecycles={
+            'function': 'enter-never',
+            'mcp': 'enter-always',
+            'dynamic': 'enter-never',
+        },
+        sequential_tools_in_durable_context=True,
+        unsupported_runtime_toolset_kinds=frozenset({'function', 'mcp', 'dynamic'}),
+        tool_config_key='absurd',
+    )
     # Absurd has no raise-time non-retryable exception equivalent to Lambda's `ExecutionError` or
     # Restate's `TerminalError`. Serialization failures therefore use the base behavior: the task's
     # `RetryStrategy`/`max_attempts` governs retries, and the task fails after those attempts are exhausted.
-    _unsupported_runtime_toolset_kinds = frozenset({'function', 'mcp', 'dynamic'})
-    _wrapped_toolset_kinds: ClassVar[frozenset[ToolsetKind]] = frozenset({'function', 'mcp', 'dynamic'})
-    _toolset_lifecycles = {
-        'function': 'enter-never',
-        'mcp': 'enter-always',
-        'dynamic': 'enter-never',
-    }
-    _journal_discovery: ClassVar[bool] = True
-    _force_sequential_tools_in_durable_context: ClassVar[bool] = True
-    _durable_unit_noun = 'step'
-    _durable_container_noun = 'task'
-    _tool_config_key = _TOOL_CONFIG_KEY
 
     def __init__(
         self,
@@ -156,34 +153,31 @@ class AbsurdDurability(BaseDurabilityCapability[AgentDepsT]):
         for model_id in models or {}:
             _reject_model_id_hash(model_id)
         self._parallel_execution_mode: ParallelExecutionMode = parallel_execution_mode
+        self._absurd_agent: AbstractAgent[AgentDepsT, Any] | None = None
+        self._absurd_default_model_id = 'default'
+
+    def for_agent(self, agent: AbstractAgent[AgentDepsT, Any]) -> Self:
+        bound = super().for_agent(agent)
+        bound._absurd_agent = agent
+        bound._absurd_default_model_id = agent.model if isinstance(agent.model, str) else 'default'
+        return bound
 
     @property
     def in_durable_context(self) -> bool:
         return current_async_task_context() is not None
 
-    def _build_operation_backend(self) -> AbsurdOperationBackend:
-        resolve_tool = self._build_resolve_tool_config({})
+    def get_durable_operation_backend(self) -> AbsurdOperationBackend:
         return AbsurdOperationBackend(
             agent_name=self.name,
-            default_model_id=self._default_model_id,
-            config=AbsurdOperationConfig(
-                lambda tool, tool_name: resolve_tool(cast(ToolsetTool[Any] | None, tool), tool_name)
-            ),
+            default_model_id=self._absurd_default_model_id,
+            config=AbsurdOperationConfig(),
         )
-
-    def _normalize_unit_config(self, config: Any) -> DurableConfig:
-        if config:
-            raise UserError(
-                f'Absurd steps take no per-tool options, so non-empty {_TOOL_CONFIG_KEY!r} metadata '
-                'would have no effect. Remove the config.'
-            )
-        return {}
 
     async def wrap_run(self, ctx: RunContext[AgentDepsT], *, handler: WrapRunHandler) -> AgentRunResult[Any]:
         """Allow Absurd's encounter-safe ordered parallel mode when explicitly configured."""
         if self._parallel_execution_mode == 'sequential':
             return await super().wrap_run(ctx, handler=handler)
-        agent = self._agent
+        agent = self._absurd_agent
         if agent is None or not self.in_durable_context:
             return await handler()
         with agent.parallel_tool_call_execution_mode(self._parallel_execution_mode):
