@@ -17,9 +17,17 @@ from pydantic_ai import (
     ToolReturnPart,
     UserPromptPart,
 )
+from pydantic_ai import messages as _pydantic_ai_messages
 
 from pydantic_ai_harness import Coder
 from pydantic_ai_harness.repo_context import AgentContextInventory, AssetRoot
+
+# Pydantic AI separates instruction parts contributed by different sources with a blank line, where
+# earlier versions joined them with a single newline. The prompt recorded below has the blank-line
+# form, and it cannot be normalized away without also collapsing the blank lines inside each part's
+# own text. So this one snapshot is skipped where the installed Pydantic AI still joins the old way.
+# Remove the guard once the harness's `pydantic-ai-slim` floor moves past that release.
+_SEPARATES_INSTRUCTION_PARTS = hasattr(_pydantic_ai_messages, 'InstructionId')
 
 if TYPE_CHECKING:
 
@@ -42,6 +50,10 @@ _SNAPSHOT_OUTPUT_ENVIRONMENT_VARIABLES = (
 )
 
 
+@pytest.mark.skipif(
+    not _SEPARATES_INSTRUCTION_PARTS,
+    reason='Recorded prompt has the blank line Pydantic AI puts between instruction parts.',
+)
 @pytest.mark.vcr
 async def test_coder_completes_task(
     tmp_path: Path, allow_model_requests: None, monkeypatch: pytest.MonkeyPatch
