@@ -1,7 +1,7 @@
 name: gh-aw engine ref
 
 # GitHub Agentic Workflows resolves its `pydantic-ai` engine from
-# `gh-aw/pydantic.md` on this repository's `gh-aw-engine` branch. The release job
+# `gh-aw/pydantic.md` on this repository's `gh-aw-engine` branch. The release path
 # in `main.yml` advances that branch whenever a tag ships the version the
 # definition pins, which covers changes that ride along with a release. This
 # workflow covers the rest: a correction to the definition itself has no package
