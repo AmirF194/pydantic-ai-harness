@@ -1,5 +1,7 @@
 import asyncio
 import os
+import re
+from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -17,17 +19,29 @@ from pydantic_ai import (
     ToolReturnPart,
     UserPromptPart,
 )
-from pydantic_ai import messages as _pydantic_ai_messages
 
 from pydantic_ai_harness import Coder
 from pydantic_ai_harness.repo_context import AgentContextInventory, AssetRoot
 
-# Pydantic AI separates instruction parts contributed by different sources with a blank line, where
-# earlier versions joined them with a single newline. The prompt recorded below has the blank-line
-# form, and it cannot be normalized away without also collapsing the blank lines inside each part's
-# own text. So this one snapshot is skipped where the installed Pydantic AI still joins the old way.
-# Remove the guard once the harness's `pydantic-ai-slim` floor moves past that release.
-_SEPARATES_INSTRUCTION_PARTS = hasattr(_pydantic_ai_messages, 'InstructionId')
+
+def collapsed_instructions(messages: list[Any]) -> list[Any]:
+    """Compare instructions with every run of newlines collapsed to one.
+
+    Pydantic AI separates instruction parts contributed by different sources with a blank line, where
+    the version this package floors at joins them with a single newline. Collapsing runs of newlines
+    on both sides lets one recorded prompt hold across that bump. It flattens the blank lines inside
+    a part's own text too, which is why the prompt below reads more tightly than what is actually
+    sent -- what this test is about is the work the coder does, not how its prompt is glued together.
+
+    Drop this, and re-record the prompt as sent, once the floor moves past that release.
+    """
+    return [
+        replace(message, instructions=re.sub(r'\n+', '\n', message.instructions))
+        if isinstance(message, ModelRequest) and message.instructions is not None
+        else message
+        for message in messages
+    ]
+
 
 if TYPE_CHECKING:
 
@@ -50,10 +64,6 @@ _SNAPSHOT_OUTPUT_ENVIRONMENT_VARIABLES = (
 )
 
 
-@pytest.mark.skipif(
-    not _SEPARATES_INSTRUCTION_PARTS,
-    reason='Recorded prompt has the blank line Pydantic AI puts between instruction parts.',
-)
 @pytest.mark.vcr
 async def test_coder_completes_task(
     tmp_path: Path, allow_model_requests: None, monkeypatch: pytest.MonkeyPatch
@@ -130,7 +140,7 @@ async def test_coder_completes_task(
     )
     result = await agent.run(prompt)
 
-    assert result.all_messages() == snapshot(
+    assert collapsed_instructions(result.all_messages()) == snapshot(
         [
             ModelRequest(
                 parts=[
@@ -143,15 +153,10 @@ async def test_coder_completes_task(
                 instructions="""\
 <context-file path="AGENTS.md">
 Run tests with `pytest -q`. Keep domain policy separate from presentation and preserve public defaults.
-
 </context-file>
-
 Call `inventory_agent_context` to map where this repo keeps its coding-assistant setup (instruction dirs, skills, sub-agents, and hooks) so you can read and translate it.
-
 You have a planning tool, `write_plan`. For multi-step work, call it first to lay out the steps, then keep it current: mark exactly one step `in_progress`, and mark a step `completed` as soon as it is fully done. Pass the full plan every time you call `write_plan`. Use `add_task` to append a single step, `update_task_status`/`update_task_statuses` to move steps between statuses, and `read_plan` to see step ids before a granular edit.
-
 You can delegate self-contained tasks to these sub-agents using the `delegate_task` tool. Each runs in its own fresh context and does not see this conversation, so pass everything it needs.
-
 Available sub-agents:
 - explorer: Explore the codebase and answer questions without modifying anything\
 """,
@@ -232,15 +237,10 @@ text_renderer.py  (170 bytes)\
                 instructions="""\
 <context-file path="AGENTS.md">
 Run tests with `pytest -q`. Keep domain policy separate from presentation and preserve public defaults.
-
 </context-file>
-
 Call `inventory_agent_context` to map where this repo keeps its coding-assistant setup (instruction dirs, skills, sub-agents, and hooks) so you can read and translate it.
-
 You have a planning tool, `write_plan`. For multi-step work, call it first to lay out the steps, then keep it current: mark exactly one step `in_progress`, and mark a step `completed` as soon as it is fully done. Pass the full plan every time you call `write_plan`. Use `add_task` to append a single step, `update_task_status`/`update_task_statuses` to move steps between statuses, and `read_plan` to see step ids before a granular edit.
-
 You can delegate self-contained tasks to these sub-agents using the `delegate_task` tool. Each runs in its own fresh context and does not see this conversation, so pass everything it needs.
-
 Available sub-agents:
 - explorer: Explore the codebase and answer questions without modifying anything\
 """,
@@ -304,15 +304,10 @@ Plan updated: 3 step(s).
                 instructions="""\
 <context-file path="AGENTS.md">
 Run tests with `pytest -q`. Keep domain policy separate from presentation and preserve public defaults.
-
 </context-file>
-
 Call `inventory_agent_context` to map where this repo keeps its coding-assistant setup (instruction dirs, skills, sub-agents, and hooks) so you can read and translate it.
-
 You have a planning tool, `write_plan`. For multi-step work, call it first to lay out the steps, then keep it current: mark exactly one step `in_progress`, and mark a step `completed` as soon as it is fully done. Pass the full plan every time you call `write_plan`. Use `add_task` to append a single step, `update_task_status`/`update_task_statuses` to move steps between statuses, and `read_plan` to see step ids before a granular edit.
-
 You can delegate self-contained tasks to these sub-agents using the `delegate_task` tool. Each runs in its own fresh context and does not see this conversation, so pass everything it needs.
-
 Available sub-agents:
 - explorer: Explore the codebase and answer questions without modifying anything\
 """,
@@ -545,15 +540,10 @@ The README explicitly states "**each output format has its own renderer module**
                 instructions="""\
 <context-file path="AGENTS.md">
 Run tests with `pytest -q`. Keep domain policy separate from presentation and preserve public defaults.
-
 </context-file>
-
 Call `inventory_agent_context` to map where this repo keeps its coding-assistant setup (instruction dirs, skills, sub-agents, and hooks) so you can read and translate it.
-
 You have a planning tool, `write_plan`. For multi-step work, call it first to lay out the steps, then keep it current: mark exactly one step `in_progress`, and mark a step `completed` as soon as it is fully done. Pass the full plan every time you call `write_plan`. Use `add_task` to append a single step, `update_task_status`/`update_task_statuses` to move steps between statuses, and `read_plan` to see step ids before a granular edit.
-
 You can delegate self-contained tasks to these sub-agents using the `delegate_task` tool. Each runs in its own fresh context and does not see this conversation, so pass everything it needs.
-
 Available sub-agents:
 - explorer: Explore the codebase and answer questions without modifying anything\
 """,
@@ -606,15 +596,10 @@ No changes applied. Errors:
                 instructions="""\
 <context-file path="AGENTS.md">
 Run tests with `pytest -q`. Keep domain policy separate from presentation and preserve public defaults.
-
 </context-file>
-
 Call `inventory_agent_context` to map where this repo keeps its coding-assistant setup (instruction dirs, skills, sub-agents, and hooks) so you can read and translate it.
-
 You have a planning tool, `write_plan`. For multi-step work, call it first to lay out the steps, then keep it current: mark exactly one step `in_progress`, and mark a step `completed` as soon as it is fully done. Pass the full plan every time you call `write_plan`. Use `add_task` to append a single step, `update_task_status`/`update_task_statuses` to move steps between statuses, and `read_plan` to see step ids before a granular edit.
-
 You can delegate self-contained tasks to these sub-agents using the `delegate_task` tool. Each runs in its own fresh context and does not see this conversation, so pass everything it needs.
-
 Available sub-agents:
 - explorer: Explore the codebase and answer questions without modifying anything\
 """,
@@ -662,15 +647,10 @@ Summary:\\ 0\\ completed,\\ 1\\ in\\ progress,\\ 2\\ pending\
                 instructions="""\
 <context-file path="AGENTS.md">
 Run tests with `pytest -q`. Keep domain policy separate from presentation and preserve public defaults.
-
 </context-file>
-
 Call `inventory_agent_context` to map where this repo keeps its coding-assistant setup (instruction dirs, skills, sub-agents, and hooks) so you can read and translate it.
-
 You have a planning tool, `write_plan`. For multi-step work, call it first to lay out the steps, then keep it current: mark exactly one step `in_progress`, and mark a step `completed` as soon as it is fully done. Pass the full plan every time you call `write_plan`. Use `add_task` to append a single step, `update_task_status`/`update_task_statuses` to move steps between statuses, and `read_plan` to see step ids before a granular edit.
-
 You can delegate self-contained tasks to these sub-agents using the `delegate_task` tool. Each runs in its own fresh context and does not see this conversation, so pass everything it needs.
-
 Available sub-agents:
 - explorer: Explore the codebase and answer questions without modifying anything\
 """,
@@ -718,15 +698,10 @@ No changes applied. Errors:
                 instructions="""\
 <context-file path="AGENTS.md">
 Run tests with `pytest -q`. Keep domain policy separate from presentation and preserve public defaults.
-
 </context-file>
-
 Call `inventory_agent_context` to map where this repo keeps its coding-assistant setup (instruction dirs, skills, sub-agents, and hooks) so you can read and translate it.
-
 You have a planning tool, `write_plan`. For multi-step work, call it first to lay out the steps, then keep it current: mark exactly one step `in_progress`, and mark a step `completed` as soon as it is fully done. Pass the full plan every time you call `write_plan`. Use `add_task` to append a single step, `update_task_status`/`update_task_statuses` to move steps between statuses, and `read_plan` to see step ids before a granular edit.
-
 You can delegate self-contained tasks to these sub-agents using the `delegate_task` tool. Each runs in its own fresh context and does not see this conversation, so pass everything it needs.
-
 Available sub-agents:
 - explorer: Explore the codebase and answer questions without modifying anything\
 """,
@@ -831,15 +806,10 @@ def render_report(
                 instructions="""\
 <context-file path="AGENTS.md">
 Run tests with `pytest -q`. Keep domain policy separate from presentation and preserve public defaults.
-
 </context-file>
-
 Call `inventory_agent_context` to map where this repo keeps its coding-assistant setup (instruction dirs, skills, sub-agents, and hooks) so you can read and translate it.
-
 You have a planning tool, `write_plan`. For multi-step work, call it first to lay out the steps, then keep it current: mark exactly one step `in_progress`, and mark a step `completed` as soon as it is fully done. Pass the full plan every time you call `write_plan`. Use `add_task` to append a single step, `update_task_status`/`update_task_statuses` to move steps between statuses, and `read_plan` to see step ids before a granular edit.
-
 You can delegate self-contained tasks to these sub-agents using the `delegate_task` tool. Each runs in its own fresh context and does not see this conversation, so pass everything it needs.
-
 Available sub-agents:
 - explorer: Explore the codebase and answer questions without modifying anything\
 """,
@@ -898,15 +868,10 @@ def run(
                 instructions="""\
 <context-file path="AGENTS.md">
 Run tests with `pytest -q`. Keep domain policy separate from presentation and preserve public defaults.
-
 </context-file>
-
 Call `inventory_agent_context` to map where this repo keeps its coding-assistant setup (instruction dirs, skills, sub-agents, and hooks) so you can read and translate it.
-
 You have a planning tool, `write_plan`. For multi-step work, call it first to lay out the steps, then keep it current: mark exactly one step `in_progress`, and mark a step `completed` as soon as it is fully done. Pass the full plan every time you call `write_plan`. Use `add_task` to append a single step, `update_task_status`/`update_task_statuses` to move steps between statuses, and `read_plan` to see step ids before a granular edit.
-
 You can delegate self-contained tasks to these sub-agents using the `delegate_task` tool. Each runs in its own fresh context and does not see this conversation, so pass everything it needs.
-
 Available sub-agents:
 - explorer: Explore the codebase and answer questions without modifying anything\
 """,
@@ -985,15 +950,10 @@ No changes applied. Errors:
                 instructions="""\
 <context-file path="AGENTS.md">
 Run tests with `pytest -q`. Keep domain policy separate from presentation and preserve public defaults.
-
 </context-file>
-
 Call `inventory_agent_context` to map where this repo keeps its coding-assistant setup (instruction dirs, skills, sub-agents, and hooks) so you can read and translate it.
-
 You have a planning tool, `write_plan`. For multi-step work, call it first to lay out the steps, then keep it current: mark exactly one step `in_progress`, and mark a step `completed` as soon as it is fully done. Pass the full plan every time you call `write_plan`. Use `add_task` to append a single step, `update_task_status`/`update_task_statuses` to move steps between statuses, and `read_plan` to see step ids before a granular edit.
-
 You can delegate self-contained tasks to these sub-agents using the `delegate_task` tool. Each runs in its own fresh context and does not see this conversation, so pass everything it needs.
-
 Available sub-agents:
 - explorer: Explore the codebase and answer questions without modifying anything\
 """,
@@ -1051,15 +1011,10 @@ def test_text_report_hides_internal_by_default() -> None:\
                 instructions="""\
 <context-file path="AGENTS.md">
 Run tests with `pytest -q`. Keep domain policy separate from presentation and preserve public defaults.
-
 </context-file>
-
 Call `inventory_agent_context` to map where this repo keeps its coding-assistant setup (instruction dirs, skills, sub-agents, and hooks) so you can read and translate it.
-
 You have a planning tool, `write_plan`. For multi-step work, call it first to lay out the steps, then keep it current: mark exactly one step `in_progress`, and mark a step `completed` as soon as it is fully done. Pass the full plan every time you call `write_plan`. Use `add_task` to append a single step, `update_task_status`/`update_task_statuses` to move steps between statuses, and `read_plan` to see step ids before a granular edit.
-
 You can delegate self-contained tasks to these sub-agents using the `delegate_task` tool. Each runs in its own fresh context and does not see this conversation, so pass everything it needs.
-
 Available sub-agents:
 - explorer: Explore the codebase and answer questions without modifying anything\
 """,
@@ -1179,15 +1134,10 @@ def test_service_text_remains_default_format() -> None:
                 instructions="""\
 <context-file path="AGENTS.md">
 Run tests with `pytest -q`. Keep domain policy separate from presentation and preserve public defaults.
-
 </context-file>
-
 Call `inventory_agent_context` to map where this repo keeps its coding-assistant setup (instruction dirs, skills, sub-agents, and hooks) so you can read and translate it.
-
 You have a planning tool, `write_plan`. For multi-step work, call it first to lay out the steps, then keep it current: mark exactly one step `in_progress`, and mark a step `completed` as soon as it is fully done. Pass the full plan every time you call `write_plan`. Use `add_task` to append a single step, `update_task_status`/`update_task_statuses` to move steps between statuses, and `read_plan` to see step ids before a granular edit.
-
 You can delegate self-contained tasks to these sub-agents using the `delegate_task` tool. Each runs in its own fresh context and does not see this conversation, so pass everything it needs.
-
 Available sub-agents:
 - explorer: Explore the codebase and answer questions without modifying anything\
 """,
@@ -1226,15 +1176,10 @@ Available sub-agents:
                 instructions="""\
 <context-file path="AGENTS.md">
 Run tests with `pytest -q`. Keep domain policy separate from presentation and preserve public defaults.
-
 </context-file>
-
 Call `inventory_agent_context` to map where this repo keeps its coding-assistant setup (instruction dirs, skills, sub-agents, and hooks) so you can read and translate it.
-
 You have a planning tool, `write_plan`. For multi-step work, call it first to lay out the steps, then keep it current: mark exactly one step `in_progress`, and mark a step `completed` as soon as it is fully done. Pass the full plan every time you call `write_plan`. Use `add_task` to append a single step, `update_task_status`/`update_task_statuses` to move steps between statuses, and `read_plan` to see step ids before a granular edit.
-
 You can delegate self-contained tasks to these sub-agents using the `delegate_task` tool. Each runs in its own fresh context and does not see this conversation, so pass everything it needs.
-
 Available sub-agents:
 - explorer: Explore the codebase and answer questions without modifying anything\
 """,
@@ -1278,15 +1223,10 @@ Available sub-agents:
                 instructions="""\
 <context-file path="AGENTS.md">
 Run tests with `pytest -q`. Keep domain policy separate from presentation and preserve public defaults.
-
 </context-file>
-
 Call `inventory_agent_context` to map where this repo keeps its coding-assistant setup (instruction dirs, skills, sub-agents, and hooks) so you can read and translate it.
-
 You have a planning tool, `write_plan`. For multi-step work, call it first to lay out the steps, then keep it current: mark exactly one step `in_progress`, and mark a step `completed` as soon as it is fully done. Pass the full plan every time you call `write_plan`. Use `add_task` to append a single step, `update_task_status`/`update_task_statuses` to move steps between statuses, and `read_plan` to see step ids before a granular edit.
-
 You can delegate self-contained tasks to these sub-agents using the `delegate_task` tool. Each runs in its own fresh context and does not see this conversation, so pass everything it needs.
-
 Available sub-agents:
 - explorer: Explore the codebase and answer questions without modifying anything\
 """,
