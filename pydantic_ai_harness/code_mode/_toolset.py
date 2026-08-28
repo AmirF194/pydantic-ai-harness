@@ -52,6 +52,7 @@ except ImportError as _import_error:  # pragma: no cover
         'pydantic-monty is required for CodeMode. Install it with: pip install "pydantic-ai-harness[code-mode]"'
     ) from _import_error
 from pydantic_ai_harness._monty_exec import MontyExecutor, PrintCapture, is_sandbox_panic
+from pydantic_ai_harness.code_mode._eager import EagerState, _EagerPart  # pyright: ignore[reportPrivateUsage]
 from pydantic_ai_harness.code_mode._events import (
     SpeculativeCallClaimedEvent,
     SpeculativeCallMissedEvent,
@@ -571,6 +572,9 @@ class CodeModeToolset(WrapperToolset[AgentDepsT]):
     """
 
     speculation: SpeculationState | None = field(default=None, kw_only=True)
+
+    eager: EagerState | None = field(default=None, kw_only=True)
+    """Eager streamed execution state, bound back to this toolset for statement feeds."""
     """Per-run speculation store, set by `CodeMode` when `speculate` is enabled.
 
     The capability's stream watcher launches calls into it; the dispatch path below claims
@@ -616,6 +620,10 @@ class CodeModeToolset(WrapperToolset[AgentDepsT]):
         run_state = _MontyRunState()
         await self.wrapped.__aenter__()
         self._run_state = run_state
+        if self.eager is not None:
+            # Bind here rather than at construction: the framework may enter a per-step copy,
+            # and the pump must feed through an instance that owns the live run state.
+            self.eager.bind(self)
         return self
 
     async def __aexit__(self, *args: Any) -> bool | None:
@@ -748,6 +756,8 @@ class CodeModeToolset(WrapperToolset[AgentDepsT]):
         self, name: str, tool_args: dict[str, Any], ctx: RunContext[AgentDepsT], tool: ToolsetTool[AgentDepsT]
     ) -> Any:
         """Execute Python code in the sandbox, or pass through to a native tool."""
+        if isinstance(tool, _RunCodeTool) and self.eager is not None:
+            return await self._call_tool_eager(name, tool_args, ctx, tool)
         if self.speculation is None or not isinstance(tool, _RunCodeTool):
             return await self._call_tool_impl(name, tool_args, ctx, tool)
         code = tool_args.get('code')
@@ -766,8 +776,87 @@ class CodeModeToolset(WrapperToolset[AgentDepsT]):
         await self.speculation.evict_part(ctx.tool_call_id or 'pyd_ai_code_mode')
         return result
 
+    async def _call_tool_eager(
+        self, name: str, tool_args: dict[str, Any], ctx: RunContext[AgentDepsT], tool: _RunCodeTool[AgentDepsT]
+    ) -> Any:
+        """Execute `run_code` on top of statements the stream watcher already fed.
+
+        The pump ran the streamed prefix statement by statement in the live session; this
+        dispatch waits for it to finish, then feeds only the remainder. The final statement
+        is never fed early (the stream scanner keeps the last parsed statement provisional),
+        so the snippet's result always comes from the tail feed. Prints and nested tool-call
+        records from the pumped prefix are merged into the returned `ToolReturn`.
+        """
+        assert self.eager is not None
+        code = tool_args.get('code')
+        restart = tool_args.get('restart', False)
+        part = None
+        if isinstance(code, str) and not _in_temporal_workflow(ctx):
+            part = self.eager.take(ctx.tool_call_id or 'pyd_ai_code_mode', code)
+        if part is not None:
+            await self.eager.drain(part)
+        if part is None:
+            # Nothing streamed for this part (non-streaming run, Temporal, or a part the
+            # watcher never saw): the normal path handles it.
+            return await self._call_tool_impl(name, tool_args, ctx, tool)
+        assert isinstance(code, str), '`take` only runs for string code'
+        if restart:
+            # The model asked for a fresh REPL; the reset discards the pumped prefix too.
+            return await self._call_tool_impl(name, tool_args, ctx, tool)
+        if part.error is not None:
+            raise part.error
+        lines = code.split('\n')
+        if '\n'.join(lines[: part.fed_line_count]) != part.fed_prefix:
+            run_state = self._run_state
+            assert run_state is not None, '`CodeModeToolset` must be entered before calling `run_code`'
+            run_state.reset()
+            raise ModelRetry(
+                'The submitted code no longer matches the prefix eager execution already ran, '
+                'so the session was restarted. Send the snippet again.'
+            )
+        tail = '\n'.join(lines[part.fed_line_count :])
+        return await self._call_tool_impl(
+            name,
+            {'code': tail},
+            ctx,
+            tool,
+            prior_output=part.output,
+            prior_nested=(part.nested_calls, part.nested_returns),
+        )
+
+    async def feed_eager_fragment(self, part: _EagerPart, source: str, ctx: RunContext[AgentDepsT]) -> None:
+        """Feed one closed statement into the session, accumulating its observable effects.
+
+        A trailing `None` expression pins the fragment's result: mid-snippet statement values
+        are discarded by whole-snippet semantics anyway, and a `None` result makes the
+        fragment's `ToolReturn` shape deterministic (`{}` or `{'output': ...}`), so prints
+        and nested call records can be extracted without guessing.
+        """
+        tools = await self.get_tools(ctx)
+        run_code_tool = tools['run_code']
+        assert isinstance(run_code_tool, _RunCodeTool)
+        result = await self._call_tool_impl('run_code', {'code': source + '\nNone'}, ctx, run_code_tool)
+        assert isinstance(result, ToolReturn)
+        value = result.return_value
+        assert isinstance(value, dict), 'the pinned `None` result makes the fragment return a dict'
+        output = value.get('output')  # pyright: ignore[reportUnknownMemberType,reportUnknownVariableType]
+        if isinstance(output, str):
+            part.output += output
+        metadata: Any = result.metadata
+        assert metadata is not None, 'run_code always attaches code_mode metadata'
+        fragment_calls: dict[str, ToolCallPart] = metadata['tool_calls']
+        fragment_returns: dict[str, ToolReturnPart] = metadata['tool_returns']
+        part.nested_calls.update(fragment_calls)
+        part.nested_returns.update(fragment_returns)
+
     async def _call_tool_impl(  # noqa: C901
-        self, name: str, tool_args: dict[str, Any], ctx: RunContext[AgentDepsT], tool: ToolsetTool[AgentDepsT]
+        self,
+        name: str,
+        tool_args: dict[str, Any],
+        ctx: RunContext[AgentDepsT],
+        tool: ToolsetTool[AgentDepsT],
+        prior_output: str = '',
+        prior_nested: tuple[dict[str, ToolCallPart], dict[str, ToolReturnPart]] | None = None,
     ) -> Any:
         if not isinstance(tool, _RunCodeTool):
             # Native (non-sandboxed) tool -- pass through to the wrapped toolset.
@@ -810,9 +899,10 @@ class CodeModeToolset(WrapperToolset[AgentDepsT]):
         sequential_tools = {name for name, td in callable_defs.items() if td.sequential}
 
         # Collect nested tool calls and returns keyed by tool_call_id so they
-        # can be attached as metadata on the run_code ToolReturnPart.
-        nested_calls: dict[str, ToolCallPart] = {}
-        nested_returns: dict[str, ToolReturnPart] = {}
+        # can be attached as metadata on the run_code ToolReturnPart. Under eager
+        # execution the pumped prefix's records seed the maps.
+        nested_calls: dict[str, ToolCallPart] = dict(prior_nested[0]) if prior_nested is not None else {}
+        nested_returns: dict[str, ToolReturnPart] = dict(prior_nested[1]) if prior_nested is not None else {}
         call_counter = 0
         budget_exhausted = False
 
@@ -1074,7 +1164,7 @@ class CodeModeToolset(WrapperToolset[AgentDepsT]):
             ) from e
 
         result = completed.output
-        printed = capture.joined
+        printed = prior_output + capture.joined
 
         # Validate result to reconstruct multimodal types (e.g. BinaryContent from
         # serialized dicts) so they flow through to the model natively.

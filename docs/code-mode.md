@@ -219,6 +219,34 @@ time-bounded work behind a Temporal activity instead.
 
 State persists between `run_code` calls within the same agent run -- variables, imports, and function definitions carry over. Pass `restart: true` in the tool call to reset state. If a worker crash or host-side execution failure invalidates the session, `run_code` returns a model retry that reports the reset; the next snippet must recreate any required state.
 
+## Eager execution (experimental)
+
+`eager=True` is the lighter streaming tier: instead of predicting calls, each top-level
+statement of a streamed `run_code` snippet executes in the live REPL as soon as it has
+fully streamed, and the `run_code` dispatch only executes the remainder. Nothing is
+predicted, so nothing can miss or be wasted -- the trade is that side effects land before
+the tool call is committed and are not rolled back.
+
+```python
+agent = Agent(
+    'openai:gpt-standard-5',
+    capabilities=[CodeMode(eager=True)],
+)
+```
+
+A statement that fails mid-stream leaves the session exactly as a failed snippet does
+today: assignments made before the failing line persist, and the error surfaces as the
+`run_code` result for the model to retry against. `restart: true` discards the executed
+prefix along with the rest of the session.
+
+Choosing a tier: `speculate` hides tool latency behind generation and confines early
+execution to an allowlist of side-effect-free tools, at the cost of misses (calls whose
+arguments the scanner cannot read) and wasted launches (branches not taken). `eager` runs
+the real program early with no allowlist and no waste, at the cost of un-rollback-able
+side effects for snippets that fail or are abandoned mid-stream. They are mutually
+exclusive. Eager execution puts runs in streaming mode and has no effect under Temporal
+durable execution.
+
 ## Speculative execution (experimental)
 
 `speculate` names tools that may start executing while the model is still streaming the
