@@ -26,7 +26,7 @@ from __future__ import annotations
 import asyncio
 import contextvars
 import threading
-from collections.abc import Callable, Coroutine
+from collections.abc import Awaitable, Callable, Coroutine
 from concurrent.futures import Future
 from concurrent.futures import TimeoutError as FutureTimeoutError
 from dataclasses import dataclass
@@ -183,7 +183,7 @@ class StepBridge:
     async def run_step(
         self,
         name: str,
-        operation: Callable[[], Coroutine[Any, Any, T]],
+        operation: Callable[[], Awaitable[T]],
         config: StepConfig | None = None,
     ) -> T:
         """Checkpoint `operation` as a durable step. Runs on the agent loop."""
@@ -198,6 +198,9 @@ class StepBridge:
 
         loop = asyncio.get_running_loop()
 
+        async def run_operation() -> T:
+            return await operation()
+
         def body(_step_context: Any) -> T:
             # Runs on the handler thread, inside `context.step(...)`. Hand the real work back to
             # the agent loop and block until it finishes.
@@ -210,7 +213,7 @@ class StepBridge:
                     # Creating the task inside `step_context` makes it the task's context, which is
                     # what `create_task(context=...)` does on 3.11+, spelled so it also type-checks
                     # against the repo's 3.10 target.
-                    task: asyncio.Task[T] = step_context.run(lambda: loop.create_task(operation()))
+                    task: asyncio.Task[T] = step_context.run(lambda: loop.create_task(run_operation()))
                 except BaseException as exc:  # pragma: no cover - task creation failing is not reproducible
                     result.set_exception(exc)
                     return

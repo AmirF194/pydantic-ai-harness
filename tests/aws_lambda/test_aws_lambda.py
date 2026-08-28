@@ -372,6 +372,18 @@ def act() -> str:
 
 
 class TestBinding:
+    def test_binding_does_not_mutate_the_template_capability(self) -> None:
+        capability = AWSLambdaDurability()
+
+        agent = Agent('test', name='a', capabilities=[capability])
+        bound = AWSLambdaDurability.from_agent(agent)
+
+        assert capability.agent is None
+        assert capability.default_model_id is None
+        assert bound is not None
+        assert bound.agent is agent
+        assert bound.default_model_id == 'test'
+
     def test_agent_without_a_name_is_rejected(self) -> None:
         with pytest.raises(UserError, match='unique `name`'):
             Agent(TestModel(), capabilities=[AWSLambdaDurability()])
