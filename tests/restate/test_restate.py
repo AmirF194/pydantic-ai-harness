@@ -36,12 +36,13 @@ from pydantic_ai.messages import (
 )
 from pydantic_ai.models.function import AgentInfo, DeltaToolCall, DeltaToolCalls, FunctionModel
 from pydantic_ai.tools import DeferredToolRequests
-from pydantic_ai.toolsets import ExternalToolset, FunctionToolset
+from pydantic_ai.toolsets import DynamicToolset, ExternalToolset, FunctionToolset
 from restate.exceptions import TerminalError
 
 from pydantic_ai_harness.restate import RestateDurability
 
-from .conftest import FakeRestateContext, restate_context
+from .conftest import Entry, FakeRestateContext, restate_context
+from .test_restate_mcp import FakeMCPToolset
 
 pytestmark = pytest.mark.anyio
 
@@ -516,8 +517,6 @@ class TestModelSelection:
 class TestRuntimeToolsets:
     @pytest.mark.parametrize('kind', ['function', 'mcp', 'dynamic'])
     async def test_runtime_executing_toolset_rejected_inside_handler(self, kind: str) -> None:
-        from pydantic_ai.toolsets import DynamicToolset
-
         toolset: object
         if kind == 'function':
             late = FunctionToolset[object](id='late')
@@ -530,9 +529,6 @@ class TestRuntimeToolsets:
         elif kind == 'dynamic':
             toolset = DynamicToolset[object](lambda ctx: FunctionToolset[object](id='inner'), id='late')
         else:
-            pytest.importorskip('pydantic_ai.mcp')
-            from .test_restate_mcp import FakeMCPToolset
-
             toolset = FakeMCPToolset(id='late')
 
         agent = Agent(_text_model(), name='a', capabilities=[RestateDurability()])
@@ -771,8 +767,6 @@ class TestCheckpointFormat:
         assert model_calls['calls'] == 1
 
     async def test_hand_written_model_request_payload_replays(self) -> None:
-        from .conftest import Entry
-
         counter = {'calls': 0}
         agent = Agent(_text_model(counter), name='gold', capabilities=[RestateDurability()])
 

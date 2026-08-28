@@ -15,6 +15,10 @@ finished. A step is journaled after it runs, so a crash between a tool's side ef
 entry re-runs the tool on recovery: keep tool side effects idempotent. Outside a Restate context the
 capability is transparent and the run is a normal, non-durable agent run.
 
+Restate Durability is a released, non-experimental capability. Pydantic AI Harness is still on 0.x
+releases, so the API may change between minor releases. See the repository
+[version policy](https://github.com/pydantic/pydantic-ai-harness#version-policy).
+
 [Source](https://github.com/pydantic/pydantic-ai-harness/tree/main/pydantic_ai_harness/restate/)
 
 ## Installation
@@ -83,8 +87,6 @@ with its recorded result, so the handler's step sequence must stay stable across
 - Leaf toolsets that execute their own tools (function toolsets, MCP servers) need a unique `id`,
   which identifies their steps within the handler. A `DynamicToolset` also needs an `id`; it is
   supported when built at construction time, but cannot be added per-run via `run(toolsets=...)`.
-- The agent's `name` and a toolset's `id` are part of every step name, so they should not be changed
-  once the durable agent has been deployed: a rename changes the recorded step sequence.
 - A journaled tool's return value is written to the journal as JSON bytes, so it must be
   JSON-serializable. Structured returns such as `ToolReturn` and `BinaryContent` are encoded by
   Pydantic first, so they round-trip.
@@ -124,8 +126,11 @@ agent = Agent('openai:gpt-5', name='calc', toolsets=[tools], capabilities=[Resta
 
 `False` is the only supported value for the `restate` metadata key. Every step is journaled through
 one shared set of run options, so a mapping (`metadata={'restate': {...}}`) has nothing to apply and
-raises a `UserError` rather than being dropped. MCP tools cannot opt out: they perform I/O and so are
-always journaled.
+raises a `UserError` rather than being dropped. The opt-out and this rule apply to a tool from a
+dynamic toolset as well: `False` runs it inline (its listing stays journaled), and a mapping raises.
+
+MCP tools cannot opt out: they perform I/O and so are always journaled. Setting
+`metadata={'restate': False}` on an MCP tool raises a `UserError`.
 
 ## Composition with other capabilities
 

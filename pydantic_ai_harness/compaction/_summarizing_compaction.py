@@ -22,8 +22,10 @@ from pydantic_ai.messages import (
 )
 from pydantic_ai.models import Model
 from pydantic_ai.models.fallback import FallbackModel
+from pydantic_ai.settings import ModelSettings
 from pydantic_ai.tools import RunContext
 
+from pydantic_ai_harness._usage import reserved_usage_limits
 from pydantic_ai_harness.compaction._context_window import DEFAULT_CONTEXT_WINDOW
 from pydantic_ai_harness.compaction._pinning import is_pinned, reinject_pinned
 from pydantic_ai_harness.compaction._receipts import (
@@ -43,6 +45,7 @@ from pydantic_ai_harness.compaction._shared import (
     find_safe_cutoff,
     find_token_cutoff,
     is_realtime_model,
+    record_compaction_reclaim,
     resolve_token_trigger,
     validate_token_trigger,
 )
@@ -83,6 +86,10 @@ preamble, no markdown fences.
 {messages}
 </messages>\
 """
+
+_DEFAULT_INSTRUCTIONS = (
+    'You are a context summarization assistant. Extract the most important information from conversations.'
+)
 
 _SUMMARY_PREFIX = 'Summary of previous conversation:\n\n'
 
@@ -269,6 +276,13 @@ class SummarizingCompaction(AbstractCapability[AgentDepsT]):
     `ModelRequestContext.model`; set this explicitly to pin the summarizer regardless.
     """
 
+    model_settings: ModelSettings | None = field(default=None, kw_only=True)
+    """Settings for the dedicated summary model call.
+
+    These merge over defaults carried by `model`, allowing the summary call to use a
+    policy that differs from the running agent without mutating the model.
+    """
+
     max_messages: int | None = None
     """Trigger compaction when message count exceeds this value."""
 
@@ -308,6 +322,14 @@ class SummarizingCompaction(AbstractCapability[AgentDepsT]):
     """Prompt template for generating summaries.
 
     Must contain a ``{messages}`` placeholder.
+    """
+
+    instructions: str = field(default=_DEFAULT_INSTRUCTIONS, kw_only=True)
+    """Instructions for the internal agent that writes the summary.
+
+    `summary_prompt` shapes the user turn of the summary request; this sets the internal
+    agent's static instructions, which Pydantic AI sends in the request's system prompt.
+    Override it when the summarizer endpoint requires a fixed leading instruction.
     """
 
     tokenizer: Callable[[str], int] | None = None
@@ -566,15 +588,27 @@ class SummarizingCompaction(AbstractCapability[AgentDepsT]):
         token_trigger = resolve_token_trigger(
             self.max_tokens, self.max_fraction, request_ctx.model, self.fallback_context_window, self.context_window
         )
-        if not exceeds(messages, self.max_messages, token_trigger, self.tokenizer):
+        if not exceeds(
+            messages,
+            self.max_messages,
+            token_trigger,
+            self.tokenizer,
+            model_request_parameters=request_context.model_request_parameters,
+        ):
             return request_context
-        request_context.messages = await compact_with_span(
+        compacted = await compact_with_span(
             request_ctx,
             strategy='SummarizingCompaction',
             messages=messages,
             compact=lambda: self.compact(messages, request_ctx),
             tokenizer=self.tokenizer,
         )
+        record_compaction_reclaim(
+            request_context,
+            estimate_token_count(messages, self.tokenizer),
+            estimate_token_count(compacted, self.tokenizer),
+        )
+        request_context.messages = compacted
         return request_context
 
     async def _summarize(
@@ -610,7 +644,8 @@ class SummarizingCompaction(AbstractCapability[AgentDepsT]):
         # `Model[Any]`, mirroring core's own `reinject_system_prompt` idiom.
         agent: Agent[None, str] = Agent(
             cast('Model[Any] | str', model),
-            instructions='You are a context summarization assistant. Extract the most important information from conversations.',
+            instructions=self.instructions,
+            model_settings=self.model_settings,
         )
-        result = await agent.run(prompt, usage=ctx.usage)
+        result = await agent.run(prompt, usage=ctx.usage, usage_limits=reserved_usage_limits(ctx.usage_limits))
         return result.output.strip()
