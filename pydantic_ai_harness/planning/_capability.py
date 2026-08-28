@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Sequence
+from copy import copy
 from dataclasses import KW_ONLY, dataclass, field, replace
 from typing import TYPE_CHECKING, Literal
 
@@ -123,8 +124,7 @@ class Planning(AbstractCapability[AgentDepsT]):
 
     async def for_run(self, ctx: RunContext[AgentDepsT]) -> Planning[AgentDepsT]:
         """Return a clone with this run's store resolved and cached (per-run isolation)."""
-        clone = replace(self)
-        clone._set_durable_operation_bindings(self._get_durable_operation_bindings())
+        clone = copy(self)
         clone._resolved_store = clone._resolve_store(ctx)
         return clone
 

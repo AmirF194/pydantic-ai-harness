@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Awaitable, Callable, Sequence
+from copy import copy
 from dataclasses import KW_ONLY, dataclass, field, replace
 from typing import TYPE_CHECKING, Generic, Literal, TypeGuard
 
@@ -135,12 +136,12 @@ class SystemReminders(AbstractCapability[AgentDepsT]):
     async def for_run(self, ctx: RunContext[AgentDepsT]) -> SystemReminders[AgentDepsT]:
         """Return a fresh per-run instance with reset counters (config preserved).
 
-        `replace` builds a new instance whose generated `__init__` re-initializes the
-        `init=False` fields -- `_request_count` back to `0` and `_fire_counts` to an empty
-        dict -- so concurrent runs on the same agent never share fire state.
+        The clone resets `_request_count` and `_fire_counts`, so concurrent runs on the
+        same agent do not share fire state.
         """
-        clone = replace(self)
-        clone._set_durable_operation_bindings(self._get_durable_operation_bindings())
+        clone = copy(self)
+        clone._request_count = 0
+        clone._fire_counts = {}
         return clone
 
     async def wrap_model_request(

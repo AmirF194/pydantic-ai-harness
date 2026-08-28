@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 from collections.abc import Callable
+from copy import copy
 from dataclasses import KW_ONLY, dataclass, field, replace
 from typing import Literal
 
@@ -115,8 +116,7 @@ class Memory(AbstractCapability[AgentDepsT]):
 
     async def for_run(self, ctx: RunContext[AgentDepsT]) -> Memory[AgentDepsT]:
         """Return a clone with scope resolution isolated to this run."""
-        clone = replace(self)
-        clone._set_durable_operation_bindings(self._get_durable_operation_bindings())
+        clone = copy(self)
         clone._resolved_scope = None
         clone._resolved_scope = clone._resolve_scope(ctx)
         return clone

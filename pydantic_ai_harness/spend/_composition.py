@@ -18,7 +18,7 @@ from __future__ import annotations
 import warnings
 
 from pydantic_ai.capabilities import AbstractCapability, CombinedCapability, Hooks, WrapperCapability
-from pydantic_ai.durable_exec._base import BaseDurabilityCapability  # pyright: ignore[reportPrivateUsage]
+from pydantic_ai.durable_exec import BaseDurabilityCapability
 from pydantic_ai.tools import AgentDepsT
 
 from pydantic_ai_harness.spend._exceptions import SpendCompositionWarning
@@ -125,10 +125,8 @@ def _may_reject_a_billed_response(capability: AbstractCapability[AgentDepsT]) ->
     <https://github.com/pydantic/pydantic-ai-harness/issues/531>, while DBOS recovery and
     Prefect flow retry re-execute the accrual and report nothing, leaving what the counter
     ends up holding to the store. Matched by `isinstance` against
-    the base the bundled Temporal, DBOS and Prefect integrations share, the same way
-    `PlaywrightBrowser.for_agent` matches it, so both sites move together if core renames
-    `pydantic_ai.durable_exec._base`. A public route is asked for in
-    [pydantic-ai#7771](https://github.com/pydantic/pydantic-ai/issues/7771).
+    the public base the bundled Temporal, DBOS and Prefect integrations share, the same way
+    `PlaywrightBrowser.for_agent` matches it.
 
     Everything else is reported, including a capability that would not have rejected anything
     on the run in hand. `InputGuardrail` is the case in point: it can reach a billed response

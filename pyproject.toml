@@ -169,6 +169,9 @@ bump = true
 # together under every resolution mode. Move this floor whenever that one moves.
 override-dependencies = ['anthropic>=1.0.0', 'openai>=2.45.0']
 
+[tool.uv.sources]
+pydantic-ai-slim = { git = "https://github.com/pydantic/pydantic-ai.git", branch = "claude/durable-base-declarative", subdirectory = "pydantic_ai_slim" }
+
 
 [tool.hatch.build.targets.wheel]
 packages = ['pydantic_ai_harness']
