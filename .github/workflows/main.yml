@@ -143,9 +143,10 @@ jobs:
       - run: make typecheck
 
       # `gh-aw/pydantic.md` is read by GitHub Agentic Workflows off the
-      # `gh-aw-engine` branch, and both jobs that advance that branch key off its
-      # frontmatter. Validating it on every pull request means an edit that breaks
-      # those fields fails here rather than on the release that would ship it.
+      # `gh-aw-engine` branch, and the two jobs that verify a commit before that
+      # branch advances to it key off its frontmatter. Validating it on every pull
+      # request means an edit that breaks those fields fails here rather than on
+      # the release that would ship it.
       - run: uv run --script scripts/gh_aw_engine_version.py
 
   test:
@@ -535,7 +536,7 @@ jobs:
   # token runs no code from this repository and none from PyPI. See
   # `advance-gh-aw-engine` below.
   verify-gh-aw-engine:
-    name: Verify the gh-aw engine pin
+    name: gh-aw engine / verify (release)
     needs: [release]
     # Same skipped-ancestor opt-out as `release` above.
     if: ${{ !cancelled() && needs.release.result == 'success' }}
@@ -546,7 +547,7 @@ jobs:
     outputs:
       # The advancing job takes this commit rather than resolving the tag itself,
       # so the commit that was validated is the commit that ships.
-      sha: ${{ steps.commit.outputs.sha }}
+      sha: ${{ github.sha }}
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
@@ -561,71 +562,21 @@ jobs:
       # engine definition if the definition pins that same version.
       - run: uv run --script scripts/gh_aw_engine_version.py --expect "${GITHUB_REF_NAME#v}"
 
-      - id: commit
-        run: echo "sha=${GITHUB_SHA}" >> "$GITHUB_OUTPUT"
-
   advance-gh-aw-engine:
-    name: Advance the gh-aw engine ref
+    name: gh-aw engine / advance (release)
     needs: [verify-gh-aw-engine]
     if: ${{ !cancelled() && needs.verify-gh-aw-engine.result == 'success' }}
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    # The write token is granted to a deployment of this environment, and an
-    # environment's protection rules are enforced by GitHub rather than by the
-    # workflow file. That distinction is the point: tag pushes run the workflow
-    # definition carried by the tag, so no condition written here can stop a ref
-    # from running its own version of this job. Protection rules can.
-    #
-    # A deployment ref policy is not the whole answer, because it matches the ref's
-    # name rather than its provenance: a `v*` policy is worth exactly as much as the
-    # restrictions on creating `v*` tags, and this repository has none. Required
-    # reviewers are what close that, which is what the `release` environment already
-    # uses for the publish one job up. Until an administrator configures this
-    # environment, the line is inert and the gate is the write-access list.
-    environment: gh-aw-engine
+    # The environment, the write token and the fast-forward are argued for in the
+    # called workflow, which the dispatch path calls too.
+    uses: ./.github/workflows/gh-aw-engine-advance.yml # zizmor: ignore[secrets-inherit] -- The advance credential is a `gh-aw-engine` environment secret, and only the called job declares that environment, so it cannot be named and passed from here
+    # A called workflow can only downgrade the caller's token, never raise it, so
+    # the write the advancing job needs has to be granted here.
     permissions:
       contents: write
-    steps:
-      # No checkout and no actions. This is the only job that holds a write token,
-      # and nothing it runs comes from the repository tree, from PyPI, or from a
-      # third-party action. The two API calls below are the entire job.
-      - name: Fast-forward the engine ref
-        env:
-          # Same reasoning as the dispatch workflow: the secret is held by the
-          # `gh-aw-engine` environment, so only a job that cleared its protection
-          # rules can read it, and a ruleset on `refs/heads/gh-aw-engine` restricts
-          # updates to that credential alone -- granted through a dedicated team
-          # holding only its machine account, since ruleset bypasses name roles,
-          # teams and GitHub Apps rather than people. The environment gate by
-          # itself binds our jobs and not the other accounts with write access. The
-          # fallback keeps this working before an administrator configures either.
-          GH_TOKEN: ${{ secrets.GH_AW_ENGINE_ADVANCE_TOKEN || github.token }}
-          SHA: ${{ needs.verify-gh-aw-engine.outputs.sha }}
-          ENGINE_REF: gh-aw-engine
-        run: |
-          # `force: false` has GitHub refuse a non-fast-forward server-side, so the
-          # guarantee holds even if this script is wrong. gh-aw's engine catalog
-          # names the branch rather than a commit and resolves it at compile time,
-          # so a non-fast-forward would change the definition under every consumer
-          # that recompiles.
-          if response="$(gh api -X PATCH \
-            "repos/${GITHUB_REPOSITORY}/git/refs/heads/${ENGINE_REF}" \
-            -f sha="${SHA}" -F force=false 2>&1)"; then
-            echo "${ENGINE_REF} now points at ${SHA}"
-            exit 0
-          fi
-
-          # A refused fast-forward and a branch that does not exist yet both answer
-          # 422, and only the message separates them. Anything else fails closed.
-          if ! printf '%s' "${response}" | grep -q 'Reference does not exist'; then
-            printf '%s\n' "${response}" >&2
-            echo "${ENGINE_REF} was not advanced to ${SHA}." >&2
-            exit 1
-          fi
-
-          gh api -X POST "repos/${GITHUB_REPOSITORY}/git/refs" \
-            -f ref="refs/heads/${ENGINE_REF}" -f sha="${SHA}" --silent
-          echo "${ENGINE_REF} created at ${SHA}"
+    with:
+      sha: ${{ needs.verify-gh-aw-engine.outputs.sha }}
+    # Environment secrets do not reach a called workflow otherwise.
+    secrets: inherit
 
   send-tweet:
     name: Send tweet

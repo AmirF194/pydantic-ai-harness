@@ -15,10 +15,10 @@ permissions:
 
 jobs:
   verify:
-    name: Verify main's engine pin
+    name: gh-aw engine / verify (dispatch)
     runs-on: ubuntu-latest
-    # Every step here reaches the network and none of them owns a timeout beyond
-    # the curl bounds below.
+    # Every step here but the `git rev-parse` reaches the network, and none of
+    # those owns a timeout beyond the curl bounds below.
     timeout-minutes: 10
     permissions:
       contents: read
@@ -72,68 +72,16 @@ jobs:
           fi
 
   advance:
-    name: Advance gh-aw-engine to main
+    name: gh-aw engine / advance (dispatch)
     needs: [verify]
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    # The write token is granted to a deployment of this environment, and an
-    # environment's protection rules are enforced by GitHub rather than by the
-    # workflow file. That matters here because `workflow_dispatch` runs the workflow
-    # definition carried by the ref the dispatcher picked, so the `ref: main`
-    # checkout above pins what gets validated but cannot pin the code that holds the
-    # token. Protection rules can.
-    #
-    # A deployment ref policy is not the whole answer, because it matches the ref's
-    # name rather than its provenance: the `v*` half of it (which the release job in
-    # `main.yml` relies on) is worth exactly as much as the restrictions on creating
-    # `v*` tags, and this repository has none. Required reviewers are what close
-    # that, which is what the `release` environment already uses for the publish.
-    # Until an administrator configures this environment, the line is inert and the
-    # gate is the write-access list.
-    environment: gh-aw-engine
+    # The environment, the write token and the fast-forward are argued for in the
+    # called workflow, which the release path in `main.yml` calls too.
+    uses: ./.github/workflows/gh-aw-engine-advance.yml # zizmor: ignore[secrets-inherit] -- The advance credential is a `gh-aw-engine` environment secret, and only the called job declares that environment, so it cannot be named and passed from here
+    # A called workflow can only downgrade the caller's token, never raise it, so
+    # the write the advancing job needs has to be granted here.
     permissions:
       contents: write
-    steps:
-      # No checkout and no actions. This is the only job that holds a write token,
-      # and nothing it runs comes from the repository tree, from PyPI, or from a
-      # third-party action. The two API calls below are the entire job.
-      - name: Fast-forward the engine ref
-        env:
-          # The secret lives in the `gh-aw-engine` environment, so only a job that
-          # cleared that environment's protection rules can read it. That is what
-          # makes it worth more than `github.token`: the environment gate binds our
-          # jobs, but every account with write access can move a branch on its own,
-          # so a ruleset on `refs/heads/gh-aw-engine` has to restrict updates to
-          # this credential alone. A ruleset grants bypass to roles, teams and
-          # GitHub Apps rather than to a named person, so the credential belongs to
-          # a machine account in a dedicated team holding nothing else, and that
-          # team is the only bypass. Until an administrator creates both, the
-          # fallback keeps the workflow working and the branch stays open to any
-          # writer.
-          GH_TOKEN: ${{ secrets.GH_AW_ENGINE_ADVANCE_TOKEN || github.token }}
-          SHA: ${{ needs.verify.outputs.sha }}
-          ENGINE_REF: gh-aw-engine
-        run: |
-          # `force: false` has GitHub refuse a non-fast-forward server-side, so the
-          # guarantee holds even if this script is wrong. gh-aw's engine catalog
-          # names the branch rather than a commit and resolves it at compile time,
-          # so a non-fast-forward would change the definition under every consumer
-          # that recompiles.
-          if response="$(gh api -X PATCH \
-            "repos/${GITHUB_REPOSITORY}/git/refs/heads/${ENGINE_REF}" \
-            -f sha="${SHA}" -F force=false 2>&1)"; then
-            echo "${ENGINE_REF} now points at ${SHA}"
-            exit 0
-          fi
-
-          # A refused fast-forward and a branch that does not exist yet both answer
-          # 422, and only the message separates them. Anything else fails closed.
-          if ! printf '%s' "${response}" | grep -q 'Reference does not exist'; then
-            printf '%s\n' "${response}" >&2
-            echo "${ENGINE_REF} was not advanced to ${SHA}." >&2
-            exit 1
-          fi
-
-          gh api -X POST "repos/${GITHUB_REPOSITORY}/git/refs" \
-            -f ref="refs/heads/${ENGINE_REF}" -f sha="${SHA}" --silent
-          echo "${ENGINE_REF} created at ${SHA}"
+    with:
+      sha: ${{ needs.verify.outputs.sha }}
+    # Environment secrets do not reach a called workflow otherwise.
+    secrets: inherit

@@ -11,12 +11,13 @@ than repo-local config: `engine.id` keys the entry in gh-aw's engine catalog, an
 A renamed field breaks the catalog entry, and a version that was never published breaks
 every run of it at install time.
 
-The lint job and both CI paths that move `gh-aw-engine` (the release job in `main.yml`
-and the `gh-aw-engine.yml` dispatch) call this, which is why the checks live here rather
-than inlined three times as shell.
+The lint job and the two jobs that verify a commit before `gh-aw-engine` advances to it
+(`verify-gh-aw-engine` in `main.yml` and `verify` in `gh-aw-engine.yml`) call this, which
+is why the checks live here rather than inlined three times as shell. The advancing jobs
+check out nothing and never run it.
 
 Inline dependency metadata, so `uv run --script scripts/gh_aw_engine_version.py` works
-without a project sync: the jobs that advance the ref need no other part of the harness.
+without a project sync: a verify job needs no other part of the harness.
 """
 
 from __future__ import annotations
@@ -31,7 +32,7 @@ from packaging.version import InvalidVersion, Version
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
 DEFINITION = Path(__file__).resolve().parent.parent / 'gh-aw' / 'pydantic.md'
-RELEASE_REF = 'gh-aw-engine'
+ENGINE_REF = 'gh-aw-engine'
 
 
 class _Engine(BaseModel):
@@ -40,7 +41,7 @@ class _Engine(BaseModel):
     engine_id: Literal['pydantic-ai'] = Field(alias='id')
     # Not `str | float`: an unquoted `0.21.0` is a YAML float and `0.21` loses a
     # component on the way back to text, so the quoting is part of the contract.
-    version: str = Field(min_length=1)
+    version: str
 
     @field_validator('version')
     @classmethod
@@ -91,7 +92,7 @@ def main() -> int:
     parser.add_argument(
         '--expect',
         metavar='VERSION',
-        help=f'also require `engine.version` to equal VERSION before `{RELEASE_REF}` may advance',
+        help=f'also require `engine.version` to equal VERSION before `{ENGINE_REF}` may advance',
     )
     expected: str | None = parser.parse_args().expect
 
@@ -104,9 +105,9 @@ def main() -> int:
     if expected is not None and version != expected:
         print(
             f'{DEFINITION} pins `engine.version: {version}` but the release is {expected}, so '
-            f'`{RELEASE_REF}` was not advanced and gh-aw keeps serving the definition pinned to '
+            f'`{ENGINE_REF}` was not advanced and gh-aw keeps serving the definition pinned to '
             f'{version}. The package release itself is unaffected. Bump `engine.version` on main '
-            f'and run the `{RELEASE_REF}` dispatch, or pin it before cutting the next tag.',
+            f'and run the `{ENGINE_REF}` dispatch, or pin it before cutting the next tag.',
             file=sys.stderr,
         )
         return 1
