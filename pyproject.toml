@@ -155,9 +155,9 @@ lint = [
 [tool.hatch.version]
 source = 'uv-dynamic-versioning'
 
-# STACKED ON pydantic-ai#6887 -- DELETE THIS BLOCK WHEN IT RELEASES (see the `logfire` extra above).
+# NEEDS UNRELEASED pydantic-ai (#6887, merged) -- DELETE THIS BLOCK WHEN IT RELEASES (see the `logfire` extra above).
 [tool.uv.sources]
-pydantic-ai-slim = { git = "https://github.com/pydantic/pydantic-ai.git", subdirectory = "pydantic_ai_slim", branch = "instruction-part-id" }
+pydantic-ai-slim = { git = "https://github.com/pydantic/pydantic-ai.git", subdirectory = "pydantic_ai_slim", branch = "main" }
 
 
 [tool.uv-dynamic-versioning]
