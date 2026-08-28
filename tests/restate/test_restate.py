@@ -516,7 +516,7 @@ class TestModelSelection:
 class TestRuntimeToolsets:
     @pytest.mark.parametrize('kind', ['function', 'mcp', 'dynamic'])
     async def test_runtime_executing_toolset_rejected_inside_handler(self, kind: str) -> None:
-        from pydantic_ai.toolsets._dynamic import DynamicToolset  # pyright: ignore[reportPrivateImportUsage]
+        from pydantic_ai.toolsets import DynamicToolset
 
         toolset: object
         if kind == 'function':

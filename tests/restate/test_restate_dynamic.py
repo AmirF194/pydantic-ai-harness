@@ -24,8 +24,7 @@ from pydantic_ai.messages import (
 )
 from pydantic_ai.models.function import AgentInfo, FunctionModel
 from pydantic_ai.tools import RunContext
-from pydantic_ai.toolsets import FunctionToolset
-from pydantic_ai.toolsets._dynamic import DynamicToolset  # pyright: ignore[reportPrivateImportUsage]
+from pydantic_ai.toolsets import DynamicToolset, FunctionToolset
 
 from pydantic_ai_harness.restate import RestateDurability
 

@@ -24,13 +24,18 @@ except ImportError as _import_error:
 
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
-from typing import Any, ClassVar, Literal, Protocol, TypeAlias, runtime_checkable
+from typing import Any, ClassVar, Literal
 
-from pydantic_ai.agent import EventStreamHandler
-from pydantic_ai.durable_exec._base import BaseDurabilityCapability
-from pydantic_ai.durable_exec._codec import JSON_CODEC
-from pydantic_ai.durable_exec._operation_backend import CallableOperationBackend
-from pydantic_ai.durable_exec._operation_names import JournalOperationNamer
+from pydantic_ai.agent import AbstractAgent, EventStreamHandler
+from pydantic_ai.durable_exec import (
+    JSON_CODEC,
+    BaseDurabilityCapability,
+    CallableOperationBackend,
+    DurabilityEngineSpec,
+    DurableOperationId,
+    JournalOperationNamer,
+    OperationConfigRole,
+)
 from pydantic_ai.exceptions import UserError
 from pydantic_ai.models import Model
 from pydantic_ai.tools import AgentDepsT
@@ -40,18 +45,10 @@ from restate.context import RunOptions
 from restate.exceptions import TerminalError
 from restate.extensions import current_context
 from restate.serde import JsonSerde
+from typing_extensions import Self
 
 _ENGINE_NAME = 'Restate'
 _TOOL_CONFIG_KEY = 'restate'
-
-RuntimeToolsetKind: TypeAlias = Literal['function', 'mcp', 'dynamic']
-ToolsetKind: TypeAlias = Literal['function', 'mcp', 'dynamic']
-Lifecycle: TypeAlias = Literal['enter-outside-durable', 'enter-always', 'enter-never']
-
-
-@runtime_checkable
-class _ToolOperationId(Protocol):
-    toolset_kind: ToolsetKind
 
 
 def _current_restate_context() -> restate.Context | None:
@@ -63,44 +60,44 @@ def _current_restate_context() -> restate.Context | None:
 
 
 class _RestateOperationConfig:
-    def base(self, role: object, operation_id: object) -> Mapping[str, Any]:
+    def base(self, role: OperationConfigRole, *, operation_id: DurableOperationId) -> Mapping[str, object]:
         del role, operation_id
         return {}
 
     def for_tool(
         self,
-        role: object,
-        operation_id: object,
+        role: OperationConfigRole,
+        *,
+        operation_id: DurableOperationId,
         tool: object | None,
         tool_name: str,
-    ) -> Mapping[str, Any] | Literal[False]:
-        del role, tool_name
+    ) -> Mapping[str, object] | Literal[False]:
+        del role, operation_id, tool_name
         config = (tool.tool_def.metadata or {}).get(_TOOL_CONFIG_KEY) if isinstance(tool, ToolsetTool) else None
         if config is False:
-            if isinstance(operation_id, _ToolOperationId) and operation_id.toolset_kind == 'mcp':
-                raise UserError('MCP tools cannot run outside a durable step in Restate.')
             return False
         if config:
             raise UserError('Restate run steps take no per-tool options; remove the config.')
         return {}
 
 
-class _RestateOperationBackend(CallableOperationBackend[Mapping[str, Any]]):
-    def __init__(self, agent_name: str, default_model_id: str | None) -> None:
+class _RestateOperationBackend(CallableOperationBackend[Mapping[str, object]]):
+    def __init__(self, agent_name: str, default_model_id: str) -> None:
         super().__init__(
-            namer=JournalOperationNamer(agent_name, default_model_id=default_model_id or 'default'),
+            namer=JournalOperationNamer(agent_name, default_model_id=default_model_id),
             config=_RestateOperationConfig(),
         )
 
-    async def _execute(
+    async def execute(
         self,
         *,
+        operation_id: DurableOperationId,
         name: str,
         body: Callable[[], Awaitable[object]],
         cache_key: tuple[object, ...],
-        config: object,
+        config: Mapping[str, object],
     ) -> object:
-        del cache_key
+        del operation_id, cache_key
         assert not config
         context = current_context()
         assert context is not None
@@ -151,23 +148,21 @@ class RestateDurability(BaseDurabilityCapability[AgentDepsT]):
         ```
     """
 
-    engine_name = _ENGINE_NAME
-    _codec: ClassVar = JSON_CODEC
-    _unsupported_runtime_toolset_kinds: ClassVar[frozenset[RuntimeToolsetKind]] = frozenset(
-        {'function', 'mcp', 'dynamic'}
+    engine_spec: ClassVar = DurabilityEngineSpec(
+        engine_name=_ENGINE_NAME,
+        durable_unit_noun='step',
+        durable_container_noun='handler',
+        codec=JSON_CODEC,
+        toolset_lifecycles={
+            'function': 'enter-never',
+            'mcp': 'enter-always',
+            'dynamic': 'enter-never',
+        },
+        sequential_tools_in_durable_context=True,
+        unsupported_runtime_toolset_kinds=frozenset({'function', 'mcp', 'dynamic'}),
+        tool_config_key=_TOOL_CONFIG_KEY,
     )
-    _wrapped_toolset_kinds: ClassVar[frozenset[ToolsetKind]] = frozenset({'function', 'mcp', 'dynamic'})
-    _toolset_lifecycles: ClassVar[Mapping[ToolsetKind, Lifecycle]] = {
-        'function': 'enter-never',
-        'mcp': 'enter-always',
-        'dynamic': 'enter-never',
-    }
-    _tool_call_result_upgrade_lenient: ClassVar[bool] = False
-    _journal_discovery: ClassVar[bool] = True
-    _force_sequential_tools_in_durable_context: ClassVar[bool] = True
-    _durable_unit_noun = 'step'
-    _durable_container_noun = 'handler'
-    _tool_config_key = _TOOL_CONFIG_KEY
+    _journal_default_model_id: str = 'default'
 
     def __init__(
         self,
@@ -193,9 +188,14 @@ class RestateDurability(BaseDurabilityCapability[AgentDepsT]):
         """
         super().__init__(models=models, event_stream_handler=event_stream_handler, name=name)
 
+    def for_agent(self, agent: AbstractAgent[AgentDepsT, Any]) -> Self:
+        bound = super().for_agent(agent)
+        bound._journal_default_model_id = agent.model if isinstance(agent.model, str) else 'default'
+        return bound
+
     @property
     def in_durable_context(self) -> bool:
         return _current_restate_context() is not None
 
-    def _build_operation_backend(self) -> _RestateOperationBackend:
-        return _RestateOperationBackend(self.name, self._default_model_id)
+    def get_durable_operation_backend(self) -> _RestateOperationBackend:
+        return _RestateOperationBackend(self.name, self._journal_default_model_id)
