@@ -27,6 +27,12 @@ def test_coder_agent_is_model_less_and_composed() -> None:
     assert isinstance(coder_agent, Agent)
     assert coder_agent.model is None
     assert coder_agent.name == 'coder'
+    # Pydantic AI now attributes each instruction to its source, so assert the base prompt is still
+    # the agent's own rather than dropping the check: `'agent'` is the key an application overriding
+    # this prompt addresses it by, and it would go silently missing if the attribution changed.
+    assert [(instruction.instruction, str(instruction.id)) for instruction in coder_agent._instructions] == [
+        ('You are a coding agent built on Pydantic AI.', 'agent')
+    ]
     assert any(isinstance(capability, FileSystem) for capability in coder_agent.root_capability.capabilities)
 
 
