@@ -230,7 +230,7 @@ class SystemReminders(AbstractCapability[AgentDepsT]):
                 texts.append(result)
         return texts
 
-    @durable_operation
+    @durable_operation('generate_reminder')
     async def _generate_reminder(self, ctx: RunContext[AgentDepsT], index: int, transcript: str) -> str | None:
         reminder = self.dynamic_reminders[index]
         if not _is_llm_reminder(reminder):  # pragma: no cover - operation inputs originate above

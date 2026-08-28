@@ -188,7 +188,7 @@ class Planning(AbstractCapability[AgentDepsT]):
             messages[-1] = replace(last, parts=[*last.parts, reminder])
         return await handler(request_context)
 
-    @durable_operation
+    @durable_operation('read_plan')
     async def _read_plan(self, ctx: RunContext[AgentDepsT]) -> list[PlanItem]:
         return await self.resolve_store(ctx).get_items()
 

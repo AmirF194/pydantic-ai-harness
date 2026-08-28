@@ -234,7 +234,7 @@ class Memory(AbstractCapability[AgentDepsT]):
                 )
         return request_context
 
-    @durable_operation
+    @durable_operation('load_snapshot')
     async def _load_snapshot(self, ctx: RunContext[AgentDepsT]) -> tuple[MemoryFile | None, list[str], bool]:
         store, scope = self.resolve_scope(ctx)
         main = await store.read(f'{scope}/{MAIN_FILENAME}', max_chars=self.max_memory_size)

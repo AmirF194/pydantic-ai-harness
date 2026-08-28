@@ -514,7 +514,7 @@ class SpendLimits(AbstractCapability[AgentDepsT]):
             defer_loading=defer_loading,
         )
 
-    @durable_operation
+    @durable_operation('now')
     async def _now(self) -> datetime:
         """Read the configured clock in a journaled operation."""
         return self.clock()
@@ -599,7 +599,7 @@ class SpendLimits(AbstractCapability[AgentDepsT]):
         ctx.tracer.start_span('spend budget exhausted', attributes=attributes).end()
         raise SpendLimitExceeded(f'Budget {budget.name!r} exhausted for this {budget.window}: {detail}')
 
-    @durable_operation
+    @durable_operation('read')
     async def _read(self, keys: Sequence[str]) -> Mapping[str, Spent]:
         """What each key holds, without asking the store about none of them.
 
@@ -610,7 +610,7 @@ class SpendLimits(AbstractCapability[AgentDepsT]):
         """
         return await self._store.get_many(keys) if keys else {}
 
-    @durable_operation
+    @durable_operation('accrue')
     async def _accrue(self, entries: list[SpendEntry]) -> Mapping[str, Spent]:
         """Apply one response exactly once when the durability engine replays the run."""
         return await self._store.add_many(entries) if entries else {}

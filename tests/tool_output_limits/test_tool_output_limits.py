@@ -672,7 +672,7 @@ class TestSummarize:
 
         bound = RecordingDurability.from_agent(agent)
         assert bound is not None
-        assert not any('__capability__tool_output_limits._summarize' in name for name, _ in bound.calls)
+        assert not any('__capability__tool_output_limits.summarize' in name for name, _ in bound.calls)
 
     async def test_custom_sync_summarizer(self):
         cap: ToolOutputLimits[object] = ToolOutputLimits(

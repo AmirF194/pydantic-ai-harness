@@ -432,7 +432,7 @@ class ToolOutputLimits(AbstractCapability[AgentDepsT]):
             return await self._fallback(ctx, call, action.then, unit)
         return summary, None
 
-    @durable_operation
+    @durable_operation('summarize')
     async def _summarize(
         self,
         ctx: RunContext[AgentDepsT],

@@ -202,23 +202,23 @@ class StepPersistence(AbstractCapability[AgentDepsT]):
             return ctx.run_id
         raise RuntimeError('StepPersistence run id was not materialized by `for_run`.')
 
-    @durable_operation
+    @durable_operation('register_run')
     async def _register_run(self, record: RunRecord) -> None:
         await self.store.register_run(record)
 
-    @durable_operation
+    @durable_operation('append_event')
     async def _append_event(self, event: StepEvent) -> None:
         await self.store.append_event(event)
 
-    @durable_operation
+    @durable_operation('save_snapshot')
     async def _save_snapshot(self, snapshot: ContinuableSnapshot) -> None:
         await self.store.save_snapshot(snapshot)
 
-    @durable_operation
+    @durable_operation('record_tool_effect')
     async def _record_tool_effect(self, effect: ToolEffectRecord) -> None:
         await self.store.record_tool_effect(effect)
 
-    @durable_operation
+    @durable_operation('finish_tool_effect')
     async def _finish_tool_effect(
         self,
         run_id: str,
