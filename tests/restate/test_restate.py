@@ -82,7 +82,7 @@ class _CountingOperation(AbstractCapability[object]):
     async def before_run(self, ctx: RunContext[object]) -> None:
         await self.increment(ctx)
 
-    @durable_operation
+    @durable_operation('increment')
     async def increment(self, ctx: RunContext[object]) -> int:
         self.calls.append(1)
         return len(self.calls)
