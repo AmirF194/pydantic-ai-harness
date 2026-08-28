@@ -216,5 +216,5 @@ also_copy = ['pydantic_ai_harness/', 'tests/']
 pytest_add_cli_args = ['-k', 'not trio']
 
 [tool.uv.sources]
-pydantic-ai-slim = { git = "https://github.com/pydantic/pydantic-ai.git", branch = "claude/durable-base-declarative", subdirectory = "pydantic_ai_slim" }
+pydantic-ai-slim = { git = "https://github.com/pydantic/pydantic-ai.git", branch = "main", subdirectory = "pydantic_ai_slim" }
 # See docs/mutation-testing.md for full results (89.7% kill rate, 60 equivalent mutants).
