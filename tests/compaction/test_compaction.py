@@ -2871,7 +2871,7 @@ class TestCompactWithSpan:
     async def test_non_recording_tracer_skips_attributes(self):
         # A no-op tracer returns a non-recording span, so attribute computation is skipped.
         # Events are disabled here because an emitted `CompactionStartEvent` legitimately
-        # invokes the tokenizer for its `estimated_tokens`.
+        # invokes the tokenizer for its `tokens_before`.
         before: list[ModelMessage] = [_user('a'), _user('b')]
         after: list[ModelMessage] = [_user('a')]
         called = False

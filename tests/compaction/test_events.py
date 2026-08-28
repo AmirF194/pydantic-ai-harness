@@ -66,8 +66,8 @@ async def test_cancelled_attempt_retries_and_then_emits_end() -> None:
     before = events[0]
     assert isinstance(before, CompactionStartEvent)
     assert before.strategy == 'sliding_window'
-    assert before.message_count == 2
-    assert before.estimated_tokens is not None
+    assert before.messages_before == 2
+    assert before.tokens_before is not None
     assert before.cancelled
     assert 'History before this point' not in first.all_messages_json().decode()
 
@@ -77,9 +77,9 @@ async def test_cancelled_attempt_retries_and_then_emits_end() -> None:
     retry_before = events[-2]
     assert isinstance(end, CompactionEndEvent)
     assert isinstance(retry_before, CompactionStartEvent)
-    assert end.messages_before == retry_before.message_count
+    assert end.messages_before == retry_before.messages_before
     assert end.messages_after < end.messages_before
-    assert end.tokens_before == retry_before.estimated_tokens
+    assert end.tokens_before == retry_before.tokens_before
     dropped_messages = end.messages_before - end.messages_after + 1  # the receipt itself adds one message
     assert f'({dropped_messages} messages,' in second.all_messages_json().decode()
 
@@ -149,7 +149,7 @@ async def test_fallback_cancellation_does_not_advance_but_failure_does() -> None
 def test_events_serialize() -> None:
     adapter = pydantic.TypeAdapter[AgentStreamEvent](AgentStreamEvent)
     events: list[AgentStreamEvent] = [
-        CompactionStartEvent(strategy='sliding', message_count=8, estimated_tokens=120),
+        CompactionStartEvent(strategy='sliding', messages_before=8, tokens_before=120),
         CompactionEndEvent(
             strategy='sliding',
             messages_before=8,
@@ -163,8 +163,8 @@ def test_events_serialize() -> None:
         [
             {
                 'strategy': 'sliding',
-                'message_count': 8,
-                'estimated_tokens': 120,
+                'messages_before': 8,
+                'tokens_before': 120,
                 'cancelled': False,
                 'event_kind': 'capability',
                 'kind': 'compaction.start',

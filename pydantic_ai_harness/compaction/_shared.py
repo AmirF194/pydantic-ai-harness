@@ -560,8 +560,8 @@ async def compact_with_events(
         start_event = await ctx.emit(
             CompactionStartEvent(
                 strategy=strategy,
-                message_count=len(messages),
-                estimated_tokens=tokens_before,
+                messages_before=len(messages),
+                tokens_before=tokens_before,
             )
         )
         if start_event.cancelled:
