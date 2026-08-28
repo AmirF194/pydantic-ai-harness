@@ -414,6 +414,10 @@ class TestModelSelection:
         assert 'strdef__model.request' in ctx.stored
         assert not any(name.endswith('.test') for name in ctx.stored)
 
+    async def test_string_default_model_id_with_hash_is_rejected(self) -> None:
+        with pytest.raises(UserError, match='contains'):
+            Agent('test#2', name='strdef', capabilities=[AbsurdDurability()])
+
 
 class TestRuntimeToolsets:
     async def test_runtime_executing_toolset_rejected_inside_task(self) -> None:

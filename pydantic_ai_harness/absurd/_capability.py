@@ -24,17 +24,16 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any, ClassVar, Literal
 
-from pydantic_ai.agent import AbstractAgent, EventStreamHandler, ParallelExecutionMode
+from pydantic_ai.agent import EventStreamHandler, ParallelExecutionMode
 from pydantic_ai.capabilities import WrapRunHandler
 from pydantic_ai.durable_exec import JSON_CODEC, BaseDurabilityCapability, DurabilityEngineSpec
 from pydantic_ai.exceptions import UserError
 from pydantic_ai.models import Model
 from pydantic_ai.run import AgentRunResult
 from pydantic_ai.tools import AgentDepsT, RunContext
-from typing_extensions import Self
 
 from ._context import current_async_task_context
-from ._operation_backend import AbsurdOperationBackend, AbsurdOperationConfig
+from ._operation_backend import AbsurdOperationBackend, AbsurdOperationConfig, resolve_tool_config
 
 AbsurdParallelExecutionMode = Literal['sequential', 'parallel_ordered_events']
 """Tool-call execution modes usable with Absurd. A subset of `ParallelExecutionMode`.
@@ -153,31 +152,25 @@ class AbsurdDurability(BaseDurabilityCapability[AgentDepsT]):
         for model_id in models or {}:
             _reject_model_id_hash(model_id)
         self._parallel_execution_mode: ParallelExecutionMode = parallel_execution_mode
-        self._absurd_agent: AbstractAgent[AgentDepsT, Any] | None = None
-        self._absurd_default_model_id = 'default'
-
-    def for_agent(self, agent: AbstractAgent[AgentDepsT, Any]) -> Self:
-        bound = super().for_agent(agent)
-        bound._absurd_agent = agent
-        bound._absurd_default_model_id = agent.model if isinstance(agent.model, str) else 'default'
-        return bound
 
     @property
     def in_durable_context(self) -> bool:
         return current_async_task_context() is not None
 
     def get_durable_operation_backend(self) -> AbsurdOperationBackend:
+        if self.default_model_id is not None:
+            _reject_model_id_hash(self.default_model_id)
         return AbsurdOperationBackend(
             agent_name=self.name,
-            default_model_id=self._absurd_default_model_id,
-            config=AbsurdOperationConfig(),
+            default_model_id=self.default_model_id,
+            config=AbsurdOperationConfig(model={}, event={}, capability={}, tool={}, resolve_tool=resolve_tool_config),
         )
 
     async def wrap_run(self, ctx: RunContext[AgentDepsT], *, handler: WrapRunHandler) -> AgentRunResult[Any]:
         """Allow Absurd's encounter-safe ordered parallel mode when explicitly configured."""
         if self._parallel_execution_mode == 'sequential':
             return await super().wrap_run(ctx, handler=handler)
-        agent = self._absurd_agent
+        agent = self.agent
         if agent is None or not self.in_durable_context:
             return await handler()
         with agent.parallel_tool_call_execution_mode(self._parallel_execution_mode):

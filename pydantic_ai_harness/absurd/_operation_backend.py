@@ -5,10 +5,9 @@ from typing import Any, Literal, TypeAlias
 
 from pydantic_ai import ToolsetTool
 from pydantic_ai.durable_exec import (
-    CallableOperationBackend,
     DurableOperationId,
-    JournalOperationNamer,
-    OperationConfigRole,
+    JournalCallableOperationBackend,
+    RoleBasedOperationConfig,
 )
 from pydantic_ai.exceptions import UserError
 
@@ -18,39 +17,25 @@ DurableConfig: TypeAlias = Mapping[str, Any]
 ToolConfig: TypeAlias = DurableConfig | Literal[False]
 
 
-class AbsurdOperationConfig:
-    def base(self, role: OperationConfigRole, *, operation_id: DurableOperationId) -> DurableConfig:
-        del role, operation_id
+def resolve_tool_config(operation_id: DurableOperationId, tool: object | None, tool_name: str) -> ToolConfig:
+    del operation_id
+    if not isinstance(tool, ToolsetTool) or tool.tool_def.metadata is None:
         return {}
-
-    def for_tool(
-        self,
-        role: OperationConfigRole,
-        *,
-        operation_id: DurableOperationId,
-        tool: object | None,
-        tool_name: str,
-    ) -> ToolConfig:
-        del role, operation_id
-        if not isinstance(tool, ToolsetTool) or tool.tool_def.metadata is None:
-            return {}
-        config = tool.tool_def.metadata.get('absurd')
-        if config is False:
-            return False
-        if config:
-            raise UserError(
-                f'Absurd steps take no per-tool options, so non-empty {"absurd"!r} metadata '
-                f'on tool {tool_name!r} would have no effect. Remove the config.'
-            )
-        return {}
-
-
-class AbsurdOperationBackend(CallableOperationBackend[ToolConfig]):
-    def __init__(self, *, agent_name: str, default_model_id: str | None, config: AbsurdOperationConfig) -> None:
-        super().__init__(
-            namer=JournalOperationNamer(agent_name, default_model_id=default_model_id or 'default'), config=config
+    config = tool.tool_def.metadata.get('absurd')
+    if config is False:
+        return False
+    if config:
+        raise UserError(
+            f'Absurd steps take no per-tool options, so non-empty {"absurd"!r} metadata '
+            f'on tool {tool_name!r} would have no effect. Remove the config.'
         )
+    return {}
 
+
+AbsurdOperationConfig = RoleBasedOperationConfig[DurableConfig]
+
+
+class AbsurdOperationBackend(JournalCallableOperationBackend[DurableConfig]):
     async def execute(
         self,
         *,
@@ -58,7 +43,7 @@ class AbsurdOperationBackend(CallableOperationBackend[ToolConfig]):
         name: str,
         body: Callable[[], Awaitable[object]],
         cache_key: tuple[object, ...],
-        config: ToolConfig,
+        config: DurableConfig,
     ) -> object:
         del operation_id, cache_key
         assert not config
