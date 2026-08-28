@@ -205,14 +205,16 @@ engine:
         // org namespace out of ids like `meta-llama/Llama-3.1`, so this mirrors the
         // `SplitN(model, "/", 2)` gh-aw itself uses to read the provider off.
         if (!env.PAI_MODEL) throw new Error("PAI_MODEL is required");
+        const modelProvider = env.PAI_MODEL.split("/", 1)[0].trim().toLowerCase();
         const requestedModel = env.PAI_MODEL.replace(/^[^/]*\//, "");
-        // The dotted-alias rewrite describes the api-proxy, which publishes
-        // Copilot's Claude models under dotted IDs. An endpoint named by
-        // PAI_BASE_URL gets the id the workflow wrote: a model actually called
-        // `claude-sonnet-4-5` there has to arrive as that.
-        const model = configuredBaseUrl
-          ? requestedModel
-          : requestedModel.replace(/^(claude-(?:haiku|sonnet|opus)-\d+)-(\d+)$/, "$1.$2");
+        // The dotted-alias rewrite describes the api-proxy's Copilot backend,
+        // which publishes Copilot's Claude models under dotted IDs. Every other
+        // destination — the anthropic and openai backends, or an endpoint named
+        // by PAI_BASE_URL — gets the id the workflow wrote: a model actually
+        // called `claude-sonnet-4-5` there has to arrive as that.
+        const model = !configuredBaseUrl && modelProvider === "copilot"
+          ? requestedModel.replace(/^(claude-(?:haiku|sonnet|opus)-\d+)-(\d+)$/, "$1.$2")
+          : requestedModel;
         // `-m` is always passed: the composed agent carries no model, and without
         // the flag `pai` silently falls back to its own `openai:gpt-5` default,
         // billing a model the workflow never asked for. gh-aw validates
@@ -406,11 +408,11 @@ first segment is dropped and the rest of the model ID is passed with
 `-m openai-chat:<model>`
 (`openai-chat:` selects the Pydantic AI OpenAI-compatible client and is not part
 of the model name sent upstream). Only the first segment goes, so an ID carrying
-an org namespace such as `openai/meta-llama/Llama-3.1` keeps it. On the proxy
-path, Copilot Claude aliases such as `claude-sonnet-4-5` are normalized to the
-dotted model IDs the proxy exposes, such as `claude-sonnet-4.5`; that rewrite
-does not apply when `PAI_BASE_URL` names the endpoint, which receives the ID as
-written. `-m` is always passed, because a workflow that
+an org namespace such as `openai/meta-llama/Llama-3.1` keeps it. When the provider
+segment is `copilot`, Claude aliases such as `claude-sonnet-4-5` are normalized
+to the dotted model IDs the proxy's Copilot backend exposes, such as
+`claude-sonnet-4.5`; every other destination — the `anthropic` and `openai`
+backends, or a `PAI_BASE_URL` endpoint — receives the ID as written. `-m` is always passed, because a workflow that
 declares no model would otherwise inherit the CLI's own `openai:gpt-5` default
 silently.
 
