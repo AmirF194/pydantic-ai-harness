@@ -14,6 +14,7 @@ pytest.importorskip('pydantic_ai.mcp')
 
 from typing import Any
 
+import anyio
 from pydantic_ai import Agent, ToolsetTool
 from pydantic_ai.exceptions import UserError
 from pydantic_ai.mcp import MCPToolset
@@ -229,8 +230,6 @@ class TestMultipleServers:
 class TestFakeServerFidelity:
     def test_the_fake_opens_an_implicit_session_when_not_entered(self) -> None:
         """Without this the `implicit_sessions == 0` assertion above would be vacuous."""
-        import anyio
-
         server = FakeMCPToolset(id='calc')
 
         async def call_without_entering() -> None:
@@ -256,8 +255,6 @@ class TestEnqueueGuard:
     is dropped on replay just as silently as one enqueued from a tool call."""
 
     def test_enqueue_while_listing_tools_raises(self) -> None:
-        from pydantic_ai.exceptions import UserError
-
         class EnqueueingServer(FakeMCPToolset):
             async def get_tools(self, ctx: RunContext[object]) -> dict[str, ToolsetTool[object]]:
                 ctx.enqueue('later')
@@ -270,8 +267,6 @@ class TestEnqueueGuard:
             run_durable(lambda: agent.run('add 2 and 3'), context=ctx)
 
     def test_enqueue_while_fetching_instructions_raises(self) -> None:
-        from pydantic_ai.exceptions import UserError
-
         class EnqueueingServer(FakeMCPToolset):
             async def get_instructions(self, ctx: RunContext[object]) -> InstructionPart | None:
                 ctx.enqueue('later')

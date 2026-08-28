@@ -11,6 +11,7 @@ from contextlib import asynccontextmanager
 from typing import Any
 
 import pytest
+from aws_durable_execution_sdk_python.config import StepSemantics
 from aws_durable_execution_sdk_python.exceptions import ExecutionError
 from pydantic_ai import Agent, RunContext
 from pydantic_ai._run_context import get_current_run_context  # pyright: ignore[reportPrivateUsage]
@@ -30,6 +31,8 @@ from pydantic_ai.models.function import AgentInfo, FunctionModel
 from pydantic_ai.models.test import TestModel
 from pydantic_ai.tools import DeferredToolRequests, ToolDefinition
 from pydantic_ai.toolsets import FunctionToolset
+from pydantic_ai.toolsets._dynamic import DynamicToolset  # pyright: ignore[reportPrivateUsage]
+from pydantic_ai.toolsets.external import ExternalToolset
 
 from pydantic_ai_harness.aws_lambda import (
     AWSLambdaDurability,
@@ -38,6 +41,7 @@ from pydantic_ai_harness.aws_lambda import (
 )
 
 from .conftest import FakeDurableContext
+from .test_aws_lambda_mcp import FakeMCPToolset
 
 
 def tool_then_text(tool_name: str = 'act', args: dict[str, Any] | None = None) -> FunctionModel:
@@ -102,8 +106,6 @@ class TestDurableRun:
         assert result.output == 'done'
 
     def test_steps_run_on_the_handler_thread(self) -> None:
-        import threading
-
         agent = build_agent(lambda: 'sunny')
         ctx = FakeDurableContext()
         handler_thread = threading.get_ident()
@@ -268,8 +270,6 @@ class TestCrashMidRunRetry:
 
 class TestStepConfig:
     def test_base_config_is_applied_to_every_step(self) -> None:
-        from aws_durable_execution_sdk_python.config import StepSemantics
-
         agent = build_agent(lambda: 'sunny', step_config={'step_semantics': StepSemantics.AT_MOST_ONCE_PER_RETRY})
         ctx = FakeDurableContext()
 
@@ -279,8 +279,6 @@ class TestStepConfig:
         assert all(c is not None and c.step_semantics is StepSemantics.AT_MOST_ONCE_PER_RETRY for c in configs)
 
     def test_per_tool_metadata_overrides_the_base_config_key_by_key(self) -> None:
-        from aws_durable_execution_sdk_python.config import StepSemantics
-
         toolset = FunctionToolset[object](id='tools')
 
         @toolset.tool_plain(metadata={'aws_lambda': {'step_semantics': StepSemantics.AT_MOST_ONCE_PER_RETRY}})
@@ -445,8 +443,6 @@ class TestCoverageOfRemainingPaths:
             run_durable(lambda: agent.run('go'), context=ctx)
 
     def test_toolsets_without_a_durable_wrapper_pass_through(self) -> None:
-        from pydantic_ai.toolsets.external import ExternalToolset
-
         external = ExternalToolset[object]([ToolDefinition(name='remote')], id='ext')
         agent = Agent(tool_then_text(), name='a', toolsets=[external], capabilities=[AWSLambdaDurability()])
         agent.tool_plain(act)
@@ -531,8 +527,6 @@ class TestBridgeFailureModes:
     def test_a_cancelled_step_operation_does_not_hang_the_handler(self) -> None:
         # `Task.exception()` raises for a cancelled task, so a naive done-callback would strand the
         # handler thread inside `context.step(...)` until the function timed out.
-        import asyncio
-
         def act() -> str:
             raise asyncio.CancelledError('inner cancel')
 
@@ -683,8 +677,6 @@ class TestBridgeFailureModes:
 class TestRuntimeToolsets:
     @pytest.mark.parametrize('kind', ['function', 'mcp', 'dynamic'])
     def test_executing_toolsets_added_per_run_are_rejected(self, kind: str) -> None:
-        from pydantic_ai.toolsets._dynamic import DynamicToolset
-
         toolset: object
         if kind == 'function':
             toolset = FunctionToolset[object](id='late')
@@ -692,8 +684,6 @@ class TestRuntimeToolsets:
             toolset = DynamicToolset[object](lambda ctx: FunctionToolset[object](), id='late')
         else:
             pytest.importorskip('pydantic_ai.mcp')
-            from .test_aws_lambda_mcp import FakeMCPToolset
-
             toolset = FakeMCPToolset(id='late')
 
         agent = build_agent(act)
@@ -703,8 +693,6 @@ class TestRuntimeToolsets:
             run_durable(lambda: agent.run('go', toolsets=[toolset]), context=ctx)
 
     def test_non_executing_runtime_toolsets_pass_through(self) -> None:
-        from pydantic_ai.toolsets.external import ExternalToolset
-
         agent = build_agent(act)
         ctx = FakeDurableContext()
 

@@ -14,6 +14,7 @@ pytest.importorskip('aws_durable_execution_sdk_python')
 from typing import Any
 
 from pydantic_ai import Agent
+from pydantic_ai.exceptions import UserError
 from pydantic_ai.messages import (
     ModelMessage,
     ModelResponse,
@@ -106,8 +107,6 @@ class TestDynamicToolset:
         assert resolver.calls == [21]
 
     def test_a_dynamic_toolset_needs_an_id(self) -> None:
-        from pydantic_ai.exceptions import UserError
-
         dynamic = DynamicToolset[object](Resolver())
         with pytest.raises(UserError, match='unique `id`'):
             Agent(double_then_done(), name='d', toolsets=[dynamic], capabilities=[AWSLambdaDurability()])
@@ -138,7 +137,6 @@ class TestEnqueueGuard:
         """Resolution is checkpointed, so on replay the recorded tool set is served and the factory
         never runs again -- anything it enqueued the first time round would be lost. The factory is
         user code, which makes this the discovery path most likely to try."""
-        from pydantic_ai.exceptions import UserError
 
         def resolver(ctx: RunContext[object]) -> FunctionToolset[object]:
             ctx.enqueue('later')

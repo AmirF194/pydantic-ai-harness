@@ -8,7 +8,9 @@ from contextlib import asynccontextmanager
 from typing import Protocol, TypeGuard, runtime_checkable
 
 import pytest
+import sniffio
 from pydantic_ai import Agent, RunContext
+from pydantic_ai.capabilities import AbstractCapability
 from pydantic_ai.exceptions import ModelRetry
 from pydantic_ai.messages import ModelMessage, ModelResponse, TextPart, ToolCallPart, ToolReturnPart
 from pydantic_ai.models.function import AgentInfo, FunctionModel
@@ -16,6 +18,9 @@ from pydantic_ai.models.test import TestModel
 from pydantic_ai.toolsets import AbstractToolset
 from pydantic_ai.usage import RunUsage
 
+import pydantic_ai_harness
+import pydantic_ai_harness.modal_sandbox as modal_sandbox
+from pydantic_ai_harness.code_mode import CodeMode
 from pydantic_ai_harness.modal_sandbox import (
     ModalSandbox,
     ModalSandboxError,
@@ -23,6 +28,7 @@ from pydantic_ai_harness.modal_sandbox import (
     ModalSandboxTerminalError,
     ModalSandboxUnavailableError,
 )
+from pydantic_ai_harness.modal_sandbox import ModalSandbox as Exported
 
 from .fake_modal import FakeModal, FileInfo
 
@@ -776,19 +782,14 @@ class TestCapability:
         assert ModalSandbox(sandbox_id='sb-keep', max_command_timeout=600).max_command_timeout == 600
 
     def test_exported_from_capability_submodule(self) -> None:
-        import pydantic_ai_harness
-        import pydantic_ai_harness.modal_sandbox as modal_sandbox
-        from pydantic_ai_harness.modal_sandbox import ModalSandbox as Exported
 
         assert Exported is ModalSandbox
         assert 'ModalSandboxToolset' not in modal_sandbox.__all__
         assert 'ModalSandboxExecResult' in modal_sandbox.__all__
-        # Capabilities with optional dependencies are imported from their submodule, not the package root.
-        assert 'ModalSandbox' not in pydantic_ai_harness.__all__
+        assert pydantic_ai_harness.ModalSandbox is ModalSandbox
 
     @pytest.mark.anyio(backends=['asyncio'])
     async def test_agent_integration(self, fake_modal: FakeModal) -> None:
-        import sniffio
 
         if sniffio.current_async_library() != 'asyncio':  # pragma: no cover
             pytest.skip('Agent.run() requires asyncio')
@@ -800,7 +801,6 @@ class TestCapability:
 
     @pytest.mark.anyio(backends=['asyncio'])
     async def test_agent_can_call_run_command(self, fake_modal: FakeModal) -> None:
-        import sniffio
 
         if sniffio.current_async_library() != 'asyncio':  # pragma: no cover
             pytest.skip('Agent.run() requires asyncio')
@@ -828,7 +828,6 @@ class TestCapability:
 
     @pytest.mark.anyio(backends=['asyncio'])
     async def test_agent_context_does_not_create_an_unused_base_sandbox(self, fake_modal: FakeModal) -> None:
-        import sniffio
 
         if sniffio.current_async_library() != 'asyncio':  # pragma: no cover
             pytest.skip('Agent.run() requires asyncio')
@@ -847,7 +846,6 @@ class TestCapability:
 
     @pytest.mark.anyio(backends=['asyncio'])
     async def test_agent_run_failing_terminally_still_tears_down(self, fake_modal: FakeModal) -> None:
-        import sniffio
 
         if sniffio.current_async_library() != 'asyncio':  # pragma: no cover
             pytest.skip('Agent.run() requires asyncio')
@@ -867,3 +865,56 @@ class TestCapability:
             await agent.run('run a command')
         assert fake_modal.sandboxes[0].terminated is True
         assert fake_modal.sandboxes[0].detached is True
+
+
+async def _tools_offered_to_model(*, modal_first: bool) -> dict[str, str | None]:
+    """Run an agent with ModalSandbox and CodeMode and return the tools the model was offered."""
+    offered: dict[str, str | None] = {}
+
+    def capture(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        offered.update({tool.name: tool.description for tool in info.function_tools})
+        return ModelResponse(parts=[TextPart('done')])
+
+    sandbox = ModalSandbox[object]()
+    code_mode = CodeMode[object]()
+    capabilities: list[AbstractCapability[object]] = [sandbox, code_mode] if modal_first else [code_mode, sandbox]
+    agent: Agent[None, str] = Agent(FunctionModel(capture), capabilities=capabilities)
+    await agent.run('go')
+    return offered
+
+
+class TestCodeModeInterop:
+    """`run_command` takes a command line, so CodeMode leaves it native.
+
+    Folding it into `run_code` would make the model write a Monty script whose argument is a
+    shell script quoted as a Python string, running the outer script on the host and the inner
+    one in the microVM. The file tools carry no command line, so they stay sandboxed like any
+    other tool.
+    """
+
+    @pytest.mark.anyio(backends=['asyncio'])
+    @pytest.mark.parametrize('modal_first', [True, False], ids=['modal-first', 'code-mode-first'])
+    async def test_run_command_stays_native(self, fake_modal: FakeModal, modal_first: bool) -> None:
+
+        if sniffio.current_async_library() != 'asyncio':  # pragma: no cover
+            pytest.skip('Agent.run() requires asyncio')
+        tools = await _tools_offered_to_model(modal_first=modal_first)
+
+        assert 'run_command' in tools
+        run_code_description = tools['run_code']
+        assert run_code_description is not None
+        assert 'async def run_command' not in run_code_description
+
+    @pytest.mark.anyio(backends=['asyncio'])
+    @pytest.mark.parametrize('modal_first', [True, False], ids=['modal-first', 'code-mode-first'])
+    async def test_file_tools_are_still_sandboxed(self, fake_modal: FakeModal, modal_first: bool) -> None:
+
+        if sniffio.current_async_library() != 'asyncio':  # pragma: no cover
+            pytest.skip('Agent.run() requires asyncio')
+        tools = await _tools_offered_to_model(modal_first=modal_first)
+
+        run_code_description = tools['run_code']
+        assert run_code_description is not None
+        for name in ('read_file', 'write_file', 'list_directory'):
+            assert name not in tools
+            assert f'async def {name}' in run_code_description

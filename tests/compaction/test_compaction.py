@@ -2,23 +2,33 @@
 
 from __future__ import annotations
 
+import asyncio
 import dataclasses
 from typing import Any
 from unittest.mock import AsyncMock, patch
 
 import pytest
-from opentelemetry.trace import NoOpTracer, Tracer
-from pydantic_ai import Agent
-from pydantic_ai.capabilities import AbstractCapability
+from opentelemetry.trace import NoOpTracer, Tracer, get_tracer
+from pydantic_ai import Agent, Tool
+from pydantic_ai.capabilities import AbstractCapability, ToolSearch
+from pydantic_ai.exceptions import ModelAPIError
 from pydantic_ai.messages import (
+    BinaryContent,
+    CachePoint,
+    FilePart,
+    ImageUrl,
     LoadCapabilityCallPart,
     ModelMessage,
     ModelMessagesTypeAdapter,
     ModelRequest,
     ModelResponse,
+    NativeToolCallPart,
+    NativeToolReturnPart,
+    RetryPromptPart,
     SystemPromptPart,
     TextContent,
     TextPart,
+    ThinkingPart,
     ToolCallPart,
     ToolReturnPart,
     ToolSearchCallPart,
@@ -26,21 +36,31 @@ from pydantic_ai.messages import (
     ToolSearchReturnPart,
     UserPromptPart,
 )
+from pydantic_ai.messages import ModelResponse as _MR
+from pydantic_ai.messages import TextPart as _TP
 from pydantic_ai.models import Model, ModelRequestContext, ModelRequestParameters
+from pydantic_ai.models.fallback import FallbackModel
 from pydantic_ai.models.function import AgentInfo, FunctionModel
+from pydantic_ai.models.instrumented import InstrumentationSettings
 from pydantic_ai.models.test import TestModel
+from pydantic_ai.settings import ModelSettings
+from pydantic_ai.tools import RunContext
 from pydantic_ai.toolsets._tool_search import parse_discovered_tools
-from pydantic_ai.usage import RunUsage
+from pydantic_ai.usage import RequestUsage, RunUsage, UsageLimits
 
+import pydantic_ai_harness
+import pydantic_ai_harness.compaction as compaction
 from pydantic_ai_harness.compaction import (
     ClampOversizedMessages,
     ClearToolResults,
     DeduplicateFileReads,
+    FallbackCompaction,
     SlidingWindowCompaction,
     SummarizingCompaction,
     TieredCompaction,
     TranscriptHandleProvider,
     WarnNearLimits,
+    estimate_context_tokens,
     estimate_token_count,
     is_pinned,
     pin,
@@ -60,11 +80,13 @@ from pydantic_ai_harness.compaction._shared import (
     prepend_first_user_message,
 )
 from pydantic_ai_harness.compaction._summarizing_compaction import (
+    _DEFAULT_SUMMARY_PROMPT,
     _SUMMARY_PREFIX,
     _extract_previous_summary,
     _extract_system_prompts,
     _format_messages,
 )
+from pydantic_ai_harness.step_persistence import InMemoryStepStore, StepPersistence
 
 try:
     from logfire.testing import CaptureLogfire
@@ -83,6 +105,7 @@ def _make_ctx(
     requests: int = 0,
     input_tokens: int = 0,
     output_tokens: int = 0,
+    usage_limits: UsageLimits | None = None,
 ) -> Any:
     """Build a minimal RunContext-like object for testing hooks."""
 
@@ -91,6 +114,7 @@ def _make_ctx(
     @dataclasses.dataclass
     class _FakeCtx:
         usage: RunUsage
+        usage_limits: UsageLimits | None = None
         model: Model = dataclasses.field(default_factory=TestModel)
         deps: None = None
         tracer: Tracer = dataclasses.field(default_factory=NoOpTracer)
@@ -101,7 +125,7 @@ def _make_ctx(
             default_factory=dict[str, AbstractCapability[None]]
         )
 
-    return _FakeCtx(usage=usage)
+    return _FakeCtx(usage=usage, usage_limits=usage_limits)
 
 
 def _make_request_context(messages: list[ModelMessage], model: Model | None = None) -> ModelRequestContext:
@@ -167,6 +191,73 @@ class TestEstimateTokenCount:
             _tool_return('search', 'tc1', 'result text here'),
         ]
         assert estimate_token_count(msgs) > 0
+
+
+# ---------------------------------------------------------------------------
+# estimate_context_tokens
+# ---------------------------------------------------------------------------
+
+
+def _assistant_with_usage(text: str, input_tokens: int, output_tokens: int) -> ModelResponse:
+    return ModelResponse(
+        parts=[TextPart(content=text)],
+        usage=RequestUsage(input_tokens=input_tokens, output_tokens=output_tokens),
+    )
+
+
+class TestEstimateContextTokens:
+    def test_no_usage_falls_back_to_heuristic(self):
+        msgs: list[ModelMessage] = [_user('x' * 40), _assistant('y' * 40)]
+        assert estimate_context_tokens(msgs) == estimate_token_count(msgs)
+
+    def test_anchors_on_reported_usage(self):
+        # The heuristic would say ~12 tokens; the provider said the request was 50K.
+        msgs: list[ModelMessage] = [_user('x' * 40), _assistant_with_usage('short', 50_000, 500)]
+        assert estimate_context_tokens(msgs) == 50_500
+
+    def test_counts_only_messages_after_the_anchor(self):
+        msgs: list[ModelMessage] = [
+            _user('x' * 40),
+            _assistant_with_usage('short', 50_000, 500),
+            _tool_return('search', 'tc1', 'z' * 400),
+        ]
+        assert estimate_context_tokens(msgs) == 50_500 + 100
+
+    def test_anchors_on_the_most_recent_usage(self):
+        msgs: list[ModelMessage] = [
+            _assistant_with_usage('a', 10_000, 100),
+            _user('x' * 40),
+            _assistant_with_usage('b', 50_000, 1_000),
+        ]
+        assert estimate_context_tokens(msgs) == 51_000
+
+    def test_zero_usage_response_is_not_an_anchor(self):
+        # TestModel/FunctionModel histories report no usage; the whole history falls back.
+        msgs: list[ModelMessage] = [_user('x' * 40), _assistant('y' * 40)]
+        assert estimate_context_tokens(msgs) == estimate_token_count(msgs) > 0
+
+    def test_suffix_does_not_recount_unchanged_instructions(self):
+        # Instructions travelled inside the anchor's input_tokens; counting the copy carried
+        # by a later request would double them.
+        request_before = ModelRequest(parts=[UserPromptPart(content='q')], instructions='i' * 4_000)
+        request_after = ModelRequest(parts=[UserPromptPart(content='a' * 40)], instructions='i' * 4_000)
+        msgs: list[ModelMessage] = [request_before, _assistant_with_usage('short', 50_000, 500), request_after]
+        assert estimate_context_tokens(msgs) == 50_500 + 10
+
+    def test_instructions_changed_after_the_anchor_are_counted(self):
+        # The anchor paid for the old instructions only; a new set (dynamic instructions, or a
+        # resumed history under a new prompt) must be added to the estimate.
+        request_before = ModelRequest(parts=[UserPromptPart(content='q')], instructions='old')
+        request_after = ModelRequest(parts=[UserPromptPart(content='a' * 40)], instructions='i' * 4_000)
+        msgs: list[ModelMessage] = [request_before, _assistant_with_usage('short', 50_000, 500), request_after]
+        assert estimate_context_tokens(msgs) == 50_500 + 10 + 1_000
+
+    def test_tokenizer_applies_to_the_suffix(self):
+        msgs: list[ModelMessage] = [
+            _assistant_with_usage('short', 50_000, 500),
+            _user('three short words'),
+        ]
+        assert estimate_context_tokens(msgs, tokenizer=lambda s: len(s.split())) == 50_503
 
 
 # ---------------------------------------------------------------------------
@@ -363,6 +454,122 @@ class TestSlidingWindowCompaction:
         assert len(result.messages) < 10
 
 
+class TestFallbackCompaction:
+    @pytest.fixture
+    def anyio_backend(self) -> str:
+        # The exhausted-model test runs a real Agent; trio hits a core event-loop quirk unrelated to compaction.
+        return 'asyncio'
+
+    def test_validation_empty_chain(self):
+        with pytest.raises(ValueError, match='fallback_chain must not be empty'):
+            FallbackCompaction(fallback_chain=[])
+
+    def test_validation_empty_fallback_on(self):
+        with pytest.raises(ValueError, match='fallback_on must not be empty'):
+            FallbackCompaction(fallback_chain=[AsyncMock()], fallback_on=())
+
+    def test_validation_cancelled_error(self):
+        with pytest.raises(ValueError, match='fallback_on must contain only Exception subclasses'):
+            FallbackCompaction(
+                fallback_chain=[AsyncMock()],
+                fallback_on=(asyncio.CancelledError,),  # pyright: ignore[reportArgumentType]
+            )
+
+    @pytest.mark.anyio
+    async def test_returns_first_success(self):
+        first = AsyncMock()
+        first.compact.return_value = [_user('summary')]
+        second = AsyncMock()
+        fallback = FallbackCompaction(fallback_chain=[first, second])
+
+        result = await fallback.compact([_user('original')], _make_ctx())
+
+        assert result == first.compact.return_value
+        second.compact.assert_not_called()
+
+    @pytest.mark.anyio
+    async def test_fallback_receives_fresh_original_list(self):
+        class MutateThenFail:
+            async def compact(self, messages: list[ModelMessage], ctx: RunContext[None]) -> list[ModelMessage]:
+                messages.clear()
+                raise RuntimeError('summary failed')
+
+        second = AsyncMock()
+        messages: list[ModelMessage] = [_user('original')]
+        second.compact.return_value = messages
+        fallback = FallbackCompaction(fallback_chain=[MutateThenFail(), second], fallback_on=(RuntimeError,))
+
+        result = await fallback.compact(messages, _make_ctx())
+
+        assert result == messages
+        assert second.compact.call_args.args[0] == messages
+
+    @pytest.mark.anyio
+    async def test_reraises_last_failure(self):
+        first = AsyncMock()
+        first.compact.side_effect = ValueError('first')
+        second = AsyncMock()
+        second.compact.side_effect = RuntimeError('last')
+        fallback = FallbackCompaction(fallback_chain=[first, second], fallback_on=(Exception,))
+
+        with pytest.raises(RuntimeError, match='last'):
+            await fallback.compact([_user('original')], _make_ctx())
+
+    @pytest.mark.anyio
+    async def test_non_matching_error_does_not_fallback(self):
+        first = AsyncMock()
+        first.compact.side_effect = ValueError('programming error')
+        second = AsyncMock()
+        fallback = FallbackCompaction(fallback_chain=[first, second])
+
+        with pytest.raises(ValueError, match='programming error'):
+            await fallback.compact([_user('original')], _make_ctx())
+        second.compact.assert_not_called()
+
+    @pytest.mark.anyio
+    async def test_cancellation_does_not_fallback(self):
+        first = AsyncMock()
+        first.compact.side_effect = asyncio.CancelledError
+        second = AsyncMock()
+        fallback = FallbackCompaction(fallback_chain=[first, second])
+
+        with pytest.raises(asyncio.CancelledError):
+            await fallback.compact([_user('original')], _make_ctx())
+        second.compact.assert_not_called()
+
+    @pytest.mark.anyio
+    async def test_fallback_model_exhaustion_uses_next_strategy(self):
+        def fail(_messages: list[ModelMessage], _info: AgentInfo) -> ModelResponse:
+            raise ModelAPIError('summarizer', 'rejected history')
+
+        summarizer = SummarizingCompaction(
+            model=FallbackModel(FunctionModel(fail), FunctionModel(fail)),
+            max_messages=1,
+            keep_messages=1,
+        )
+        deterministic = AsyncMock()
+        deterministic.compact.return_value = [_user('trimmed')]
+        fallback = FallbackCompaction(fallback_chain=[summarizer, deterministic])
+
+        result = await fallback.compact([_user('old'), _assistant('old'), _user('recent')], _make_ctx())
+
+        assert result == deterministic.compact.return_value
+        deterministic.compact.assert_awaited_once()
+
+    def test_with_focus_updates_only_supported_strategies(self):
+        summarizer = SummarizingCompaction(max_messages=1)
+        sliding = SlidingWindowCompaction(max_messages=1)
+        fallback = FallbackCompaction(fallback_chain=[summarizer, sliding])
+
+        focused = fallback.with_focus('authentication')
+
+        assert focused is not fallback
+        focused_summarizer = focused.fallback_chain[0]
+        assert isinstance(focused_summarizer, SummarizingCompaction)
+        assert 'Give particular weight to: authentication' in focused_summarizer.summary_prompt
+        assert focused.fallback_chain[1] is sliding
+
+
 # ---------------------------------------------------------------------------
 # WarnNearLimits
 # ---------------------------------------------------------------------------
@@ -533,6 +740,37 @@ class TestCompaction:
         ctx = _make_ctx()
         result = await comp.before_model_request(ctx, rc)
         assert result.messages == messages
+
+    @pytest.mark.anyio
+    async def test_summary_model_settings_override_model_defaults_without_mutation(self, anyio_backend: str):
+        if anyio_backend != 'asyncio':
+            pytest.skip('pydantic-ai Agent execution uses asyncio')
+        observed_settings: list[ModelSettings | None] = []
+
+        def summarize(_messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+            observed_settings.append(info.model_settings)
+            return ModelResponse(parts=[TextPart(content='A summary.')])
+
+        model_defaults = ModelSettings(temperature=1.0, max_tokens=4_096)
+        original_model_defaults = model_defaults.copy()
+        model = FunctionModel(summarize, settings=model_defaults)
+        summary_settings = ModelSettings(max_tokens=1_024)
+        original_summary_settings = summary_settings.copy()
+        comp = SummarizingCompaction(
+            model=model,
+            model_settings=summary_settings,
+            max_messages=1,
+            keep_messages=1,
+        )
+
+        await comp.compact(
+            [_user('first'), _assistant('response'), _user('latest')],
+            _make_ctx(),
+        )
+
+        assert observed_settings == [ModelSettings(temperature=1.0, max_tokens=1_024)]
+        assert summary_settings == original_summary_settings
+        assert model_defaults == original_model_defaults
 
     @pytest.mark.anyio
     async def test_compaction_replaces_old_messages(self):
@@ -734,9 +972,7 @@ class TestExtractSystemPrompts:
 
 
 class TestExports:
-    def test_exposed_under_submodule_only(self):
-        import pydantic_ai_harness
-        import pydantic_ai_harness.compaction as compaction
+    def test_exposed_under_submodule_and_top_level(self):
 
         names = [
             'SlidingWindowCompaction',
@@ -745,12 +981,11 @@ class TestExports:
             'WarnNearLimits',
             'SummarizingCompaction',
             'TieredCompaction',
+            'FallbackCompaction',
         ]
         for name in names:
-            # Available from the capability submodule...
             assert hasattr(compaction, name)
-            # ...and deliberately NOT from the top-level namespace.
-            assert not hasattr(pydantic_ai_harness, name)
+            assert getattr(pydantic_ai_harness, name) is getattr(compaction, name)
 
 
 # ---------------------------------------------------------------------------
@@ -762,7 +997,6 @@ class TestUserPromptMultiModal:
     """Cover _user_prompt_text_for_counting and _user_prompt_text for non-string UserContent."""
 
     def test_estimate_with_text_content_parts(self):
-        from pydantic_ai.messages import TextContent
 
         part = UserPromptPart(content=[TextContent(content='hello')])
         msgs: list[ModelMessage] = [ModelRequest(parts=[part])]
@@ -777,7 +1011,6 @@ class TestUserPromptMultiModal:
         assert estimate_token_count(msgs) == 2
 
     def test_format_with_text_content(self):
-        from pydantic_ai.messages import TextContent
 
         part = UserPromptPart(content=[TextContent(content='multi-part')])
         msgs: list[ModelMessage] = [ModelRequest(parts=[part])]
@@ -1810,6 +2043,52 @@ class TestTieredCompaction:
         assert len(result.messages) == 1
 
     @pytest.mark.anyio
+    async def test_triggers_on_anchored_usage_the_heuristic_cannot_see(self):
+        # ~101 tokens by the heuristic, but the provider reported the request at 90K:
+        # dense content the character estimate is blind to. The anchored gate must fire.
+        calls: list[str] = []
+        t1 = _RecordingTier('t1', calls, drop=1)
+        cap = TieredCompaction(tiers=[t1], target_tokens=50_000)
+        messages: list[ModelMessage] = [_user('x' * 400), _assistant_with_usage('short', 90_000, 100)]
+        rc = _make_request_context(messages)
+        result = await cap.before_model_request(_make_ctx(), rc)
+        assert calls == ['t1']
+        assert len(result.messages) == 1
+
+    @pytest.mark.anyio
+    async def test_escalation_subtracts_tier_reclaim_from_anchored_baseline(self):
+        # The anchor predates any tier rewrite, so re-anchoring would show no reclaim and
+        # always escalate to the last tier. Subtracting the removed text's estimate must
+        # register t1's reclaim (14K -> 12K <= 13K target) and never reach t2.
+        calls: list[str] = []
+        t1 = _RecordingTier('t1', calls, drop=6)
+        t2 = _RecordingTier('t2', calls)
+        cap = TieredCompaction(tiers=[t1, t2], target_tokens=13_000, tokenizer=len)
+        messages: list[ModelMessage] = [_assistant_with_usage('', 10_000, 0)] + [
+            _tool_return('search', f'tc{i}', 'z' * 400) for i in range(10)
+        ]
+        rc = _make_request_context(messages)
+        result = await cap.before_model_request(_make_ctx(), rc)
+        assert calls == ['t1']
+        assert len(result.messages) == 5
+
+    @pytest.mark.anyio
+    async def test_escalation_never_counts_fixed_overhead_as_reclaimed(self):
+        # 100K of the baseline is anchored overhead (tool definitions, instructions) that no
+        # tier can touch. Halving the 4K of message text must leave the estimate at ~102K,
+        # not the ~52K a proportional rescale would claim, so escalation continues to t2.
+        calls: list[str] = []
+        t1 = _RecordingTier('t1', calls, drop=6)
+        t2 = _RecordingTier('t2', calls)
+        cap = TieredCompaction(tiers=[t1, t2], target_tokens=60_000, tokenizer=len)
+        messages: list[ModelMessage] = [_assistant_with_usage('', 100_000, 0)] + [
+            _tool_return('search', f'tc{i}', 'z' * 400) for i in range(10)
+        ]
+        rc = _make_request_context(messages)
+        await cap.before_model_request(_make_ctx(), rc)
+        assert calls == ['t1', 't2']
+
+    @pytest.mark.anyio
     async def test_full_escalation(self):
         calls: list[str] = []
         t1 = _RecordingTier('t1', calls, drop=1)  # 5 -> 4 messages (~40 tokens) still > 15
@@ -1887,8 +2166,62 @@ class TestSummarizingCompactionModel:
         # Its usage is threaded into the parent run for honest accounting.
         assert mock_agent_instance.run.call_args.kwargs['usage'] is ctx.usage
 
+    @pytest.mark.anyio
+    async def test_nested_summary_reserves_parent_usage_limits(self):
+        comp = SummarizingCompaction(max_messages=3, keep_messages=1, preserve_first_user_message=False)
+        messages: list[ModelMessage] = [_user('a'), _assistant('b'), _user('c'), _assistant('d')]
+        ctx = _make_ctx(usage_limits=UsageLimits(request_limit=5, tool_calls_limit=2))
+
+        mock_result = AsyncMock()
+        mock_result.output = 'Bounded summary.'
+        with patch('pydantic_ai.Agent') as MockAgent:
+            mock_agent_instance = AsyncMock()
+            mock_agent_instance.run.return_value = mock_result
+            MockAgent.return_value = mock_agent_instance
+            await comp.before_model_request(ctx, _make_request_context(messages))
+
+        assert mock_agent_instance.run.call_args.kwargs['usage_limits'] == UsageLimits(
+            request_limit=4, tool_calls_limit=2
+        )
+
+    @pytest.mark.anyio
+    async def test_summarizer_agent_gets_the_default_instructions(self):
+        comp = SummarizingCompaction(max_messages=3, keep_messages=1, preserve_first_user_message=False)
+        messages: list[ModelMessage] = [_user('a'), _assistant('b'), _user('c'), _assistant('d')]
+
+        mock_result = AsyncMock()
+        mock_result.output = 'Default-instructions summary.'
+        with patch('pydantic_ai.Agent') as MockAgent:
+            mock_agent_instance = AsyncMock()
+            mock_agent_instance.run.return_value = mock_result
+            MockAgent.return_value = mock_agent_instance
+            await comp.before_model_request(_make_ctx(), _make_request_context(messages))
+
+        assert MockAgent.call_args.kwargs['instructions'] == comp.instructions
+        assert 'context summarization assistant' in MockAgent.call_args.kwargs['instructions']
+
+    @pytest.mark.anyio
+    async def test_instructions_override_reaches_the_summarizer_agent(self):
+        required = 'Required endpoint instruction.'
+        comp = SummarizingCompaction(
+            max_messages=3,
+            keep_messages=1,
+            preserve_first_user_message=False,
+            instructions=required,
+        )
+        messages: list[ModelMessage] = [_user('a'), _assistant('b'), _user('c'), _assistant('d')]
+
+        mock_result = AsyncMock()
+        mock_result.output = 'Overridden-instructions summary.'
+        with patch('pydantic_ai.Agent') as MockAgent:
+            mock_agent_instance = AsyncMock()
+            mock_agent_instance.run.return_value = mock_result
+            MockAgent.return_value = mock_agent_instance
+            await comp.before_model_request(_make_ctx(), _make_request_context(messages))
+
+        assert MockAgent.call_args.kwargs['instructions'] == required
+
     def test_default_prompt_has_structured_sections(self):
-        from pydantic_ai_harness.compaction._summarizing_compaction import _DEFAULT_SUMMARY_PROMPT
 
         for heading in (
             '## Intent',
@@ -2047,7 +2380,6 @@ class TestClampOversizedMessages:
 
     @pytest.mark.anyio
     async def test_request_messages_and_other_parts_untouched(self):
-        from pydantic_ai.messages import ThinkingPart
 
         big_user = _user('u' * 5_000)
         mixed = ModelResponse(parts=[ThinkingPart(content='t' * 5_000), TextPart(content='z' * 5_000)])
@@ -2093,8 +2425,6 @@ class TestPublicPath:
 
     @pytest.mark.anyio
     async def test_capabilities_wired_into_agent(self):
-        from pydantic_ai import Agent
-        from pydantic_ai.models.test import TestModel
 
         agent = Agent(
             TestModel(),
@@ -2105,8 +2435,6 @@ class TestPublicPath:
 
     @pytest.mark.anyio
     async def test_clamp_oversized_wired_into_agent(self):
-        from pydantic_ai import Agent
-        from pydantic_ai.models.test import TestModel
 
         agent = Agent(
             TestModel(),
@@ -2122,9 +2450,6 @@ class TestPublicPath:
         # `parse_discovered_tools`; blanking it to a string used to crash the *next*
         # request. Drive a multi-request run (search -> clear fires -> another request)
         # and assert it completes with discovery intact.
-        from pydantic_ai import Agent, Tool
-        from pydantic_ai.capabilities import ToolSearch
-        from pydantic_ai.models.function import FunctionModel
 
         def hidden_gem(x: int) -> int:
             return x + 1
@@ -2178,7 +2503,6 @@ class TestHelperBranchCoverage:
 
     def test_a_retry_and_a_thinking_block_are_counted(self):
         """Both are sent to the provider, and a run under load is where they appear."""
-        from pydantic_ai.messages import RetryPromptPart, ThinkingPart
 
         msgs: list[ModelMessage] = [
             ModelRequest(parts=[RetryPromptPart(content='r' * 400)]),
@@ -2191,7 +2515,6 @@ class TestHelperBranchCoverage:
 
     def test_a_provider_side_tool_call_and_its_result_are_counted(self):
         """A web search runs on the provider's side and its result still lands in the context."""
-        from pydantic_ai.messages import NativeToolCallPart, NativeToolReturnPart
 
         msgs: list[ModelMessage] = [
             ModelResponse(
@@ -2222,7 +2545,6 @@ class TestHelperBranchCoverage:
 
     def test_a_binary_part_is_not_counted_as_characters(self):
         """`FilePart` carries bytes; its length in characters would mean nothing."""
-        from pydantic_ai.messages import BinaryContent, FilePart
 
         msgs: list[ModelMessage] = [
             ModelResponse(parts=[FilePart(content=BinaryContent(data=b'\x00' * 4_000, media_type='image/png'))])
@@ -2231,7 +2553,6 @@ class TestHelperBranchCoverage:
         assert _format_messages(msgs) == ''
 
     def test_user_prompt_text_skips_non_text_content(self):
-        from pydantic_ai.messages import ImageUrl
 
         part = UserPromptPart(content=[ImageUrl(url='https://example.com/y.png'), 'hello'])
         msgs: list[ModelMessage] = [ModelRequest(parts=[part])]
@@ -2306,7 +2627,6 @@ def _make_ctx_with_tracer() -> Any:
     The `capfire` fixture configures the global OTel provider, so a tracer fetched from it
     captures the `compact_messages` span without needing a full instrumented `Agent` run.
     """
-    from opentelemetry.trace import get_tracer
 
     ctx = _make_ctx()
     ctx.tracer = get_tracer('test')
@@ -2323,9 +2643,6 @@ class TestCompactionSpan:
 
     @pytest.mark.anyio
     async def test_span_emitted_when_threshold_exceeded(self, capfire: CaptureLogfire) -> None:
-        from pydantic_ai import Agent
-        from pydantic_ai.models.instrumented import InstrumentationSettings
-        from pydantic_ai.models.test import TestModel
 
         agent: Agent[None, str] = Agent(
             TestModel(),
@@ -2348,9 +2665,6 @@ class TestCompactionSpan:
 
     @pytest.mark.anyio
     async def test_no_span_when_threshold_not_exceeded(self, capfire: CaptureLogfire) -> None:
-        from pydantic_ai import Agent
-        from pydantic_ai.models.instrumented import InstrumentationSettings
-        from pydantic_ai.models.test import TestModel
 
         agent: Agent[None, str] = Agent(
             TestModel(),
@@ -2408,7 +2722,6 @@ class TestCompactionSpan:
 
     @pytest.mark.anyio
     async def test_clamp_no_span_for_non_oversized_or_skipped_parts(self, capfire: CaptureLogfire) -> None:
-        from pydantic_ai.messages import ThinkingPart
 
         comp = ClampOversizedMessages(max_part_chars=1_000, clamp_tool_call_args=True)
         messages: list[ModelMessage] = [
@@ -3067,7 +3380,6 @@ class TestKeepUserMessages:
 
     @pytest.mark.anyio
     async def test_bounds_text_inside_sequence_content(self):
-        from pydantic_ai.messages import CachePoint
 
         comp = SummarizingCompaction(
             model='test:m',
@@ -3243,9 +3555,6 @@ class TestAnchoredIncremental:
 
     @pytest.mark.anyio
     async def test_previous_summary_fed_as_anchor_with_update_instruction(self):
-        from pydantic_ai.messages import ModelResponse as _MR
-        from pydantic_ai.messages import TextPart as _TP
-        from pydantic_ai.models.function import FunctionModel
 
         captured: list[str] = []
 
@@ -3357,7 +3666,6 @@ class TestBridgePrefix:
 
     @pytest.mark.anyio
     async def test_same_fallback_model_does_not_add_a_bridge(self):
-        from pydantic_ai.models.fallback import FallbackModel
 
         fallback = FallbackModel(TestModel(), TestModel())
         ctx = _make_ctx()
@@ -3427,7 +3735,6 @@ class TestPinsSurviveStrategies:
 class TestStepPersistenceHandle:
     @pytest.mark.anyio
     async def test_handle_is_run_id_and_reaches_the_receipt(self):
-        from pydantic_ai_harness.step_persistence import InMemoryStepStore, StepPersistence
 
         sp: StepPersistence[None] = StepPersistence(store=InMemoryStepStore(), run_id='libr-1')
         assert isinstance(sp, TranscriptHandleProvider)
@@ -3435,7 +3742,6 @@ class TestStepPersistenceHandle:
         assert 'Persisted run handle: libr-1.' in await _receipt_for(_CtxWith.capabilities(sp=sp))
 
     def test_handle_none_before_materialization(self):
-        from pydantic_ai_harness.step_persistence import InMemoryStepStore, StepPersistence
 
         sp: StepPersistence[None] = StepPersistence(store=InMemoryStepStore())
         assert sp.compaction_transcript_handle() is None
