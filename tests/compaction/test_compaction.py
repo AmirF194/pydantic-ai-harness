@@ -109,8 +109,8 @@ def _make_ctx(
             default_factory=dict[str, AbstractCapability[None]]
         )
 
-        async def emit_event(self, event: Any) -> Any:
-            # Like the real `RunContext.emit_event` with no listeners: inline dispatch
+        async def emit(self, event: Any) -> Any:
+            # Like the real `RunContext.emit` with no listeners: inline dispatch
             # returns the (unmutated) event for the emitter to inspect.
             return event
 
@@ -2885,7 +2885,7 @@ class TestCompactWithSpan:
             return after
 
         result = await compact_with_span(
-            _make_ctx(), strategy='Strat', messages=before, compact=_compact, tokenizer=_tokenizer, emit_events=False
+            _make_ctx(), strategy='Strat', messages=before, compact=_compact, tokenizer=_tokenizer, emits=False
         )
         assert result is after
         assert called is False

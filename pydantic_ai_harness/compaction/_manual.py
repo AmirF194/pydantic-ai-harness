@@ -123,5 +123,5 @@ async def compact_now(
         messages=messages,
         compact=lambda: focused.compact(messages, ctx),
         tokenizer=tokenizer,
-        emit_events=False,
+        emits=False,
     )

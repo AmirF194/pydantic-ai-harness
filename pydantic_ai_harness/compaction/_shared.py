@@ -481,7 +481,7 @@ async def compact_with_span(
     messages: list[ModelMessage],
     compact: Callable[[], Awaitable[list[ModelMessage]]],
     tokenizer: Callable[[str], int] | None = None,
-    emit_events: bool = True,
+    emits: bool = True,
 ) -> list[ModelMessage]:
     """Run *compact* and emit lifecycle signals when it changes the history.
 
@@ -497,7 +497,7 @@ async def compact_with_span(
         compact: Zero-argument async callable returning the compacted message list.
         tokenizer: Optional tokenizer for the `compaction.tokens_*` estimates. When `None`,
             uses the same ~4 characters-per-token heuristic as `estimate_token_count`.
-        emit_events: Whether to emit lifecycle events. Disable this outside an agent run.
+        emits: Whether to emit lifecycle events. Disable this outside an agent run.
     """
     token = open_receipt_scope()
     try:
@@ -507,7 +507,7 @@ async def compact_with_span(
             messages=messages,
             compact=compact,
             tokenizer=tokenizer,
-            emit_events=emit_events,
+            emits=emits,
         )
         receipts = drain_receipts()
     finally:
@@ -547,17 +547,17 @@ async def compact_with_events(
     messages: list[ModelMessage],
     compact: Callable[[], Awaitable[list[ModelMessage]]],
     tokenizer: Callable[[str], int] | None = None,
-    emit_events: bool | None = None,
+    emits: bool | None = None,
 ) -> list[ModelMessage]:
     """Run one strategy attempt with a cancellable start event and a changed-only end event."""
-    enabled = _COMPACTION_EVENTS_ENABLED.get() if emit_events is None else emit_events
+    enabled = _COMPACTION_EVENTS_ENABLED.get() if emits is None else emits
     token = _COMPACTION_EVENTS_ENABLED.set(enabled)
     try:
         if not enabled:
             return await compact()
 
         tokens_before = estimate_token_count(messages, tokenizer)
-        start_event = await ctx.emit_event(
+        start_event = await ctx.emit(
             CompactionStartEvent(
                 strategy=strategy,
                 message_count=len(messages),
@@ -570,7 +570,7 @@ async def compact_with_events(
         compacted = await compact()
         if not _history_changed(messages, compacted):
             return messages
-        await ctx.emit_event(
+        await ctx.emit(
             CompactionEndEvent(
                 strategy=strategy,
                 messages_before=len(messages),
