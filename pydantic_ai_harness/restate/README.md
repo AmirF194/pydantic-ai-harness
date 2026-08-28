@@ -22,7 +22,7 @@ releases, so the API may change between minor releases. See the repository
 ## Installation
 
 ```bash
-uv add "pydantic-ai-harness[restate]"
+uv add "pydantic-ai-harness[restate]" "pydantic-ai-slim[openai]"
 ```
 
 ## Quick start
