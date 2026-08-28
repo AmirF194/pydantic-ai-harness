@@ -158,7 +158,7 @@ async def run_blocks(capfire: CaptureLogfire, name: str, value: dict[str, Any]) 
         capabilities=[AgentControl(name, label='production')],
     )
 
-    @agent.instructions(id='today')
+    @agent.instructions(name='today')
     def today(_ctx: RunContext[object]) -> str:
         return 'DYNAMIC: today is Monday.'
 
@@ -168,8 +168,12 @@ async def run_blocks(capfire: CaptureLogfire, name: str, value: dict[str, Any]) 
 
 
 def triples(parts: list[InstructionPart]) -> list[tuple[str | None, str, bool]]:
-    """Each block as the `(id, text, dynamic)` the model was sent it under."""
-    return [(part.id, part.content, part.dynamic) for part in parts]
+    """Each part as the `(id, text, dynamic)` the model was sent it under.
+
+    The id is rendered to the string a managed config addresses it by, which is the form this
+    capability's whole contract is written in.
+    """
+    return [(str(part.id) if part.id is not None else None, part.content, part.dynamic) for part in parts]
 
 
 AGENT_BLOCK = ('agent', 'AGENT: You are a concise checkout assistant.', False)
@@ -561,7 +565,7 @@ async def test_auto_create_snapshots_every_instruction_block(
         capabilities=[AgentControl()],
     )
 
-    @agent.instructions(id='today')
+    @agent.instructions(name='today')
     def today(_ctx: RunContext[object]) -> str:
         return 'DYNAMIC: today is Monday.'
 
@@ -604,7 +608,7 @@ async def test_existing_variable_publishes_changed_baseline_once_without_clobber
         capabilities=[AgentControl(label='production')],
     )
 
-    @agent.instructions(id='today')
+    @agent.instructions(name='today')
     def dynamic(_ctx: RunContext[object]) -> str:
         return f'DYNAMIC: today is {today[0]}.'
 
@@ -682,7 +686,7 @@ async def test_baseline_publish_failure_does_not_affect_run_and_warns_once(
     instruction = ['first']
     agent = Agent(TestModel(), name='publish_failure', capabilities=[AgentControl(label='production')])
 
-    @agent.instructions(id='changing')
+    @agent.instructions(name='changing')
     def changing(_ctx: RunContext[object]) -> str:
         return instruction[0]
 

@@ -422,8 +422,8 @@ from pydantic-ai's [`InstructionPart.id`](https://ai.pydantic.dev/api/messages/#
 | `agent` | the agent's own literal `instructions` |
 | `toolset:<id>` | everything a toolset with that `id` contributes |
 | `capability:<id>` | everything a capability with that `id` contributes |
-| `agent:<declared>` | one `@agent.instructions(id=...)` block |
-| `capability:<id>:<declared>` | one `@capability.instructions(id=...)` block |
+| `agent:<name>` | one `@agent.instructions(name=...)` part |
+| `capability:<id>:<name>` | one `@capability.instructions(name=...)` part |
 
 Blocks pydantic-ai cannot key have no entry that reaches them: a callable passed to
 `Agent(instructions=...)`, anything from `run(instructions=...)`, a toolset with no `id` of its own. An

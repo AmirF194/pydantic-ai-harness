@@ -167,30 +167,30 @@ The keys are Pydantic AI's
 [`InstructionPart.id`](https://ai.pydantic.dev/api/messages/#pydantic_ai.messages.InstructionPart.id):
 
 A **source key** addresses everything that source contributes; appending a segment addresses one
-block the author declared within it:
+part the author named within it:
 
 | `id` | Addresses |
 | --- | --- |
 | `agent` | the agent's own literal `instructions` |
 | `toolset:<id>` | everything a toolset with that `id` contributes |
 | `capability:<id>` | everything a capability with that `id` contributes |
-| `agent:<declared>` | one block the agent declared |
-| `toolset:<id>:<declared>` | one block that toolset declared |
-| `capability:<id>:<declared>` | one block that capability declared |
+| `agent:<name>` | one part the agent named |
+| `toolset:<id>:<name>` | one part that toolset named |
+| `capability:<id>:<name>` | one part that capability named |
 
-An author declares a block's id either where a function is registered
-(`@agent.instructions(id=...)`, `@capability.instructions(id=...)`) or on the text itself, by writing
-it as an `InstructionPart` with an `id` — in `Agent(instructions=...)`, `Capability(instructions=...)`,
-or a `get_instructions()` return. They name the block relative to what they own (`limits`) and
+A code author names a part either where a function is registered
+(`@agent.instructions(name=...)`, `@capability.instructions(name=...)`) or on the text itself, by writing
+it as an `InstructionPart` with a `name` — in `Agent(instructions=...)`, `Capability(instructions=...)`,
+or a `get_instructions()` return. They name the part relative to what they own (`limits`) and
 Pydantic AI qualifies it against the source key (`toolset:weather:limits`), so a code author never
-repeats their own identity and no block can claim a top-level key.
+repeats their own identity and no part can claim a top-level key.
 
-Blocks Pydantic AI cannot key cannot be addressed at all: a callable passed to
-`Agent(instructions=...)` without a declared `id`, anything from `run(instructions=...)`, and
-anything from a toolset or capability that has no `id` of its own — without a source key there is
-nothing for a declared segment to hang off. Give the toolset or capability an `id`, or declare one on
-the block, if you want it reachable. An `id` that matches nothing here is inert rather than an error,
-so one config can be applied across services that don't all install the same toolsets.
+Parts Pydantic AI cannot key cannot be addressed at all: a callable passed to
+`Agent(instructions=...)` with no `name`, anything from `run(instructions=...)`, and anything from a
+toolset or capability that has no `id` of its own — without a source key there is nothing for a name
+to hang off. Give the toolset or capability an `id`, or name the part, if you want it reachable. An
+`id` that matches nothing here is inert rather than an error, so one config can be applied across
+services that don't all install the same toolsets.
 
 !!! warning "Don't re-add the prompt you already have"
     Copying an agent's observed system prompt into a managed value as *added* text -- lifted out of a

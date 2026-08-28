@@ -404,6 +404,16 @@ def _added_instructions(config: AgentConfig) -> str | None:
     return '\n\n'.join(added) or None
 
 
+def _instruction_key(part: InstructionPart) -> str | None:
+    """The string key a managed config addresses this part by, or `None` if nothing addresses it.
+
+    Pydantic AI issues a structured [`InstructionId`][pydantic_ai.messages.InstructionId]; a managed
+    config arrives as JSON and names parts by the string that id renders to. Bridging the two once
+    here keeps every caller comparing keys of the same kind.
+    """
+    return str(part.id) if part.id is not None else None
+
+
 def _instruction_overrides(config: AgentConfig) -> dict[str, str | None]:
     """Replacement text per addressed [`InstructionPart.id`][pydantic_ai.messages.InstructionPart.id], `None` to drop it."""
     return _first_by_key(
@@ -1193,10 +1203,11 @@ class AgentControl(ManagedVariableCapability[AgentDepsT, AgentConfig]):
             return request_context
         parts: list[InstructionPart] = []
         for part in parameters.instruction_parts:
-            if part.id is None or part.id not in overrides:
+            key = _instruction_key(part)
+            if key is None or key not in overrides:
                 parts.append(part)
                 continue
-            replacement = overrides[part.id]
+            replacement = overrides[key]
             if replacement is not None:
                 parts.append(replace(part, content=replacement))
         request_context.model_request_parameters = replace(parameters, instruction_parts=parts)
@@ -1266,9 +1277,9 @@ class AgentControl(ManagedVariableCapability[AgentDepsT, AgentConfig]):
         """
         own_instruction_id = f'capability:{self.id}'
         instructions: list[InstructionText | InstructionBlock] = [
-            InstructionBlock(id=part.id, instructions=part.content, dynamic=part.dynamic)
+            InstructionBlock(id=_instruction_key(part), instructions=part.content, dynamic=part.dynamic)
             for part in request_context.model_request_parameters.instruction_parts or []
-            if part.content.strip() and part.id != own_instruction_id
+            if part.content.strip() and _instruction_key(part) != own_instruction_id
         ]
         tool_definitions: list[ToolDefinitionOverride] = []
         for tool in self._code_tools.get() or []:
