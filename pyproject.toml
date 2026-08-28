@@ -176,7 +176,6 @@ override-dependencies = ['anthropic>=1.0.0', 'openai>=3.0.0']
 
 
 [tool.uv.sources]
-openai = { git = "https://github.com/openai/openai-python.git", branch = "main" }
 pydantic-ai-slim = { git = "https://github.com/pydantic/pydantic-ai.git", branch = "main", subdirectory = "pydantic_ai_slim" }
 
 
