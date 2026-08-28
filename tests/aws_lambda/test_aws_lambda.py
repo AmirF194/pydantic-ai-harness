@@ -138,7 +138,7 @@ class TestCapabilityOperation:
             async def before_run(self, ctx: RunContext[Any]) -> None:
                 await self.record(ctx, 'value')
 
-            @durable_operation
+            @durable_operation('record')
             async def record(self, ctx: RunContext[Any], value: str) -> str:
                 self.calls += 1
                 return value
