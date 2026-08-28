@@ -360,7 +360,7 @@ class FileSystemToolset(FunctionToolset[AgentDepsT]):
             if ctx is not None:
                 safe_path = _model_safe_filename(os.fspath(resolved), self._real_root)
                 content_hash = hashlib.sha256(raw).hexdigest()[:12]
-                await ctx.emit_event(FileReadEvent(path=safe_path, content_hash=content_hash))
+                await ctx.emit(FileReadEvent(path=safe_path, content_hash=content_hash))
             return f'[Binary file: {size} bytes. Use a binary-aware tool to inspect.]'
 
         text = raw.decode('utf-8', errors='replace')
@@ -368,7 +368,7 @@ class FileSystemToolset(FunctionToolset[AgentDepsT]):
         content_hash = _content_hash(text)
         safe_path = _model_safe_filename(os.fspath(resolved), self._real_root)
         if ctx is not None:
-            await ctx.emit_event(FileReadEvent(path=safe_path, content_hash=content_hash))
+            await ctx.emit(FileReadEvent(path=safe_path, content_hash=content_hash))
 
         header = f'[{path} | {len(lines)} lines | hash:{content_hash}]\n'
         return header + _format_lines(lines, offset, limit)
@@ -480,7 +480,7 @@ class FileSystemToolset(FunctionToolset[AgentDepsT]):
         lines = len(content.splitlines())
         safe_path = _model_safe_filename(os.fspath(resolved), self._real_root)
         if ctx is not None:
-            await ctx.emit_event(FileWrittenEvent(path=safe_path, content_hash=new_hash))
+            await ctx.emit(FileWrittenEvent(path=safe_path, content_hash=new_hash))
         return f'Wrote {len(content)} chars ({lines} lines) to {path}. [hash:{new_hash}]'
 
     async def edit_file(self, path: str, old_text: str, new_text: str, *, expected_hash: str | None = None) -> str:
@@ -551,7 +551,7 @@ class FileSystemToolset(FunctionToolset[AgentDepsT]):
         new_hash = _content_hash(new_content)
         safe_path = _model_safe_filename(os.fspath(resolved), self._real_root)
         if ctx is not None:
-            await ctx.emit_event(FileWrittenEvent(path=safe_path, content_hash=new_hash))
+            await ctx.emit(FileWrittenEvent(path=safe_path, content_hash=new_hash))
         return f'Edited {path}. [hash:{new_hash}]'
 
     async def list_directory(self, path: str = '.') -> str:
@@ -613,7 +613,7 @@ class FileSystemToolset(FunctionToolset[AgentDepsT]):
             entry_count += 1
         safe_path = _model_safe_filename(os.fspath(resolved), self._real_root)
         if ctx is not None:
-            await ctx.emit_event(DirectoryListedEvent(path=safe_path, entry_count=entry_count))
+            await ctx.emit(DirectoryListedEvent(path=safe_path, entry_count=entry_count))
         return '\n'.join(entries) if entries else '(empty directory)'
 
     @_recoverable
