@@ -90,7 +90,7 @@ class TestCapabilityOperation:
             async def before_run(self, ctx: RunContext[object]) -> None:
                 await self.record(ctx, 'started')
 
-            @durable_operation
+            @durable_operation('record')
             async def record(self, ctx: RunContext[object], value: str) -> None:
                 del ctx
                 calls.append(value)
