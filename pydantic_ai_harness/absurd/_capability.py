@@ -22,6 +22,7 @@ except ImportError as _import_error:  # pragma: no cover
 
 from collections.abc import Mapping
 from dataclasses import dataclass
+from threading import Lock
 from typing import Any, ClassVar, Literal
 
 from pydantic_ai.agent import EventStreamHandler, ParallelExecutionMode
@@ -31,6 +32,7 @@ from pydantic_ai.exceptions import UserError
 from pydantic_ai.models import Model
 from pydantic_ai.run import AgentRunResult
 from pydantic_ai.tools import AgentDepsT, RunContext
+from pydantic_ai.toolsets import AbstractToolset
 
 from ._context import current_async_task_context
 from ._operation_backend import AbsurdOperationBackend, AbsurdOperationConfig, resolve_tool_config
@@ -52,6 +54,11 @@ in the model's tool-call order once the whole batch completes, so every repeated
 calls and event-handler steps alike -- lines up on replay."""
 
 _ENGINE_NAME = 'Absurd'
+
+# Absurd disambiguates repeated step names by encounter order within one task. Two overlapping
+# runs using the same task context and namespace would therefore claim each other's checkpoints.
+_active_run_namespaces: set[tuple[object, str]] = set()
+_active_run_namespaces_lock = Lock()
 
 
 def _reject_model_id_hash(model_id: str) -> None:
@@ -166,12 +173,33 @@ class AbsurdDurability(BaseDurabilityCapability[AgentDepsT]):
             config=AbsurdOperationConfig(model={}, event={}, capability={}, tool={}, resolve_tool=resolve_tool_config),
         )
 
+    def get_wrapper_toolset(self, toolset: AbstractToolset[AgentDepsT]) -> AbstractToolset[AgentDepsT] | None:
+        """Register construction-time toolsets added through a decorator after agent binding."""
+        if self.agent is not None:  # pragma: no branch
+            self._register_toolsets(self.agent)
+        return super().get_wrapper_toolset(toolset)
+
     async def wrap_run(self, ctx: RunContext[AgentDepsT], *, handler: WrapRunHandler) -> AgentRunResult[Any]:
         """Allow Absurd's encounter-safe ordered parallel mode when explicitly configured."""
-        if self._parallel_execution_mode == 'sequential':
-            return await super().wrap_run(ctx, handler=handler)
         agent = self.agent
-        if agent is None or not self.in_durable_context:
+        task_ctx = current_async_task_context()
+        if agent is None or task_ctx is None:
             return await handler()
-        with agent.parallel_tool_call_execution_mode(self._parallel_execution_mode):
-            return await handler()
+
+        namespace_key = (task_ctx, self.name)
+        with _active_run_namespaces_lock:
+            if namespace_key in _active_run_namespaces:
+                raise UserError(
+                    f'Concurrent Absurd agent runs with checkpoint namespace {self.name!r} are not supported '
+                    'in the same task context. Await one run before starting another, or use a distinct '
+                    '`AbsurdDurability(name=...)` value or task context.'
+                )
+            _active_run_namespaces.add(namespace_key)
+        try:
+            if self._parallel_execution_mode == 'sequential':
+                return await super().wrap_run(ctx, handler=handler)
+            with agent.parallel_tool_call_execution_mode(self._parallel_execution_mode):
+                return await handler()
+        finally:
+            with _active_run_namespaces_lock:
+                _active_run_namespaces.remove(namespace_key)

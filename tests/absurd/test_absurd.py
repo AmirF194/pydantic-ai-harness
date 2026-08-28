@@ -40,7 +40,7 @@ from pydantic_ai.toolsets import ExternalToolset, FunctionToolset
 
 from pydantic_ai_harness.absurd import AbsurdDurability
 
-from .conftest import FakeAsyncTaskContext, FakeSyncTaskContext, absurd_task_context
+from ._helpers import FakeAsyncTaskContext, FakeSyncTaskContext, absurd_task_context
 
 pytestmark = pytest.mark.anyio
 
@@ -439,6 +439,61 @@ class TestRuntimeToolsets:
         with absurd_task_context(ctx):
             result = await agent.run('hi', toolsets=[ExternalToolset(tool_defs=[])])
         assert result.output == 'ok'
+
+    async def test_decorated_toolset_added_after_binding_is_checkpointed(self) -> None:
+        calls = {'factory': 0, 'tool': 0}
+        agent = Agent(
+            _tool_then_done_model('greet', {'name': 'Ada'}), name='decorated', capabilities=[AbsurdDurability()]
+        )
+
+        @agent.toolset(id='decorated-tools')
+        def build(ctx: RunContext[object]) -> FunctionToolset[object]:
+            del ctx
+            calls['factory'] += 1
+            toolset = FunctionToolset[object](id='inner')
+
+            @toolset.tool_plain
+            def greet(name: str) -> str:
+                calls['tool'] += 1
+                return f'hello {name}'
+
+            return toolset
+
+        ctx = FakeAsyncTaskContext()
+        with absurd_task_context(ctx):
+            first = await agent.run('greet')
+
+        first_factory_calls = calls['factory']
+        replay = ctx.replay()
+        with absurd_task_context(replay):
+            second = await agent.run('greet')
+
+        assert first.output == second.output == 'done'
+        assert calls == {'factory': first_factory_calls, 'tool': 1}
+        assert replay.invoked == []
+
+
+class TestConcurrentRuns:
+    async def test_same_task_namespace_cannot_overlap(self) -> None:
+        started = asyncio.Event()
+        release = asyncio.Event()
+
+        async def model_fn(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+            started.set()
+            await release.wait()
+            return ModelResponse(parts=[TextPart(content='ok')])
+
+        agent = Agent(FunctionModel(model_fn), name='shared', capabilities=[AbsurdDurability()])
+        ctx = FakeAsyncTaskContext()
+        with absurd_task_context(ctx):
+            first = asyncio.create_task(agent.run('first'))
+            await asyncio.wait_for(started.wait(), timeout=1)
+            try:
+                with pytest.raises(UserError, match='Concurrent Absurd agent runs'):
+                    await asyncio.wait_for(agent.run('second'), timeout=1)
+            finally:
+                release.set()
+                await asyncio.wait_for(first, timeout=1)
 
 
 class TestNonWrappedLeaf:

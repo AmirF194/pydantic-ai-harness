@@ -31,7 +31,7 @@ from pydantic_ai.toolsets._dynamic import DynamicToolset  # pyright: ignore[repo
 
 from pydantic_ai_harness import CodeMode
 from pydantic_ai_harness.absurd import AbsurdDurability
-from tests.absurd.conftest import (  # pyright: ignore[reportMissingTypeStubs]
+from tests.absurd._helpers import (  # pyright: ignore[reportMissingTypeStubs]
     FakeAsyncTaskContext,
     absurd_task_context,
 )

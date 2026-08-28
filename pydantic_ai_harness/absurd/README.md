@@ -1,7 +1,5 @@
 # Absurd Durability
 
-> The API may change between releases. Where practical, breaking changes ship with a deprecation warning.
-
 `AbsurdDurability` makes an agent run durable on [Absurd](https://github.com/earendil-works/absurd), a
 Postgres-based durable-execution engine by Armin Ronacher (Python SDK `absurd-sdk`). Attach the
 capability and call `agent.run()` inside an Absurd task handler: every model request, MCP call, and
@@ -13,6 +11,8 @@ effect and its checkpoint re-runs the tool on recovery: keep tool side effects i
 task the capability is transparent and the run is a normal, non-durable agent run.
 
 [Source](https://github.com/pydantic/pydantic-ai-harness/tree/main/pydantic_ai_harness/absurd/)
+
+> While Pydantic AI Harness is on 0.x releases, the API may change between minor releases; when it does, deprecation warnings and release-note migration guidance tell you (or your agent) exactly how to upgrade. See the [version policy](https://github.com/pydantic/pydantic-ai-harness#version-policy).
 
 ## Installation
 
@@ -106,6 +106,9 @@ checkpoint and lines up on replay.
   contain `#`, the character Absurd uses to disambiguate repeated step names. A `#` in a model id
   is rejected with a `UserError`.
 - A checkpointed tool's return value is stored in Postgres as JSON, so it must be JSON-serializable.
+- Concurrent runs with the same capability name in one Absurd task context are rejected because
+  encounter-order step names would let the runs claim each other's checkpoints. Await one run
+  before starting another, or give each run a distinct capability `name` or task context.
 - The executing toolsets are fixed when the agent is constructed. Passing an executing toolset
   per-run via `run(toolsets=...)` inside a task raises a `UserError`, because a runtime toolset has
   no registered steps and would re-run its side effects on recovery. Non-executing toolsets such as
@@ -116,6 +119,14 @@ checkpoint and lines up on replay.
   checkpointed. The handler may run more than once if the run recovers before that step is
   checkpointed, so keep its side effects idempotent.
 - Do not use `run_sync` inside a task handler. The handler is async; use `await agent.run(...)`.
+
+## Parallel execution
+
+`parallel_execution_mode` defaults to `'sequential'`. Set it to `'parallel_ordered_events'` to run
+tool calls concurrently while emitting their result events in model-call order. Plain `'parallel'`
+is excluded because completion-order event delivery can assign repeated event-handler step names
+to different calls on replay. Outside an Absurd task, the agent's configured execution mode is left
+unchanged.
 
 ## Per-tool opt-out
 

@@ -28,7 +28,7 @@ from pydantic_ai.toolsets._dynamic import DynamicToolset  # pyright: ignore[repo
 
 from pydantic_ai_harness.absurd import AbsurdDurability
 
-from .conftest import FakeAsyncTaskContext, absurd_task_context
+from ._helpers import FakeAsyncTaskContext, absurd_task_context
 
 pytestmark = pytest.mark.anyio
 

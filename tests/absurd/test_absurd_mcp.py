@@ -31,7 +31,7 @@ from pydantic_ai.tools import RunContext, ToolDefinition
 
 from pydantic_ai_harness.absurd import AbsurdDurability
 
-from .conftest import FakeAsyncTaskContext, absurd_task_context
+from ._helpers import FakeAsyncTaskContext, absurd_task_context
 
 pytestmark = pytest.mark.anyio
 
