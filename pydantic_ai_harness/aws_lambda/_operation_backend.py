@@ -5,17 +5,17 @@ from typing import Any, Literal
 
 from aws_durable_execution_sdk_python.config import StepConfig
 from aws_durable_execution_sdk_python.exceptions import ExecutionError
-from pydantic_ai.durable_exec._operation import (
-    CallToolId,
+from pydantic_ai.durable_exec import (
+    CallableOperationBackend,
     DurableOperationId,
-    GetInstructionsId,
-    GetToolsId,
+    JournalOperationNamer,
     OperationConfigRole,
+    ToolsetCallToolId,
+    ToolsetGetInstructionsId,
+    ToolsetGetToolsId,
     ToolsetKind,
-    ValidateToolArgumentsId,
+    ToolsetValidateToolArgumentsId,
 )
-from pydantic_ai.durable_exec._operation_backend import CallableOperationBackend
-from pydantic_ai.durable_exec._operation_names import JournalOperationNamer
 from pydantic_core import PydanticSerializationError
 
 from ._bridge import current_bridge
@@ -31,15 +31,15 @@ class AWSLambdaOperationConfig:
         self._base = base
         self._tool = tool
 
-    def base(self, role: OperationConfigRole, operation_id: DurableOperationId) -> StepConfig | None:
-        if role is OperationConfigRole.CAPABILITY:
+    def base(self, role: OperationConfigRole, *, operation_id: DurableOperationId) -> StepConfig | None:
+        if role == 'capability':
             return None
-        if role in (OperationConfigRole.MODEL, OperationConfigRole.EVENT):
+        if role in ('model', 'event'):
             return _step_config(self._base)
-        if isinstance(operation_id, GetInstructionsId):
+        if isinstance(operation_id, ToolsetGetInstructionsId):
             kind: ToolsetKind = 'mcp'
         else:
-            assert isinstance(operation_id, GetToolsId | CallToolId | ValidateToolArgumentsId)
+            assert isinstance(operation_id, ToolsetGetToolsId | ToolsetCallToolId | ToolsetValidateToolArgumentsId)
             kind = operation_id.toolset_kind
         config = self._tool(kind, None, '')
         assert config is not False
@@ -48,12 +48,13 @@ class AWSLambdaOperationConfig:
     def for_tool(
         self,
         role: OperationConfigRole,
+        *,
         operation_id: DurableOperationId,
         tool: object | None,
         tool_name: str,
     ) -> StepConfig | Literal[False] | None:
-        assert role in (OperationConfigRole.TOOL_CALL, OperationConfigRole.TOOL_VALIDATION)
-        assert isinstance(operation_id, CallToolId | ValidateToolArgumentsId)
+        assert role == 'tool'
+        assert isinstance(operation_id, ToolsetCallToolId | ToolsetValidateToolArgumentsId)
         return self._tool(operation_id.toolset_kind, tool, tool_name)
 
 
@@ -69,16 +70,16 @@ class AWSLambdaOperationBackend(CallableOperationBackend[StepConfig | None]):
             namer=JournalOperationNamer(agent_name, default_model_id=default_model_id or 'default'), config=config
         )
 
-    async def _execute(
+    async def execute(
         self,
         *,
+        operation_id: DurableOperationId,
         name: str,
         body: Callable[[], Awaitable[object]],
         cache_key: tuple[object, ...],
-        config: object,
+        config: StepConfig | None,
     ) -> object:
-        del cache_key
-        assert config is None or isinstance(config, StepConfig)
+        del operation_id, cache_key
 
         async def operation() -> object:
             try:

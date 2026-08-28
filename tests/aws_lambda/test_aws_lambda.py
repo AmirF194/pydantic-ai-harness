@@ -324,6 +324,16 @@ class TestStepConfig:
         with pytest.raises(UserError, match="Unknown 'aws_lambda' step config key 'retries'"):
             run_durable(lambda: agent.run('go'), context=ctx)
 
+    def test_non_mapping_per_tool_config_is_rejected(self) -> None:
+        toolset = FunctionToolset[object](id='tools')
+        toolset.add_function(act, metadata={'aws_lambda': 'invalid'})
+
+        agent = Agent(tool_then_text(), name='a', toolsets=[toolset], capabilities=[AWSLambdaDurability()])
+        ctx = FakeDurableContext()
+
+        with pytest.raises(UserError, match='expected a dict .* or `False`, got str'):
+            run_durable(lambda: agent.run('go'), context=ctx)
+
 
 class TestNesting:
     """A nested durable run cannot make progress: the handler thread is blocked servicing the

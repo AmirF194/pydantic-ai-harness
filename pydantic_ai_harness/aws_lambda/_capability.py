@@ -25,14 +25,19 @@ from dataclasses import dataclass, fields
 from typing import Any, ClassVar, Literal, TypeAlias
 
 from aws_durable_execution_sdk_python.config import StepConfig
-from pydantic_ai.agent import EventStreamHandler
-from pydantic_ai.durable_exec._base import BaseDurabilityCapability
-from pydantic_ai.durable_exec._codec import JSON_CODEC
-from pydantic_ai.durable_exec._operation_backend import DurableOperationBackend
+from pydantic import TypeAdapter
+from pydantic_ai.agent import AbstractAgent, EventStreamHandler
+from pydantic_ai.durable_exec import (
+    JSON_CODEC,
+    BaseDurabilityCapability,
+    DurabilityEngineSpec,
+    DurableOperationBackend,
+)
 from pydantic_ai.exceptions import UserError
 from pydantic_ai.models import Model
 from pydantic_ai.tools import AgentDepsT
 from pydantic_ai.toolsets import ToolsetTool
+from typing_extensions import Self
 
 from ._bridge import ENGINE_NAME as _ENGINE_NAME
 from ._bridge import in_durable_context
@@ -40,9 +45,9 @@ from ._operation_backend import AWSLambdaOperationBackend, AWSLambdaOperationCon
 
 _TOOL_CONFIG_KEY = 'aws_lambda'
 _ToolsetKind: TypeAlias = Literal['function', 'mcp', 'dynamic']
-_Lifecycle: TypeAlias = Literal['enter-outside-durable', 'enter-always', 'enter-never']
 # Derived rather than listed so a new SDK `StepConfig` field is accepted, not rejected as unknown.
 _STEP_CONFIG_FIELDS = frozenset(f.name for f in fields(StepConfig))
+_STEP_CONFIG_MAPPING_ADAPTER = TypeAdapter(dict[str, object])
 
 
 def _step_config(config: Mapping[str, Any] | None) -> StepConfig | None:
@@ -107,21 +112,16 @@ class AWSLambdaDurability(BaseDurabilityCapability[AgentDepsT]):
         ```
     """
 
-    engine_name = _ENGINE_NAME
-    _codec: ClassVar = JSON_CODEC
-    _unsupported_runtime_toolset_kinds: ClassVar[frozenset[_ToolsetKind]] = frozenset({'function', 'mcp', 'dynamic'})
-    _wrapped_toolset_kinds: ClassVar[frozenset[_ToolsetKind]] = frozenset({'function', 'mcp', 'dynamic'})
-    _toolset_lifecycles: ClassVar[Mapping[_ToolsetKind, _Lifecycle]] = {
-        'function': 'enter-always',
-        'mcp': 'enter-always',
-        'dynamic': 'enter-never',
-    }
-    _tool_call_result_upgrade_lenient: ClassVar[bool] = True
-    _journal_discovery: ClassVar[bool] = True
-    _force_sequential_tools_in_durable_context: ClassVar[bool] = True
-    _durable_unit_noun = 'step'
-    _durable_container_noun = 'handler'
-    _tool_config_key = _TOOL_CONFIG_KEY
+    engine_spec: ClassVar = DurabilityEngineSpec(
+        engine_name=_ENGINE_NAME,
+        durable_unit_noun='step',
+        durable_container_noun='handler',
+        codec=JSON_CODEC,
+        tool_call_result_upgrade_lenient=True,
+        sequential_tools_in_durable_context=True,
+        unsupported_runtime_toolset_kinds=frozenset({'function', 'mcp', 'dynamic'}),
+        tool_config_key=_TOOL_CONFIG_KEY,
+    )
 
     def __init__(
         self,
@@ -151,22 +151,35 @@ class AWSLambdaDurability(BaseDurabilityCapability[AgentDepsT]):
         super().__init__(models=models, event_stream_handler=event_stream_handler, name=name)
         _step_config(step_config)
         self._base_step_config = step_config
+        self._lambda_default_model_id: str | None = None
+
+    def for_agent(self, agent: AbstractAgent[AgentDepsT, Any]) -> Self:
+        self._lambda_default_model_id = agent.model if isinstance(agent.model, str) else None
+        return super().for_agent(agent)
 
     @property
     def in_durable_context(self) -> bool:
         return in_durable_context()
 
-    def _build_operation_backend(  # pyright: ignore[reportIncompatibleMethodOverride]
-        self,
-    ) -> DurableOperationBackend[StepConfig | None]:
+    def get_durable_operation_backend(self) -> DurableOperationBackend[StepConfig | None]:
         def tool_config(kind: _ToolsetKind, tool: object | None, tool_name: str) -> StepConfig | Literal[False] | None:
-            config = self._build_resolve_tool_config(self._base_step_config)(_toolset_tool(tool), tool_name)
-            if config is False:
+            toolset_tool = _toolset_tool(tool)
+            metadata = toolset_tool.tool_def.metadata if toolset_tool is not None else None
+            metadata_config: object = metadata.get(_TOOL_CONFIG_KEY) if metadata is not None else None
+            if metadata_config is False:
                 return False
+            if metadata_config is not None and not isinstance(metadata_config, dict):
+                raise UserError(
+                    f'Tool {tool_name!r} has invalid {_TOOL_CONFIG_KEY!r} metadata: expected a dict '
+                    f'(`{_ENGINE_NAME} durable config`) or `False`, got {type(metadata_config).__name__}.'
+                )
+            config = dict(self._base_step_config or {})
+            if metadata_config:
+                config.update(_STEP_CONFIG_MAPPING_ADAPTER.validate_python(metadata_config, strict=True))
             return _step_config(config)
 
         return AWSLambdaOperationBackend(
             agent_name=self.name,
-            default_model_id=self._default_model_id,
+            default_model_id=self._lambda_default_model_id,
             config=AWSLambdaOperationConfig(base=self._base_step_config, tool=tool_config),
         )
