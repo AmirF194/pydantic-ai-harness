@@ -1,4 +1,14 @@
-"""Durable execution for Pydantic AI agents on Absurd."""
+"""Durable execution for Pydantic AI agents on the Absurd engine.
+
+Absurd (`absurd-sdk`) is a Postgres-based durable-execution engine. This module
+checkpoints an agent's I/O -- model requests, MCP calls, and function tool calls
+-- into Absurd steps (`ctx.step(...)`), so a worker crash mid-run resumes from
+the last completed step instead of restarting the run.
+
+The step names and checkpoint payload shapes are kept byte-compatible with the
+`pydantic-ai-absurd` package by Marcelo Trylesinski, so a run started under one
+package can resume under the other.
+"""
 
 from __future__ import annotations
 
@@ -6,72 +16,116 @@ try:
     import absurd_sdk  # noqa: F401  # pyright: ignore[reportUnusedImport]
 except ImportError as _import_error:  # pragma: no cover
     raise ImportError(
-        'The Absurd durability capability requires the `absurd` extra. '
-        'Install it with `pip install "pydantic-ai-harness[absurd]"` or '
-        '`uv add "pydantic-ai-harness[absurd]"`.'
+        'Please install the `absurd-sdk` package to use the Absurd durability capability, '
+        'you can use the `absurd` optional group -- `pip install "pydantic-ai-harness[absurd]"`'
     ) from _import_error
 
 from collections.abc import Mapping
 from dataclasses import dataclass
 from threading import Lock
-from typing import Any, ClassVar, Literal, get_args
+from typing import Any, ClassVar, Literal
 
-from absurd_sdk import AsyncTaskContext, JsonValue
-from pydantic import TypeAdapter
-from pydantic_ai import FunctionToolset
 from pydantic_ai.agent import EventStreamHandler, ParallelExecutionMode
-from pydantic_ai.agent.abstract import AbstractAgent
-from pydantic_ai.capabilities.abstract import WrapModelRequestHandler, WrapRunHandler
-from pydantic_ai.durable_exec._base import BaseDurabilityCapability
-from pydantic_ai.durable_exec._runtime_toolsets import RuntimeToolsetKind, reject_unsupported_runtime_toolsets
-from pydantic_ai.durable_exec._utils import DurableModel, StreamedActivityResult, capture_event_stream
+from pydantic_ai.capabilities import WrapRunHandler
+from pydantic_ai.durable_exec import JSON_CODEC, BaseDurabilityCapability, DurabilityEngineSpec
 from pydantic_ai.exceptions import UserError
-from pydantic_ai.messages import AgentStreamEvent, ModelResponse, ModelResponseStreamEvent
-from pydantic_ai.models import CompletedStreamedResponse, Model, ModelRequestContext
+from pydantic_ai.models import Model
 from pydantic_ai.run import AgentRunResult
 from pydantic_ai.tools import AgentDepsT, RunContext
-from pydantic_ai.toolsets import AbstractToolset, DynamicToolset, WrapperToolset
+from pydantic_ai.toolsets import AbstractToolset
 
-from ._function_toolset import AbsurdFunctionToolset
-from ._utils import current_async_context
+from ._context import current_async_task_context
+from ._operation_backend import AbsurdOperationBackend, AbsurdOperationConfig, resolve_tool_config
 
 AbsurdParallelExecutionMode = Literal['sequential', 'parallel_ordered_events']
-"""Tool-call execution modes supported by Absurd."""
+"""Tool-call execution modes usable with Absurd. A subset of `ParallelExecutionMode`.
 
-_response_adapter: TypeAdapter[ModelResponse] = TypeAdapter(ModelResponse)
-_events_adapter: TypeAdapter[list[ModelResponseStreamEvent]] = TypeAdapter(list[ModelResponseStreamEvent])
-_allowed_parallel_execution_modes: tuple[str, ...] = get_args(AbsurdParallelExecutionMode)
-_active_run_namespaces: set[tuple[AsyncTaskContext, str]] = set()
+Absurd disambiguates repeated step names by encounter order (the second `ctx.step(name, ...)` for a
+given `name` records under `name#2`, the third under `name#3`, ...). A replay lines up with its
+checkpoints only if each repeated step name claims the same slot it did on the first run.
+
+The slot is claimed synchronously when `ctx.step(...)` is entered, before the step body runs. Tool
+calls are scheduled in the model's tool-call order under both parallel modes, so their step names are
+assigned in that order regardless of which call finishes first -- completion order does not move a
+tool call's slot. `'parallel'` is nonetheless excluded because it emits tool-result events (and so
+the per-event `event_stream_handler` steps) in completion order, which races and could assign one of
+those repeated step names a different slot on replay. `'parallel_ordered_events'` emits those events
+in the model's tool-call order once the whole batch completes, so every repeated step name -- tool
+calls and event-handler steps alike -- lines up on replay."""
+
+_ENGINE_NAME = 'Absurd'
+
+# Absurd disambiguates repeated step names by encounter order within one task. Two overlapping
+# runs using the same task context and namespace would therefore claim each other's checkpoints.
+_active_run_namespaces: set[tuple[object, str]] = set()
 _active_run_namespaces_lock = Lock()
 
 
-def _reject_hash_in_step_suffix(value: str, *, kind: str) -> None:
-    if '#' in value:
-        raise UserError(f'{kind} {value!r} contains `#`, which Absurd uses to disambiguate repeated steps.')
-
-
-def _serialize_response(response: ModelResponse) -> JsonValue:
-    return _response_adapter.dump_python(response, mode='json')
-
-
-def _deserialize_response(payload: JsonValue) -> ModelResponse:
-    return _response_adapter.validate_python(payload)
+def _reject_model_id_hash(model_id: str) -> None:
+    """Reject a model id containing `#`, which Absurd reserves for encounter counters."""
+    if '#' in model_id:
+        raise UserError(
+            f'Model id {model_id!r} contains {"#"!r}, which Absurd uses to disambiguate repeated '
+            'step names. Folded into the model step name it would collide with that suffix. Choose '
+            'a model id without `#`.'
+        )
 
 
 @dataclass(init=False)
 class AbsurdDurability(BaseDurabilityCapability[AgentDepsT]):
-    """Checkpoint model, MCP, and function-tool I/O in Absurd steps.
+    """Capability that makes an agent durable by checkpointing its I/O into Absurd steps.
 
-    Use `capabilities=[AbsurdDurability()]` and run the agent from an async Absurd task
-    handler. Outside an Absurd task, the capability behaves like a normal capability.
+    Attach it via `capabilities=[AbsurdDurability()]` and call `agent.run()` inside an Absurd
+    task handler: every model request, MCP call, function tool call, and dynamic-toolset
+    resolution is wrapped in `ctx.step(...)`, so a worker crash mid-run resumes from the last
+    completed step instead of restarting. A completed step is served from its checkpoint on
+    replay instead of being recomputed, so tokens are not re-spent on work that already finished.
+    A step is checkpointed after it runs, so a crash between a tool's side effect and its checkpoint
+    re-runs the tool on recovery: keep tool side effects idempotent. Outside a task the capability
+    is transparent and the run is a normal, non-durable agent run.
+
+    The capability discovers the agent's model, name, and toolsets automatically when it is bound
+    to the agent. Step results are stored in Postgres as JSON, so a checkpointed tool's return
+    value must be JSON-serializable.
+
+    Step names and checkpoint payload shapes are compatible with the `pydantic-ai-absurd` package,
+    so a run can migrate between the two.
+
+    Example:
+        ```python {test="skip"}
+        from absurd_sdk import AsyncAbsurd, AsyncTaskContext, JsonValue
+        from pydantic_ai import Agent
+        from pydantic_ai_harness.absurd import AbsurdDurability
+
+        absurd = AsyncAbsurd('postgresql://localhost/absurd', queue_name='agents')
+        agent = Agent('openai:gpt-5', name='analyst', capabilities=[AbsurdDurability()])
+
+
+        @absurd.register_task(name='analyse')
+        async def analyse(params: JsonValue, ctx: AsyncTaskContext) -> JsonValue:
+            assert isinstance(params, dict)
+            result = await agent.run(params['prompt'])
+            return {'output': result.output}
+        ```
     """
 
-    engine_name = 'Absurd'
-    _unsupported_runtime_toolset_kinds: ClassVar[frozenset[RuntimeToolsetKind]] = frozenset(
-        {'function', 'mcp', 'dynamic'}
+    engine_spec: ClassVar = DurabilityEngineSpec(
+        engine_name=_ENGINE_NAME,
+        durable_unit_noun='step',
+        durable_container_noun='task',
+        codec=JSON_CODEC,
+        toolset_lifecycles={
+            'function': 'enter-never',
+            'mcp': 'enter-always',
+            'dynamic': 'enter-never',
+        },
+        sequential_tools_in_durable_context=True,
+        unsupported_runtime_toolset_kinds=frozenset({'function', 'mcp', 'dynamic'}),
+        tool_config_key='absurd',
     )
-    _durable_unit_noun = 'step'
-    _durable_container_noun = 'task'
+    # Absurd has no raise-time non-retryable exception equivalent to Lambda's `ExecutionError` or
+    # Restate's `TerminalError`. Serialization failures therefore use the base behavior: the task's
+    # `RetryStrategy`/`max_attempts` governs retries, and the task fails after those attempts are exhausted.
 
     def __init__(
         self,
@@ -81,100 +135,57 @@ class AbsurdDurability(BaseDurabilityCapability[AgentDepsT]):
         name: str | None = None,
         parallel_execution_mode: AbsurdParallelExecutionMode = 'sequential',
     ) -> None:
+        """Create an `AbsurdDurability` capability.
+
+        The agent's model, name, and toolsets are discovered automatically.
+
+        Args:
+            models: Optional additional models keyed by ID for runtime model switching via
+                `agent.run(model='<id>')`. The agent's primary model is always registered as
+                `'default'`; the ID is folded into the checkpoint step name so a replay resolves
+                to the same model.
+            event_stream_handler: Optional event stream handler. Model events are handled live
+                inside the model-request step; each tool event is handled in its own checkpointed
+                step.
+            name: Unique agent name used as the prefix for every checkpoint step. Defaults to the
+                agent's `name` when the capability is bound.
+            parallel_execution_mode: Tool-call execution mode applied for a run inside a task.
+                Defaults to `'sequential'`. `'parallel'` is excluded by type because it emits
+                tool-result and event-handler steps in completion order, which races with Absurd's
+                encounter-order step naming; see `AbsurdParallelExecutionMode` for the full
+                invariant. Outside a task the agent's configured mode is left untouched.
+        """
         super().__init__(models=models, event_stream_handler=event_stream_handler, name=name)
-        if parallel_execution_mode not in _allowed_parallel_execution_modes:
-            allowed = ' or '.join(repr(mode) for mode in _allowed_parallel_execution_modes)
-            raise UserError(f'Absurd parallel execution mode must be {allowed}, got {parallel_execution_mode!r}.')
+        for model_id in models or {}:
+            _reject_model_id_hash(model_id)
         self._parallel_execution_mode: ParallelExecutionMode = parallel_execution_mode
-        self._wrappers_by_leaf: dict[int, WrapperToolset[AgentDepsT]] = {}
-        self._construction_leaves: set[int] = set()
-        self._default_model_id: str | None = None
 
     @property
     def in_durable_context(self) -> bool:
-        return current_async_context() is not None
+        return current_async_task_context() is not None
 
-    def _bind_to_agent(self, agent: AbstractAgent[AgentDepsT, Any]) -> None:
-        self._default_model_id = agent.model if isinstance(agent.model, str) else None
-        self._wrappers_by_leaf = {}
-        self._construction_leaves = set()
-        seen_ids: dict[str, AbstractToolset[AgentDepsT]] = {}
-
-        def register(toolset: AbstractToolset[AgentDepsT]) -> AbstractToolset[AgentDepsT]:
-            if isinstance(toolset, DynamicToolset):
-                raise UserError(
-                    'DynamicToolset is not supported by AbsurdDurability because its resolution and tool calls '
-                    'are not checkpointed.'
-                )
-            if toolset.id is not None:
-                existing = seen_ids.get(toolset.id)
-                if existing is not None and existing is not toolset:
-                    raise UserError(f'Two toolsets have the same `id` {toolset.id!r}.')
-                seen_ids[toolset.id] = toolset
-            leaf_id = id(toolset)
-            if leaf_id not in self._construction_leaves:
-                self._construction_leaves.add(leaf_id)
-                wrapper = self._wrap_leaf_toolset(toolset)
-                if wrapper is not None:
-                    self._wrappers_by_leaf[leaf_id] = wrapper
-            return toolset
-
-        for toolset in agent.toolsets:
-            toolset.visit_and_replace(register)
-
-    def _wrap_leaf_toolset(self, ts: AbstractToolset[AgentDepsT]) -> WrapperToolset[AgentDepsT] | None:
-        if isinstance(ts, FunctionToolset):
-            return AbsurdFunctionToolset(
-                wrapped=ts, step_name_prefix=self.name, durable_run_context_scope=self._durable_run_context_scope
-            )
-        try:
-            from pydantic_ai.mcp import MCPToolset
-        except ImportError:  # pragma: no cover
-            return None
-        if isinstance(ts, MCPToolset):
-            from ._mcp import AbsurdMCPToolset
-
-            return AbsurdMCPToolset(
-                wrapped=ts, step_name_prefix=self.name, durable_run_context_scope=self._durable_run_context_scope
-            )
-        return None
+    def get_durable_operation_backend(self) -> AbsurdOperationBackend:
+        if self.default_model_id is not None:
+            _reject_model_id_hash(self.default_model_id)
+        return AbsurdOperationBackend(
+            agent_name=self.name,
+            default_model_id=self.default_model_id,
+            config=AbsurdOperationConfig(model={}, event={}, capability={}, tool={}, resolve_tool=resolve_tool_config),
+        )
 
     def get_wrapper_toolset(self, toolset: AbstractToolset[AgentDepsT]) -> AbstractToolset[AgentDepsT] | None:
-        in_durable_context = self.in_durable_context
-        runtime_leaves: list[AbstractToolset[AgentDepsT]] = []
-
-        def swap(leaf: AbstractToolset[AgentDepsT]) -> AbstractToolset[AgentDepsT]:
-            if in_durable_context and id(leaf) not in self._construction_leaves:
-                runtime_leaves.append(leaf)
-            return self._wrappers_by_leaf.get(id(leaf), leaf)
-
-        swapped = toolset.visit_and_replace(swap)
-        reject_unsupported_runtime_toolsets(
-            runtime_leaves,
-            unsupported_kinds=self._unsupported_runtime_toolset_kinds,
-            engine=self.engine_name,
-        )
-        return swapped
-
-    async def _dispatch_event_stream_event(self, ctx: RunContext[AgentDepsT], event: AgentStreamEvent) -> None:
-        task_ctx = current_async_context()
-        assert task_ctx is not None  # pragma: no cover
-        handler = self._event_stream_handler
-        assert handler is not None  # pragma: no cover
-
-        async def inner() -> None:
-            with self._durable_run_context_scope(ctx) as step_ctx:
-                await handler(step_ctx, self._single_event_stream(event))
-
-        await task_ctx.step(f'{self.name}__event_stream_handler', inner)
+        """Register construction-time toolsets added through a decorator after agent binding."""
+        if self.agent is not None:  # pragma: no branch
+            self._register_toolsets(self.agent)
+        return super().get_wrapper_toolset(toolset)
 
     async def wrap_run(self, ctx: RunContext[AgentDepsT], *, handler: WrapRunHandler) -> AgentRunResult[Any]:
-        agent = self._agent
-        task_ctx = current_async_context()
-        if agent is None:  # pragma: no cover
+        """Allow Absurd's encounter-safe ordered parallel mode when explicitly configured."""
+        agent = self.agent
+        task_ctx = current_async_task_context()
+        if agent is None or task_ctx is None:
             return await handler()
-        if task_ctx is None:
-            return await handler()
+
         namespace_key = (task_ctx, self.name)
         with _active_run_namespaces_lock:
             if namespace_key in _active_run_namespaces:
@@ -185,79 +196,10 @@ class AbsurdDurability(BaseDurabilityCapability[AgentDepsT]):
                 )
             _active_run_namespaces.add(namespace_key)
         try:
+            if self._parallel_execution_mode == 'sequential':
+                return await super().wrap_run(ctx, handler=handler)
             with agent.parallel_tool_call_execution_mode(self._parallel_execution_mode):
                 return await handler()
         finally:
             with _active_run_namespaces_lock:
                 _active_run_namespaces.remove(namespace_key)
-
-    async def wrap_model_request(
-        self,
-        ctx: RunContext[AgentDepsT],
-        *,
-        request_context: ModelRequestContext,
-        handler: WrapModelRequestHandler,
-    ) -> ModelResponse:
-        task_ctx = current_async_context()
-        if task_ctx is None:
-            return await handler(request_context)
-
-        model_id = self._model_id_for_request(ctx, request_context)
-        if model_id == self._default_model_id:
-            model_id = None
-        if model_id is not None:
-            _reject_hash_in_step_suffix(model_id, kind='Model ID')
-        step_suffix = '' if model_id is None else f'.{model_id}'
-        model = request_context.model
-
-        async def request_segment(request: ModelRequestContext) -> ModelResponse:
-            async def inner() -> JsonValue:
-                with self._durable_run_context_scope(ctx):
-                    response = await request.model.request(
-                        request.messages, request.model_settings, request.model_request_parameters
-                    )
-                return _serialize_response(response)
-
-            payload = await task_ctx.step(f'{self.name}__model.request{step_suffix}', inner)
-            return _deserialize_response(payload)
-
-        async def request_stream_segment(request: ModelRequestContext) -> StreamedActivityResult:
-            async def inner() -> dict[str, JsonValue]:
-                with self._durable_run_context_scope(ctx) as step_ctx:
-                    async with request.model.request_stream(
-                        request.messages, request.model_settings, request.model_request_parameters, step_ctx
-                    ) as streamed:
-                        events = await capture_event_stream(
-                            run_context=step_ctx, stream=streamed, handler=self._event_stream_handler
-                        )
-                return {
-                    'response': _serialize_response(streamed.get()),
-                    'events': _events_adapter.dump_python(events, mode='json'),
-                }
-
-            payload = await task_ctx.step(f'{self.name}__model.request_stream{step_suffix}', inner)
-            if 'response' not in payload:
-                response = _deserialize_response(payload)
-                completed = CompletedStreamedResponse(
-                    response, model_request_parameters=request.model_request_parameters, replay_events=True
-                )
-                return StreamedActivityResult(response=response, events=[event async for event in completed])
-            return StreamedActivityResult(
-                response=_deserialize_response(payload['response']),
-                events=_events_adapter.validate_python(payload['events']),
-            )
-
-        async def cancel_suspended_response_segment(response: ModelResponse) -> None:
-            async def inner() -> None:
-                with self._durable_run_context_scope(ctx):
-                    await model.cancel_suspended_response(response)
-
-            await task_ctx.step(f'{self.name}__model.cancel_suspended_response{step_suffix}', inner)
-
-        request_context.model = DurableModel(
-            request_context.model,
-            request_segment=request_segment,
-            request_stream_segment=request_stream_segment,
-            cancel_suspended_response_segment=cancel_suspended_response_segment,
-        )
-        return await handler(request_context)
