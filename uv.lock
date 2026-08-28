@@ -3548,8 +3548,8 @@ lint = [
 
 [[package]]
 name = "pydantic-ai-slim"
-version = "2.35.4.dev127+5bd30263"
-source = { git = "https://github.com/pydantic/pydantic-ai.git?subdirectory=pydantic_ai_slim&branch=claude%2Fdurable-base-declarative#5bd3026318847eb4b3d55063eeb29e30c4a759ea" }
+version = "2.35.4.dev128+ff2b0c00"
+source = { git = "https://github.com/pydantic/pydantic-ai.git?subdirectory=pydantic_ai_slim&branch=claude%2Fdurable-base-declarative#ff2b0c00f9e10660bfddb96c9b4bd2e3c52199eb" }
 dependencies = [
     { name = "anyio", version = "4.12.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
     { name = "anyio", version = "4.13.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
@@ -3824,8 +3824,8 @@ wheels = [
 
 [[package]]
 name = "pydantic-graph"
-version = "2.35.4.dev127+5bd30263"
-source = { git = "https://github.com/pydantic/pydantic-ai.git?subdirectory=pydantic_graph&branch=claude%2Fdurable-base-declarative#5bd3026318847eb4b3d55063eeb29e30c4a759ea" }
+version = "2.35.4.dev128+ff2b0c00"
+source = { git = "https://github.com/pydantic/pydantic-ai.git?subdirectory=pydantic_graph&branch=claude%2Fdurable-base-declarative#ff2b0c00f9e10660bfddb96c9b4bd2e3c52199eb" }
 dependencies = [
     { name = "anyio", version = "4.12.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
     { name = "anyio", version = "4.13.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
