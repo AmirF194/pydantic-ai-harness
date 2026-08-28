@@ -46,10 +46,10 @@ workflow supplies none.
 capabilities, so the engine writes the composition as a Python module at
 `.pydantic-ai/gh_aw_agent.py` and always passes `-a gh_aw_agent:agent`. The CLI and
 its dependencies are installed before the agent starts, with
-`pip install --user "pydantic-ai-harness[cli]==<engine version>"`. The pinned
-version is `engine.version` in `pydantic.md`, and it always names a published
-release: CI refuses to move the `gh-aw-engine` branch to a commit pinning a version
-that is not on PyPI.
+`pip install --user "pydantic-ai-harness[cli]==<engine version>"
+"pydantic-ai-slim[openai,mcp]"`. The pinned version is `engine.version` in
+`pydantic.md`, and it always names a published release: CI refuses to move the
+`gh-aw-engine` branch to a commit pinning a version that is not on PyPI.
 
 MCP servers arrive as `.pydantic-ai/mcp.json` in the `mcpServers` shape Claude
 Desktop and Cursor use. Tools carry their server name as a prefix, so safe outputs

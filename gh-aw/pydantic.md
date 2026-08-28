@@ -41,6 +41,7 @@ engine:
         copilot: api.githubcopilot.com
         anthropic: api.anthropic.com
         openai: api.openai.com
+        codex: api.openai.com
     execution:
       command-name: pai
       step-name: Execute Pydantic AI CLI
@@ -49,7 +50,7 @@ engine:
       provider-env-mode: universal-llm-consumer
     harness-script: |
       const { spawnSync } = require("child_process");
-      const { mkdirSync, readFileSync, writeFileSync } = require("fs");
+      const { chmodSync, mkdirSync, readFileSync, writeFileSync } = require("fs");
       const { homedir } = require("os");
       const { join } = require("path");
       const { fetchAWFReflect, resolveProviderEndpointFromReflect, deriveBaseUrlFromModelsURL } = require("./awf_reflect.cjs");
@@ -90,7 +91,9 @@ engine:
 
         const agentDir = join(workspace, ".pydantic-ai");
         mkdirSync(agentDir, { recursive: true, mode: 0o700 });
-        writeFileSync(join(agentDir, "gh_aw_agent.py"), AGENT_MODULE, { mode: 0o600 });
+        const agentModulePath = join(agentDir, "gh_aw_agent.py");
+        writeFileSync(agentModulePath, AGENT_MODULE, { mode: 0o600 });
+        chmodSync(agentModulePath, 0o600);
 
         const env = { ...process.env };
         // `pip install --user` puts `pai` here. The runner tool cache that holds
@@ -123,9 +126,9 @@ engine:
         //
         // It has to be a variable of this definition's own, because AWF sets
         // OPENAI_BASE_URL on this step itself (to the api-proxy on
-        // host.docker.internal): that variable is always present, so it can never
-        // say what the workflow asked for, and reading it as intent is what made
-        // the pre-#52843 definition pick the wrong endpoint.
+        // host.docker.internal) whenever the firewall is enabled, so its presence
+        // cannot carry the workflow's intent, and reading it as intent is what
+        // made the pre-#52843 definition pick the wrong endpoint.
         //
         // There is deliberately no matching key knob. gh-aw excludes any
         // `engine.env` value holding a secret from the agent sandbox
@@ -197,13 +200,12 @@ engine:
         // marker that selects its OpenAI-compatible client, so the bare model ID
         // reaches the api-proxy — which steers to the configured provider by the
         // port it is reached on, not by a prefix in the model name: Copilot
-        // rejects `copilot/<model>` with `model_not_supported`. The proxy exposes
-        // Copilot Claude models under their dotted IDs, so
-        // `copilot/claude-sonnet-4-5` becomes `claude-sonnet-4.5`.
+        // rejects `copilot/<model>` with `model_not_supported`.
         // Only the first segment is the provider. Stripping greedily would eat an
         // org namespace out of ids like `meta-llama/Llama-3.1`, so this mirrors the
         // `SplitN(model, "/", 2)` gh-aw itself uses to read the provider off.
-        const requestedModel = env.PAI_MODEL?.replace(/^[^/]*\//, "") || "gpt-5";
+        if (!env.PAI_MODEL) throw new Error("PAI_MODEL is required");
+        const requestedModel = env.PAI_MODEL.replace(/^[^/]*\//, "");
         // The dotted-alias rewrite describes the api-proxy, which publishes
         // Copilot's Claude models under dotted IDs. An endpoint named by
         // PAI_BASE_URL gets the id the workflow wrote: a model actually called
@@ -213,8 +215,9 @@ engine:
           : requestedModel.replace(/^(claude-(?:haiku|sonnet|opus)-\d+)-(\d+)$/, "$1.$2");
         // `-m` is always passed: the composed agent carries no model, and without
         // the flag `pai` silently falls back to its own `openai:gpt-5` default,
-        // billing a model the workflow never asked for. The fallback here is the
-        // same model, made explicit.
+        // billing a model the workflow never asked for. gh-aw validates
+        // `provider/model` at compile time, so PAI_MODEL is set for every compiled
+        // workflow, and the throw above covers any other invocation.
         const args = [...commandArgs, "-a", "gh_aw_agent:agent", "-m", `openai-chat:${model}`, readFileSync(promptFile, "utf8")];
         log(`provider=${configuredBaseUrl ? "(PAI_BASE_URL)" : provider} model=${model} baseUrl=${baseUrl}`);
         const result = spawnSync(command, args, { cwd: workspace, env, stdio: "inherit" });
@@ -290,7 +293,7 @@ engine:
         const logEntries = [];
         const mcpFailures = [];
         let maxTurnsHit = false;
-        const AWF_INFRA_RE = /^\[(INFO|WARN|SUCCESS|ERROR|entrypoint|health-check)\]|^ (?:Container|Network|Volume) |^Process exiting with code:/;
+        const AWF_INFRA_RE = /^\[(INFO|WARN|SUCCESS|ERROR|entrypoint|health-check|pydantic-ai)\]|^ (?:Container|Network|Volume) |^Process exiting with code:/;
         let inputTokens = 0;
         let outputTokens = 0;
         let toolCallIndex = 0;
@@ -381,7 +384,12 @@ script writes that composition as a Python module at
 `.pydantic-ai/gh_aw_agent.py`, puts the directory on `PYTHONPATH`, and always
 passes `-a gh_aw_agent:agent`. Because `pai` reduces a failed load to a single
 line naming the target, the harness imports the module itself first and fails
-the step with the underlying Python traceback.
+the step with the underlying Python traceback. Once
+[pydantic/pydantic-ai#1374](https://github.com/pydantic/pydantic-ai/pull/1374)
+ships `--mcp-config`, the module becomes unnecessary:
+`-a pydantic_ai_harness.coder:coder_agent --mcp-config .pydantic-ai/mcp.json`
+composes the same agent, because the CLI loads the same `mcpServers` document
+and passes the toolsets into the run.
 
 MCP servers are rendered into `.pydantic-ai/mcp.json` in the same `mcpServers`
 shape Claude Desktop and Cursor use, which `pydantic_ai.mcp.load_mcp_toolsets`
@@ -419,11 +427,9 @@ Responses are streamed. The proxy's aggregated non-streaming body omits
 `object` and `choices[].index`, which Pydantic AI rejects during response
 validation, so `--no-stream` is deliberately not passed.
 
-`pai` renders its output as Markdown for a terminal and has no structured
-output mode, so the log parser reconstructs turns from that text and reads token
-counts only from any JSON lines the run happens to emit. Structured output is
-tracked upstream in
-[pydantic/pydantic-ai#1374](https://github.com/pydantic/pydantic-ai/pull/1374).
+`pai` renders its output as Markdown for a terminal and has no structured output
+mode today, so the log parser reconstructs turns from that text and reads token
+counts only from any JSON lines the run happens to emit.
 
 The CLI and the coder capabilities are installed before the agent runs with
 `pip install --user "pydantic-ai-harness[cli]==<engine version>"
