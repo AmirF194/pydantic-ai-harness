@@ -130,6 +130,9 @@ bump = true
 [tool.hatch.build.targets.wheel]
 packages = ['pydantic_ai_harness']
 
+[tool.uv.sources]
+pydantic-ai-slim = { git = "https://github.com/pydantic/pydantic-ai.git", branch = "main", subdirectory = "pydantic_ai_slim" }
+
 [tool.ruff]
 line-length = 120
 target-version = 'py310'

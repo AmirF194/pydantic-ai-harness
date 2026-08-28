@@ -8,13 +8,17 @@ stored entries without re-running the action -- are reproduced faithfully by the
 
 from __future__ import annotations
 
-from collections.abc import AsyncIterable, AsyncIterator
+import builtins
+import runpy
+from collections.abc import AsyncIterable, AsyncIterator, Mapping, Sequence
+from pathlib import Path
 
 import pytest
 
 pytest.importorskip('restate')
 
 from pydantic_ai import Agent, RunContext
+from pydantic_ai.capabilities import AbstractCapability, durable_operation
 from pydantic_ai.exceptions import ApprovalRequired, CallDeferred, ModelRetry, UserError
 from pydantic_ai.messages import (
     AgentStreamEvent,
@@ -33,6 +37,7 @@ from pydantic_ai.messages import (
 from pydantic_ai.models.function import AgentInfo, DeltaToolCall, DeltaToolCalls, FunctionModel
 from pydantic_ai.tools import DeferredToolRequests
 from pydantic_ai.toolsets import ExternalToolset, FunctionToolset
+from restate.exceptions import TerminalError
 
 from pydantic_ai_harness.restate import RestateDurability
 
@@ -67,7 +72,41 @@ def _tool_then_done_model(tool_name: str, args: dict[str, object]) -> FunctionMo
     return FunctionModel(fn, model_name='fn')
 
 
+class _CountingOperation(AbstractCapability[object]):
+    id = 'counter'
+
+    def __init__(self, calls: list[int]) -> None:
+        self.calls = calls
+
+    async def before_run(self, ctx: RunContext[object]) -> None:
+        await self.increment(ctx)
+
+    @durable_operation
+    async def increment(self, ctx: RunContext[object]) -> int:
+        self.calls.append(1)
+        return len(self.calls)
+
+
 class TestTransparency:
+    def test_missing_restate_dependency_has_install_guidance(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        real_import = builtins.__import__
+
+        def import_without_restate(
+            name: str,
+            globals: Mapping[str, object] | None = None,
+            locals: Mapping[str, object] | None = None,
+            fromlist: Sequence[str] = (),
+            level: int = 0,
+        ) -> object:
+            if name == 'restate':
+                raise ImportError
+            return real_import(name, globals, locals, fromlist, level)
+
+        monkeypatch.setattr(builtins, '__import__', import_without_restate)
+        capability_path = Path(__file__).parents[2] / 'pydantic_ai_harness' / 'restate' / '_capability.py'
+        with pytest.raises(ImportError, match=r'pydantic-ai-harness\[restate\]'):
+            runpy.run_path(str(capability_path))
+
     async def test_run_outside_context_is_transparent(self) -> None:
         counter = {'calls': 0}
         agent = Agent(_text_model(counter), name='a', capabilities=[RestateDurability()])
@@ -261,6 +300,21 @@ class TestControlFlowSignals:
 
 
 class TestToolResultSerialization:
+    async def test_non_serializable_tool_return_is_terminal(self) -> None:
+        toolset = FunctionToolset[object](id='tools')
+
+        @toolset.tool_plain
+        def act() -> object:
+            return object()
+
+        agent = Agent(
+            _tool_then_done_model('act', {}), name='bad', toolsets=[toolset], capabilities=[RestateDurability()]
+        )
+
+        ctx = FakeRestateContext()
+        with restate_context(ctx), pytest.raises(TerminalError):
+            await agent.run('go')
+
     async def test_tool_return_round_trips(self) -> None:
         toolset = FunctionToolset[object](id='tools')
 
@@ -462,7 +516,7 @@ class TestModelSelection:
 class TestRuntimeToolsets:
     @pytest.mark.parametrize('kind', ['function', 'mcp', 'dynamic'])
     async def test_runtime_executing_toolset_rejected_inside_handler(self, kind: str) -> None:
-        from pydantic_ai.toolsets._dynamic import DynamicToolset  # pyright: ignore[reportPrivateImportUsage]
+        from pydantic_ai.toolsets import DynamicToolset
 
         toolset: object
         if kind == 'function':
@@ -691,6 +745,31 @@ class TestRepeatedStepNames:
 
 
 class TestCheckpointFormat:
+    async def test_capability_operation_name_and_replay_are_pinned(self) -> None:
+        operation_calls: list[int] = []
+        model_calls = {'calls': 0}
+        agent = Agent(
+            _text_model(model_calls),
+            name='compat',
+            capabilities=[_CountingOperation(operation_calls), RestateDurability()],
+        )
+
+        ctx = FakeRestateContext()
+        with restate_context(ctx):
+            await agent.run('hi')
+
+        assert ctx.step_names == ['compat__capability__counter.increment', 'compat__model.request']
+        assert operation_calls == [1]
+
+        replay = ctx.replay()
+        with restate_context(replay):
+            await agent.run('hi')
+
+        assert replay.step_names == ctx.step_names
+        assert replay.invoked == []
+        assert operation_calls == [1]
+        assert model_calls['calls'] == 1
+
     async def test_hand_written_model_request_payload_replays(self) -> None:
         from .conftest import Entry
 
