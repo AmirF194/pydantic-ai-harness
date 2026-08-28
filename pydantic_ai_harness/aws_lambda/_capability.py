@@ -20,277 +20,27 @@ except ImportError as _import_error:  # pragma: no cover
         '`pip install "pydantic-ai-harness[aws-lambda]"`'
     ) from _import_error
 
-from collections.abc import Generator, Mapping, Sequence
-from contextlib import contextmanager
-from dataclasses import dataclass, fields, replace
-from typing import TYPE_CHECKING, Any, ClassVar
+from collections.abc import Mapping
+from dataclasses import dataclass
+from typing import Any, ClassVar
 
 from aws_durable_execution_sdk_python.config import StepConfig
-from pydantic import TypeAdapter
-from pydantic_ai import FunctionToolset, ToolsetTool
-from pydantic_ai._enqueue import PendingMessage  # pyright: ignore[reportPrivateUsage]
-from pydantic_ai._run_context import set_current_run_context  # pyright: ignore[reportPrivateUsage]
+from aws_durable_execution_sdk_python.exceptions import ExecutionError
 from pydantic_ai.agent import EventStreamHandler
-from pydantic_ai.agent.abstract import AbstractAgent
-from pydantic_ai.capabilities.abstract import WrapModelRequestHandler, WrapRunHandler
-from pydantic_ai.durable_exec._base import BaseDurabilityCapability
-from pydantic_ai.durable_exec._runtime_toolsets import RuntimeToolsetKind
-from pydantic_ai.durable_exec._toolset import (
-    CallToolResult,
-    DurableDynamicToolset,
-    DurableFunctionToolset,
-    DurableMCPToolset,
-    DynamicToolsResult,
-    EnqueueGuard,
-    ToolConfig,
-    call_dynamic_tool,
-    get_dynamic_tools,
-    resolve_tool_durable_config,
-    unwrap_recorded_tool_call_result,
-    wrap_tool_call_result,
+from pydantic_ai.durable_exec import (
+    JSON_CODEC,
+    BaseDurabilityCapability,
+    DurabilityEngineSpec,
+    DurableOperationBackend,
 )
-from pydantic_ai.durable_exec._utils import DurableModel, StreamedActivityResult, capture_event_stream
-from pydantic_ai.exceptions import UserError
-from pydantic_ai.messages import AgentStreamEvent, InstructionPart, ModelResponse, ModelResponseStreamEvent
-from pydantic_ai.models import Model, ModelRequestContext
-from pydantic_ai.run import AgentRunResult
-from pydantic_ai.tools import AgentDepsT, RunContext, ToolDefinition
-from pydantic_ai.toolsets import AbstractToolset, WrapperToolset
-from pydantic_ai.toolsets._dynamic import DynamicToolset  # pyright: ignore[reportPrivateUsage]
+from pydantic_ai.models import Model
+from pydantic_ai.tools import AgentDepsT
 
 from ._bridge import ENGINE_NAME as _ENGINE_NAME
-from ._bridge import StepBridge, current_bridge, in_durable_context
-
-if TYPE_CHECKING:
-    from pydantic_ai.mcp import MCPToolset
+from ._bridge import in_durable_context
+from ._operation_backend import AWSLambdaOperationBackend, AWSLambdaOperationConfig
 
 _TOOL_CONFIG_KEY = 'aws_lambda'
-_TOOL_CONFIG_LABEL = 'AWS Lambda step config'
-_NO_FALLBACK_CONFIG: Mapping[str, ToolConfig] = {}
-# Derived rather than listed so a new SDK `StepConfig` field is accepted, not rejected as unknown.
-_STEP_CONFIG_FIELDS = frozenset(f.name for f in fields(StepConfig))
-
-_Instructions = str | InstructionPart | Sequence[str | InstructionPart] | None
-_JsonValue = Any
-
-_response_adapter: TypeAdapter[ModelResponse] = TypeAdapter(ModelResponse)
-_events_adapter: TypeAdapter[list[ModelResponseStreamEvent]] = TypeAdapter(list[ModelResponseStreamEvent])
-_call_tool_result_adapter: TypeAdapter[CallToolResult] = TypeAdapter(CallToolResult)
-_tool_defs_adapter: TypeAdapter[dict[str, ToolDefinition]] = TypeAdapter(dict[str, ToolDefinition])
-_dynamic_tools_adapter: TypeAdapter[DynamicToolsResult] = TypeAdapter(DynamicToolsResult)
-_instructions_adapter: TypeAdapter[_Instructions] = TypeAdapter(_Instructions)
-
-
-def _require_bridge() -> StepBridge:
-    bridge = current_bridge()
-    assert bridge is not None  # pragma: no cover - callers gate on `in_durable_context`
-    return bridge
-
-
-def _merge_config(base: Mapping[str, Any] | None, per_tool: Mapping[str, Any] | None) -> Mapping[str, Any]:
-    """Per-tool step config overrides the base key by key, as it does for Temporal and Prefect.
-
-    Merging rather than replacing means a tool that sets only `step_semantics` keeps the base
-    `retry_strategy`, and an explicit empty mapping is simply a no-op.
-    """
-    return {**(base or {}), **(per_tool or {})}
-
-
-def _step_config(config: Mapping[str, Any] | None) -> StepConfig | None:
-    """Build a `StepConfig` from a per-tool metadata mapping."""
-    if not config:
-        return None
-    unknown = sorted(set(config) - _STEP_CONFIG_FIELDS)
-    if unknown:
-        raise UserError(
-            f'Unknown {_TOOL_CONFIG_KEY!r} step config {"key" if len(unknown) == 1 else "keys"} '
-            f'{", ".join(repr(key) for key in unknown)}. Supported keys are '
-            f'{", ".join(repr(field) for field in sorted(_STEP_CONFIG_FIELDS))}.'
-        )
-    return StepConfig(**config)
-
-
-@contextmanager
-def _durable_step_scope(ctx: RunContext[AgentDepsT]) -> Generator[RunContext[AgentDepsT]]:
-    """Run user code inside a durable step with `enqueue()` disabled.
-
-    A replay serves the recorded step output without re-running the code, so messages enqueued
-    from inside the step -- a tool call, an `event_stream_handler` delivering events inside the
-    model step or in its own handler step, a streaming model's own body -- would be dropped.
-
-    Both the yielded context and the ambient `get_current_run_context()` are guarded, matching the
-    base's `_durable_run_context_scope` (pydantic/pydantic-ai#6671), so it makes no difference
-    whether user code reads the context it was handed or the ambient getter. This module keeps its
-    own spelling of the scope only because the durable toolsets are built by module-level factories
-    that hold no reference to the capability.
-    """
-    pending: list[PendingMessage] = EnqueueGuard(
-        '`ctx.enqueue()` is not supported inside an AWS Lambda durable step because a replay '
-        'serves the recorded step output and would drop the enqueued messages. Enqueue messages '
-        'from handler-level code instead.'
-    )
-    guarded = replace(ctx, pending_messages=pending)
-    with set_current_run_context(guarded):
-        yield guarded
-
-
-def _serialize_call_tool_result(result: CallToolResult) -> _JsonValue:
-    return _call_tool_result_adapter.dump_python(result, mode='json')
-
-
-def _deserialize_call_tool_result(payload: _JsonValue) -> CallToolResult:
-    return _call_tool_result_adapter.validate_python(payload)
-
-
-def _resolve_function_tool_config(tool: ToolsetTool[Any] | None, tool_name: str) -> ToolConfig:
-    return resolve_tool_durable_config(
-        tool, tool_name, _NO_FALLBACK_CONFIG, metadata_key=_TOOL_CONFIG_KEY, config_type_label=_TOOL_CONFIG_LABEL
-    )
-
-
-def _resolve_mcp_tool_config(tool: ToolsetTool[Any] | None, tool_name: str) -> ToolConfig:
-    config = _resolve_function_tool_config(tool, tool_name)
-    if config is False:
-        raise UserError(
-            f'{_ENGINE_NAME} checkpointing for MCP tool {tool_name!r} was disabled with '
-            f'metadata={{{_TOOL_CONFIG_KEY!r}: False}}, but MCP tools perform I/O and so cannot run '
-            'outside a step. Remove the metadata so the call stays checkpointed.'
-        )
-    return config
-
-
-def _build_function_toolset(
-    toolset: FunctionToolset[AgentDepsT], *, step_name_prefix: str, base_config: Mapping[str, Any] | None
-) -> DurableFunctionToolset[AgentDepsT]:
-    name = f'{step_name_prefix}__function_toolset__{toolset.id}'
-
-    async def call_tool_operation(
-        tool_name: str,
-        tool_args: dict[str, Any],
-        ctx: RunContext[AgentDepsT],
-        tool: ToolsetTool[AgentDepsT],
-        config: Mapping[str, Any],
-    ) -> Any:
-        async def operation() -> _JsonValue:
-            with _durable_step_scope(ctx) as step_ctx:
-                result = await wrap_tool_call_result(toolset.call_tool(tool_name, tool_args, step_ctx, tool))
-            return _serialize_call_tool_result(result)
-
-        payload = await _require_bridge().run_step(
-            f'{name}.call_tool:{tool_name}', operation, _step_config(_merge_config(base_config, config))
-        )
-        return unwrap_recorded_tool_call_result(_deserialize_call_tool_result(payload))
-
-    return DurableFunctionToolset(
-        toolset,
-        in_durable_context=in_durable_context,
-        call_tool_operation=call_tool_operation,
-        resolve_tool_config=_resolve_function_tool_config,
-        # The durable path is gated on `in_durable_context`, so outside a durable handler the
-        # wrapper must enter the wrapped toolset itself, as the plain run would.
-        lifecycle='enter-always',
-        durable_config=base_config,
-    )
-
-
-def _build_mcp_toolset(
-    toolset: MCPToolset[AgentDepsT], *, step_name_prefix: str, base_config: Mapping[str, Any] | None
-) -> DurableMCPToolset[AgentDepsT]:
-    name = f'{step_name_prefix}__mcp_server__{toolset.id}'
-
-    async def get_tools_operation(ctx: RunContext[AgentDepsT]) -> dict[str, ToolDefinition]:
-        async def operation() -> _JsonValue:
-            with _durable_step_scope(ctx) as step_ctx:
-                tools = await toolset.get_tools(step_ctx)
-            return _tool_defs_adapter.dump_python({n: t.tool_def for n, t in tools.items()}, mode='json')
-
-        payload = await _require_bridge().run_step(f'{name}.get_tools', operation, _step_config(base_config))
-        return _tool_defs_adapter.validate_python(payload)
-
-    async def get_instructions_operation(ctx: RunContext[AgentDepsT]) -> _Instructions:
-        async def operation() -> _JsonValue:
-            with _durable_step_scope(ctx) as step_ctx:
-                instructions = await toolset.get_instructions(step_ctx)
-            return _instructions_adapter.dump_python(instructions, mode='json')
-
-        payload = await _require_bridge().run_step(f'{name}.get_instructions', operation, _step_config(base_config))
-        return _instructions_adapter.validate_python(payload)
-
-    async def call_tool_operation(
-        tool_name: str,
-        tool_args: dict[str, Any],
-        ctx: RunContext[AgentDepsT],
-        tool: ToolsetTool[AgentDepsT],
-        config: Mapping[str, Any],
-    ) -> Any:
-        async def operation() -> _JsonValue:
-            with _durable_step_scope(ctx) as step_ctx:
-                result = await wrap_tool_call_result(toolset.call_tool(tool_name, tool_args, step_ctx, tool))
-            return _serialize_call_tool_result(result)
-
-        payload = await _require_bridge().run_step(
-            f'{name}.call_tool:{tool_name}', operation, _step_config(_merge_config(base_config, config))
-        )
-        return unwrap_recorded_tool_call_result(_deserialize_call_tool_result(payload))
-
-    return DurableMCPToolset(
-        toolset,
-        in_durable_context=in_durable_context,
-        get_tools_operation=get_tools_operation,
-        get_instructions_operation=get_instructions_operation,
-        call_tool_operation=call_tool_operation,
-        resolve_tool_config=_resolve_mcp_tool_config,
-        # Keep one session for the run rather than an implicit session per call, which is what a
-        # plain (non-durable) run does. Prefect takes the same stance for a gated engine.
-        lifecycle='enter-always',
-        durable_config=base_config,
-    )
-
-
-def _build_dynamic_toolset(
-    toolset: DynamicToolset[AgentDepsT], *, step_name_prefix: str, base_config: Mapping[str, Any] | None
-) -> DurableDynamicToolset[AgentDepsT]:
-    name = f'{step_name_prefix}__dynamic_toolset__{toolset.id}'
-
-    async def get_tools_operation(ctx: RunContext[AgentDepsT]) -> DynamicToolsResult:
-        async def operation() -> _JsonValue:
-            # The strongest case for guarding discovery: the toolset function here is user code.
-            with _durable_step_scope(ctx) as step_ctx:
-                tools = await get_dynamic_tools(toolset, step_ctx)
-            return _dynamic_tools_adapter.dump_python(tools, mode='json')
-
-        payload = await _require_bridge().run_step(f'{name}.get_tools', operation, _step_config(base_config))
-        return _dynamic_tools_adapter.validate_python(payload)
-
-    async def call_tool_operation(
-        tool_name: str,
-        tool_args: dict[str, Any],
-        ctx: RunContext[AgentDepsT],
-        tool: ToolsetTool[AgentDepsT],
-        config: Mapping[str, Any],
-    ) -> Any:
-        async def operation() -> _JsonValue:
-            # Arg re-validation happens inside `call_dynamic_tool`: a `ValidationError` from it is
-            # deterministic, so letting it leave the step un-checkpointed is safe and `ToolManager`
-            # turns it into a retry prompt.
-            with _durable_step_scope(ctx) as step_ctx:
-                result = await wrap_tool_call_result(call_dynamic_tool(toolset, tool_name, tool_args, step_ctx))
-            return _serialize_call_tool_result(result)
-
-        payload = await _require_bridge().run_step(
-            f'{name}.call_tool:{tool_name}', operation, _step_config(_merge_config(base_config, config))
-        )
-        return unwrap_recorded_tool_call_result(_deserialize_call_tool_result(payload))
-
-    return DurableDynamicToolset(
-        toolset,
-        in_durable_context=in_durable_context,
-        get_tools_operation=get_tools_operation,
-        call_tool_operation=call_tool_operation,
-        resolve_tool_config=_resolve_function_tool_config,
-        lifecycle='enter-never',
-        durable_config=base_config,
-    )
 
 
 @dataclass(init=False)
@@ -335,13 +85,16 @@ class AWSLambdaDurability(BaseDurabilityCapability[AgentDepsT]):
         ```
     """
 
-    engine_name = _ENGINE_NAME
-    _unsupported_runtime_toolset_kinds: ClassVar[frozenset[RuntimeToolsetKind]] = frozenset(
-        {'function', 'mcp', 'dynamic'}
+    engine_spec: ClassVar = DurabilityEngineSpec(
+        engine_name=_ENGINE_NAME,
+        durable_unit_noun='step',
+        durable_container_noun='handler',
+        codec=JSON_CODEC,
+        serialization_failure=lambda exc: ExecutionError(str(exc)),
+        sequential_tools_in_durable_context=True,
+        unsupported_runtime_toolset_kinds=frozenset({'function', 'mcp', 'dynamic'}),
+        tool_config_key=_TOOL_CONFIG_KEY,
     )
-    _durable_unit_noun = 'step'
-    _durable_container_noun = 'durable execution'
-    _tool_config_key = _TOOL_CONFIG_KEY
 
     def __init__(
         self,
@@ -369,127 +122,16 @@ class AWSLambdaDurability(BaseDurabilityCapability[AgentDepsT]):
                 `metadata={'aws_lambda': {...}}` overrides it key by key for that tool.
         """
         super().__init__(models=models, event_stream_handler=event_stream_handler, name=name)
-        # Validate eagerly so a bad config fails at construction rather than mid-execution.
-        _step_config(step_config)
+        AWSLambdaOperationConfig(step_config)
         self._base_step_config = step_config
-        self._default_model_id: str | None = None
 
     @property
     def in_durable_context(self) -> bool:
         return in_durable_context()
 
-    def _bind_to_agent(self, agent: AbstractAgent[AgentDepsT, Any]) -> None:
-        # Lambda durable steps are ad-hoc `context.step(...)` calls, so there is nothing to
-        # register up front beyond the durable toolset wrappers.
-        #
-        # Only a *string* default needs recording. A model supplied as an instance leaves
-        # `ModelRequestContext.model_id` unset, so `_model_id_for_request` resolves it through the
-        # base's model registry, which already answers `None` for the agent's own model -- there is
-        # no suffix to suppress. A string default is the one case that takes the provenance fast
-        # path instead and so arrives here carrying its own name.
-        self._default_model_id = agent.model if isinstance(agent.model, str) else None
-        self._register_toolsets(agent)
-
-    def _wrap_leaf_toolset(self, ts: AbstractToolset[AgentDepsT]) -> WrapperToolset[AgentDepsT] | None:
-        if isinstance(ts, FunctionToolset):
-            return _build_function_toolset(ts, step_name_prefix=self.name, base_config=self._base_step_config)
-        if isinstance(ts, DynamicToolset):
-            return _build_dynamic_toolset(ts, step_name_prefix=self.name, base_config=self._base_step_config)
-        try:
-            from pydantic_ai.mcp import MCPToolset
-        except ImportError:  # pragma: no cover - only when the mcp extra is absent
-            return None
-        if isinstance(ts, MCPToolset):
-            return _build_mcp_toolset(ts, step_name_prefix=self.name, base_config=self._base_step_config)
-        return None
-
-    async def _dispatch_event_stream_event(self, ctx: RunContext[AgentDepsT], event: AgentStreamEvent) -> None:
-        handler = self._event_stream_handler
-        assert handler is not None  # pragma: no cover - only dispatched when a handler is set
-
-        async def operation() -> None:
-            with _durable_step_scope(ctx) as step_ctx:
-                await handler(step_ctx, self._single_event_stream(event))
-
-        # Checkpoint the handler call so its side effects are not repeated when the execution resumes.
-        await _require_bridge().run_step(
-            f'{self.name}__event_stream_handler', operation, _step_config(self._base_step_config)
+    def get_durable_operation_backend(self) -> DurableOperationBackend[StepConfig | None]:
+        return AWSLambdaOperationBackend(
+            agent_name=self.name,
+            default_model_id=self.default_model_id,
+            config=AWSLambdaOperationConfig(self._base_step_config),
         )
-
-    async def wrap_run(self, ctx: RunContext[AgentDepsT], *, handler: WrapRunHandler) -> AgentRunResult[Any]:
-        """Run tool calls one at a time inside a durable execution.
-
-        A step's identity comes from the order steps are reached, so concurrently scheduled tool
-        calls could claim each other's checkpoints when the execution resumes. Outside a durable
-        handler the agent's configured mode is left untouched, so an ordinary run keeps its
-        parallelism.
-        """
-        agent = self._agent
-        if agent is None or not self.in_durable_context:
-            return await handler()
-        with agent.parallel_tool_call_execution_mode('sequential'):
-            return await handler()
-
-    async def wrap_model_request(
-        self, ctx: RunContext[AgentDepsT], *, request_context: ModelRequestContext, handler: WrapModelRequestHandler
-    ) -> ModelResponse:
-        """Checkpoint each model-request segment into a durable step."""
-        if not self.in_durable_context:
-            return await handler(request_context)
-
-        # The step runs in the same process, so the model needs no cross-boundary rebuild; the
-        # model id only disambiguates the step name. A string default carries itself as
-        # provenance, so suppress the suffix for it to keep one name for the default model.
-        model_id = self._model_id_for_request(ctx, request_context)
-        if model_id is not None and model_id == self._default_model_id:
-            model_id = None
-        suffix = '' if model_id is None else f'.{model_id}'
-        config = _step_config(self._base_step_config)
-        model = request_context.model
-
-        async def request_segment(request: ModelRequestContext) -> ModelResponse:
-            async def operation() -> _JsonValue:
-                response = await request.model.request(
-                    request.messages, request.model_settings, request.model_request_parameters
-                )
-                return _response_adapter.dump_python(response, mode='json')
-
-            payload = await _require_bridge().run_step(f'{self.name}__model.request{suffix}', operation, config)
-            return _response_adapter.validate_python(payload)
-
-        async def request_stream_segment(request: ModelRequestContext) -> StreamedActivityResult:
-            async def operation() -> _JsonValue:
-                # One scope over both: the model body runs inside this step too, so a streaming
-                # model that enqueues from its own body would have those messages dropped on
-                # replay exactly like a handler that enqueues while draining the event stream.
-                with _durable_step_scope(ctx) as step_ctx:
-                    async with request.model.request_stream(
-                        request.messages, request.model_settings, request.model_request_parameters, step_ctx
-                    ) as streamed:
-                        events = await capture_event_stream(
-                            run_context=step_ctx, stream=streamed, handler=self._event_stream_handler
-                        )
-                return {
-                    'response': _response_adapter.dump_python(streamed.get(), mode='json'),
-                    'events': _events_adapter.dump_python(events, mode='json'),
-                }
-
-            payload = await _require_bridge().run_step(f'{self.name}__model.request_stream{suffix}', operation, config)
-            return StreamedActivityResult(
-                response=_response_adapter.validate_python(payload['response']),
-                events=_events_adapter.validate_python(payload['events']),
-            )
-
-        async def cancel_suspended_response_segment(response: ModelResponse) -> None:
-            async def operation() -> None:
-                await model.cancel_suspended_response(response)
-
-            await _require_bridge().run_step(f'{self.name}__model.cancel_suspended_response{suffix}', operation, config)
-
-        request_context.model = DurableModel(
-            request_context.model,
-            request_segment=request_segment,
-            request_stream_segment=request_stream_segment,
-            cancel_suspended_response_segment=cancel_suspended_response_segment,
-        )
-        return await handler(request_context)

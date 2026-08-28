@@ -11,8 +11,10 @@ from contextlib import asynccontextmanager
 from typing import Any
 
 import pytest
+from aws_durable_execution_sdk_python.exceptions import ExecutionError
 from pydantic_ai import Agent, RunContext
 from pydantic_ai._run_context import get_current_run_context  # pyright: ignore[reportPrivateUsage]
+from pydantic_ai.capabilities import AbstractCapability, durable_operation
 from pydantic_ai.exceptions import ApprovalRequired, CallDeferred, ModelRetry, UserError
 from pydantic_ai.messages import (
     AgentStreamEvent,
@@ -123,6 +125,43 @@ class TestDurableRun:
         assert [op.status for op in ctx.failed] == ['failed']
 
 
+class TestCapabilityOperation:
+    def test_operation_is_journaled_and_replayed_without_rerunning_handler(self) -> None:
+        class Contributor(AbstractCapability[Any]):
+            id = 'contributor'
+
+            def __init__(self) -> None:
+                self.calls = 0
+
+            async def before_run(self, ctx: RunContext[Any]) -> None:
+                await self.record(ctx, 'value')
+
+            @durable_operation
+            async def record(self, ctx: RunContext[Any], value: str) -> str:
+                self.calls += 1
+                return value
+
+        contributor = Contributor()
+        agent = Agent(
+            TestModel(custom_output_text='done'),
+            name='a',
+            capabilities=[contributor, AWSLambdaDurability()],
+        )
+
+        first = FakeDurableContext()
+        run_durable(lambda: agent.run('go'), context=first)
+
+        assert first.step_names[0] == 'a__capability__contributor.record'
+        assert contributor.calls == 1
+
+        resumed = FakeDurableContext(journal=first.operations)
+        result = run_durable(lambda: agent.run('go'), context=resumed)
+
+        assert result.output == 'done'
+        assert resumed.invoked == []
+        assert contributor.calls == 1
+
+
 class TestControlFlowSignals:
     """Control-flow signals must cross a step as values, not as step failures.
 
@@ -189,6 +228,15 @@ class TestToolResultSerialization:
 
         assert result.output == 'done'
         assert ctx.failed == []
+
+    def test_non_serializable_tool_result_fails_without_retry(self) -> None:
+        agent = build_agent(lambda: object())
+        ctx = FakeDurableContext()
+
+        with pytest.raises(ExecutionError, match='Unable to serialize unknown type'):
+            run_durable(lambda: agent.run('go'), context=ctx)
+
+        assert len(ctx.failed) == 1
 
 
 class TestCrashMidRunRetry:
@@ -276,6 +324,16 @@ class TestStepConfig:
         with pytest.raises(UserError, match="Unknown 'aws_lambda' step config key 'retries'"):
             run_durable(lambda: agent.run('go'), context=ctx)
 
+    def test_non_mapping_per_tool_config_is_rejected(self) -> None:
+        toolset = FunctionToolset[object](id='tools')
+        toolset.add_function(act, metadata={'aws_lambda': 'invalid'})
+
+        agent = Agent(tool_then_text(), name='a', toolsets=[toolset], capabilities=[AWSLambdaDurability()])
+        ctx = FakeDurableContext()
+
+        with pytest.raises(UserError, match='expected a dict .* or `False`, got str'):
+            run_durable(lambda: agent.run('go'), context=ctx)
+
 
 class TestNesting:
     """A nested durable run cannot make progress: the handler thread is blocked servicing the
@@ -314,6 +372,18 @@ def act() -> str:
 
 
 class TestBinding:
+    def test_binding_does_not_mutate_the_template_capability(self) -> None:
+        capability = AWSLambdaDurability()
+
+        agent = Agent('test', name='a', capabilities=[capability])
+        bound = AWSLambdaDurability.from_agent(agent)
+
+        assert capability.agent is None
+        assert capability.default_model_id is None
+        assert bound is not None
+        assert bound.agent is agent
+        assert bound.default_model_id == 'test'
+
     def test_agent_without_a_name_is_rejected(self) -> None:
         with pytest.raises(UserError, match='unique `name`'):
             Agent(TestModel(), capabilities=[AWSLambdaDurability()])

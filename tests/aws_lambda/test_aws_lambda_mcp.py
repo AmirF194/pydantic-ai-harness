@@ -133,7 +133,7 @@ class TestMcpCheckpointing:
         assert server.tool_calls == [('add', {'a': 2, 'b': 3})]
         assert 'calc__mcp_server__calc.get_tools' in ctx.step_names
         assert 'calc__mcp_server__calc.get_instructions' in ctx.step_names
-        assert 'calc__mcp_server__calc.call_tool:add' in ctx.step_names
+        assert 'calc__mcp_server__calc.call_tool' in ctx.step_names
 
     def test_resume_does_not_reach_the_server(self) -> None:
         server = FakeMCPToolset(id='calc', instructions='Use the calculator.')
@@ -176,7 +176,7 @@ class TestMcpCheckpointing:
         agent = build(server)
         ctx = FakeDurableContext()
 
-        with pytest.raises(UserError, match='cannot run outside a step'):
+        with pytest.raises(UserError, match='cannot run outside a durable step'):
             run_durable(lambda: agent.run('add 2 and 3'), context=ctx)
 
     def test_transparent_outside_a_durable_handler(self) -> None:
