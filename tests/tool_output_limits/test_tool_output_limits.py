@@ -558,6 +558,14 @@ class TestSpill:
         assert out.metadata['orig'] is True
         assert 'overflow_handle' in out.metadata
 
+    async def test_spill_preserves_non_mapping_metadata(self, tmp_path: Path):
+        store = LocalFileStore(base_dir=tmp_path)
+        cap: ToolOutputLimits[object] = ToolOutputLimits(bands=[Band(over=5, action=Spill())], store=store)
+        out = await _run(cap, ToolReturn(return_value='a' * 100, metadata='app-request-id-123'))
+        assert isinstance(out, ToolReturn)
+        assert out.metadata['original_metadata'] == 'app-request-id-123'
+        assert 'overflow_handle' in out.metadata
+
 
 class _BrokenStore:
     """An `OverflowStore` whose writes always fail (for fallback tests)."""
@@ -758,6 +766,10 @@ class TestInternals:
 
     def test_with_handles_non_mapping(self):
         meta = _with_handles('not-a-mapping', 'h/1.0', 42)
+        assert meta == {'original_metadata': 'not-a-mapping', 'overflow_handle': 'h/1.0', 'overflow_bytes': 42}
+
+    def test_with_handles_none(self):
+        meta = _with_handles(None, 'h/1.0', 42)
         assert meta == {'overflow_handle': 'h/1.0', 'overflow_bytes': 42}
 
     def test_with_handles_content_only(self):
