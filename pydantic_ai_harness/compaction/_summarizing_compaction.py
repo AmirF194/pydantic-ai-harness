@@ -607,7 +607,7 @@ class SummarizingCompaction(AbstractCapability[AgentDepsT]):
         request_context.messages = compacted
         return request_context
 
-    @durable_operation
+    @durable_operation('_summarize')
     async def _summarize(
         self,
         messages: list[ModelMessage],
