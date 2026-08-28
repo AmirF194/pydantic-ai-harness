@@ -384,16 +384,16 @@ class PlanningToolset(FunctionToolset[AgentDepsT]):
         for item in after:
             previous = old.get(item.id)
             if previous is None:
-                await ctx.emit_event(PlanCreatedEvent(item=item))
+                await ctx.emit(PlanCreatedEvent(item=item))
             elif item != previous:
-                await ctx.emit_event(PlanUpdatedEvent(item=item, previous_state=previous))
+                await ctx.emit(PlanUpdatedEvent(item=item, previous_state=previous))
                 if item.status != previous.status:
-                    await ctx.emit_event(PlanStatusChangedEvent(item=item, previous_state=previous))
+                    await ctx.emit(PlanStatusChangedEvent(item=item, previous_state=previous))
                     if item.status is TaskStatus.completed:
-                        await ctx.emit_event(PlanCompletedEvent(item=item, previous_state=previous))
+                        await ctx.emit(PlanCompletedEvent(item=item, previous_state=previous))
         for item in before:
             if item.id not in new:
-                await ctx.emit_event(PlanDeletedEvent(item=item))
+                await ctx.emit(PlanDeletedEvent(item=item))
 
     async def write_plan(self, ctx: RunContext[AgentDepsT], items: list[PlanItem]) -> str:
         """Create or replace the whole plan.

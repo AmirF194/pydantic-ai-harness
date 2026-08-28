@@ -92,7 +92,7 @@ def _ctx(model: Any = None) -> Any:
         deps: None = None
         tracer: Tracer = dataclasses.field(default_factory=NoOpTracer)
 
-        async def emit_event(self, event: Any) -> Any:
+        async def emit(self, event: Any) -> Any:
             return event
 
     return _FakeCtx(model=model) if model is not None else _FakeCtx()

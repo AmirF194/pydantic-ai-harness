@@ -189,7 +189,7 @@ class SystemReminders(AbstractCapability[AgentDepsT]):
                 for key, _text in fired:
                     self._fire_counts[key] = self._fire_counts.get(key, 0) + 1
                 for text in texts:
-                    await ctx.emit_event(ReminderFiredEvent(text=text))
+                    await ctx.emit(ReminderFiredEvent(text=text))
                 if self.on_fire is not None:
                     for text in texts:
                         self.on_fire(text)

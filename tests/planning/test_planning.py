@@ -61,10 +61,10 @@ def anyio_backend() -> str:
 def _ctx() -> RunContext[None]:
     ctx = MagicMock()
 
-    async def emit_event(event: object) -> object:
+    async def emit(event: object) -> object:
         return event
 
-    ctx.emit_event = AsyncMock(side_effect=emit_event)
+    ctx.emit = AsyncMock(side_effect=emit)
     return cast(RunContext[None], ctx)
 
 

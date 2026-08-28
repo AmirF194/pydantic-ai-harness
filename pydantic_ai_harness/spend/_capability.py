@@ -366,7 +366,7 @@ class SpendLimits(AbstractCapability[AgentDepsT]):
             priced=priced,
             budgets=tuple(statuses),
         )
-        await ctx.emit_event(
+        await ctx.emit(
             SpendRecordedEvent(
                 model=snapshot.model,
                 usage=snapshot.usage,

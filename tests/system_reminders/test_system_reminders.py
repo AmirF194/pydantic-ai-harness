@@ -60,10 +60,10 @@ def _ctx(
     ctx.usage = usage if usage is not None else RunUsage()
     ctx.usage_limits = usage_limits if usage_limits is not None else UsageLimits()
 
-    async def emit_event(event: Any) -> Any:
+    async def emit(event: Any) -> Any:
         return event
 
-    ctx.emit_event = emit_event
+    ctx.emit = emit
     return ctx
 
 

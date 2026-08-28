@@ -142,7 +142,7 @@ class ReportContextUsage(AbstractCapability[AgentDepsT]):
     ) -> ModelRequestContext:
         """Measure the pending history, emit it, and invoke the compatibility callback."""
         reading = self._measure(request_context)
-        await ctx.emit_event(
+        await ctx.emit(
             ContextUsageEvent(
                 used_tokens=reading.used_tokens,
                 window_tokens=reading.window_tokens,
