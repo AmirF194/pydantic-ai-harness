@@ -23,6 +23,7 @@ from pydantic_ai_harness.compaction._shared import (
     estimate_token_count,
     record_compaction_reclaim,
     resolve_token_trigger,
+    strategy_id,
     validate_token_trigger,
 )
 
@@ -163,7 +164,7 @@ class TieredCompaction(AbstractCapability[AgentDepsT]):
             tier_messages = messages
             messages = await compact_with_events(
                 ctx,
-                strategy=type(tier).__name__,
+                strategy=strategy_id(tier),
                 messages=tier_messages,
                 compact=lambda: tier.compact(tier_messages, ctx),
             )
@@ -209,7 +210,7 @@ class TieredCompaction(AbstractCapability[AgentDepsT]):
             return request_context
         compacted = await compact_with_span(
             request_ctx,
-            strategy='TieredCompaction',
+            strategy='tiered',
             messages=messages,
             compact=lambda: self._escalate(messages, request_ctx, target, request_context.model_request_parameters),
             tokenizer=self.tokenizer,

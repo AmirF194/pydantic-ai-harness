@@ -611,6 +611,12 @@ class CompactionStrategy(Protocol[AgentDepsT]):
     capability's `before_model_request`).  A strategy that composes others may define its own
     stop condition instead -- `TieredCompaction` escalates only until the history fits its
     target.  Implementations must preserve tool-call / tool-return pairing.
+
+    A strategy may declare a `strategy_id` class attribute: the stable identifier its
+    `CompactionStartEvent`/`CompactionEndEvent` emissions and OTel span attributes carry.
+    Without one, the snake-cased class name (minus a `Compaction` suffix) is used, which
+    changes if the class is renamed -- declare an explicit id for anything consumers persist
+    or branch on.
     """
 
     async def compact(
@@ -618,6 +624,15 @@ class CompactionStrategy(Protocol[AgentDepsT]):
         messages: list[ModelMessage],
         ctx: RunContext[AgentDepsT],
     ) -> list[ModelMessage]: ...  # pragma: no cover
+
+
+def strategy_id(strategy: object) -> str:
+    """The stable identifier `strategy`'s compaction events and span attributes carry."""
+    declared = getattr(strategy, 'strategy_id', None)
+    if isinstance(declared, str) and declared:
+        return declared
+    name = type(strategy).__name__.removesuffix('Compaction') or type(strategy).__name__
+    return ''.join(f'_{c.lower()}' if c.isupper() else c for c in name).lstrip('_')
 
 
 # ---------------------------------------------------------------------------

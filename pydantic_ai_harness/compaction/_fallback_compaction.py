@@ -11,7 +11,7 @@ from pydantic_ai.exceptions import FallbackExceptionGroup, ModelAPIError
 from pydantic_ai.messages import ModelMessage
 from pydantic_ai.tools import RunContext
 
-from pydantic_ai_harness.compaction._shared import CompactionStrategy, SupportsFocus, compact_with_events
+from pydantic_ai_harness.compaction._shared import CompactionStrategy, SupportsFocus, compact_with_events, strategy_id
 
 
 @dataclass
@@ -58,7 +58,7 @@ class FallbackCompaction(Generic[AgentDepsT]):
                 attempt_messages = list(messages)
                 return await compact_with_events(
                     ctx,
-                    strategy=type(strategy).__name__,
+                    strategy=strategy_id(strategy),
                     messages=attempt_messages,
                     compact=lambda: strategy.compact(attempt_messages, ctx),
                 )

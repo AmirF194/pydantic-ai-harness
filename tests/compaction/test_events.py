@@ -65,7 +65,7 @@ async def test_cancelled_attempt_retries_and_then_emits_end() -> None:
     assert len(events) == 1
     before = events[0]
     assert isinstance(before, CompactionStartEvent)
-    assert before.strategy == 'SlidingWindowCompaction'
+    assert before.strategy == 'sliding_window'
     assert before.message_count == 2
     assert before.estimated_tokens is not None
     assert before.cancelled
@@ -133,7 +133,7 @@ async def test_fallback_cancellation_does_not_advance_but_failure_does() -> None
         @on_event(CompactionStartEvent)
         async def cancel_failure(self, ctx: RunContext[Any], event: CompactionStartEvent) -> None:
             nonlocal cancelled
-            if event.strategy == '_FailingStrategy' and not cancelled:
+            if event.strategy == 'failing_strategy' and not cancelled:
                 event.cancel()
                 cancelled = True
 

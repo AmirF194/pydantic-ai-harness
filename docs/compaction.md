@@ -381,7 +381,7 @@ The span name is the static `compact_messages`; the strategy is an attribute, no
 | Attribute | Type | Meaning |
 |---|---|---|
 | `gen_ai.conversation.compacted` | bool | Always `true`; the OpenTelemetry GenAI convention's flag for a compacted context |
-| `compaction.strategy` | str | Strategy class name (for example `SlidingWindowCompaction`, `SummarizingCompaction`) |
+| `compaction.strategy` | str | Stable strategy identifier (for example `sliding_window`, `summarizing`) |
 | `compaction.messages_before` | int | Message count before compaction |
 | `compaction.messages_after` | int | Message count after compaction |
 | `compaction.tokens_before` | int | Estimated token count before compaction |

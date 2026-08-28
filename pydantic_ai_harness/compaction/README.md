@@ -431,7 +431,7 @@ to keep span cardinality low. Attributes:
 | Attribute | Type | Meaning |
 |---|---|---|
 | `gen_ai.conversation.compacted` | bool | Always `true`; the OpenTelemetry GenAI convention's flag for a compacted context |
-| `compaction.strategy` | str | Strategy class name (e.g. `SlidingWindowCompaction`, `SummarizingCompaction`) |
+| `compaction.strategy` | str | Stable strategy identifier (e.g. `sliding_window`, `summarizing`) |
 | `compaction.messages_before` | int | Message count before compaction |
 | `compaction.messages_after` | int | Message count after compaction |
 | `compaction.tokens_before` | int | Estimated token count before compaction |
